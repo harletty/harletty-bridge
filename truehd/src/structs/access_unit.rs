@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 use log::Level::{Error, Warn};
 use log::{trace, warn};
+use std::time::Instant;
 
 use crate::log_or_err;
 use crate::process::MAX_PRESENTATIONS;
@@ -62,6 +63,7 @@ pub struct AccessUnit {
 
 impl AccessUnit {
     pub fn read(state: &mut ParserState, reader: &mut BsIoSliceReader) -> Result<Self> {
+        let access_unit_started = Instant::now();
         state.is_major_sync = false;
 
         if !state.has_valid_branch {
@@ -167,10 +169,12 @@ impl AccessUnit {
             bail!(AccessUnitError::NoSubstream)
         };
 
+        let substream_directories_started = Instant::now();
         for i in 0..substreams {
             state.substream_index = i;
             au.substream_directory[i] = SubstreamDirectory::read(state, reader)?;
         }
+        state.record_parse_substream_directories(substream_directories_started.elapsed());
 
         state.has_valid_branch = false;
 
@@ -189,6 +193,7 @@ impl AccessUnit {
         state.substream_segment_start_pos = reader.position()?;
         state.has_parsed_substream = false;
 
+        let substream_segments_started = Instant::now();
         for i in 0..substreams {
             state.substream_index = i;
 
@@ -204,9 +209,12 @@ impl AccessUnit {
             au.substream_segment[i] = SubstreamSegment::read(state, reader)?;
             state.has_parsed_substream = true;
         }
+        state.record_parse_substream_segments(substream_segments_started.elapsed());
 
         if state.expected_au_end_pos() > reader.position()? as usize + 16 {
+            let extra_data_started = Instant::now();
             let extra_data = ExtraData::read(state, reader)?;
+            state.record_parse_extra_data(extra_data_started.elapsed());
             au.extra_data = Some(extra_data);
         }
 
@@ -228,6 +236,7 @@ impl AccessUnit {
         state.au_counter += 1; // TODO: migrate to gap check, should reset on sync check
 
         au.has_valid_branch = state.has_valid_branch || state.has_substream_info_changed;
+        state.record_parse_access_unit_total(access_unit_started.elapsed());
 
         Ok(au)
     }
