@@ -13,6 +13,7 @@
 use anyhow::{Result, anyhow, bail};
 use log::Level::Warn;
 use log::{info, trace, warn};
+use std::time::{Duration, Instant};
 
 use crate::log_or_err;
 use crate::process::decode::DecoderState;
@@ -187,6 +188,7 @@ impl BlockHeader {
 
 impl Block {
     pub fn read(state: &mut ParserState, reader: &mut BsIoSliceReader) -> Result<Self> {
+        let block_started = Instant::now();
         let mut b = Block::default();
 
         // block_header_exists
@@ -311,8 +313,14 @@ impl Block {
                 state.substream_state_mut()?.output_timing_history[i] = output_timing;
 
                 let substream_size = if state.substream_index == 0 {
+                    // substream_end_ptr is an offset in 16-bit words from
+                    // substream_segment_start_pos (D). Substream 0 starts at D (offset 0),
+                    // so its size in 16-bit words is simply end_ptr.
+                    // Using (D >> 4) as start_ptr is wrong: D is the absolute bit position of
+                    // the segment start within the AU, not a 0-based offset from D itself.
+                    // Encoders that embed major sync in every AU produce a large D, causing
+                    // D/16 > end_ptr_0 and an underflow (e.g. WALL-E HYPERION remux).
                     state.substream_state()?.substream_end_ptr
-                        - (state.substream_segment_start_pos >> 4) as u16
                 } else {
                     state.substream_state()?.substream_end_ptr
                         - state.substream_state[state.substream_index - 1].substream_end_ptr
@@ -353,6 +361,7 @@ impl Block {
             quantiser_step_size,
             ..
         } = *state.substream_state()?;
+        state.record_parse_block_header_setup(block_started.elapsed());
 
         let block_data_start_pos = reader.position()?;
 
@@ -373,6 +382,7 @@ impl Block {
 
         for blki in 0..block_size {
             // bypassed_lsb
+            let bypassed_lsb_started = Instant::now();
             let bypassed_lsb_start_pos = reader.position()?;
 
             if restart_sync_word == 0x31EC {
@@ -396,14 +406,17 @@ impl Block {
                     } as i32;
                 }
             }
+            state.record_parse_block_bypassed_lsb(bypassed_lsb_started.elapsed());
 
             let bypassed_lsb_bits = reader.position()? - bypassed_lsb_start_pos;
             let block_data = &mut b.block_data[blki];
 
             let mut channel_data = [0i32; 16];
             let mut position_checks_needed = false;
+            let mut checks_total = Duration::ZERO;
 
             // huff decode
+            let huffman_started = Instant::now();
             for chi in min_chan..=max_chan {
                 let huff_offset = huff_offset[chi];
                 let huff_type = huff_type[chi];
@@ -448,6 +461,7 @@ impl Block {
                 audio_data <<= quantiser_step_size;
 
                 if position_checks_needed {
+                    let checks_started = Instant::now();
                     let huff_size = reader.position()? - huff_start_pos;
 
                     if audio_data >= 1 << 23 {
@@ -466,15 +480,21 @@ impl Block {
                     if huff_size > 29 {
                         bail!(BlockError::HuffmanSampleTooLong);
                     }
+                    checks_total += checks_started.elapsed();
                 }
 
                 channel_data[chi] = audio_data;
             }
+            state.record_parse_block_huffman_decode(huffman_started.elapsed());
 
             block_data[min_chan..(max_chan + 1)]
                 .copy_from_slice(&channel_data[min_chan..(max_chan + 1)]);
+            if !checks_total.is_zero() {
+                state.record_parse_block_checks(checks_total);
+            }
         }
 
+        let checks_started = Instant::now();
         if let Some(block_data_bits) = b.block_data_bits {
             let actual_block_data_bits = reader.position()? - block_data_start_pos;
             if actual_block_data_bits != block_data_bits as u64 {
@@ -492,6 +512,7 @@ impl Block {
                 b.block_header_crc
             );
         }
+        state.record_parse_block_checks(checks_started.elapsed());
 
         Ok(b)
     }

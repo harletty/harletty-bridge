@@ -17,6 +17,7 @@
 
 use anyhow::{Result, anyhow};
 use log::{trace, warn};
+use std::time::Instant;
 
 use crate::log_or_err;
 use crate::process::parse::ParserState;
@@ -150,6 +151,7 @@ impl SubstreamSegment {
         let mut last_block_in_segment = false;
         state.substream_state_mut()?.block_index = 0;
 
+        let blocks_started = Instant::now();
         while !last_block_in_segment {
             if ss.block.len() > 4 || ss.block.len() >= 3 && state.format_sync == MAJOR_SYNC_FBA {
                 log_or_err!(
@@ -162,7 +164,9 @@ impl SubstreamSegment {
             last_block_in_segment = reader.get()?;
             state.substream_state_mut()?.block_index += 1;
         }
+        state.record_parse_substream_segment_blocks(blocks_started.elapsed());
 
+        let tail_started = Instant::now();
         reader.align_16bit()?;
 
         let crc_present = state.substream_state()?.crc_present;
@@ -287,6 +291,8 @@ impl SubstreamSegment {
                 })
             );
         }
+
+        state.record_parse_substream_segment_tail(tail_started.elapsed());
 
         Ok(ss)
     }

@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use std::time::Duration;
 
 use crate::process::extract::Frame;
 use crate::process::{MAX_PRESENTATIONS, PresentationMap};
@@ -20,6 +21,20 @@ pub struct Parser {
     state: ParserState,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParserPerfStats {
+    pub access_unit_total: Duration,
+    pub substream_directories: Duration,
+    pub substream_segments: Duration,
+    pub substream_segment_blocks: Duration,
+    pub substream_segment_tail: Duration,
+    pub extra_data: Duration,
+    pub block_header_setup: Duration,
+    pub block_bypassed_lsb: Duration,
+    pub block_huffman_decode: Duration,
+    pub block_checks: Duration,
+}
+
 impl Parser {
     /// Parses an audio frame into a structured access unit.
     ///
@@ -27,8 +42,13 @@ impl Parser {
     /// and timing information. Handles both major sync frames (with stream
     /// configuration) and continuation frames (audio data only).
     pub fn parse(&mut self, frame: &Frame) -> Result<AccessUnit> {
+        self.state.last_parse_stats = ParserPerfStats::default();
         let reader = &mut BsIoSliceReader::from_slice(frame.as_ref());
         AccessUnit::read(&mut self.state, reader)
+    }
+
+    pub fn last_parse_stats(&self) -> ParserPerfStats {
+        self.state.last_parse_stats
     }
 
     pub fn set_required_presentations(
@@ -251,6 +271,8 @@ pub struct ParserState {
     pub crc_substream: Crc8,
     pub crc_major_sync_info: Crc16,
 
+    pub last_parse_stats: ParserPerfStats,
+
     pub bypassed_lsb: [[i32; 16]; 160],
     pub sample_buffer: [[i32; 16]; 160],
 }
@@ -334,10 +356,63 @@ impl Default for ParserState {
             crc_restart_block_header: Crc8::new(&CRC_RESTART_BLOCK_HEADER_ALG),
             crc_substream: Crc8::new(&CRC_SUBSTREAM_ALG),
             crc_major_sync_info: Crc16::new(&CRC_MAJOR_SYNC_INFO_ALG),
+            last_parse_stats: ParserPerfStats::default(),
 
             bypassed_lsb: [[0; 16]; 160],
             sample_buffer: [[0; 16]; 160],
         }
+    }
+}
+
+impl ParserState {
+    #[inline]
+    pub fn record_parse_substream_directories(&mut self, elapsed: Duration) {
+        self.last_parse_stats.substream_directories += elapsed;
+    }
+
+    #[inline]
+    pub fn record_parse_substream_segments(&mut self, elapsed: Duration) {
+        self.last_parse_stats.substream_segments += elapsed;
+    }
+
+    #[inline]
+    pub fn record_parse_substream_segment_blocks(&mut self, elapsed: Duration) {
+        self.last_parse_stats.substream_segment_blocks += elapsed;
+    }
+
+    #[inline]
+    pub fn record_parse_substream_segment_tail(&mut self, elapsed: Duration) {
+        self.last_parse_stats.substream_segment_tail += elapsed;
+    }
+
+    #[inline]
+    pub fn record_parse_extra_data(&mut self, elapsed: Duration) {
+        self.last_parse_stats.extra_data += elapsed;
+    }
+
+    #[inline]
+    pub fn record_parse_block_header_setup(&mut self, elapsed: Duration) {
+        self.last_parse_stats.block_header_setup += elapsed;
+    }
+
+    #[inline]
+    pub fn record_parse_block_bypassed_lsb(&mut self, elapsed: Duration) {
+        self.last_parse_stats.block_bypassed_lsb += elapsed;
+    }
+
+    #[inline]
+    pub fn record_parse_block_huffman_decode(&mut self, elapsed: Duration) {
+        self.last_parse_stats.block_huffman_decode += elapsed;
+    }
+
+    #[inline]
+    pub fn record_parse_block_checks(&mut self, elapsed: Duration) {
+        self.last_parse_stats.block_checks += elapsed;
+    }
+
+    #[inline]
+    pub fn record_parse_access_unit_total(&mut self, elapsed: Duration) {
+        self.last_parse_stats.access_unit_total = elapsed;
     }
 }
 
