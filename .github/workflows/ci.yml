@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout harletty-bridge
+        uses: actions/checkout@v4
+        with:
+          path: harletty-bridge
+
+      - name: Checkout Omniphony (path dependencies)
+        uses: actions/checkout@v4
+        with:
+          repository: mgth/Omniphony
+          path: Omniphony
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release)
+        run: cargo build --release
+        working-directory: harletty-bridge
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: harletty-bridge-linux-x86_64
+          path: harletty-bridge/target/release/libharletty_bridge.so
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout harletty-bridge
+        uses: actions/checkout@v4
+        with:
+          path: harletty-bridge
+
+      - name: Checkout Omniphony (path dependencies)
+        uses: actions/checkout@v4
+        with:
+          repository: mgth/Omniphony
+          path: Omniphony
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release)
+        run: cargo build --release
+        working-directory: harletty-bridge
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: harletty-bridge-windows-x86_64
+          path: harletty-bridge/target/release/harletty_bridge.dll
