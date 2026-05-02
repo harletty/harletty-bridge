@@ -1,42 +1,30 @@
 [workspace]
-members = ["truehd", "truehdd-macros"]
+members = ["truehd"]
 resolver = "2"
 
 [package]
-name = "truehdd"
-version = "0.4.0"
+name = "harletty-bridge"
+version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Tools for inspecting and decoding Dolby TrueHD bitstreams"
-repository = "https://github.com/truehdd/truehdd"
-build = "build.rs"
-authors = ["Rainbaby"]
-rust-version = "1.87.0"
 
-[[bin]]
-name = "truehdd"
-path = "src/main.rs"
+# cdylib: loadable .so/.dll   rlib: linkable by tests / static fallback
+[lib]
+name = "harletty_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+bridge-perf = []
 
 [dependencies]
-truehdd-macros = { version = "0.1.0", path = "truehdd-macros" }
+bridge_api = { version = "0.1.0", path = "../Omniphony/omniphony-renderer/bridge_api" }
+spdif = { version = "0.1.0", path = "../Omniphony/omniphony-renderer/spdif" }
+sys = { version = "0.1.0", path = "../Omniphony/omniphony-renderer/sys" }
 truehd = { version = "0.4.0", path = "truehd" }
+abi_stable = "0.11"
+log = "0.4"
+anyhow = "1.0"
 
-anyhow = "1.0.99"
-clap = { version = "4.5.45", features = ["derive"] }
-env_logger = "0.11.8"
-indicatif = "0.18.0"
-indicatif-log-bridge = "0.2.3"
-log = "0.4.27"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_yaml_ng = "0.10.0"
-
-[build-dependencies]
-anyhow = "1.0.99"
-vergen-gitcl = { version = "1.0.8", default-features = false, features = ["build"] }
-chrono = "0.4.41"
-serde_json = "1.0.142"
-
-[profile.release-deploy]
-inherits = "release"
-lto = "thin"
-strip = "symbols"
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
