@@ -1,10 +1,9 @@
-name: CI
+name: Release
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    tags:
+      - 'v*'
 
 jobs:
   build-linux:
@@ -32,11 +31,16 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
 
+      - name: Package (zip)
+        run: |
+          cd harletty-bridge/target/release
+          zip "harletty-bridge-${GITHUB_REF_NAME}-linux-x86_64.zip" libharletty_bridge.so
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: harletty-bridge-linux-x86_64
-          path: harletty-bridge/target/release/libharletty_bridge.so
+          path: harletty-bridge/target/release/harletty-bridge-*-linux-x86_64.zip
 
   build-windows:
     runs-on: windows-latest
@@ -63,8 +67,37 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
 
+      - name: Package (zip)
+        run: |
+          cd harletty-bridge/target/release
+          Compress-Archive -Path harletty_bridge.dll -DestinationPath "harletty-bridge-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: harletty-bridge-windows-x86_64
-          path: harletty-bridge/target/release/harletty_bridge.dll
+          path: harletty-bridge/target/release/harletty-bridge-*-windows-x86_64.zip
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: harletty-bridge-linux-x86_64
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: harletty-bridge-windows-x86_64
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            harletty-bridge-*-linux-x86_64.zip
+            harletty-bridge-*-windows-x86_64.zip
