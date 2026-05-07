@@ -5,6 +5,7 @@ use super::metadata::{JocPayload, MetadataParseState, OamdPayload, ParsedEmdfPay
 use super::syncframe::{
     AccessUnitInfo, AuxDataDecodeState, CoreDecodeState, ParseError,
     decode_core_pcm_frame_with_state, inspect_access_unit_with_metadata_state,
+    inspect_legacy_ac3_access_unit,
 };
 use crate::BedChannel;
 
@@ -157,6 +158,36 @@ impl PcmDecoder {
             pcm,
         })
     }
+
+    /// Decode one complete legacy AC-3 syncframe into core PCM.
+    pub fn push_legacy_ac3_access_unit(
+        &mut self,
+        access_unit: &[u8],
+    ) -> Result<PcmPushResult, ParseError> {
+        self.apply_debug_log_level();
+        let info = inspect_legacy_ac3_access_unit(access_unit)?;
+
+        if access_unit.len() < info.frame_size {
+            return Err(ParseError::TruncatedFrame {
+                expected: info.frame_size,
+                available: access_unit.len(),
+            });
+        }
+        if access_unit.len() != info.frame_size {
+            return Err(ParseError::TrailingData {
+                expected: info.frame_size,
+                provided: access_unit.len(),
+            });
+        }
+
+        let pcm = decode_core_pcm_frame_with_state(access_unit, &info, &mut self.core_state)?;
+        self.frames_seen += 1;
+        Ok(PcmPushResult {
+            frames_seen: self.frames_seen,
+            info,
+            pcm,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -260,6 +291,66 @@ impl ObjectPcmDecoder {
         };
 
         let core = decode_core_pcm_frame_with_state(access_unit, &info, &mut self.core_state)?;
+        let object_channels = self.joc_state.decode_frame(&core, &joc)?;
+        let object_active = joc.objects.iter().map(|object| object.active).collect();
+        let oamd_payloads = info
+            .payloads()
+            .filter_map(|payload| match &payload.parsed {
+                ParsedEmdfPayloadData::Oamd(oamd) => {
+                    Some((oamd.clone(), payload.info.sample_offset))
+                }
+                _ => None,
+            })
+            .collect();
+
+        self.frames_seen += 1;
+        Ok(Some(ObjectPcmPushResult {
+            frames_seen: self.frames_seen,
+            info,
+            pcm: ObjectPcmFrame {
+                core,
+                object_channels,
+                object_active,
+                joc,
+                oamd_payloads,
+            },
+        }))
+    }
+
+    /// Decode dynamic object PCM from a dependent access unit using externally decoded core PCM.
+    pub fn push_access_unit_with_core(
+        &mut self,
+        access_unit: &[u8],
+        core: CorePcmFrame,
+    ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
+        self.apply_debug_log_level();
+        let info = inspect_access_unit_with_metadata_state(
+            access_unit,
+            &mut self.metadata_state,
+            Some(&mut self.aux_state),
+        )?;
+
+        if access_unit.len() < info.frame_size {
+            return Err(ParseError::TruncatedFrame {
+                expected: info.frame_size,
+                available: access_unit.len(),
+            });
+        }
+        if access_unit.len() != info.frame_size {
+            return Err(ParseError::TrailingData {
+                expected: info.frame_size,
+                provided: access_unit.len(),
+            });
+        }
+
+        let joc = info.payloads().find_map(|payload| match &payload.parsed {
+            ParsedEmdfPayloadData::Joc(joc) => Some(joc.clone()),
+            _ => None,
+        });
+        let Some(joc) = joc else {
+            return Ok(None);
+        };
+
         let object_channels = self.joc_state.decode_frame(&core, &joc)?;
         let object_active = joc.objects.iter().map(|object| object.active).collect();
         let oamd_payloads = info

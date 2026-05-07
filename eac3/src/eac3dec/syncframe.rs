@@ -26,6 +26,27 @@ use thiserror::Error;
 const EAC3_BLOCKS: [u8; 4] = [1, 2, 3, 6];
 const AC3_SAMPLE_RATES: [u32; 3] = [48_000, 44_100, 32_000];
 const AC3_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
+const AC3_FRAME_SIZE_WORDS: [[usize; 3]; 19] = [
+    [64, 69, 96],
+    [80, 87, 120],
+    [96, 104, 144],
+    [112, 121, 168],
+    [128, 139, 192],
+    [160, 174, 240],
+    [192, 208, 288],
+    [224, 243, 336],
+    [256, 278, 384],
+    [320, 348, 480],
+    [384, 417, 576],
+    [448, 487, 672],
+    [512, 557, 768],
+    [640, 696, 960],
+    [768, 835, 1152],
+    [896, 975, 1344],
+    [1024, 1114, 1536],
+    [1152, 1253, 1728],
+    [1280, 1393, 1920],
+];
 const DEF_CPL_BNDSTRC: [bool; 18] = [
     false, false, false, false, false, false, false, false, true, false, true, true, false, true,
     true, true, true, true,
@@ -112,6 +133,7 @@ fn emit_aux_debug(args: fmt::Arguments<'_>) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// E-AC-3 frame coding mode.
 pub enum FrameType {
+    LegacyAc3,
     Independent,
     Dependent,
     Ac3Convert,
@@ -120,6 +142,7 @@ pub enum FrameType {
 impl fmt::Display for FrameType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            FrameType::LegacyAc3 => f.write_str("legacy-ac3"),
             FrameType::Independent => f.write_str("independent"),
             FrameType::Dependent => f.write_str("dependent"),
             FrameType::Ac3Convert => f.write_str("ac3-convert"),
@@ -700,6 +723,92 @@ pub fn inspect_access_unit(data: &[u8]) -> Result<AccessUnitInfo, ParseError> {
     inspect_access_unit_with_metadata_state(data, &mut metadata_state, None)
 }
 
+/// Parse one complete legacy AC-3 access unit.
+///
+/// This path is intentionally narrow: it exposes the core PCM syntax needed by
+/// E-AC-3 dependent/JOC streams that carry their 5.1 core as a legacy AC-3
+/// syncframe.  Metadata/aux payload recovery remains E-AC-3 only.
+pub fn inspect_legacy_ac3_access_unit(data: &[u8]) -> Result<AccessUnitInfo, ParseError> {
+    if data.len() < 7 {
+        return Err(ParseError::ShortPacket);
+    }
+
+    let mut reader = BitReader::new(data);
+    let sync = reader.read_bits(16).ok_or(ParseError::ShortPacket)?;
+    if sync != 0x0B77 {
+        return Err(ParseError::BadSyncword);
+    }
+
+    reader.skip_bits(16).ok_or(ParseError::ShortPacket)?; // crc1
+    let fscod = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as u8;
+    let frmsizecod = reader.read_bits(6).ok_or(ParseError::ShortPacket)? as u8;
+    let sample_rate = *AC3_SAMPLE_RATES
+        .get(usize::from(fscod))
+        .ok_or(ParseError::InvalidHeader("sample-rate"))?;
+    let frame_size = legacy_ac3_frame_size(fscod, frmsizecod)?;
+    if data.len() < frame_size {
+        return Err(ParseError::TruncatedFrame {
+            expected: frame_size,
+            available: data.len(),
+        });
+    }
+
+    let frame = &data[..frame_size];
+    let mut reader = BitReader::with_offset(frame, 40);
+    let bitstream_id = reader.read_bits(5).ok_or(ParseError::ShortPacket)? as u8;
+    if bitstream_id > 10 {
+        return Err(ParseError::InvalidHeader("legacy-bsid"));
+    }
+    let substreamid = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as u8; // bsmod
+    let channel_mode = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as u8;
+    if (channel_mode & 0x01) != 0 && channel_mode != 1 {
+        reader.skip_bits(2).ok_or(ParseError::ShortPacket)?; // cmixlev
+    }
+    if (channel_mode & 0x04) != 0 {
+        reader.skip_bits(2).ok_or(ParseError::ShortPacket)?; // surmixlev
+    }
+    if channel_mode == 2 {
+        reader.skip_bits(2).ok_or(ParseError::ShortPacket)?; // dsurmod
+    }
+    let lfe_on = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+    let fullband_channels = AC3_CHANNELS[channel_mode as usize];
+    let channels = fullband_channels + u8::from(lfe_on);
+
+    skip_legacy_ac3_bsi_tail(&mut reader, channel_mode)?;
+    let body_start_bit_offset = reader.position();
+    let audio_frame =
+        legacy_ac3_audio_frame_info(body_start_bit_offset, fullband_channels as usize, lfe_on);
+
+    Ok(AccessUnitInfo {
+        frame_size,
+        bitstream_id,
+        frame_type: FrameType::LegacyAc3,
+        substreamid,
+        sample_rate,
+        num_blocks: 6,
+        channel_mode,
+        channels,
+        fullband_channels,
+        lfe_on,
+        addbsi_present: false,
+        extension_type_a: false,
+        complexity_index_type_a: 0,
+        mixing_metadata_present: false,
+        informational_metadata_present: false,
+        addbsi_bytes: Vec::new(),
+        body_start_bit_offset,
+        audio_frame,
+        skip_fields: Vec::new(),
+        trailing_aux_data: Vec::new(),
+        aux_data: Vec::new(),
+        aux_parse_status: AuxParseStatus::Disabled,
+        emdf_source: EmdfSource::None,
+        emdf_blocks: Vec::new(),
+        emdf_block_count: 0,
+        first_emdf_sync_offset: None,
+    })
+}
+
 pub(crate) fn inspect_access_unit_with_metadata_state(
     data: &[u8],
     metadata_state: &mut MetadataParseState,
@@ -981,6 +1090,87 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
         first_emdf_sync_offset,
         emdf_blocks,
     })
+}
+
+fn legacy_ac3_frame_size(fscod: u8, frmsizecod: u8) -> Result<usize, ParseError> {
+    let bitrate_index = usize::from(frmsizecod >> 1);
+    if fscod > 2 || bitrate_index >= AC3_FRAME_SIZE_WORDS.len() {
+        return Err(ParseError::InvalidHeader("frame-size"));
+    }
+    Ok(AC3_FRAME_SIZE_WORDS[bitrate_index][usize::from(fscod)] * 2)
+}
+
+fn skip_legacy_ac3_bsi_tail(
+    reader: &mut BitReader<'_>,
+    channel_mode: u8,
+) -> Result<(), ParseError> {
+    let dual_mono = channel_mode == 0;
+    reader.skip_bits(5).ok_or(ParseError::ShortPacket)?; // dialnorm
+    skip_conditional_bits(reader, 8)?; // compre/compr
+    if dual_mono {
+        reader.skip_bits(5).ok_or(ParseError::ShortPacket)?; // dialnorm2
+        skip_conditional_bits(reader, 8)?; // compr2e/compr2
+    }
+    skip_conditional_bits(reader, 8)?; // langcode/langcod
+    if dual_mono {
+        skip_conditional_bits(reader, 8)?; // langcod2e/langcod2
+    }
+    if reader.read_bit().ok_or(ParseError::ShortPacket)? {
+        reader.skip_bits(7).ok_or(ParseError::ShortPacket)?; // mixlevel + roomtyp
+    }
+    if dual_mono && reader.read_bit().ok_or(ParseError::ShortPacket)? {
+        reader.skip_bits(7).ok_or(ParseError::ShortPacket)?; // mixlevel2 + roomtyp2
+    }
+    reader.skip_bits(2).ok_or(ParseError::ShortPacket)?; // copyrightb + origbs
+    skip_conditional_bits(reader, 14)?; // timecod1e/timecod1
+    skip_conditional_bits(reader, 14)?; // timecod2e/timecod2
+    if reader.read_bit().ok_or(ParseError::ShortPacket)? {
+        let addbsil = reader.read_bits(6).ok_or(ParseError::ShortPacket)? as usize + 1;
+        reader
+            .skip_bits(addbsil * 8)
+            .ok_or(ParseError::ShortPacket)?;
+    }
+    Ok(())
+}
+
+fn legacy_ac3_audio_frame_info(
+    block_payload_start_bit_offset: usize,
+    fullband_channels: usize,
+    lfe_on: bool,
+) -> AudioFrameInfo {
+    let num_blocks = 6usize;
+    let lfe_exponent_strategy = if lfe_on {
+        vec![false; num_blocks]
+    } else {
+        Vec::new()
+    };
+    AudioFrameInfo {
+        exponent_strategies_embedded: true,
+        adaptive_hybrid_transform_enabled: false,
+        snr_offset_strategy: 2,
+        transient_processing_enabled: false,
+        block_switching_enabled: true,
+        dithering_enabled: true,
+        bit_allocation_mode_enabled: true,
+        frame_gain_syntax_enabled: false,
+        delta_bit_allocation_enabled: true,
+        skip_field_syntax_enabled: true,
+        spectral_extension_attenuation_enabled: false,
+        coupling_strategy_updates: vec![false; num_blocks],
+        coupling_in_use: vec![false; num_blocks],
+        coupling_exponent_strategy: vec![None; num_blocks],
+        channel_exponent_strategy: vec![vec![ExpStrategy::Reuse; fullband_channels]; num_blocks],
+        lfe_exponent_strategy,
+        converter_exponent_strategy_present: false,
+        converter_exponent_strategy: Vec::new(),
+        frame_csnr_offset: None,
+        frame_fsnr_offset: None,
+        transient_processors: vec![None; fullband_channels],
+        spectral_extension_attenuation: vec![None; fullband_channels],
+        block_start_info_present: false,
+        block_start_info_bit_len: 0,
+        block_payload_start_bit_offset,
+    }
 }
 
 fn read_mixing_metadata(
@@ -1378,6 +1568,7 @@ fn collect_skip_fields(
     }
 
     let mut state = BlockSyntaxState::new(fullband_channels, lfe_on, sample_rate_index);
+    let mut audio_frame = audio_frame.clone();
     let mut skip_fields = Vec::new();
     for block in 0..num_blocks {
         let block_start = block_starts[block];
@@ -1399,7 +1590,7 @@ fn collect_skip_fields(
             channel_mode,
             fullband_channels,
             lfe_on,
-            audio_frame,
+            &mut audio_frame,
             &mut state,
             false,
         )? {
@@ -1421,6 +1612,7 @@ fn collect_skip_fields_without_block_start(
     audio_payload_end_bit: usize,
     state: &mut BlockSyntaxState,
 ) -> Result<Vec<SkipFieldInfo>, ParseError> {
+    let mut audio_frame = audio_frame.clone();
     let mut reader = BitReader::with_offset(frame, audio_frame.block_payload_start_bit_offset);
     reader.set_limit_bits(audio_payload_end_bit);
 
@@ -1433,7 +1625,7 @@ fn collect_skip_fields_without_block_start(
             channel_mode,
             fullband_channels,
             lfe_on,
-            audio_frame,
+            &mut audio_frame,
             state,
             true,
         )? {
@@ -1530,7 +1722,7 @@ fn parse_block(
     channel_mode: u8,
     fullband_channels: usize,
     lfe_on: bool,
-    audio_frame: &AudioFrameInfo,
+    audio_frame: &mut AudioFrameInfo,
     state: &mut BlockSyntaxState,
     consume_mantissas: bool,
 ) -> Result<Option<SkipFieldInfo>, ParseError> {
@@ -1551,28 +1743,58 @@ fn parse_block(
         skip_conditional_bits(reader, 8)?;
     }
 
-    read_spx(reader, block, channel_mode, fullband_channels, state)?;
-    read_coupling_strategy(
-        reader,
-        block,
-        channel_mode,
-        fullband_channels,
-        audio_frame,
-        state,
-    )?;
-    read_coupling_coordinates(
-        reader,
-        block,
-        channel_mode,
-        fullband_channels,
-        audio_frame,
-        state,
-    )?;
+    if matches!(frame_type, FrameType::LegacyAc3) {
+        read_legacy_ac3_coupling_strategy(
+            reader,
+            block,
+            channel_mode,
+            fullband_channels,
+            audio_frame,
+            state,
+        )?;
+        read_legacy_ac3_coupling_coordinates(
+            reader,
+            block,
+            channel_mode,
+            fullband_channels,
+            audio_frame,
+            state,
+        )?;
+        read_legacy_ac3_exponent_strategies(reader, block, fullband_channels, lfe_on, audio_frame)?;
+    } else {
+        read_spx(reader, block, channel_mode, fullband_channels, state)?;
+        read_coupling_strategy(
+            reader,
+            block,
+            channel_mode,
+            fullband_channels,
+            audio_frame,
+            state,
+        )?;
+        read_coupling_coordinates(
+            reader,
+            block,
+            channel_mode,
+            fullband_channels,
+            audio_frame,
+            state,
+        )?;
+    }
     let allocation = read_exponents(reader, block, fullband_channels, lfe_on, audio_frame, state)?;
 
     read_bit_allocation_params(reader, audio_frame, state)?;
-    read_snr_offsets(reader, block, fullband_channels, lfe_on, audio_frame, state)?;
-    read_frame_gain_codes(reader, block, fullband_channels, lfe_on, audio_frame, state)?;
+    read_snr_offsets(
+        reader,
+        block,
+        frame_type,
+        fullband_channels,
+        lfe_on,
+        audio_frame,
+        state,
+    )?;
+    if !matches!(frame_type, FrameType::LegacyAc3) {
+        read_frame_gain_codes(reader, block, fullband_channels, lfe_on, audio_frame, state)?;
+    }
 
     if matches!(frame_type, FrameType::Independent)
         && reader.read_bit().ok_or(ParseError::ShortPacket)?
@@ -1580,7 +1802,11 @@ fn parse_block(
         reader.skip_bits(10).ok_or(ParseError::ShortPacket)?;
     }
 
-    read_coupling_leak_info(reader, audio_frame.coupling_in_use[block], state)?;
+    if matches!(frame_type, FrameType::LegacyAc3) {
+        read_legacy_ac3_coupling_leak_info(reader, audio_frame.coupling_in_use[block], state)?;
+    } else {
+        read_coupling_leak_info(reader, audio_frame.coupling_in_use[block], state)?;
+    }
 
     read_delta_bit_allocation(reader, block, fullband_channels, audio_frame, state)?;
 
@@ -1632,6 +1858,103 @@ fn skip_conditional_bits(reader: &mut BitReader<'_>, bits: usize) -> Result<(), 
     Ok(())
 }
 
+fn read_legacy_ac3_coupling_strategy(
+    reader: &mut BitReader<'_>,
+    block: usize,
+    channel_mode: u8,
+    fullband_channels: usize,
+    audio_frame: &mut AudioFrameInfo,
+    state: &mut BlockSyntaxState,
+) -> Result<(), ParseError> {
+    if channel_mode <= 1 {
+        audio_frame.coupling_strategy_updates[block] = false;
+        audio_frame.coupling_in_use[block] = false;
+        state.clear_coupling();
+        return Ok(());
+    }
+
+    let update = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+    if block == 0 && !update {
+        return Err(ParseError::InvalidHeader("cplstrat"));
+    }
+    audio_frame.coupling_strategy_updates[block] = update;
+    if update {
+        let in_use = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+        audio_frame.coupling_in_use[block] = in_use;
+        state.ecplinu = false;
+        if in_use {
+            if channel_mode == 2 {
+                for in_use in &mut state.chincpl {
+                    *in_use = true;
+                }
+            } else {
+                for channel in 0..fullband_channels {
+                    state.chincpl[channel] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+                }
+            }
+
+            state.phsflginu = if channel_mode == 2 {
+                reader.read_bit().ok_or(ParseError::ShortPacket)?
+            } else {
+                false
+            };
+            state.cplbegf = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as usize;
+            state.cplendf = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as usize;
+            if state.cplendf < state.cplbegf {
+                state.clear_coupling();
+                audio_frame.coupling_in_use[block] = false;
+                return Ok(());
+            }
+            state.ncplsubnd = 3 + state.cplendf - state.cplbegf;
+            state.ncplbnd = state.ncplsubnd;
+            for band in 1..state.ncplsubnd {
+                let index = state.cplbegf + band;
+                let band_reuse = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+                let Some(slot) = state.cpl_band_struct.get_mut(index) else {
+                    return Err(ParseError::InvalidHeader("cplbndstrc"));
+                };
+                *slot = band_reuse;
+                if band_reuse {
+                    state.ncplbnd -= 1;
+                }
+            }
+        } else {
+            state.clear_coupling();
+        }
+    } else {
+        audio_frame.coupling_in_use[block] = audio_frame.coupling_in_use[block - 1];
+    }
+
+    Ok(())
+}
+
+fn read_legacy_ac3_exponent_strategies(
+    reader: &mut BitReader<'_>,
+    block: usize,
+    fullband_channels: usize,
+    lfe_on: bool,
+    audio_frame: &mut AudioFrameInfo,
+) -> Result<(), ParseError> {
+    if audio_frame.coupling_in_use[block] {
+        audio_frame.coupling_exponent_strategy[block] = Some(ExpStrategy::from_bits(
+            reader.read_bits(2).ok_or(ParseError::ShortPacket)?,
+        )?);
+    } else {
+        audio_frame.coupling_exponent_strategy[block] = None;
+    }
+
+    for channel in 0..fullband_channels {
+        audio_frame.channel_exponent_strategy[block][channel] =
+            ExpStrategy::from_bits(reader.read_bits(2).ok_or(ParseError::ShortPacket)?)?;
+    }
+    if lfe_on {
+        audio_frame.lfe_exponent_strategy[block] =
+            reader.read_bit().ok_or(ParseError::ShortPacket)?;
+    }
+
+    Ok(())
+}
+
 fn decode_coupling_coordinate(exponent: i32, mantissa: i32, master_coord: i32) -> f32 {
     let shift = if exponent != 15 {
         15 - exponent - master_coord
@@ -1671,6 +1994,25 @@ fn read_coupling_leak_info(
         reader.read_bit().ok_or(ParseError::ShortPacket)?
     };
     if coupling_leak_present {
+        state.cpl_fast_leak =
+            ((reader.read_bits(3).ok_or(ParseError::ShortPacket)? as i32) << 8) + 768;
+        state.cpl_slow_leak =
+            ((reader.read_bits(3).ok_or(ParseError::ShortPacket)? as i32) << 8) + 768;
+    }
+
+    Ok(())
+}
+
+fn read_legacy_ac3_coupling_leak_info(
+    reader: &mut BitReader<'_>,
+    coupling_in_use: bool,
+    state: &mut BlockSyntaxState,
+) -> Result<(), ParseError> {
+    if !coupling_in_use {
+        return Ok(());
+    }
+
+    if reader.read_bit().ok_or(ParseError::ShortPacket)? {
         state.cpl_fast_leak =
             ((reader.read_bits(3).ok_or(ParseError::ShortPacket)? as i32) << 8) + 768;
         state.cpl_slow_leak =
@@ -1991,6 +2333,43 @@ fn read_coupling_coordinates(
     Ok(())
 }
 
+fn read_legacy_ac3_coupling_coordinates(
+    reader: &mut BitReader<'_>,
+    block: usize,
+    channel_mode: u8,
+    fullband_channels: usize,
+    audio_frame: &AudioFrameInfo,
+    state: &mut BlockSyntaxState,
+) -> Result<(), ParseError> {
+    if !audio_frame.coupling_in_use[block] {
+        return Ok(());
+    }
+
+    let mut stereo_phase_flags_required = false;
+    for channel in 0..fullband_channels {
+        if state.chincpl[channel] {
+            let coordinates_present = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+            if coordinates_present {
+                let master_coord = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as i32 * 3;
+                for band in 0..state.ncplbnd {
+                    let exponent = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
+                    let mantissa = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
+                    state.coupling_coordinates[channel][band] =
+                        decode_coupling_coordinate(exponent, mantissa, master_coord);
+                }
+                stereo_phase_flags_required |= channel_mode == 2;
+            }
+        }
+    }
+
+    if channel_mode == 2 && state.phsflginu && stereo_phase_flags_required {
+        // TODO: Walk stereo coupling phase flags instead of falling back.
+        return Err(ParseError::UnsupportedFeature("stereo-coupling-phase"));
+    }
+
+    Ok(())
+}
+
 fn read_exponents(
     reader: &mut BitReader<'_>,
     block: usize,
@@ -2103,11 +2482,34 @@ fn read_bit_allocation_params(
 fn read_snr_offsets(
     reader: &mut BitReader<'_>,
     block: usize,
+    frame_type: FrameType,
     fullband_channels: usize,
     lfe_on: bool,
     audio_frame: &AudioFrameInfo,
     state: &mut BlockSyntaxState,
 ) -> Result<(), ParseError> {
+    if matches!(frame_type, FrameType::LegacyAc3) {
+        if !reader.read_bit().ok_or(ParseError::ShortPacket)? {
+            return Ok(());
+        }
+        state.csnr_offset = reader.read_bits(6).ok_or(ParseError::ShortPacket)? as i32;
+        if audio_frame.coupling_in_use[block] {
+            state.cpl_fsnr_offset = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
+            state.cpl_fgain_code = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as u8;
+        }
+        for channel in 0..fullband_channels {
+            state.channel_fsnr_offsets[channel] =
+                reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
+            state.channel_fgain_codes[channel] =
+                reader.read_bits(3).ok_or(ParseError::ShortPacket)? as u8;
+        }
+        if lfe_on {
+            state.lfe_fsnr_offset = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
+            state.lfe_fgain_code = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as u8;
+        }
+        return Ok(());
+    }
+
     if audio_frame.snr_offset_strategy == 0 {
         state.csnr_offset = audio_frame.frame_csnr_offset.unwrap_or_default() as i32;
         let fsnr = audio_frame.frame_fsnr_offset.unwrap_or_default() as i32;
@@ -2420,11 +2822,13 @@ pub(crate) fn decode_core_pcm_frame_with_state_into(
         .as_mut()
         .ok_or(ParseError::InvalidHeader("core-decode-state"))?;
 
+    let mut audio_frame = info.audio_frame.clone();
     for block in 0..info.num_blocks as usize {
         decode_block_core_pcm(
             &mut reader,
             block,
             info,
+            &mut audio_frame,
             block_syntax,
             imdct,
             lfe_imdct.as_mut(),
@@ -2501,6 +2905,7 @@ fn decode_block_core_pcm(
     reader: &mut BitReader<'_>,
     block: usize,
     info: &AccessUnitInfo,
+    audio_frame: &mut AudioFrameInfo,
     state: &mut BlockSyntaxState,
     imdct: &mut [ImdctState],
     lfe_imdct: Option<&mut ImdctState>,
@@ -2510,12 +2915,12 @@ fn decode_block_core_pcm(
     let fullband_count = info.fullband_channels as usize;
     let mut block_switch = vec![false; fullband_count];
 
-    if info.audio_frame.block_switching_enabled {
+    if audio_frame.block_switching_enabled {
         for flag in &mut block_switch {
             *flag = reader.read_bit().ok_or(ParseError::ShortPacket)?;
         }
     }
-    if info.audio_frame.dithering_enabled {
+    if audio_frame.dithering_enabled {
         for _ in 0..fullband_count {
             // TODO: Inject AC-3 dithering for zero-BAP bins if it matters in practice.
             reader.read_bit().ok_or(ParseError::ShortPacket)?;
@@ -2527,49 +2932,78 @@ fn decode_block_core_pcm(
         skip_conditional_bits(reader, 8)?;
     }
 
-    read_spx(reader, block, info.channel_mode, fullband_count, state)?;
-    read_coupling_strategy(
-        reader,
-        block,
-        info.channel_mode,
-        fullband_count,
-        &info.audio_frame,
-        state,
-    )?;
-    read_coupling_coordinates(
-        reader,
-        block,
-        info.channel_mode,
-        fullband_count,
-        &info.audio_frame,
-        state,
-    )?;
+    if matches!(info.frame_type, FrameType::LegacyAc3) {
+        read_legacy_ac3_coupling_strategy(
+            reader,
+            block,
+            info.channel_mode,
+            fullband_count,
+            audio_frame,
+            state,
+        )?;
+        read_legacy_ac3_coupling_coordinates(
+            reader,
+            block,
+            info.channel_mode,
+            fullband_count,
+            audio_frame,
+            state,
+        )?;
+        read_legacy_ac3_exponent_strategies(
+            reader,
+            block,
+            fullband_count,
+            info.lfe_on,
+            audio_frame,
+        )?;
+    } else {
+        read_spx(reader, block, info.channel_mode, fullband_count, state)?;
+        read_coupling_strategy(
+            reader,
+            block,
+            info.channel_mode,
+            fullband_count,
+            audio_frame,
+            state,
+        )?;
+        read_coupling_coordinates(
+            reader,
+            block,
+            info.channel_mode,
+            fullband_count,
+            audio_frame,
+            state,
+        )?;
+    }
 
     let allocation = read_exponents(
         reader,
         block,
         fullband_count,
         info.lfe_on,
-        &info.audio_frame,
+        audio_frame,
         state,
     )?;
-    read_bit_allocation_params(reader, &info.audio_frame, state)?;
+    read_bit_allocation_params(reader, audio_frame, state)?;
     read_snr_offsets(
         reader,
         block,
+        info.frame_type,
         fullband_count,
         info.lfe_on,
-        &info.audio_frame,
+        audio_frame,
         state,
     )?;
-    read_frame_gain_codes(
-        reader,
-        block,
-        fullband_count,
-        info.lfe_on,
-        &info.audio_frame,
-        state,
-    )?;
+    if !matches!(info.frame_type, FrameType::LegacyAc3) {
+        read_frame_gain_codes(
+            reader,
+            block,
+            fullband_count,
+            info.lfe_on,
+            audio_frame,
+            state,
+        )?;
+    }
 
     if info.frame_type == FrameType::Independent
         && reader.read_bit().ok_or(ParseError::ShortPacket)?
@@ -2577,13 +3011,15 @@ fn decode_block_core_pcm(
         reader.skip_bits(10).ok_or(ParseError::ShortPacket)?;
     }
 
-    read_coupling_leak_info(reader, info.audio_frame.coupling_in_use[block], state)?;
+    if matches!(info.frame_type, FrameType::LegacyAc3) {
+        read_legacy_ac3_coupling_leak_info(reader, audio_frame.coupling_in_use[block], state)?;
+    } else {
+        read_coupling_leak_info(reader, audio_frame.coupling_in_use[block], state)?;
+    }
 
-    read_delta_bit_allocation(reader, block, fullband_count, &info.audio_frame, state)?;
+    read_delta_bit_allocation(reader, block, fullband_count, audio_frame, state)?;
 
-    if info.audio_frame.skip_field_syntax_enabled
-        && reader.read_bit().ok_or(ParseError::ShortPacket)?
-    {
+    if audio_frame.skip_field_syntax_enabled && reader.read_bit().ok_or(ParseError::ShortPacket)? {
         let skip_length = reader.read_bits(9).ok_or(ParseError::ShortPacket)? as usize;
         reader
             .skip_bits(skip_length * 8)
@@ -3289,7 +3725,7 @@ mod tests {
     #[test]
     fn decodes_single_block_coupling_pcm_to_silence() {
         let payload = build_single_block_coupling_payload(FrameType::Independent, &[]);
-        let audio_frame = single_block_audio_frame(3, true);
+        let mut audio_frame = single_block_audio_frame(3, true);
         let info = AccessUnitInfo {
             frame_size: payload.len(),
             bitstream_id: 16,
@@ -3331,6 +3767,7 @@ mod tests {
             &mut reader,
             0,
             &info,
+            &mut audio_frame,
             &mut state,
             &mut imdct,
             None,

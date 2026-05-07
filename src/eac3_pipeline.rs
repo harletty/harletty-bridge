@@ -10,7 +10,6 @@ use std::time::Instant;
 use crate::bridge::AtmosBridge;
 use crate::frame_builders::float_to_pcm_i32;
 use crate::labels::{bed_channel_to_r, eac3_core_bed_indices, eac3_object_output_bed_indices};
-use crate::logging::dbg_log;
 use crate::metadata::build_eac3_metadata_frame;
 
 const LEGACY_AC3_SAMPLE_COUNT: u32 = 1536;
@@ -50,44 +49,17 @@ pub(crate) fn process_eac3_frame(
 ) -> Result<RDecodedFrame, String> {
     emit_eac3_frame_diagnostic(bridge, frame);
 
-    // Write first frame to a file for external inspection.
-    if bridge.eac3_frame_count == 1 {
-        let _ = std::fs::write("/tmp/harletty-eac3-frame.bin", frame);
-        dbg_log("eac3_first_frame_dumped_to_/tmp/harletty-eac3-frame.bin\n");
-    }
-
     match bridge.eac3_object_decoder.push_access_unit(frame) {
         Ok(Some(result)) => {
             let sample_count = result.pcm.samples_per_channel();
-            let frame_ms = sample_count as f64 / result.pcm.core.sample_rate.max(1) as f64 * 1000.0;
-            dbg_log(&format!(
-                "eac3_object_decode ok sr={} samples={} frame_ms={:.3} bed_ch={} object_ch={} active={} frames_seen={}\n",
-                result.pcm.core.sample_rate,
-                sample_count,
-                frame_ms,
-                result.pcm.core.total_channels(),
-                result.pcm.object_channels.len(),
-                result
-                    .pcm
-                    .object_active
-                    .iter()
-                    .filter(|active| **active)
-                    .count(),
-                result.frames_seen
-            ));
-
             let base_sample_pos = bridge.eac3_total_samples;
             bridge.eac3_total_samples += sample_count as u64;
             let rf = build_eac3_frame_from_object(result, base_sample_pos, bridge);
             bridge.perf.maybe_report(bridge.eac3_frame_count);
             return Ok(rf);
         }
-        Ok(None) => {
-            dbg_log("eac3_object_decode no_joc_payload fallback=core\n");
-        }
-        Err(e) => {
-            dbg_log(&format!("eac3_object_decode_error={e} fallback=core\n"));
-        }
+        Ok(None) => {}
+        Err(_) => {}
     }
 
     match bridge.eac3_pcm_decoder.push_access_unit(frame) {
@@ -95,40 +67,6 @@ pub(crate) fn process_eac3_frame(
             let info = result.info;
             let pcm = result.pcm;
             let decoded_samples = pcm.samples_per_channel();
-            let frame_ms = decoded_samples as f64 / pcm.sample_rate.max(1) as f64 * 1000.0;
-            dbg_log(&format!(
-                "eac3_inspect_ok frame={}B blocks={} expected_samples={} body_offset={} block_start={}\n",
-                info.frame_size,
-                info.num_blocks,
-                info.num_blocks as usize * 256,
-                info.body_start_bit_offset,
-                info.audio_frame.block_payload_start_bit_offset
-            ));
-
-            // Log the frame bytes near the end to diagnose footer.
-            let tail_start = frame.len().saturating_sub(16);
-            let tail: Vec<String> = frame[tail_start..]
-                .iter()
-                .map(|b| format!("{b:02X}"))
-                .collect();
-            dbg_log(&format!("eac3_frame_tail_last16=[{}]\n", tail.join(" ")));
-
-            dbg_log(&format!(
-                "eac3_decode ok sr={} samples={} frame_ms={:.3} ch={} frames_seen={}\n",
-                pcm.sample_rate,
-                decoded_samples,
-                frame_ms,
-                pcm.total_channels(),
-                result.frames_seen
-            ));
-            if decoded_samples != info.num_blocks as usize * 256 {
-                dbg_log(&format!(
-                    "eac3_decode_sample_count_mismatch decoded={} expected={} blocks={}\n",
-                    decoded_samples,
-                    info.num_blocks as usize * 256,
-                    info.num_blocks
-                ));
-            }
             let sample_count = decoded_samples as u32;
             let base_sample_pos = bridge.eac3_total_samples;
             bridge.eac3_total_samples += sample_count as u64;
@@ -138,13 +76,8 @@ pub(crate) fn process_eac3_frame(
         }
         Err(e) => {
             let diag = eac3_frame_reject_diag(frame);
-            dbg_log(&format!("eac3_decode_error={e} {diag}\n"));
             if format!("{e}") == "not-eac3" {
                 if let Some(sample_rate) = legacy_ac3_sample_rate(frame) {
-                    dbg_log(&format!(
-                        "legacy_ac3_passthrough_as_silence sr={} samples={} channels={} {}\n",
-                        sample_rate, LEGACY_AC3_SAMPLE_COUNT, LEGACY_AC3_CHANNEL_COUNT, diag
-                    ));
                     return Ok(build_silence_frame(
                         sample_rate,
                         LEGACY_AC3_SAMPLE_COUNT,
@@ -154,10 +87,6 @@ pub(crate) fn process_eac3_frame(
             }
             if format!("{e}") == "unsupported-feature:non-independent-core-pcm" {
                 if let Some((sample_rate, sample_count)) = eac3_frame_timing(frame) {
-                    dbg_log(&format!(
-                        "eac3_non_independent_passthrough_as_silence sr={} samples={} channels={} {}\n",
-                        sample_rate, sample_count, LEGACY_AC3_CHANNEL_COUNT, diag
-                    ));
                     return Ok(build_silence_frame(sample_rate, sample_count, bridge));
                 }
             }
@@ -166,12 +95,57 @@ pub(crate) fn process_eac3_frame(
     }
 }
 
+pub(crate) fn process_eac3_dependent_frame_with_core(
+    bridge: &mut AtmosBridge,
+    frame: &[u8],
+    core: CorePcmFrame,
+) -> Result<Option<RDecodedFrame>, String> {
+    emit_eac3_frame_diagnostic(bridge, frame);
+    match bridge
+        .eac3_object_decoder
+        .push_access_unit_with_core(frame, core)
+    {
+        Ok(Some(result)) => {
+            let sample_count = result.pcm.samples_per_channel();
+            let base_sample_pos = bridge.eac3_total_samples;
+            bridge.eac3_total_samples += sample_count as u64;
+            bridge.eac3_diag_stats.paired_object_frames += 1;
+            bridge.perf.maybe_report(bridge.eac3_frame_count);
+            Ok(Some(build_eac3_frame_from_object(
+                result,
+                base_sample_pos,
+                bridge,
+            )))
+        }
+        Ok(None) => Ok(None),
+        Err(err) => {
+            let diag = eac3_frame_reject_diag(frame);
+            Err(format!("E-AC3 dependent object decode error: {err} {diag}"))
+        }
+    }
+}
+
+pub(crate) fn is_legacy_ac3_frame(frame: &[u8]) -> bool {
+    legacy_ac3_info(frame).is_some()
+}
+
+pub(crate) fn is_dependent_eac3_frame(frame: &[u8]) -> bool {
+    inspect_access_unit(frame)
+        .map(|info| info.frame_type == FrameType::Dependent)
+        .unwrap_or(false)
+}
+
+pub(crate) fn diagnose_eac3_frame(bridge: &mut AtmosBridge, frame: &[u8]) {
+    emit_eac3_frame_diagnostic(bridge, frame);
+}
+
 fn emit_eac3_frame_diagnostic(bridge: &mut AtmosBridge, frame: &[u8]) {
     bridge.eac3_diag_stats.total_frames += 1;
 
     match inspect_access_unit(frame) {
         Ok(info) => {
             match info.frame_type {
+                FrameType::LegacyAc3 => bridge.eac3_diag_stats.legacy_ac3_frames += 1,
                 FrameType::Independent => bridge.eac3_diag_stats.independent_frames += 1,
                 FrameType::Dependent => bridge.eac3_diag_stats.dependent_frames += 1,
                 FrameType::Ac3Convert => bridge.eac3_diag_stats.ac3_convert_frames += 1,
@@ -182,71 +156,14 @@ fn emit_eac3_frame_diagnostic(bridge: &mut AtmosBridge, frame: &[u8]) {
             if info.oamd_payload_count() > 0 {
                 bridge.eac3_diag_stats.oamd_frames += 1;
             }
-
-            emit_live_diag(&format!("E-AC3 frame diag: {}", info.summary()));
         }
         Err(err) if format!("{err}") == "not-eac3" => {
-            if let Some(legacy) = legacy_ac3_info(frame) {
+            if legacy_ac3_info(frame).is_some() {
                 bridge.eac3_diag_stats.legacy_ac3_frames += 1;
-                emit_live_diag(&format!(
-                    "E-AC3 frame diag: legacy_ac3 bsid={} sr={} frame={} channels={} acmod={} lfe={} first8=[{}]",
-                    legacy.bsid,
-                    legacy.sample_rate,
-                    legacy.frame_size,
-                    legacy.channels,
-                    legacy.channel_mode,
-                    if legacy.lfe_on { 1 } else { 0 },
-                    first_bytes_hex(frame, 8)
-                ));
-            } else {
-                emit_live_diag(&format!(
-                    "E-AC3 frame diag: not-eac3 {} first8=[{}]",
-                    eac3_frame_reject_diag(frame),
-                    first_bytes_hex(frame, 8)
-                ));
             }
         }
-        Err(err) => {
-            emit_live_diag(&format!(
-                "E-AC3 frame diag failed: error={} {}",
-                err,
-                eac3_frame_reject_diag(frame)
-            ));
-        }
+        Err(_) => {}
     }
-
-    maybe_report_eac3_diag_summary(bridge);
-}
-
-fn maybe_report_eac3_diag_summary(bridge: &mut AtmosBridge) {
-    let total = bridge.eac3_diag_stats.total_frames;
-    if total == 0 || total - bridge.eac3_diag_stats.last_report_frame < 64 {
-        return;
-    }
-    bridge.eac3_diag_stats.last_report_frame = total;
-
-    let summary = format!(
-        "E-AC3 diag summary: total={} legacy_ac3={} independent={} dependent={} ac3_convert={} joc_frames={} oamd_frames={}",
-        bridge.eac3_diag_stats.total_frames,
-        bridge.eac3_diag_stats.legacy_ac3_frames,
-        bridge.eac3_diag_stats.independent_frames,
-        bridge.eac3_diag_stats.dependent_frames,
-        bridge.eac3_diag_stats.ac3_convert_frames,
-        bridge.eac3_diag_stats.joc_frames,
-        bridge.eac3_diag_stats.oamd_frames
-    );
-    emit_live_diag(&summary);
-    bridge.eac3_diag_stats.pending_summary = Some(summary);
-}
-
-fn emit_live_diag(message: &str) {
-    log::info!(target: "harletty-bridge::eac3_diag", "{message}");
-    sys::live_log::emit_external_record(log::Level::Info, "harletty-bridge::eac3_diag", message);
-    sys::live_log::emit_external_record(
-        log::Level::Info,
-        "audio_input::bridge",
-        &format!("harletty E-AC3 diag: {message}"),
-    );
 }
 
 pub(crate) fn is_temporary_eac3_silence_frame(frame: &RDecodedFrame) -> bool {
@@ -277,15 +194,6 @@ fn eac3_frame_reject_diag(frame: &[u8]) -> String {
     )
 }
 
-fn first_bytes_hex(frame: &[u8], count: usize) -> String {
-    frame
-        .iter()
-        .take(count)
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn frame_bsid(frame: &[u8]) -> Option<u8> {
     if frame.len() < 6 {
         return None;
@@ -301,6 +209,7 @@ fn legacy_ac3_sample_rate(frame: &[u8]) -> Option<u32> {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct LegacyAc3Info {
     bsid: u8,
     sample_rate: u32,

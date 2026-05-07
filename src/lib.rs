@@ -1,3 +1,4 @@
+mod ac3_native;
 mod bridge;
 mod eac3_pipeline;
 mod eac3_spdif;
@@ -13,8 +14,7 @@ use abi_stable::{
     export_root_module, prefix_type::PrefixTypeTrait, sabi_trait::prelude::TD_Opaque,
 };
 use bridge::AtmosBridge;
-use bridge_api::{BridgeLib, BridgeLibRef, FormatBridge_TO, FormatBridgeBox};
-use logging::dbg_log;
+use bridge_api::{BridgeLib, BridgeLibRef, FormatBridgeBox, FormatBridge_TO};
 
 // Silence unused import warning — FormatBridge is used via the proc-macro generated impl.
 #[allow(unused_imports)]
@@ -30,6 +30,5 @@ fn get_library() -> BridgeLibRef {
 }
 
 extern "C" fn create_bridge(strict: bool) -> FormatBridgeBox {
-    dbg_log(&format!("create_bridge strict={}\n", strict));
     FormatBridge_TO::from_value(AtmosBridge::new(strict), TD_Opaque)
 }

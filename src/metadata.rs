@@ -7,7 +7,6 @@ use truehd::structs::oamd::{ObjectAudioMetadataPayload, SpeakerLabels};
 
 use crate::bridge::AtmosBridge;
 use crate::labels::speaker_to_id;
-use crate::logging::dbg_log;
 use crate::perf::PerfStats;
 
 /// Build an [`RMetadataFrame`] from an OAMD payload parsed from E-AC3.
@@ -48,16 +47,6 @@ pub(crate) fn build_eac3_metadata_frame(
             });
         }
     }
-
-    dbg_log(&format!(
-        "eac3_metadata bed_indices={:?} bed_ch={} object_ch={} object_count={} bed_or_isf={} dynamic_events={}\n",
-        bed_indices,
-        bed_indices.len(),
-        object_channel_count,
-        oamd.object_count,
-        oamd.bed_or_isf_objects,
-        events.len()
-    ));
 
     RMetadataFrame {
         events,
