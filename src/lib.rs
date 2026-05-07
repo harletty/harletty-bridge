@@ -1,4 +1,7 @@
+mod eac3_spdif;
+mod eac3dec;
 mod mat;
+mod renderer;
 
 use abi_stable::{
     export_root_module,
@@ -11,11 +14,14 @@ use bridge_api::{
     RCoordinateFormat, RDecodedFrame, RInputTransport, RMetadataFrame, RPushResult,
     RVbapCartesianDefaults, RVbapTableMode,
 };
+use eac3_spdif::Eac3SpdifStream;
 use mat::MatStream;
 #[cfg(feature = "bridge-perf")]
 use std::env;
 #[cfg(feature = "bridge-perf")]
 use std::time::{Duration, Instant};
+#[cfg(feature = "bridge-perf")]
+use truehd::process::parse::ParserPerfStats;
 use truehd::{
     process::{
         MAX_PRESENTATIONS,
@@ -28,14 +34,82 @@ use truehd::{
         oamd::{ObjectAudioMetadataPayload, SpeakerLabels},
     },
 };
-#[cfg(feature = "bridge-perf")]
-use truehd::process::parse::ParserPerfStats;
+
+// E-AC3 decoder imports.
+use crate::eac3dec::{
+    AccessUnitInfo, CorePcmFrame, OamdPayload, ObjectPcmDecoder, ObjectPcmPushResult,
+    ParsedEmdfPayloadData, PcmDecoder,
+};
 
 // Silence unused import warning — FormatBridge is used via the proc-macro generated impl.
 #[allow(unused_imports)]
 use bridge_api::FormatBridge as _FormatBridgeTrait;
 
-/// Plugin entry point: export the root module so `gsrd` can load it.
+fn bridge_diag_log(level: log::Level, message: &str) {
+    sys::live_log::emit_external_record(
+        level,
+        "harletty-bridge::eac3",
+        message.trim_end_matches('\n'),
+    );
+}
+
+fn dbg_log(msg: &str) {
+    bridge_diag_log(log::Level::Info, msg);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PcmStats {
+    max_abs: i32,
+    near_clip_count: usize,
+}
+
+impl PcmStats {
+    fn from_frame(frame: &RDecodedFrame) -> Result<Self, String> {
+        if frame.sample_count == 0 {
+            return Err("sample_count_zero".to_string());
+        }
+        if frame.sampling_frequency == 0 {
+            return Err("sample_rate_zero".to_string());
+        }
+        if frame.channel_count == 0 {
+            return Err("channel_count_zero".to_string());
+        }
+
+        let expected = frame.sample_count as usize * frame.channel_count as usize;
+        if frame.pcm.len() != expected {
+            return Err(format!(
+                "pcm_len_mismatch expected={} actual={}",
+                expected,
+                frame.pcm.len()
+            ));
+        }
+
+        let near_clip_threshold = (i32::MAX as f32 * 0.999) as i32;
+        let mut max_abs = 0i32;
+        let mut near_clip_count = 0usize;
+        for &sample in &frame.pcm {
+            let abs = sample.saturating_abs();
+            max_abs = max_abs.max(abs);
+            if abs >= near_clip_threshold {
+                near_clip_count += 1;
+            }
+        }
+
+        if near_clip_count > expected / 16 {
+            return Err(format!(
+                "too_many_near_clip_samples near_clip={} total={} max_abs={}",
+                near_clip_count, expected, max_abs
+            ));
+        }
+
+        Ok(Self {
+            max_abs,
+            near_clip_count,
+        })
+    }
+}
+
+/// Plugin entry point: export the root module so the host can load it.
 #[export_root_module]
 fn get_library() -> BridgeLibRef {
     BridgeLib {
@@ -45,6 +119,7 @@ fn get_library() -> BridgeLibRef {
 }
 
 extern "C" fn create_bridge(strict: bool) -> FormatBridgeBox {
+    dbg_log(&format!("create_bridge strict={}\n", strict));
     FormatBridge_TO::from_value(AtmosBridge::new(strict), TD_Opaque)
 }
 
@@ -53,17 +128,27 @@ extern "C" fn create_bridge(strict: bool) -> FormatBridgeBox {
 // ---------------------------------------------------------------------------
 
 struct AtmosBridge {
+    // ── TrueHD pipeline ──────────────────────────────────────────────
     mat_stream: MatStream,
     extractor: Extractor,
     parser: Parser,
     decoder: Decoder,
+    // ── E-AC3 pipeline ───────────────────────────────────────────────
+    eac3_spdif: Eac3SpdifStream,
+    eac3_pcm_decoder: PcmDecoder,
+    eac3_object_decoder: ObjectPcmDecoder,
+    eac3_frame_count: u64,
+    eac3_total_samples: u64,
+    /// True when the most recent `push_packet` used the E-AC3 path.
+    eac3_active: bool,
+    // ── Shared ───────────────────────────────────────────────────────
     presentation: u8,
     strict: bool,
     /// Running total of decoded samples (used for metadata timestamping).
     total_samples: u64,
     /// Current dialogue level from the last major sync.
     current_dialogue_level: Option<i8>,
-    /// Substream info tracking for change detection.
+    /// Substream info tracking for change detection (TrueHD only).
     current_substream_info: Option<u8>,
     current_extended_substream_info: Option<u8>,
     recovering_until_major_sync: bool,
@@ -95,11 +180,27 @@ impl AtmosBridge {
             .for_each(|p| *p = true);
         parser.set_required_presentations(&required_presentations);
 
+        let eac3_log_level = if strict {
+            log::Level::Warn
+        } else {
+            log::Level::Error
+        };
+        let mut eac3_pcm = PcmDecoder::new();
+        eac3_pcm.set_debug_log_level(eac3_log_level);
+        let mut eac3_obj = ObjectPcmDecoder::new();
+        eac3_obj.set_debug_log_level(eac3_log_level);
+
         let bridge = Self {
             mat_stream: MatStream::default(),
             extractor: Extractor::default(),
             parser,
             decoder,
+            eac3_spdif: Eac3SpdifStream::default(),
+            eac3_pcm_decoder: eac3_pcm,
+            eac3_object_decoder: eac3_obj,
+            eac3_frame_count: 0,
+            eac3_total_samples: 0,
+            eac3_active: false,
             presentation,
             strict,
             total_samples: 0,
@@ -129,10 +230,18 @@ impl AtmosBridge {
     }
 
     fn reset_pipeline(&mut self) {
+        // TrueHD reset.
         self.mat_stream.reset();
         self.extractor = Extractor::default();
         self.parser = Parser::default();
         self.decoder = Decoder::default();
+
+        // E-AC3 reset.
+        self.eac3_spdif.reset();
+        self.eac3_pcm_decoder.reset();
+        self.eac3_object_decoder.reset();
+        self.eac3_frame_count = 0;
+        self.eac3_active = false;
 
         // Re-apply configuration to new parser/decoder instances.
         let fail_level = if self.strict {
@@ -142,6 +251,8 @@ impl AtmosBridge {
         };
         self.parser.set_fail_level(fail_level);
         self.decoder.set_fail_level(fail_level);
+        self.eac3_pcm_decoder.set_debug_log_level(fail_level);
+        self.eac3_object_decoder.set_debug_log_level(fail_level);
         let mut required_presentations = [false; MAX_PRESENTATIONS];
         required_presentations[..=self.presentation as usize]
             .iter_mut()
@@ -152,6 +263,10 @@ impl AtmosBridge {
         self.recovering_until_major_sync = false;
     }
 }
+
+// ---------------------------------------------------------------------------
+// PerfStats — unchanged from the TrueHD bridge.
+// ---------------------------------------------------------------------------
 
 #[cfg(feature = "bridge-perf")]
 #[derive(Default)]
@@ -314,7 +429,8 @@ impl PerfStats {
             self.parse_access_unit.record(stats.access_unit_total);
             self.parse_substream_directories
                 .record(stats.substream_directories);
-            self.parse_substream_segments.record(stats.substream_segments);
+            self.parse_substream_segments
+                .record(stats.substream_segments);
             self.parse_substream_segment_blocks
                 .record(stats.substream_segment_blocks);
             self.parse_substream_segment_tail
@@ -584,13 +700,7 @@ impl PerfStats {
 }
 
 // ---------------------------------------------------------------------------
-// Drain context — borrows individual AtmosBridge fields so that drain_frames
-// can be called inside catch_unwind without aliasing &mut Self.
-//
-// By capturing only a DrainContext (individual field borrows), the closure
-// passed to catch_unwind does not hold a second &mut AtmosBridge.  After
-// catch_unwind returns the DrainContext borrow is released and the caller can
-// safely call self.reset_pipeline().
+// Drain context — borrowed fields for TrueHD drain_frames.
 // ---------------------------------------------------------------------------
 
 struct DrainContext<'a> {
@@ -637,11 +747,10 @@ impl DrainContext<'_> {
     }
 }
 
-/// Drain the extractor and decode all available frames.
-///
-/// Returns the decoded frames and an optional error message (non-empty only in
-/// strict mode).  On error the caller is responsible for calling
-/// `reset_pipeline()`.
+// ---------------------------------------------------------------------------
+// TrueHD drain_frames — unchanged.
+// ---------------------------------------------------------------------------
+
 fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<String>) {
     let mut frames = Vec::new();
     let mut error_msg: Option<String> = None;
@@ -687,7 +796,8 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
                 #[cfg(feature = "bridge-perf")]
                 {
                     ctx.perf.record_parse(parse_started.elapsed());
-                    ctx.perf.record_parse_substats(ctx.parser.last_parse_stats());
+                    ctx.perf
+                        .record_parse_substats(ctx.parser.last_parse_stats());
                 }
 
                 // Track substream info changes and extract dialogue level.
@@ -785,7 +895,7 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
 
                 #[cfg(feature = "bridge-perf")]
                 let build_started = Instant::now();
-                frames.push(build_frame(ctx, &decoded, base_sample_pos));
+                frames.push(build_thd_frame(ctx, &decoded, base_sample_pos));
                 #[cfg(feature = "bridge-perf")]
                 ctx.perf.record_build(build_started.elapsed());
                 ctx.perf.maybe_report(*ctx.frame_count);
@@ -816,8 +926,8 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
     (frames, None)
 }
 
-/// Build an [`RDecodedFrame`] from a decoded access unit.
-fn build_frame(
+/// Build an [`RDecodedFrame`] from a TrueHD decoded access unit.
+fn build_thd_frame(
     ctx: &mut DrainContext<'_>,
     decoded: &DecodedAccessUnit,
     base_sample_pos: u64,
@@ -857,7 +967,7 @@ fn build_frame(
     let mut metadata_events = 0usize;
     for oamd in &decoded.oamd {
         let evo_base = base_sample_pos + oamd.evo_sample_offset;
-        let meta = build_metadata_frame(
+        let meta = build_metadata_frame_from_oamd(
             oamd,
             evo_base,
             base_sample_pos,
@@ -887,6 +997,407 @@ fn build_frame(
         is_new_segment: decoded.substream_info_changed,
     }
 }
+
+// ---------------------------------------------------------------------------
+// E-AC3 processing
+// ---------------------------------------------------------------------------
+
+/// Process a raw E-AC3 access unit (one complete syncframe).
+///
+/// Attempts object-level decode first (JOC + OAMD), then falls back to
+/// core PCM decode.  Converts the result into one [`RDecodedFrame`].
+fn process_eac3_frame(bridge: &mut AtmosBridge, frame: &[u8]) -> Result<RDecodedFrame, String> {
+    // Write first frame to a file for external inspection.
+    if bridge.eac3_frame_count == 1 {
+        let _ = std::fs::write("/tmp/harletty-eac3-frame.bin", frame);
+        dbg_log("eac3_first_frame_dumped_to_/tmp/harletty-eac3-frame.bin\n");
+    }
+
+    match bridge.eac3_object_decoder.push_access_unit(frame) {
+        Ok(Some(result)) => {
+            let sample_count = result.pcm.samples_per_channel();
+            let frame_ms = sample_count as f64 / result.pcm.core.sample_rate.max(1) as f64 * 1000.0;
+            dbg_log(&format!(
+                "eac3_object_decode ok sr={} samples={} frame_ms={:.3} bed_ch={} object_ch={} active={} frames_seen={}\n",
+                result.pcm.core.sample_rate,
+                sample_count,
+                frame_ms,
+                result.pcm.core.total_channels(),
+                result.pcm.object_channels.len(),
+                result
+                    .pcm
+                    .object_active
+                    .iter()
+                    .filter(|active| **active)
+                    .count(),
+                result.frames_seen
+            ));
+
+            let base_sample_pos = bridge.eac3_total_samples;
+            bridge.eac3_total_samples += sample_count as u64;
+            let rf = build_eac3_frame_from_object(result, base_sample_pos, bridge);
+            bridge.perf.maybe_report(bridge.eac3_frame_count);
+            return Ok(rf);
+        }
+        Ok(None) => {
+            dbg_log("eac3_object_decode no_joc_payload fallback=core\n");
+        }
+        Err(e) => {
+            dbg_log(&format!("eac3_object_decode_error={e} fallback=core\n"));
+        }
+    }
+
+    match bridge.eac3_pcm_decoder.push_access_unit(frame) {
+        Ok(result) => {
+            let info = result.info;
+            let pcm = result.pcm;
+            let decoded_samples = pcm.samples_per_channel();
+            let frame_ms = decoded_samples as f64 / pcm.sample_rate.max(1) as f64 * 1000.0;
+            dbg_log(&format!(
+                "eac3_inspect_ok frame={}B blocks={} expected_samples={} body_offset={} block_start={}\n",
+                info.frame_size,
+                info.num_blocks,
+                info.num_blocks as usize * 256,
+                info.body_start_bit_offset,
+                info.audio_frame.block_payload_start_bit_offset
+            ));
+
+            // Log the frame bytes near the end to diagnose footer.
+            let tail_start = frame.len().saturating_sub(16);
+            let tail: Vec<String> = frame[tail_start..]
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect();
+            dbg_log(&format!("eac3_frame_tail_last16=[{}]\n", tail.join(" ")));
+
+            dbg_log(&format!(
+                "eac3_decode ok sr={} samples={} frame_ms={:.3} ch={} frames_seen={}\n",
+                pcm.sample_rate,
+                decoded_samples,
+                frame_ms,
+                pcm.total_channels(),
+                result.frames_seen
+            ));
+            if decoded_samples != info.num_blocks as usize * 256 {
+                dbg_log(&format!(
+                    "eac3_decode_sample_count_mismatch decoded={} expected={} blocks={}\n",
+                    decoded_samples,
+                    info.num_blocks as usize * 256,
+                    info.num_blocks
+                ));
+            }
+            let sample_count = decoded_samples as u32;
+            let base_sample_pos = bridge.eac3_total_samples;
+            bridge.eac3_total_samples += sample_count as u64;
+            let rf = build_eac3_frame_from_core(&pcm, &info, base_sample_pos, bridge);
+            bridge.perf.maybe_report(bridge.eac3_frame_count);
+            Ok(rf)
+        }
+        Err(e) => {
+            dbg_log(&format!("eac3_decode_error={e}\n"));
+            Err(format!("E-AC3 decode error: {e}"))
+        }
+    }
+}
+
+/// Build an [`RDecodedFrame`] from an E-AC3 object decode result.
+fn build_eac3_frame_from_object(
+    result: ObjectPcmPushResult,
+    base_sample_pos: u64,
+    bridge: &mut AtmosBridge,
+) -> RDecodedFrame {
+    let pcm_frame = &result.pcm;
+    let core = &pcm_frame.core;
+    let sample_count = pcm_frame.samples_per_channel();
+    let sampling_frequency = core.sample_rate;
+    let bed_channels = core.fullband_channels.len() + usize::from(core.lfe_channel.is_some());
+    let object_channels = pcm_frame.object_channels.len();
+    let total_channel_count = bed_channels + object_channels;
+
+    // Build interleaved PCM: bed channels first, then dynamic-object channels.
+    // JOC output is dynamic-only — `object_channels[i]` corresponds to OAMD
+    // object[bed_or_isf_objects + i] (cf. libstarmine_ad render.rs:881).
+    let pcm_capacity = sample_count * total_channel_count;
+    let mut pcm: RVec<i32> = RVec::with_capacity(pcm_capacity);
+
+    for s in 0..sample_count {
+        for ch in &core.fullband_channels {
+            pcm.push(float_to_pcm_i32(ch[s]));
+        }
+        if let Some(lfe) = &core.lfe_channel {
+            pcm.push(float_to_pcm_i32(lfe[s]));
+        }
+        for obj_ch in &pcm_frame.object_channels {
+            pcm.push(float_to_pcm_i32(obj_ch[s]));
+        }
+    }
+
+    // Channel labels.
+    let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
+    for bed in &core.fullband_channel_order {
+        channel_labels.push(bed_channel_to_r(*bed));
+    }
+    if core.lfe_channel.is_some() {
+        channel_labels.push(RChannelLabel::LFE);
+    }
+    for _ in 0..object_channels {
+        channel_labels.push(RChannelLabel::Unknown);
+    }
+
+    // Metadata from OAMD payloads.
+    #[cfg(feature = "bridge-perf")]
+    let metadata_started = Instant::now();
+    let mut metadata: RVec<RMetadataFrame> = RVec::new();
+    #[cfg(feature = "bridge-perf")]
+    let mut metadata_events = 0usize;
+    let bed_indices = eac3_core_bed_indices(core);
+    for (oamd, sample_offset) in &pcm_frame.oamd_payloads {
+        let evo_base = base_sample_pos + sample_offset.unwrap_or(0) as u64;
+        let oamd_ref: &OamdPayload = oamd;
+        let meta = build_eac3_metadata_frame(
+            oamd_ref,
+            evo_base,
+            base_sample_pos,
+            &bed_indices,
+            object_channels,
+            bridge,
+        );
+        #[cfg(feature = "bridge-perf")]
+        {
+            metadata_events += meta.events.len();
+        }
+        metadata.push(meta);
+    }
+    #[cfg(feature = "bridge-perf")]
+    {
+        let elapsed = metadata_started.elapsed();
+        bridge.perf.record_build_metadata(elapsed);
+        bridge
+            .perf
+            .note_built_frame(metadata.len(), metadata_events);
+    }
+
+    RDecodedFrame {
+        sampling_frequency,
+        sample_count: sample_count as u32,
+        channel_count: total_channel_count as u32,
+        pcm,
+        channel_labels,
+        metadata,
+        dialogue_level: bridge.current_dialogue_level.into(),
+        is_new_segment: false,
+    }
+}
+
+/// Build an [`RDecodedFrame`] from a core-PCM-only E-AC3 decode result.
+fn build_eac3_frame_from_core(
+    core: &CorePcmFrame,
+    info: &AccessUnitInfo,
+    base_sample_pos: u64,
+    bridge: &mut AtmosBridge,
+) -> RDecodedFrame {
+    let sampling_frequency = core.sample_rate;
+    let sample_count = core.samples_per_channel();
+    let total_channel_count = core.total_channels();
+
+    // Build interleaved PCM.
+    let pcm_capacity = sample_count * total_channel_count;
+    let mut pcm: RVec<i32> = RVec::with_capacity(pcm_capacity);
+
+    for s in 0..sample_count {
+        for ch in &core.fullband_channels {
+            pcm.push(float_to_pcm_i32(ch[s]));
+        }
+        if let Some(lfe) = &core.lfe_channel {
+            pcm.push(float_to_pcm_i32(lfe[s]));
+        }
+    }
+
+    // Channel labels.
+    let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
+    for bed in &core.fullband_channel_order {
+        channel_labels.push(bed_channel_to_r(*bed));
+    }
+    if core.lfe_channel.is_some() {
+        channel_labels.push(RChannelLabel::LFE);
+    }
+
+    // Extract metadata from OAMD payloads in the access unit info.
+    let mut metadata: RVec<RMetadataFrame> = RVec::new();
+    let bed_indices = eac3_core_bed_indices(core);
+    for payload in info.payloads() {
+        if let ParsedEmdfPayloadData::Oamd(oamd) = &payload.parsed {
+            let evo_base = base_sample_pos + payload.info.sample_offset.unwrap_or(0) as u64;
+            let meta =
+                build_eac3_metadata_frame(oamd, evo_base, base_sample_pos, &bed_indices, 0, bridge);
+            metadata.push(meta);
+        }
+    }
+
+    RDecodedFrame {
+        sampling_frequency,
+        sample_count: sample_count as u32,
+        channel_count: total_channel_count as u32,
+        pcm,
+        channel_labels,
+        metadata,
+        dialogue_level: bridge.current_dialogue_level.into(),
+        is_new_segment: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TrueHD / E-AC3 metadata frame builders
+// ---------------------------------------------------------------------------
+
+/// Build an [`RMetadataFrame`] from an OAMD payload parsed from E-AC3.
+fn build_eac3_metadata_frame(
+    oamd: &OamdPayload,
+    evo_base: u64,
+    frame_sample_pos: u64,
+    bed_indices: &[usize],
+    object_channel_count: usize,
+    bridge: &mut AtmosBridge,
+) -> RMetadataFrame {
+    let events = extract_eac3_events(oamd, evo_base, bed_indices, object_channel_count);
+    let bed_indices: RVec<usize> = bed_indices.iter().copied().collect();
+
+    let mut name_updates = RVec::new();
+    let dynamic_objects = oamd
+        .object_count
+        .saturating_sub(oamd.bed_or_isf_objects)
+        .min(object_channel_count);
+    for dynamic_idx in 0..dynamic_objects {
+        let id = (10 + dynamic_idx) as u32;
+        let key = ObjectNameKey::Dynamic(id as usize);
+        if name_key_changed(&mut bridge.object_name_keys_by_id, id, &key) {
+            name_updates.push(bridge_api::RNameUpdate {
+                id,
+                name: object_name_from_key(&key).into(),
+            });
+        }
+    }
+
+    dbg_log(&format!(
+        "eac3_metadata bed_indices={:?} bed_ch={} object_ch={} object_count={} bed_or_isf={} dynamic_events={}\n",
+        bed_indices,
+        bed_indices.len(),
+        object_channel_count,
+        oamd.object_count,
+        oamd.bed_or_isf_objects,
+        events.len()
+    ));
+
+    RMetadataFrame {
+        events,
+        bed_indices,
+        name_updates,
+        sample_pos: frame_sample_pos,
+        ramp_duration: 0,
+    }
+}
+
+/// Convert an E-AC3 OAMD payload into the bridge event list.
+///
+/// Mirrors TrueHD's structure: bed events first (one per PCM bed channel,
+/// `has_pos=false`, `id=speaker_id`), then dynamic events (`id=10+dynamic_idx`).
+/// Studio displays slots ordered by `events[]` index, so the bed events keep
+/// the dynamic slots aligned with their position metadata.
+fn extract_eac3_events(
+    oamd: &OamdPayload,
+    base_sample_pos: u64,
+    bed_indices: &[usize],
+    object_channel_count: usize,
+) -> RVec<bridge_api::REvent> {
+    let dynamic_objects = oamd
+        .object_count
+        .saturating_sub(oamd.bed_or_isf_objects)
+        .min(object_channel_count);
+    let mut events: RVec<bridge_api::REvent> =
+        RVec::with_capacity(bed_indices.len() + dynamic_objects);
+
+    for &speaker_id in bed_indices {
+        events.push(bridge_api::REvent {
+            id: speaker_id as u32,
+            sample_pos: base_sample_pos,
+            has_pos: false,
+            pos: [0.0; 3],
+            gain_db: 0,
+            spread: 0.0,
+            ramp_duration: 0,
+        });
+    }
+
+    for element in &oamd.elements {
+        let crate::eac3dec::OamdElementKind::Object(ref obj_element) = element.kind else {
+            continue;
+        };
+
+        for obj_idx in 0..obj_element.object_blocks.len() {
+            let Some(blocks) = obj_element.object_blocks.get(obj_idx) else {
+                continue;
+            };
+            let Some(block) = blocks.first() else {
+                continue;
+            };
+
+            if obj_idx < oamd.bed_or_isf_objects {
+                continue;
+            }
+            let dynamic_idx = obj_idx - oamd.bed_or_isf_objects;
+            if dynamic_idx >= object_channel_count {
+                continue;
+            }
+            let id = (10 + dynamic_idx) as u32;
+            let has_pos = block.valid_position;
+            let pos: [f64; 3] = if has_pos {
+                match block.position.as_ref() {
+                    Some(p) if !block.differential_position => [
+                        ((p.x as f64).clamp(0.0, 1.0) - 0.5) * 2.0,
+                        (0.5 - (p.y as f64).clamp(0.0, 1.0)) * 2.0,
+                        (p.z as f64).clamp(-1.0, 1.0),
+                    ],
+                    Some(p) => [
+                        (p.x as f64).clamp(-1.0, 1.0),
+                        (-(p.y as f64)).clamp(-1.0, 1.0),
+                        (p.z as f64).clamp(-1.0, 1.0),
+                    ],
+                    None => [0.0; 3],
+                }
+            } else {
+                [0.0; 3]
+            };
+            let spread = (block.size.unwrap_or(0.0) as f64 * 180.0).clamp(0.0, 180.0);
+
+            let sample_offset = obj_element
+                .block_updates
+                .first()
+                .map(|u| u.offset as u64)
+                .unwrap_or(0);
+            let ramp_duration = obj_element
+                .block_updates
+                .first()
+                .map(|u| u.ramp_duration as u32)
+                .unwrap_or(0);
+
+            events.push(bridge_api::REvent {
+                id,
+                sample_pos: base_sample_pos + sample_offset,
+                has_pos,
+                pos,
+                gain_db: block.gain.unwrap_or(0.0) as i8,
+                spread,
+                ramp_duration,
+            });
+        }
+    }
+
+    events
+}
+
+// ---------------------------------------------------------------------------
+// TrueHD extractor input processing — unchanged.
+// ---------------------------------------------------------------------------
 
 fn process_extractor_input(bridge: &mut AtmosBridge, input: &[u8], result: &mut RPushResult) {
     if input.is_empty() {
@@ -948,10 +1459,6 @@ fn process_extractor_input(bridge: &mut AtmosBridge, input: &[u8], result: &mut 
     }
 }
 
-// ---------------------------------------------------------------------------
-// FormatBridge implementation
-// ---------------------------------------------------------------------------
-
 /// Extract a panic message from the payload returned by catch_unwind.
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -963,6 +1470,10 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FormatBridge implementation
+// ---------------------------------------------------------------------------
+
 impl FormatBridge for AtmosBridge {
     fn push_packet(
         &mut self,
@@ -970,6 +1481,10 @@ impl FormatBridge for AtmosBridge {
         transport: RInputTransport,
         data_type: u8,
     ) -> RPushResult {
+        dbg_log(&format!(
+            "push_packet dt=0x{data_type:02X} len={}\n",
+            data.len()
+        ));
         let mut result = RPushResult {
             frames: RVec::new(),
             error_message: RString::new(),
@@ -980,68 +1495,181 @@ impl FormatBridge for AtmosBridge {
             RInputTransport::Raw => {
                 #[cfg(feature = "bridge-perf")]
                 self.perf.note_raw_packet(data.len());
-                process_extractor_input(self, data.as_slice(), &mut result)
+                process_extractor_input(self, data.as_slice(), &mut result);
+                result
             }
             RInputTransport::Iec61937 => {
-                if !MatStream::accepts_data_type(data_type) {
-                    let msg = format!(
-                        "Unsupported IEC 61937 data type for this bridge: 0x{data_type:02X}"
+                // ── TrueHD (data type 0x16) ───────────────────────────
+                if MatStream::accepts_data_type(data_type) {
+                    self.eac3_active = false;
+
+                    #[cfg(feature = "bridge-perf")]
+                    let mat_started = Instant::now();
+                    #[cfg(feature = "bridge-perf")]
+                    self.perf.note_mat_packet(data.len());
+                    self.mat_stream.push_payload(data.as_slice());
+                    loop {
+                        #[cfg(feature = "bridge-perf")]
+                        let chunk_extract_started = Instant::now();
+                        match self.mat_stream.next_chunk() {
+                            Ok(Some(chunk)) => {
+                                #[cfg(feature = "bridge-perf")]
+                                {
+                                    self.perf
+                                        .record_mat_chunk_extract(chunk_extract_started.elapsed());
+                                    self.perf.note_mat_chunk(chunk.len());
+                                }
+                                process_extractor_input(self, &chunk, &mut result);
+                                if result.did_reset {
+                                    break;
+                                }
+                            }
+                            Ok(None) => {
+                                #[cfg(feature = "bridge-perf")]
+                                self.perf
+                                    .record_mat_chunk_extract(chunk_extract_started.elapsed());
+                                break;
+                            }
+                            Err(msg) => {
+                                #[cfg(feature = "bridge-perf")]
+                                self.perf
+                                    .record_mat_chunk_extract(chunk_extract_started.elapsed());
+                                log::warn!("{msg}");
+                                self.reset_pipeline();
+                                result.did_reset = true;
+                                if self.strict {
+                                    result.error_message = msg.into();
+                                }
+                                return result;
+                            }
+                        }
+                    }
+                    #[cfg(feature = "bridge-perf")]
+                    self.perf.record_mat(mat_started.elapsed());
+                    return result;
+                }
+
+                // ── E-AC3 (data type 0x15) ────────────────────────────
+                if Eac3SpdifStream::accepts_data_type(data_type) {
+                    bridge_diag_log(
+                        log::Level::Info,
+                        &format!("eac3_branch dt=0x{data_type:02X} len={}", data.len()),
                     );
-                    log::warn!("{msg}");
-                    if self.strict {
-                        result.error_message = msg.into();
-                        self.reset_pipeline();
-                        result.did_reset = true;
+                    self.eac3_active = true;
+                    let preview_len = data.len().min(16);
+                    let preview: String = data[..preview_len]
+                        .iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    bridge_diag_log(log::Level::Info, &format!("eac3_preview=[{preview}]"));
+
+                    self.eac3_spdif.push_payload(data.as_slice());
+                    let mut frame_count_in_packet = 0u32;
+                    loop {
+                        match self.eac3_spdif.next_frame() {
+                            Ok(Some(frame)) => {
+                                frame_count_in_packet += 1;
+                                self.eac3_frame_count += 1;
+                                bridge_diag_log(
+                                    log::Level::Info,
+                                    &format!(
+                                        "eac3_frame_extracted index={} bytes={} sync=0x{:02X}{:02X} first6={:02X?}",
+                                        self.eac3_frame_count,
+                                        frame.len(),
+                                        frame.first().copied().unwrap_or(0),
+                                        frame.get(1).copied().unwrap_or(0),
+                                        &frame.get(..6).unwrap_or(&[])
+                                    ),
+                                );
+                                let decode_result = process_eac3_frame(self, &frame);
+                                match decode_result {
+                                    Ok(decoded_frame) => {
+                                        let stats = match PcmStats::from_frame(&decoded_frame) {
+                                            Ok(stats) => stats,
+                                            Err(reason) => {
+                                                bridge_diag_log(
+                                                    log::Level::Warn,
+                                                    &format!(
+                                                        "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={}",
+                                                        self.eac3_frame_count,
+                                                        reason,
+                                                        decoded_frame.sampling_frequency,
+                                                        decoded_frame.sample_count,
+                                                        decoded_frame.channel_count,
+                                                        decoded_frame.pcm.len()
+                                                    ),
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        bridge_diag_log(
+                                            log::Level::Info,
+                                            &format!(
+                                                "eac3_frame_ready index={} sr={} samples={} ch={} max_abs={} near_clip={}",
+                                                self.eac3_frame_count,
+                                                decoded_frame.sampling_frequency,
+                                                decoded_frame.sample_count,
+                                                decoded_frame.channel_count,
+                                                stats.max_abs,
+                                                stats.near_clip_count
+                                            ),
+                                        );
+                                        log::debug!(
+                                            "E-AC3 decoded frame: sr={} samples={} ch={}",
+                                            decoded_frame.sampling_frequency,
+                                            decoded_frame.sample_count,
+                                            decoded_frame.channel_count
+                                        );
+                                        result.frames.push(decoded_frame);
+                                    }
+                                    Err(msg) => {
+                                        log::warn!("{msg}");
+                                        self.reset_pipeline();
+                                        result.did_reset = true;
+                                        if self.strict {
+                                            result.error_message = msg.into();
+                                        }
+                                        return result;
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                if frame_count_in_packet == 0 {
+                                    bridge_diag_log(
+                                        log::Level::Info,
+                                        &format!("eac3_no_frame_extracted len={}", data.len()),
+                                    );
+                                }
+                                break;
+                            }
+                            Err(msg) => {
+                                bridge_diag_log(log::Level::Warn, &format!("eac3_error={msg}"));
+                                log::warn!("{msg}");
+                                self.reset_pipeline();
+                                result.did_reset = true;
+                                if self.strict {
+                                    result.error_message = msg.into();
+                                }
+                                return result;
+                            }
+                        }
                     }
                     return result;
                 }
 
-                #[cfg(feature = "bridge-perf")]
-                let mat_started = Instant::now();
-                #[cfg(feature = "bridge-perf")]
-                self.perf.note_mat_packet(data.len());
-                self.mat_stream.push_payload(data.as_slice());
-                loop {
-                    #[cfg(feature = "bridge-perf")]
-                    let chunk_extract_started = Instant::now();
-                    match self.mat_stream.next_chunk() {
-                        Ok(Some(chunk)) => {
-                            #[cfg(feature = "bridge-perf")]
-                            {
-                                self.perf
-                                    .record_mat_chunk_extract(chunk_extract_started.elapsed());
-                                self.perf.note_mat_chunk(chunk.len());
-                            }
-                            process_extractor_input(self, &chunk, &mut result);
-                            if result.did_reset {
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            #[cfg(feature = "bridge-perf")]
-                            self.perf
-                                .record_mat_chunk_extract(chunk_extract_started.elapsed());
-                            break;
-                        }
-                        Err(msg) => {
-                            #[cfg(feature = "bridge-perf")]
-                            self.perf
-                                .record_mat_chunk_extract(chunk_extract_started.elapsed());
-                            log::warn!("{msg}");
-                            self.reset_pipeline();
-                            result.did_reset = true;
-                            if self.strict {
-                                result.error_message = msg.into();
-                            }
-                            return result;
-                        }
-                    }
+                // Unsupported data type.
+                let msg =
+                    format!("Unsupported IEC 61937 data type for this bridge: 0x{data_type:02X}");
+                log::warn!("{msg}");
+                if self.strict {
+                    result.error_message = msg.into();
+                    self.reset_pipeline();
+                    result.did_reset = true;
                 }
-                #[cfg(feature = "bridge-perf")]
-                self.perf.record_mat(mat_started.elapsed());
+                result
             }
         }
-        result
     }
 
     fn reset(&mut self) {
@@ -1052,12 +1680,18 @@ impl FormatBridge for AtmosBridge {
     }
 
     fn is_ready(&self) -> bool {
-        self.frame_count > 0
+        self.frame_count > 0 || self.eac3_frame_count > 0
     }
 
     fn is_spatial(&self) -> bool {
-        // Presentations 0–(MAX-2) are pure downmixes; the top presentation carries objects.
-        self.presentation >= (MAX_PRESENTATIONS as u8) - 1
+        if self.eac3_active {
+            // E-AC3/JOC is spatial when we've decoded object channels.
+            // The object decoder count acts as a proxy.
+            self.eac3_object_decoder.frames_seen() > 0
+        } else {
+            // Presentations 0–(MAX-2) are pure downmixes; the top presentation carries objects.
+            self.presentation >= (MAX_PRESENTATIONS as u8) - 1
+        }
     }
 
     fn configure(&mut self, key: RStr<'_>, value: RStr<'_>) -> bool {
@@ -1148,10 +1782,10 @@ impl FormatBridge for AtmosBridge {
 }
 
 // ---------------------------------------------------------------------------
-// Helper functions (moved/adapted from gsrd handler.rs and old bridge)
+// Helper functions
 // ---------------------------------------------------------------------------
 
-/// Convert a `ChannelLabel` to its ABI-stable counterpart.
+/// Convert a TrueHD `ChannelLabel` to its ABI-stable counterpart.
 fn channel_label_to_r(label: &ChannelLabel) -> RChannelLabel {
     match label {
         ChannelLabel::L => RChannelLabel::L,
@@ -1179,6 +1813,72 @@ fn channel_label_to_r(label: &ChannelLabel) -> RChannelLabel {
         ChannelLabel::Tfc => RChannelLabel::Tfc,
         ChannelLabel::LFE2 => RChannelLabel::LFE2,
     }
+}
+
+/// Convert an E-AC3 `BedChannel` to its ABI-stable counterpart.
+fn bed_channel_to_r(ch: crate::renderer::BedChannel) -> RChannelLabel {
+    use crate::renderer::BedChannel;
+    match ch {
+        BedChannel::FrontLeft => RChannelLabel::L,
+        BedChannel::FrontRight => RChannelLabel::R,
+        BedChannel::Center => RChannelLabel::C,
+        BedChannel::LowFrequencyEffects => RChannelLabel::LFE,
+        BedChannel::SurroundLeft => RChannelLabel::Ls,
+        BedChannel::SurroundRight => RChannelLabel::Rs,
+        BedChannel::RearCenter => RChannelLabel::Cb,
+        BedChannel::RearLeft => RChannelLabel::Lb,
+        BedChannel::RearRight => RChannelLabel::Rb,
+        BedChannel::TopFrontLeft => RChannelLabel::Tfl,
+        BedChannel::TopFrontRight => RChannelLabel::Tfr,
+        BedChannel::TopSurroundLeft => RChannelLabel::Tsl,
+        BedChannel::TopSurroundRight => RChannelLabel::Tsr,
+        BedChannel::TopRearLeft => RChannelLabel::Tbl,
+        BedChannel::TopRearRight => RChannelLabel::Tbr,
+        BedChannel::WideLeft => RChannelLabel::Lw,
+        BedChannel::WideRight => RChannelLabel::Rw,
+        BedChannel::LowFrequencyEffects2 => RChannelLabel::LFE2,
+    }
+}
+
+/// Map a `BedChannel` to the speaker ID space used by the bridge.
+fn bed_channel_to_speaker_id(ch: crate::renderer::BedChannel) -> usize {
+    use crate::renderer::BedChannel;
+    match ch {
+        BedChannel::FrontLeft => 0,
+        BedChannel::FrontRight => 1,
+        BedChannel::Center => 2,
+        BedChannel::LowFrequencyEffects => 3,
+        BedChannel::SurroundLeft => 4,
+        BedChannel::SurroundRight => 5,
+        BedChannel::RearCenter => 6,
+        BedChannel::RearLeft => 6,
+        BedChannel::RearRight => 7,
+        BedChannel::TopFrontLeft => 8,
+        BedChannel::TopFrontRight => 9,
+        BedChannel::TopSurroundLeft => 8,
+        BedChannel::TopSurroundRight => 9,
+        BedChannel::TopRearLeft => 8,
+        BedChannel::TopRearRight => 9,
+        BedChannel::WideLeft => 0,
+        BedChannel::WideRight => 1,
+        BedChannel::LowFrequencyEffects2 => 3,
+    }
+}
+
+fn eac3_core_bed_indices(core: &CorePcmFrame) -> Vec<usize> {
+    let mut bed_indices = Vec::with_capacity(core.total_channels());
+    bed_indices.extend(
+        core.fullband_channel_order
+            .iter()
+            .copied()
+            .map(bed_channel_to_speaker_id),
+    );
+    if core.lfe_channel.is_some() {
+        bed_indices.push(bed_channel_to_speaker_id(
+            crate::renderer::BedChannel::LowFrequencyEffects,
+        ));
+    }
+    bed_indices
 }
 
 /// Remap a speaker index to the Atmos channel-ID space.
@@ -1214,34 +1914,6 @@ fn object_name_from_key(key: &ObjectNameKey) -> String {
 }
 
 #[inline]
-fn object_name_key_for_index(
-    object_index: usize,
-    object_id: u32,
-    bed_index_vec: &[usize],
-    num_isf_objects: usize,
-    num_dynamic_objects: usize,
-) -> ObjectNameKey {
-    let bed_count = bed_index_vec.len();
-    if object_index < bed_count {
-        return ObjectNameKey::Bed(bed_index_vec[object_index] as u8);
-    }
-    let isf_start = bed_count;
-    let isf_end = isf_start + num_isf_objects;
-    if object_index < isf_end {
-        return ObjectNameKey::Isf(object_index - isf_start);
-    }
-    let dyn_start = isf_end;
-    let dyn_end = dyn_start + num_dynamic_objects;
-    if object_index < dyn_end {
-        // Use the ADM object ID directly so the name reflects the real ADM numbering
-        // (dynamic objects start at 10 in Atmos/TrueHD).
-        return ObjectNameKey::Dynamic(object_id as usize);
-    }
-    // Fallback for malformed object counts.
-    ObjectNameKey::Dynamic(object_id as usize)
-}
-
-#[inline]
 fn name_key_changed(cache: &mut Vec<Option<ObjectNameKey>>, id: u32, key: &ObjectNameKey) -> bool {
     let idx = id as usize;
     if idx >= cache.len() {
@@ -1258,7 +1930,7 @@ fn name_key_changed(cache: &mut Vec<Option<ObjectNameKey>>, id: u32, key: &Objec
     }
 }
 
-fn build_metadata_frame(
+fn build_metadata_frame_from_oamd(
     oamd: &ObjectAudioMetadataPayload,
     evo_base: u64,
     frame_sample_pos: u64,
@@ -1292,8 +1964,13 @@ fn build_metadata_frame(
     let num_dynamic_objects = oamd.program_assignment.num_dynamic_objects;
     for (idx, event) in events.iter().enumerate() {
         let id = event.id;
-        let key =
-            object_name_key_for_index(idx, id, &bed_index_vec, num_isf_objects, num_dynamic_objects);
+        let key = object_name_key_for_index(
+            idx,
+            id,
+            &bed_index_vec,
+            num_isf_objects,
+            num_dynamic_objects,
+        );
         if name_key_changed(name_key_cache, id, &key) {
             name_updates.push(bridge_api::RNameUpdate {
                 id,
@@ -1320,7 +1997,32 @@ fn build_metadata_frame(
     }
 }
 
-/// Extract spatial events from an OAMD frame.
+#[inline]
+fn object_name_key_for_index(
+    object_index: usize,
+    object_id: u32,
+    bed_index_vec: &[usize],
+    num_isf_objects: usize,
+    num_dynamic_objects: usize,
+) -> ObjectNameKey {
+    let bed_count = bed_index_vec.len();
+    if object_index < bed_count {
+        return ObjectNameKey::Bed(bed_index_vec[object_index] as u8);
+    }
+    let isf_start = bed_count;
+    let isf_end = isf_start + num_isf_objects;
+    if object_index < isf_end {
+        return ObjectNameKey::Isf(object_index - isf_start);
+    }
+    let dyn_start = isf_end;
+    let dyn_end = dyn_start + num_dynamic_objects;
+    if object_index < dyn_end {
+        return ObjectNameKey::Dynamic(object_id as usize);
+    }
+    ObjectNameKey::Dynamic(object_id as usize)
+}
+
+/// Extract spatial events from a TrueHD OAMD frame.
 fn extract_events(
     oamd: &ObjectAudioMetadataPayload,
     base_sample_pos: u64,
@@ -1330,7 +2032,6 @@ fn extract_events(
         return RVec::new();
     };
 
-    // TODO: multi-block support. For now, skip unsupported layouts non-fatally.
     if object_element.md_update_info.num_obj_info_blocks != 1 {
         log::warn!(
             "atmos-bridge: unsupported OAMD with num_obj_info_blocks={} (expected 1); skipping metadata frame",
@@ -1447,4 +2148,59 @@ fn extract_events(
     }
 
     events
+}
+
+/// Convert a floating-point PCM sample to the bridge's i32 PCM convention
+/// (24-bit signed, stored in i32, matching the TrueHD decoder's range).
+fn float_to_pcm_i32(sample: f32) -> i32 {
+    if !sample.is_finite() {
+        return 0;
+    }
+    const SCALE: f32 = 8_388_607.0; // 2^23 - 1
+    (sample.clamp(-1.0, 1.0) * SCALE) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PcmStats;
+    use abi_stable::std_types::RVec;
+    use bridge_api::{RChannelLabel, RDecodedFrame};
+
+    fn decoded_frame(sample_count: u32, channel_count: u32, pcm: Vec<i32>) -> RDecodedFrame {
+        RDecodedFrame {
+            sampling_frequency: 48_000,
+            sample_count,
+            channel_count,
+            pcm: pcm.into(),
+            channel_labels: (0..channel_count)
+                .map(|_| RChannelLabel::Unknown)
+                .collect::<Vec<_>>()
+                .into(),
+            metadata: RVec::new(),
+            dialogue_level: None.into(),
+            is_new_segment: false,
+        }
+    }
+
+    #[test]
+    fn pcm_stats_accepts_matching_frame() {
+        let frame = decoded_frame(2, 2, vec![0, 10, -20, 30]);
+        let stats = PcmStats::from_frame(&frame).expect("frame should be valid");
+        assert_eq!(stats.max_abs, 30);
+        assert_eq!(stats.near_clip_count, 0);
+    }
+
+    #[test]
+    fn pcm_stats_rejects_length_mismatch() {
+        let frame = decoded_frame(2, 2, vec![0, 10, -20]);
+        let err = PcmStats::from_frame(&frame).expect_err("frame should be rejected");
+        assert!(err.starts_with("pcm_len_mismatch"));
+    }
+
+    #[test]
+    fn pcm_stats_rejects_many_clipped_samples() {
+        let frame = decoded_frame(16, 2, vec![i32::MAX; 32]);
+        let err = PcmStats::from_frame(&frame).expect_err("frame should be rejected");
+        assert!(err.starts_with("too_many_near_clip_samples"));
+    }
 }
