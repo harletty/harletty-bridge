@@ -8,9 +8,9 @@ use eac3::{ObjectPcmDecoder, PcmDecoder};
 use std::env;
 #[cfg(feature = "bridge-perf")]
 use std::time::Instant;
-use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, parse::Parser};
+use truehd::process::{decode::Decoder, extract::Extractor, parse::Parser, MAX_PRESENTATIONS};
 
-use crate::eac3_pipeline::process_eac3_frame;
+use crate::eac3_pipeline::{is_temporary_eac3_silence_frame, process_eac3_frame};
 use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::PcmStats;
 use crate::logging::{bridge_diag_log, dbg_log};
@@ -18,6 +18,19 @@ use crate::mat::MatStream;
 use crate::metadata::ObjectNameKey;
 use crate::perf::PerfStats;
 use crate::truehd_pipeline::process_extractor_input;
+
+#[derive(Debug, Default)]
+pub(crate) struct Eac3DiagStats {
+    pub(crate) total_frames: u64,
+    pub(crate) legacy_ac3_frames: u64,
+    pub(crate) independent_frames: u64,
+    pub(crate) dependent_frames: u64,
+    pub(crate) ac3_convert_frames: u64,
+    pub(crate) joc_frames: u64,
+    pub(crate) oamd_frames: u64,
+    pub(crate) last_report_frame: u64,
+    pub(crate) pending_summary: Option<String>,
+}
 
 pub(crate) struct AtmosBridge {
     // ── TrueHD pipeline ──────────────────────────────────────────────
@@ -33,6 +46,7 @@ pub(crate) struct AtmosBridge {
     pub(crate) eac3_total_samples: u64,
     /// True when the most recent `push_packet` used the E-AC3 path.
     pub(crate) eac3_active: bool,
+    pub(crate) eac3_diag_stats: Eac3DiagStats,
     // ── Shared ───────────────────────────────────────────────────────
     pub(crate) presentation: u8,
     pub(crate) strict: bool,
@@ -94,6 +108,7 @@ impl AtmosBridge {
             eac3_frame_count: 0,
             eac3_total_samples: 0,
             eac3_active: false,
+            eac3_diag_stats: Eac3DiagStats::default(),
             presentation,
             strict,
             total_samples: 0,
@@ -249,6 +264,7 @@ impl FormatBridge for AtmosBridge {
 
                     self.eac3_spdif.push_payload(data.as_slice());
                     let mut frame_count_in_packet = 0u32;
+                    let mut temporary_silence_pushed = false;
                     loop {
                         match self.eac3_spdif.next_frame() {
                             Ok(Some(frame)) => {
@@ -304,15 +320,28 @@ impl FormatBridge for AtmosBridge {
                                             decoded_frame.sample_count,
                                             decoded_frame.channel_count
                                         );
+                                        if is_temporary_eac3_silence_frame(&decoded_frame) {
+                                            if temporary_silence_pushed {
+                                                bridge_diag_log(
+                                                    log::Level::Info,
+                                                    &format!(
+                                                        "eac3_temporary_silence_skip index={} reason=already-clocked-this-packet samples={} ch={}",
+                                                        self.eac3_frame_count,
+                                                        decoded_frame.sample_count,
+                                                        decoded_frame.channel_count
+                                                    ),
+                                                );
+                                                continue;
+                                            }
+                                            temporary_silence_pushed = true;
+                                        }
                                         result.frames.push(decoded_frame);
                                     }
                                     Err(msg) => {
                                         log::warn!("{msg}");
                                         self.reset_pipeline();
                                         result.did_reset = true;
-                                        if self.strict {
-                                            result.error_message = msg.into();
-                                        }
+                                        result.error_message = msg.into();
                                         return result;
                                     }
                                 }
@@ -331,11 +360,14 @@ impl FormatBridge for AtmosBridge {
                                 log::warn!("{msg}");
                                 self.reset_pipeline();
                                 result.did_reset = true;
-                                if self.strict {
-                                    result.error_message = msg.into();
-                                }
+                                result.error_message = msg.into();
                                 return result;
                             }
+                        }
+                    }
+                    if result.error_message.is_empty() {
+                        if let Some(summary) = self.eac3_diag_stats.pending_summary.take() {
+                            result.error_message = summary.into();
                         }
                     }
                     return result;
