@@ -23,6 +23,17 @@ pub(crate) fn build_eac3_metadata_frame(
     let bed_indices: RVec<usize> = bed_indices.iter().copied().collect();
 
     let mut name_updates = RVec::new();
+    for &speaker_id in bed_indices.iter() {
+        let id = speaker_id as u32;
+        let key = ObjectNameKey::Bed(speaker_id as u8);
+        if name_key_changed(&mut bridge.object_name_keys_by_id, id, &key) {
+            name_updates.push(bridge_api::RNameUpdate {
+                id,
+                name: object_name_from_key(&key).into(),
+            });
+        }
+    }
+
     let dynamic_objects = oamd
         .object_count
         .saturating_sub(oamd.bed_or_isf_objects)
@@ -153,6 +164,40 @@ fn extract_eac3_events(
     }
 
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::AtmosBridge;
+
+    fn empty_oamd_payload() -> OamdPayload {
+        OamdPayload {
+            version: 0,
+            object_count: 1,
+            alternate_object_present: false,
+            element_count: 0,
+            beds: 1,
+            bed_instances: 1,
+            bed_or_isf_objects: 1,
+            dynamic_objects: 0,
+            isf_in_use: false,
+            isf_index: None,
+            bed_assignment: vec![vec![eac3::BedChannel::LowFrequencyEffects]],
+            elements: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn eac3_metadata_names_lfe_bed() {
+        let mut bridge = AtmosBridge::new(false);
+
+        let meta = build_eac3_metadata_frame(&empty_oamd_payload(), 0, 0, &[3], 0, &mut bridge);
+
+        assert_eq!(meta.name_updates.len(), 1);
+        assert_eq!(meta.name_updates[0].id, 3);
+        assert_eq!(meta.name_updates[0].name.as_str(), "LFE");
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
