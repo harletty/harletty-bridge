@@ -218,6 +218,11 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 [[package]]
 name = "eac3"
 version = "0.1.0"
+dependencies = [
+ "log",
+ "rustfft",
+ "thiserror",
+]
 
 [[package]]
 name = "env_filter"
@@ -258,12 +263,11 @@ dependencies = [
  "abi_stable",
  "anyhow",
  "bridge_api",
+ "eac3",
  "libc",
  "log",
- "rustfft",
  "spdif",
  "sys",
- "thiserror",
  "truehd",
 ]
 
