@@ -6,7 +6,7 @@ use super::syncframe::{
     AccessUnitInfo, AuxDataDecodeState, CoreDecodeState, ParseError,
     decode_core_pcm_frame_with_state, inspect_access_unit_with_metadata_state,
 };
-use crate::renderer::BedChannel;
+use crate::BedChannel;
 
 #[derive(Debug, Clone, PartialEq)]
 /// Decoded core channel PCM for one access unit.

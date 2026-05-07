@@ -8,7 +8,7 @@ use super::metadata::{JocObject, JocObjectData, JocPayload};
 use super::pcm::CorePcmFrame;
 use super::qmf::{QMF_SUBBANDS, QmfSubbands, QuadratureMirrorFilterBank};
 use super::syncframe::ParseError;
-use crate::renderer::BedChannel;
+use crate::BedChannel;
 
 const JOC_INPUT_ORDER: [BedChannel; 7] = [
     BedChannel::FrontLeft,
@@ -533,8 +533,7 @@ mod tests {
         build_object_timeslots, decode_parameter_points, expanded_parameter_band_mapping,
         map_input_channel_indices,
     };
-    use crate::eac3dec::{CorePcmFrame, JocObject, JocObjectData};
-    use crate::renderer::BedChannel;
+    use crate::{BedChannel, CorePcmFrame, JocObject, JocObjectData};
 
     #[test]
     fn parameter_band_mapping_expands_last_band() {

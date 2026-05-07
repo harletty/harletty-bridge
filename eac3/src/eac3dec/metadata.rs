@@ -2,7 +2,7 @@
 
 use super::bitstream::BitReader;
 use super::syncframe::ParseError;
-use crate::renderer::{BedChannel, ObjectAnchor, Vec3};
+use crate::{BedChannel, ObjectAnchor, Vec3};
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
 

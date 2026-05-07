@@ -19,7 +19,7 @@ use super::metadata::{
     MetadataParseState, ParsedEmdfPayloadData, parse_emdf_payload_body_with_state,
 };
 use super::pcm::CorePcmFrame;
-use crate::renderer::BedChannel;
+use crate::BedChannel;
 use std::sync::atomic::{AtomicU8, Ordering};
 use thiserror::Error;
 
@@ -694,7 +694,7 @@ impl CoreDecodeState {
 /// Parse one complete access unit without keeping any cross-frame state.
 ///
 /// Use this helper for one-off inspection, tests, or tools that already manage stream boundaries
-/// externally. Stateful callers should prefer [`crate::eac3dec::Decoder`].
+/// externally. Stateful callers should prefer [`crate::Decoder`].
 pub fn inspect_access_unit(data: &[u8]) -> Result<AccessUnitInfo, ParseError> {
     let mut metadata_state = MetadataParseState::default();
     inspect_access_unit_with_metadata_state(data, &mut metadata_state, None)
@@ -2941,7 +2941,7 @@ mod tests {
         AccessUnitInfo, AudioFrameInfo, BlockSyntaxState, CoreDecodeState, EmdfSource, ExpStrategy,
         FrameType, ParseError, apply_spx_extension, decode_block_core_pcm, inspect_access_unit,
     };
-    use crate::renderer::BedChannel;
+    use crate::BedChannel;
 
     fn push_bits(bits: &mut Vec<bool>, value: u32, width: usize) {
         for bit in (0..width).rev() {

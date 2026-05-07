@@ -13,3 +13,6 @@ name = "eac3"
 crate-type = ["lib"]
 
 [dependencies]
+log = "0.4"
+rustfft = "6.4"
+thiserror = "2.0"

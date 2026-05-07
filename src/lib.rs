@@ -1,7 +1,5 @@
 mod eac3_spdif;
-mod eac3dec;
 mod mat;
-mod renderer;
 
 use abi_stable::{
     export_root_module,
@@ -36,7 +34,7 @@ use truehd::{
 };
 
 // E-AC3 decoder imports.
-use crate::eac3dec::{
+use eac3::{
     AccessUnitInfo, CorePcmFrame, OamdPayload, ObjectPcmDecoder, ObjectPcmPushResult,
     ParsedEmdfPayloadData, PcmDecoder,
 };
@@ -1329,7 +1327,7 @@ fn extract_eac3_events(
     }
 
     for element in &oamd.elements {
-        let crate::eac3dec::OamdElementKind::Object(ref obj_element) = element.kind else {
+        let eac3::OamdElementKind::Object(ref obj_element) = element.kind else {
             continue;
         };
 
@@ -1816,8 +1814,8 @@ fn channel_label_to_r(label: &ChannelLabel) -> RChannelLabel {
 }
 
 /// Convert an E-AC3 `BedChannel` to its ABI-stable counterpart.
-fn bed_channel_to_r(ch: crate::renderer::BedChannel) -> RChannelLabel {
-    use crate::renderer::BedChannel;
+fn bed_channel_to_r(ch: eac3::BedChannel) -> RChannelLabel {
+    use eac3::BedChannel;
     match ch {
         BedChannel::FrontLeft => RChannelLabel::L,
         BedChannel::FrontRight => RChannelLabel::R,
@@ -1841,8 +1839,8 @@ fn bed_channel_to_r(ch: crate::renderer::BedChannel) -> RChannelLabel {
 }
 
 /// Map a `BedChannel` to the speaker ID space used by the bridge.
-fn bed_channel_to_speaker_id(ch: crate::renderer::BedChannel) -> usize {
-    use crate::renderer::BedChannel;
+fn bed_channel_to_speaker_id(ch: eac3::BedChannel) -> usize {
+    use eac3::BedChannel;
     match ch {
         BedChannel::FrontLeft => 0,
         BedChannel::FrontRight => 1,
@@ -1875,7 +1873,7 @@ fn eac3_core_bed_indices(core: &CorePcmFrame) -> Vec<usize> {
     );
     if core.lfe_channel.is_some() {
         bed_indices.push(bed_channel_to_speaker_id(
-            crate::renderer::BedChannel::LowFrequencyEffects,
+            eac3::BedChannel::LowFrequencyEffects,
         ));
     }
     bed_indices
