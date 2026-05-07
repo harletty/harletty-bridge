@@ -98,6 +98,16 @@ pub(crate) fn eac3_core_bed_indices(core: &CorePcmFrame) -> Vec<usize> {
     bed_indices
 }
 
+pub(crate) fn eac3_object_output_bed_indices(core: &CorePcmFrame) -> Vec<usize> {
+    if core.lfe_channel.is_some() {
+        vec![bed_channel_to_speaker_id(
+            eac3::BedChannel::LowFrequencyEffects,
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Remap a speaker index to the Atmos channel-ID space.
 /// IDs 0-9 are bed channels; 10+ are dynamic objects.
 pub(crate) fn speaker_to_id(speaker_index: usize) -> usize {

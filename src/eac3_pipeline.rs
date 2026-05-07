@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::bridge::AtmosBridge;
 use crate::frame_builders::float_to_pcm_i32;
-use crate::labels::{bed_channel_to_r, eac3_core_bed_indices};
+use crate::labels::{bed_channel_to_r, eac3_core_bed_indices, eac3_object_output_bed_indices};
 use crate::logging::dbg_log;
 use crate::metadata::build_eac3_metadata_frame;
 
@@ -121,39 +121,11 @@ fn build_eac3_frame_from_object(
     let core = &pcm_frame.core;
     let sample_count = pcm_frame.samples_per_channel();
     let sampling_frequency = core.sample_rate;
-    let bed_channels = core.fullband_channels.len() + usize::from(core.lfe_channel.is_some());
+    let bed_channels = usize::from(core.lfe_channel.is_some());
     let object_channels = pcm_frame.object_channels.len();
     let total_channel_count = bed_channels + object_channels;
 
-    // Build interleaved PCM: bed channels first, then dynamic-object channels.
-    // JOC output is dynamic-only — `object_channels[i]` corresponds to OAMD
-    // object[bed_or_isf_objects + i] (cf. libstarmine_ad render.rs:881).
-    let pcm_capacity = sample_count * total_channel_count;
-    let mut pcm: RVec<i32> = RVec::with_capacity(pcm_capacity);
-
-    for s in 0..sample_count {
-        for ch in &core.fullband_channels {
-            pcm.push(float_to_pcm_i32(ch[s]));
-        }
-        if let Some(lfe) = &core.lfe_channel {
-            pcm.push(float_to_pcm_i32(lfe[s]));
-        }
-        for obj_ch in &pcm_frame.object_channels {
-            pcm.push(float_to_pcm_i32(obj_ch[s]));
-        }
-    }
-
-    // Channel labels.
-    let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
-    for bed in &core.fullband_channel_order {
-        channel_labels.push(bed_channel_to_r(*bed));
-    }
-    if core.lfe_channel.is_some() {
-        channel_labels.push(RChannelLabel::LFE);
-    }
-    for _ in 0..object_channels {
-        channel_labels.push(RChannelLabel::Unknown);
-    }
+    let (pcm, channel_labels) = build_eac3_object_output_pcm_and_labels(pcm_frame);
 
     // Metadata from OAMD payloads.
     #[cfg(feature = "bridge-perf")]
@@ -161,7 +133,7 @@ fn build_eac3_frame_from_object(
     let mut metadata: RVec<RMetadataFrame> = RVec::new();
     #[cfg(feature = "bridge-perf")]
     let mut metadata_events = 0usize;
-    let bed_indices = eac3_core_bed_indices(core);
+    let bed_indices = eac3_object_output_bed_indices(core);
     for (oamd, sample_offset) in &pcm_frame.oamd_payloads {
         let evo_base = base_sample_pos + sample_offset.unwrap_or(0) as u64;
         let oamd_ref: &OamdPayload = oamd;
@@ -198,6 +170,41 @@ fn build_eac3_frame_from_object(
         dialogue_level: bridge.current_dialogue_level.into(),
         is_new_segment: false,
     }
+}
+
+fn build_eac3_object_output_pcm_and_labels(
+    pcm_frame: &eac3::ObjectPcmFrame,
+) -> (RVec<i32>, RVec<RChannelLabel>) {
+    let core = &pcm_frame.core;
+    let sample_count = pcm_frame.samples_per_channel();
+    let bed_channels = usize::from(core.lfe_channel.is_some());
+    let object_channels = pcm_frame.object_channels.len();
+    let total_channel_count = bed_channels + object_channels;
+
+    // Build interleaved PCM: LFE bed first, then dynamic-object channels.
+    // JOC output is dynamic-only and does not carry LFE. The fullband core bed
+    // is used as JOC input, so exposing it here would double-count the final mix.
+    let pcm_capacity = sample_count * total_channel_count;
+    let mut pcm: RVec<i32> = RVec::with_capacity(pcm_capacity);
+
+    for s in 0..sample_count {
+        if let Some(lfe) = &core.lfe_channel {
+            pcm.push(float_to_pcm_i32(lfe[s]));
+        }
+        for obj_ch in &pcm_frame.object_channels {
+            pcm.push(float_to_pcm_i32(obj_ch[s]));
+        }
+    }
+
+    let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
+    if core.lfe_channel.is_some() {
+        channel_labels.push(RChannelLabel::LFE);
+    }
+    for _ in 0..object_channels {
+        channel_labels.push(RChannelLabel::Unknown);
+    }
+
+    (pcm, channel_labels)
 }
 
 /// Build an [`RDecodedFrame`] from a core-PCM-only E-AC3 decode result.
@@ -254,5 +261,98 @@ fn build_eac3_frame_from_core(
         metadata,
         dialogue_level: bridge.current_dialogue_level.into(),
         is_new_segment: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::labels::eac3_object_output_bed_indices;
+    use eac3::{BedChannel, CorePcmFrame, JocPayload, ObjectPcmFrame};
+
+    fn object_pcm_frame(core: CorePcmFrame, object_channels: Vec<Vec<f32>>) -> ObjectPcmFrame {
+        ObjectPcmFrame {
+            core,
+            object_active: vec![true; object_channels.len()],
+            object_channels,
+            joc: JocPayload {
+                downmix_config: 0,
+                channel_count: 0,
+                object_count: 0,
+                gain: 1.0,
+                sequence_counter: 0,
+                objects: Vec::new(),
+            },
+            oamd_payloads: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn eac3_object_output_keeps_only_lfe_bed_before_dynamic_objects() {
+        let core = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![
+                BedChannel::FrontLeft,
+                BedChannel::FrontRight,
+                BedChannel::Center,
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+            ],
+            fullband_channels: vec![
+                vec![0.11, 0.12],
+                vec![0.21, 0.22],
+                vec![0.31, 0.32],
+                vec![0.41, 0.42],
+                vec![0.51, 0.52],
+            ],
+            lfe_channel: Some(vec![0.61, 0.62]),
+        };
+        let frame = object_pcm_frame(core.clone(), vec![vec![0.71, 0.72], vec![0.81, 0.82]]);
+
+        let (pcm, labels) = build_eac3_object_output_pcm_and_labels(&frame);
+
+        assert_eq!(
+            labels.as_slice(),
+            &[
+                RChannelLabel::LFE,
+                RChannelLabel::Unknown,
+                RChannelLabel::Unknown
+            ]
+        );
+        assert_eq!(
+            pcm.as_slice(),
+            &[
+                float_to_pcm_i32(0.61),
+                float_to_pcm_i32(0.71),
+                float_to_pcm_i32(0.81),
+                float_to_pcm_i32(0.62),
+                float_to_pcm_i32(0.72),
+                float_to_pcm_i32(0.82),
+            ]
+        );
+        assert_eq!(eac3_object_output_bed_indices(&core), vec![3]);
+    }
+
+    #[test]
+    fn eac3_object_output_omits_bed_when_lfe_is_absent() {
+        let core = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![BedChannel::FrontLeft, BedChannel::FrontRight],
+            fullband_channels: vec![vec![0.11], vec![0.21]],
+            lfe_channel: None,
+        };
+        let frame = object_pcm_frame(core.clone(), vec![vec![0.31], vec![0.41]]);
+
+        let (pcm, labels) = build_eac3_object_output_pcm_and_labels(&frame);
+
+        assert_eq!(
+            labels.as_slice(),
+            &[RChannelLabel::Unknown, RChannelLabel::Unknown]
+        );
+        assert_eq!(
+            pcm.as_slice(),
+            &[float_to_pcm_i32(0.31), float_to_pcm_i32(0.41)]
+        );
+        assert!(eac3_object_output_bed_indices(&core).is_empty());
     }
 }
