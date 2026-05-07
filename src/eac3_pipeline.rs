@@ -1,6 +1,9 @@
 use abi_stable::std_types::RVec;
 use bridge_api::{RChannelLabel, RDecodedFrame, RMetadataFrame};
-use eac3::{AccessUnitInfo, CorePcmFrame, OamdPayload, ObjectPcmPushResult, ParsedEmdfPayloadData};
+use eac3::{
+    inspect_access_unit, AccessUnitInfo, CorePcmFrame, FrameType, OamdPayload, ObjectPcmPushResult,
+    ParsedEmdfPayloadData,
+};
 #[cfg(feature = "bridge-perf")]
 use std::time::Instant;
 
@@ -10,6 +13,33 @@ use crate::labels::{bed_channel_to_r, eac3_core_bed_indices, eac3_object_output_
 use crate::logging::dbg_log;
 use crate::metadata::build_eac3_metadata_frame;
 
+const LEGACY_AC3_SAMPLE_COUNT: u32 = 1536;
+const LEGACY_AC3_CHANNEL_COUNT: u32 = 6;
+const AC3_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
+const AC3_FRAME_SIZE_WORDS: [[usize; 3]; 19] = [
+    [64, 69, 96],
+    [80, 87, 120],
+    [96, 104, 144],
+    [112, 121, 168],
+    [128, 139, 192],
+    [160, 174, 240],
+    [192, 208, 288],
+    [224, 243, 336],
+    [256, 278, 384],
+    [320, 348, 480],
+    [384, 417, 576],
+    [448, 487, 672],
+    [512, 557, 768],
+    [640, 696, 960],
+    [768, 835, 1152],
+    [896, 975, 1344],
+    [1024, 1114, 1536],
+    [1152, 1253, 1728],
+    [1280, 1393, 1920],
+];
+const EAC3_BLOCKS: [u32; 4] = [1, 2, 3, 6];
+const EAC3_SAMPLE_RATES: [u32; 3] = [48_000, 44_100, 32_000];
+
 /// Process a raw E-AC3 access unit (one complete syncframe).
 ///
 /// Attempts object-level decode first (JOC + OAMD), then falls back to
@@ -18,6 +48,8 @@ pub(crate) fn process_eac3_frame(
     bridge: &mut AtmosBridge,
     frame: &[u8],
 ) -> Result<RDecodedFrame, String> {
+    emit_eac3_frame_diagnostic(bridge, frame);
+
     // Write first frame to a file for external inspection.
     if bridge.eac3_frame_count == 1 {
         let _ = std::fs::write("/tmp/harletty-eac3-frame.bin", frame);
@@ -105,9 +137,288 @@ pub(crate) fn process_eac3_frame(
             Ok(rf)
         }
         Err(e) => {
-            dbg_log(&format!("eac3_decode_error={e}\n"));
-            Err(format!("E-AC3 decode error: {e}"))
+            let diag = eac3_frame_reject_diag(frame);
+            dbg_log(&format!("eac3_decode_error={e} {diag}\n"));
+            if format!("{e}") == "not-eac3" {
+                if let Some(sample_rate) = legacy_ac3_sample_rate(frame) {
+                    dbg_log(&format!(
+                        "legacy_ac3_passthrough_as_silence sr={} samples={} channels={} {}\n",
+                        sample_rate, LEGACY_AC3_SAMPLE_COUNT, LEGACY_AC3_CHANNEL_COUNT, diag
+                    ));
+                    return Ok(build_silence_frame(
+                        sample_rate,
+                        LEGACY_AC3_SAMPLE_COUNT,
+                        bridge,
+                    ));
+                }
+            }
+            if format!("{e}") == "unsupported-feature:non-independent-core-pcm" {
+                if let Some((sample_rate, sample_count)) = eac3_frame_timing(frame) {
+                    dbg_log(&format!(
+                        "eac3_non_independent_passthrough_as_silence sr={} samples={} channels={} {}\n",
+                        sample_rate, sample_count, LEGACY_AC3_CHANNEL_COUNT, diag
+                    ));
+                    return Ok(build_silence_frame(sample_rate, sample_count, bridge));
+                }
+            }
+            Err(format!("E-AC3 decode error: {e} {diag}"))
         }
+    }
+}
+
+fn emit_eac3_frame_diagnostic(bridge: &mut AtmosBridge, frame: &[u8]) {
+    bridge.eac3_diag_stats.total_frames += 1;
+
+    match inspect_access_unit(frame) {
+        Ok(info) => {
+            match info.frame_type {
+                FrameType::Independent => bridge.eac3_diag_stats.independent_frames += 1,
+                FrameType::Dependent => bridge.eac3_diag_stats.dependent_frames += 1,
+                FrameType::Ac3Convert => bridge.eac3_diag_stats.ac3_convert_frames += 1,
+            }
+            if info.joc_payload_count() > 0 {
+                bridge.eac3_diag_stats.joc_frames += 1;
+            }
+            if info.oamd_payload_count() > 0 {
+                bridge.eac3_diag_stats.oamd_frames += 1;
+            }
+
+            emit_live_diag(&format!("E-AC3 frame diag: {}", info.summary()));
+        }
+        Err(err) if format!("{err}") == "not-eac3" => {
+            if let Some(legacy) = legacy_ac3_info(frame) {
+                bridge.eac3_diag_stats.legacy_ac3_frames += 1;
+                emit_live_diag(&format!(
+                    "E-AC3 frame diag: legacy_ac3 bsid={} sr={} frame={} channels={} acmod={} lfe={} first8=[{}]",
+                    legacy.bsid,
+                    legacy.sample_rate,
+                    legacy.frame_size,
+                    legacy.channels,
+                    legacy.channel_mode,
+                    if legacy.lfe_on { 1 } else { 0 },
+                    first_bytes_hex(frame, 8)
+                ));
+            } else {
+                emit_live_diag(&format!(
+                    "E-AC3 frame diag: not-eac3 {} first8=[{}]",
+                    eac3_frame_reject_diag(frame),
+                    first_bytes_hex(frame, 8)
+                ));
+            }
+        }
+        Err(err) => {
+            emit_live_diag(&format!(
+                "E-AC3 frame diag failed: error={} {}",
+                err,
+                eac3_frame_reject_diag(frame)
+            ));
+        }
+    }
+
+    maybe_report_eac3_diag_summary(bridge);
+}
+
+fn maybe_report_eac3_diag_summary(bridge: &mut AtmosBridge) {
+    let total = bridge.eac3_diag_stats.total_frames;
+    if total == 0 || total - bridge.eac3_diag_stats.last_report_frame < 64 {
+        return;
+    }
+    bridge.eac3_diag_stats.last_report_frame = total;
+
+    let summary = format!(
+        "E-AC3 diag summary: total={} legacy_ac3={} independent={} dependent={} ac3_convert={} joc_frames={} oamd_frames={}",
+        bridge.eac3_diag_stats.total_frames,
+        bridge.eac3_diag_stats.legacy_ac3_frames,
+        bridge.eac3_diag_stats.independent_frames,
+        bridge.eac3_diag_stats.dependent_frames,
+        bridge.eac3_diag_stats.ac3_convert_frames,
+        bridge.eac3_diag_stats.joc_frames,
+        bridge.eac3_diag_stats.oamd_frames
+    );
+    emit_live_diag(&summary);
+    bridge.eac3_diag_stats.pending_summary = Some(summary);
+}
+
+fn emit_live_diag(message: &str) {
+    log::info!(target: "harletty-bridge::eac3_diag", "{message}");
+    sys::live_log::emit_external_record(log::Level::Info, "harletty-bridge::eac3_diag", message);
+    sys::live_log::emit_external_record(
+        log::Level::Info,
+        "audio_input::bridge",
+        &format!("harletty E-AC3 diag: {message}"),
+    );
+}
+
+pub(crate) fn is_temporary_eac3_silence_frame(frame: &RDecodedFrame) -> bool {
+    frame.sampling_frequency != 0
+        && frame.sample_count == LEGACY_AC3_SAMPLE_COUNT
+        && frame.channel_count == LEGACY_AC3_CHANNEL_COUNT
+        && frame.metadata.is_empty()
+        && frame.pcm.iter().all(|sample| *sample == 0)
+}
+
+fn eac3_frame_reject_diag(frame: &[u8]) -> String {
+    let sync = frame
+        .get(0..2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
+    let bsid = frame_bsid(frame);
+    let first8 = frame
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "sync={:?} bsid={:?} frame_bytes={} first8=[{}]",
+        sync,
+        bsid,
+        frame.len(),
+        first8
+    )
+}
+
+fn first_bytes_hex(frame: &[u8], count: usize) -> String {
+    frame
+        .iter()
+        .take(count)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn frame_bsid(frame: &[u8]) -> Option<u8> {
+    if frame.len() < 6 {
+        return None;
+    }
+    let bit_offset = 40usize;
+    let byte_index = bit_offset / 8;
+    let bit_shift = 8 - (bit_offset % 8) - 5;
+    frame.get(byte_index).map(|byte| (byte >> bit_shift) & 0x1F)
+}
+
+fn legacy_ac3_sample_rate(frame: &[u8]) -> Option<u32> {
+    legacy_ac3_info(frame).map(|info| info.sample_rate)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LegacyAc3Info {
+    bsid: u8,
+    sample_rate: u32,
+    frame_size: usize,
+    channel_mode: u8,
+    channels: u8,
+    lfe_on: bool,
+}
+
+fn legacy_ac3_info(frame: &[u8]) -> Option<LegacyAc3Info> {
+    let bsid = frame_bsid(frame)?;
+    if bsid > 10 || frame.len() < 7 {
+        return None;
+    }
+
+    let fscod = frame[4] >> 6;
+    let frmsizecod = frame[4] & 0x3F;
+    let sample_rate = match fscod {
+        0 => 48_000,
+        1 => 44_100,
+        2 => 32_000,
+        _ => return None,
+    };
+    let frame_size = ac3_frame_size_from_fscod_frmsizecod(fscod, frmsizecod)?;
+    let channel_mode = read_bits(frame, 48, 3)? as u8;
+    let mut bit_offset = 51usize;
+    if (channel_mode & 0x01) != 0 && channel_mode != 1 {
+        bit_offset += 2;
+    }
+    if (channel_mode & 0x04) != 0 {
+        bit_offset += 2;
+    }
+    if channel_mode == 2 {
+        bit_offset += 2;
+    }
+    let lfe_on = read_bits(frame, bit_offset, 1)? != 0;
+    let channels = AC3_CHANNELS[usize::from(channel_mode)] + u8::from(lfe_on);
+
+    Some(LegacyAc3Info {
+        bsid,
+        sample_rate,
+        frame_size,
+        channel_mode,
+        channels,
+        lfe_on,
+    })
+}
+
+fn ac3_frame_size_from_fscod_frmsizecod(fscod: u8, frmsizecod: u8) -> Option<usize> {
+    let bitrate_index = usize::from(frmsizecod >> 1);
+    if fscod > 2 || bitrate_index >= AC3_FRAME_SIZE_WORDS.len() {
+        return None;
+    }
+    Some(AC3_FRAME_SIZE_WORDS[bitrate_index][usize::from(fscod)] * 2)
+}
+
+fn read_bits(data: &[u8], bit_offset: usize, bit_count: usize) -> Option<u32> {
+    if bit_count > 32 || bit_offset + bit_count > data.len() * 8 {
+        return None;
+    }
+    let mut value = 0u32;
+    for bit in bit_offset..bit_offset + bit_count {
+        let byte = *data.get(bit / 8)?;
+        let bit_value = (byte >> (7 - (bit % 8))) & 1;
+        value = (value << 1) | u32::from(bit_value);
+    }
+    Some(value)
+}
+
+fn eac3_frame_timing(frame: &[u8]) -> Option<(u32, u32)> {
+    if frame.len() < 5 || frame_bsid(frame)? < 11 {
+        return None;
+    }
+
+    let sr_code = (frame[4] >> 6) & 0x03;
+    let (sample_rate, blocks) = if sr_code == 3 {
+        let sr_code2 = (frame[4] >> 4) & 0x03;
+        if sr_code2 == 3 {
+            return None;
+        }
+        (EAC3_SAMPLE_RATES[usize::from(sr_code2)] / 2, 6)
+    } else {
+        let num_blocks_code = (frame[4] >> 4) & 0x03;
+        (
+            EAC3_SAMPLE_RATES[usize::from(sr_code)],
+            EAC3_BLOCKS[usize::from(num_blocks_code)],
+        )
+    };
+
+    Some((sample_rate, blocks * 256))
+}
+
+fn build_silence_frame(
+    sample_rate: u32,
+    sample_count: u32,
+    bridge: &mut AtmosBridge,
+) -> RDecodedFrame {
+    let sample_count_usize = sample_count as usize;
+    let channel_count = LEGACY_AC3_CHANNEL_COUNT as usize;
+    bridge.eac3_total_samples += sample_count as u64;
+
+    RDecodedFrame {
+        sampling_frequency: sample_rate,
+        sample_count,
+        channel_count: LEGACY_AC3_CHANNEL_COUNT,
+        pcm: vec![0; sample_count_usize * channel_count].into(),
+        channel_labels: vec![
+            RChannelLabel::L,
+            RChannelLabel::R,
+            RChannelLabel::C,
+            RChannelLabel::LFE,
+            RChannelLabel::Ls,
+            RChannelLabel::Rs,
+        ]
+        .into(),
+        metadata: RVec::new(),
+        dialogue_level: bridge.current_dialogue_level.into(),
+        is_new_segment: false,
     }
 }
 
@@ -354,5 +665,60 @@ mod tests {
             &[float_to_pcm_i32(0.31), float_to_pcm_i32(0.41)]
         );
         assert!(eac3_object_output_bed_indices(&core).is_empty());
+    }
+
+    #[test]
+    fn legacy_ac3_not_eac3_frame_can_advance_as_silence() {
+        let mut bridge = AtmosBridge::new(false);
+        let mut frame = vec![0u8; 1234];
+        frame[..8].copy_from_slice(&[0x0B, 0x77, 0x2A, 0x68, 0x22, 0x30, 0xE1, 0xFF]);
+
+        let decoded = process_eac3_frame(&mut bridge, &frame).expect("legacy AC-3 silence frame");
+
+        assert_eq!(bridge.eac3_diag_stats.total_frames, 1);
+        assert_eq!(bridge.eac3_diag_stats.legacy_ac3_frames, 1);
+        assert_eq!(decoded.sampling_frequency, 48_000);
+        assert_eq!(decoded.sample_count, LEGACY_AC3_SAMPLE_COUNT);
+        assert_eq!(decoded.channel_count, LEGACY_AC3_CHANNEL_COUNT);
+        assert_eq!(
+            decoded.channel_labels.as_slice(),
+            &[
+                RChannelLabel::L,
+                RChannelLabel::R,
+                RChannelLabel::C,
+                RChannelLabel::LFE,
+                RChannelLabel::Ls,
+                RChannelLabel::Rs,
+            ]
+        );
+        assert_eq!(
+            decoded.pcm.len(),
+            LEGACY_AC3_SAMPLE_COUNT as usize * LEGACY_AC3_CHANNEL_COUNT as usize
+        );
+        assert!(decoded.pcm.iter().all(|sample| *sample == 0));
+    }
+
+    #[test]
+    fn legacy_ac3_diag_extracts_header_shape() {
+        let mut frame = vec![0u8; 2304];
+        frame[..8].copy_from_slice(&[0x0B, 0x77, 0x2A, 0x68, 0x22, 0x30, 0xE1, 0xFF]);
+
+        let info = legacy_ac3_info(&frame).expect("legacy AC-3 info");
+
+        assert_eq!(info.bsid, 6);
+        assert_eq!(info.sample_rate, 48_000);
+        assert_eq!(info.frame_size, 2304);
+        assert_eq!(info.channel_mode, 7);
+        assert_eq!(info.channels, 6);
+        assert!(info.lfe_on);
+    }
+
+    #[test]
+    fn dependent_eac3_timing_uses_header_blocks() {
+        let mut frame = vec![0u8; 2304];
+        frame[..8].copy_from_slice(&[0x0B, 0x77, 0x44, 0x7F, 0x3A, 0x87, 0xFF, 0x31]);
+
+        assert_eq!(frame_bsid(&frame), Some(16));
+        assert_eq!(eac3_frame_timing(&frame), Some((48_000, 1536)));
     }
 }

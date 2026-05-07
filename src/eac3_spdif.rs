@@ -52,6 +52,51 @@ fn frame_size_from_header(data: &[u8]) -> Option<usize> {
     Some((frmsiz + 1) * 2)
 }
 
+fn ac3_frame_size_from_header(data: &[u8]) -> Option<usize> {
+    if data.len() < 5 {
+        return None;
+    }
+
+    let header = if needs_unswap(data) {
+        data[5]
+    } else if data[0] == 0x0B && data[1] == 0x77 {
+        data[4]
+    } else {
+        return None;
+    };
+
+    let fscod = header >> 6;
+    let frmsizecod = header & 0x3F;
+    let bitrate_index = usize::from(frmsizecod >> 1);
+    if fscod > 2 || bitrate_index >= AC3_FRAME_SIZE_WORDS.len() {
+        return None;
+    }
+
+    Some(AC3_FRAME_SIZE_WORDS[bitrate_index][usize::from(fscod)] * 2)
+}
+
+const AC3_FRAME_SIZE_WORDS: [[usize; 3]; 19] = [
+    [64, 69, 96],
+    [80, 87, 120],
+    [96, 104, 144],
+    [112, 121, 168],
+    [128, 139, 192],
+    [160, 174, 240],
+    [192, 208, 288],
+    [224, 243, 336],
+    [256, 278, 384],
+    [320, 348, 480],
+    [384, 417, 576],
+    [448, 487, 672],
+    [512, 557, 768],
+    [640, 696, 960],
+    [768, 835, 1152],
+    [896, 975, 1344],
+    [1024, 1114, 1536],
+    [1152, 1253, 1728],
+    [1280, 1393, 1920],
+];
+
 #[derive(Debug)]
 enum ParserState {
     WaitingForPayload,
@@ -264,22 +309,13 @@ impl Eac3SpdifStream {
                         let need_unswap = self.buffer[self.cursor] == 0x77
                             && self.buffer[self.cursor + 1] == 0x0B;
 
-                        // Read frmsiz from the E-AC3 header.
-                        // In normal byte order: byte 2 bits 5-7 = frmsiz[10:8], byte 3 = frmsiz[7:0].
-                        // In swapped order: bytes 2 and 3 are swapped.
+                        // Read frame size from the syncframe header. E-AC3 and
+                        // legacy AC-3 use different header layouts.
                         let frame_bytes = if self.remaining_buffer_len() >= 6 {
-                            let (frmsiz_high_bits, frmsiz_low) = if need_unswap {
-                                let orig_b3 = self.buffer[self.cursor + 2]; // frmsiz[7:0]
-                                let orig_b2 = self.buffer[self.cursor + 3]; // header byte
-                                (orig_b2 & 0x07, orig_b3)
-                            } else {
-                                let b2 = self.buffer[self.cursor + 2];
-                                let b3 = self.buffer[self.cursor + 3];
-                                (b2 & 0x07, b3)
-                            };
-                            let frmsiz_raw =
-                                ((frmsiz_high_bits as usize) << 8) | (frmsiz_low as usize);
-                            (frmsiz_raw + 1) * 2 // frame size = (frmsiz + 1) * 2 bytes
+                            let data = &self.buffer[self.cursor..];
+                            ac3_frame_size_from_header(data)
+                                .or_else(|| frame_size_from_header(data))
+                                .unwrap_or(0)
                         } else {
                             0
                         };
@@ -379,7 +415,9 @@ impl Eac3SpdifStream {
 
                     let length_code_bytes = length_code.div_ceil(8);
                     let header_frame_bytes =
-                        frame_size_from_header(&self.buffer[self.cursor..]).unwrap_or(0);
+                        ac3_frame_size_from_header(&self.buffer[self.cursor..])
+                            .or_else(|| frame_size_from_header(&self.buffer[self.cursor..]))
+                            .unwrap_or(0);
                     let frame_bytes = if header_frame_bytes > length_code_bytes
                         && header_frame_bytes <= remaining
                     {
@@ -670,6 +708,26 @@ mod tests {
 
         let result = stream.next_frame().unwrap();
         assert_eq!(result, Some(frame));
+        assert_eq!(stream.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn extracts_legacy_ac3_raw_frames_with_ac3_header_size() {
+        let mut frame = vec![0u8; 2304];
+        frame[..8].copy_from_slice(&[0x0B, 0x77, 0x2A, 0x68, 0x22, 0x30, 0xE1, 0xFF]);
+        let mut payload = Vec::with_capacity(frame.len() * 2);
+        payload.extend_from_slice(&frame);
+        payload.extend_from_slice(&frame);
+
+        let mut stream = Eac3SpdifStream::default();
+        stream.push_payload(&payload);
+
+        let first = stream.next_frame().unwrap().unwrap();
+        let second = stream.next_frame().unwrap().unwrap();
+        assert_eq!(first.len(), 2304);
+        assert_eq!(second.len(), 2304);
+        assert_eq!(&first[..8], &frame[..8]);
+        assert_eq!(&second[..8], &frame[..8]);
         assert_eq!(stream.next_frame().unwrap(), None);
     }
 
