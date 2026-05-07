@@ -349,14 +349,28 @@ fn map_input_channel_indices(
 ) -> Result<Vec<usize>, ParseError> {
     let mut indices = Vec::with_capacity(channel_count);
     for channel in &JOC_INPUT_ORDER[..channel_count] {
-        let index = core
-            .fullband_channel_order
-            .iter()
-            .position(|candidate| candidate == channel)
+        let index = resolve_joc_input_channel_index(core, *channel)
             .ok_or(ParseError::UnsupportedFeature("joc-input-layout"))?;
         indices.push(index);
     }
     Ok(indices)
+}
+
+fn resolve_joc_input_channel_index(core: &CorePcmFrame, channel: BedChannel) -> Option<usize> {
+    core.fullband_channel_order
+        .iter()
+        .position(|candidate| *candidate == channel)
+        .or_else(|| match channel {
+            BedChannel::RearLeft => core
+                .fullband_channel_order
+                .iter()
+                .position(|candidate| *candidate == BedChannel::SurroundLeft),
+            BedChannel::RearRight => core
+                .fullband_channel_order
+                .iter()
+                .position(|candidate| *candidate == BedChannel::SurroundRight),
+            _ => None,
+        })
 }
 
 fn decode_parameter_points(
@@ -560,6 +574,25 @@ mod tests {
 
         let indices = map_input_channel_indices(&frame, 5).expect("indices");
         assert_eq!(indices, vec![0, 2, 1, 3, 4]);
+    }
+
+    #[test]
+    fn five_channel_surround_core_can_feed_rear_joc_inputs() {
+        let frame = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![
+                BedChannel::FrontLeft,
+                BedChannel::FrontRight,
+                BedChannel::Center,
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+            ],
+            fullband_channels: vec![vec![0.0; 64]; 5],
+            lfe_channel: Some(vec![0.0; 64]),
+        };
+
+        let indices = map_input_channel_indices(&frame, 7).expect("indices");
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 3, 4]);
     }
 
     #[test]

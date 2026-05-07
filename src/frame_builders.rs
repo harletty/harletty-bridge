@@ -1,6 +1,7 @@
 use bridge_api::RDecodedFrame;
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PcmStats {
     pub(crate) max_abs: i32,
     pub(crate) near_clip_count: usize,

@@ -3,17 +3,22 @@ use bridge_api::{
     FormatBridge, RCoordinateFormat, RInputTransport, RPushResult, RVbapCartesianDefaults,
     RVbapTableMode,
 };
-use eac3::{ObjectPcmDecoder, PcmDecoder};
+use eac3::{CorePcmFrame, ObjectPcmDecoder, PcmDecoder};
+use std::collections::VecDeque;
 #[cfg(feature = "bridge-perf")]
 use std::env;
 #[cfg(feature = "bridge-perf")]
 use std::time::Instant;
 use truehd::process::{decode::Decoder, extract::Extractor, parse::Parser, MAX_PRESENTATIONS};
 
-use crate::eac3_pipeline::{is_temporary_eac3_silence_frame, process_eac3_frame};
+use crate::ac3_native::NativeAc3Decoder;
+use crate::eac3_pipeline::{
+    diagnose_eac3_frame, is_dependent_eac3_frame, is_legacy_ac3_frame,
+    is_temporary_eac3_silence_frame, process_eac3_dependent_frame_with_core, process_eac3_frame,
+};
 use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::PcmStats;
-use crate::logging::{bridge_diag_log, dbg_log};
+use crate::logging::bridge_diag_log;
 use crate::mat::MatStream;
 use crate::metadata::ObjectNameKey;
 use crate::perf::PerfStats;
@@ -28,8 +33,14 @@ pub(crate) struct Eac3DiagStats {
     pub(crate) ac3_convert_frames: u64,
     pub(crate) joc_frames: u64,
     pub(crate) oamd_frames: u64,
-    pub(crate) last_report_frame: u64,
-    pub(crate) pending_summary: Option<String>,
+    pub(crate) ac3_core_decoded: u64,
+    pub(crate) ac3_core_decode_failures: u64,
+    pub(crate) dependent_pair_attempts: u64,
+    pub(crate) dependent_pair_no_object: u64,
+    pub(crate) dependent_pair_failures: u64,
+    pub(crate) paired_object_frames: u64,
+    pub(crate) last_ac3_core_decode_error: Option<String>,
+    pub(crate) last_dependent_pair_error: Option<String>,
 }
 
 pub(crate) struct AtmosBridge {
@@ -42,6 +53,9 @@ pub(crate) struct AtmosBridge {
     pub(crate) eac3_spdif: Eac3SpdifStream,
     pub(crate) eac3_pcm_decoder: PcmDecoder,
     pub(crate) eac3_object_decoder: ObjectPcmDecoder,
+    pub(crate) ac3_decoder: NativeAc3Decoder,
+    pub(crate) pending_ac3_cores: VecDeque<CorePcmFrame>,
+    pub(crate) pending_dependent_frames: VecDeque<Vec<u8>>,
     pub(crate) eac3_frame_count: u64,
     pub(crate) eac3_total_samples: u64,
     /// True when the most recent `push_packet` used the E-AC3 path.
@@ -105,6 +119,9 @@ impl AtmosBridge {
             eac3_spdif: Eac3SpdifStream::default(),
             eac3_pcm_decoder: eac3_pcm,
             eac3_object_decoder: eac3_obj,
+            ac3_decoder: NativeAc3Decoder::default(),
+            pending_ac3_cores: VecDeque::new(),
+            pending_dependent_frames: VecDeque::new(),
             eac3_frame_count: 0,
             eac3_total_samples: 0,
             eac3_active: false,
@@ -148,6 +165,9 @@ impl AtmosBridge {
         self.eac3_spdif.reset();
         self.eac3_pcm_decoder.reset();
         self.eac3_object_decoder.reset();
+        self.ac3_decoder.reset();
+        self.pending_ac3_cores.clear();
+        self.pending_dependent_frames.clear();
         self.eac3_frame_count = 0;
         self.eac3_active = false;
 
@@ -170,6 +190,30 @@ impl AtmosBridge {
         self.object_name_keys_by_id.clear();
         self.recovering_until_major_sync = false;
     }
+
+    fn try_decode_pending_eac3_pair(&mut self) -> Option<bridge_api::RDecodedFrame> {
+        let core = self.pending_ac3_cores.pop_front()?;
+        let dependent = self.pending_dependent_frames.pop_front()?;
+        self.eac3_diag_stats.dependent_pair_attempts += 1;
+        match process_eac3_dependent_frame_with_core(self, &dependent, core) {
+            Ok(Some(decoded_frame)) => Some(decoded_frame),
+            Ok(None) => {
+                self.eac3_diag_stats.dependent_pair_no_object += 1;
+                self.eac3_diag_stats.last_dependent_pair_error =
+                    Some("no_object_payload".to_string());
+                None
+            }
+            Err(err) => {
+                self.eac3_diag_stats.dependent_pair_failures += 1;
+                self.eac3_diag_stats.last_dependent_pair_error = Some(err.clone());
+                bridge_diag_log(
+                    log::Level::Warn,
+                    &format!("eac3_dependent_pair_failed error={err}"),
+                );
+                None
+            }
+        }
+    }
 }
 
 impl FormatBridge for AtmosBridge {
@@ -179,10 +223,6 @@ impl FormatBridge for AtmosBridge {
         transport: RInputTransport,
         data_type: u8,
     ) -> RPushResult {
-        dbg_log(&format!(
-            "push_packet dt=0x{data_type:02X} len={}\n",
-            data.len()
-        ));
         let mut result = RPushResult {
             frames: RVec::new(),
             error_message: RString::new(),
@@ -249,45 +289,58 @@ impl FormatBridge for AtmosBridge {
 
                 // ── E-AC3 (data type 0x15) ────────────────────────────
                 if Eac3SpdifStream::accepts_data_type(data_type) {
-                    bridge_diag_log(
-                        log::Level::Info,
-                        &format!("eac3_branch dt=0x{data_type:02X} len={}", data.len()),
-                    );
                     self.eac3_active = true;
-                    let preview_len = data.len().min(16);
-                    let preview: String = data[..preview_len]
-                        .iter()
-                        .map(|b| format!("{b:02X}"))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    bridge_diag_log(log::Level::Info, &format!("eac3_preview=[{preview}]"));
 
                     self.eac3_spdif.push_payload(data.as_slice());
-                    let mut frame_count_in_packet = 0u32;
                     let mut temporary_silence_pushed = false;
                     loop {
                         match self.eac3_spdif.next_frame() {
                             Ok(Some(frame)) => {
-                                frame_count_in_packet += 1;
                                 self.eac3_frame_count += 1;
-                                bridge_diag_log(
-                                    log::Level::Info,
-                                    &format!(
-                                        "eac3_frame_extracted index={} bytes={} sync=0x{:02X}{:02X} first6={:02X?}",
-                                        self.eac3_frame_count,
-                                        frame.len(),
-                                        frame.first().copied().unwrap_or(0),
-                                        frame.get(1).copied().unwrap_or(0),
-                                        &frame.get(..6).unwrap_or(&[])
-                                    ),
-                                );
-                                let decode_result = process_eac3_frame(self, &frame);
+                                if is_legacy_ac3_frame(&frame) {
+                                    match self.ac3_decoder.decode_frame(&frame) {
+                                        Ok(core) => {
+                                            diagnose_eac3_frame(self, &frame);
+                                            self.eac3_diag_stats.ac3_core_decoded += 1;
+                                            self.pending_ac3_cores.push_back(core);
+                                            if let Some(decoded_frame) =
+                                                self.try_decode_pending_eac3_pair()
+                                            {
+                                                result.frames.push(decoded_frame);
+                                            }
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            self.eac3_diag_stats.ac3_core_decode_failures += 1;
+                                            self.eac3_diag_stats.last_ac3_core_decode_error =
+                                                Some(err.clone());
+                                            bridge_diag_log(
+                                                log::Level::Warn,
+                                                &format!(
+                                                    "ac3_core_decode_failed index={} error={}",
+                                                    self.eac3_frame_count, err
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                let decode_result = if is_dependent_eac3_frame(&frame) {
+                                    self.pending_dependent_frames.push_back(frame.clone());
+                                    if let Some(decoded_frame) = self.try_decode_pending_eac3_pair()
+                                    {
+                                        Ok(decoded_frame)
+                                    } else {
+                                        continue;
+                                    }
+                                } else {
+                                    process_eac3_frame(self, &frame)
+                                };
+
                                 match decode_result {
                                     Ok(decoded_frame) => {
-                                        let stats = match PcmStats::from_frame(&decoded_frame) {
-                                            Ok(stats) => stats,
-                                            Err(reason) => {
-                                                bridge_diag_log(
+                                        if let Err(reason) = PcmStats::from_frame(&decoded_frame) {
+                                            bridge_diag_log(
                                                     log::Level::Warn,
                                                     &format!(
                                                         "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={}",
@@ -299,38 +352,10 @@ impl FormatBridge for AtmosBridge {
                                                         decoded_frame.pcm.len()
                                                     ),
                                                 );
-                                                continue;
-                                            }
-                                        };
-                                        bridge_diag_log(
-                                            log::Level::Info,
-                                            &format!(
-                                                "eac3_frame_ready index={} sr={} samples={} ch={} max_abs={} near_clip={}",
-                                                self.eac3_frame_count,
-                                                decoded_frame.sampling_frequency,
-                                                decoded_frame.sample_count,
-                                                decoded_frame.channel_count,
-                                                stats.max_abs,
-                                                stats.near_clip_count
-                                            ),
-                                        );
-                                        log::debug!(
-                                            "E-AC3 decoded frame: sr={} samples={} ch={}",
-                                            decoded_frame.sampling_frequency,
-                                            decoded_frame.sample_count,
-                                            decoded_frame.channel_count
-                                        );
+                                            continue;
+                                        }
                                         if is_temporary_eac3_silence_frame(&decoded_frame) {
                                             if temporary_silence_pushed {
-                                                bridge_diag_log(
-                                                    log::Level::Info,
-                                                    &format!(
-                                                        "eac3_temporary_silence_skip index={} reason=already-clocked-this-packet samples={} ch={}",
-                                                        self.eac3_frame_count,
-                                                        decoded_frame.sample_count,
-                                                        decoded_frame.channel_count
-                                                    ),
-                                                );
                                                 continue;
                                             }
                                             temporary_silence_pushed = true;
@@ -347,12 +372,6 @@ impl FormatBridge for AtmosBridge {
                                 }
                             }
                             Ok(None) => {
-                                if frame_count_in_packet == 0 {
-                                    bridge_diag_log(
-                                        log::Level::Info,
-                                        &format!("eac3_no_frame_extracted len={}", data.len()),
-                                    );
-                                }
                                 break;
                             }
                             Err(msg) => {
@@ -363,11 +382,6 @@ impl FormatBridge for AtmosBridge {
                                 result.error_message = msg.into();
                                 return result;
                             }
-                        }
-                    }
-                    if result.error_message.is_empty() {
-                        if let Some(summary) = self.eac3_diag_stats.pending_summary.take() {
-                            result.error_message = summary.into();
                         }
                     }
                     return result;

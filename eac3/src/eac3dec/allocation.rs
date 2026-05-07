@@ -375,7 +375,7 @@ impl AllocationState {
                 };
                 for _ in 0..delta.lengths[index] {
                     let Some(mask) = self.mask.get_mut(band) else {
-                        return Err(ParseError::InvalidHeader("deltba-range"));
+                        break;
                     };
                     *mask += delta_mask;
                     band += 1;
