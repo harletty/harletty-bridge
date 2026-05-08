@@ -39,6 +39,7 @@ pub(crate) struct Eac3DiagStats {
     pub(crate) dependent_pair_no_object: u64,
     pub(crate) dependent_pair_failures: u64,
     pub(crate) paired_object_frames: u64,
+    pub(crate) short_packet_silence_frames: u64,
     pub(crate) last_ac3_core_decode_error: Option<String>,
     pub(crate) last_dependent_pair_error: Option<String>,
 }
