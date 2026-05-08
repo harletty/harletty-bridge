@@ -4,6 +4,7 @@ use eac3::{
     inspect_access_unit, AccessUnitInfo, CorePcmFrame, FrameType, OamdPayload, ObjectPcmPushResult,
     ParsedEmdfPayloadData,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "bridge-perf")]
 use std::time::Instant;
 
@@ -90,6 +91,13 @@ pub(crate) fn process_eac3_frame(
                     return Ok(build_silence_frame(sample_rate, sample_count, bridge));
                 }
             }
+            if format!("{e}") == "short-packet" {
+                maybe_dump_short_packet_frame(frame);
+                if let Some((sample_rate, sample_count)) = eac3_frame_timing(frame) {
+                    bridge.eac3_diag_stats.short_packet_silence_frames += 1;
+                    return Ok(build_silence_frame(sample_rate, sample_count, bridge));
+                }
+            }
             Err(format!("E-AC3 decode error: {e} {diag}"))
         }
     }
@@ -172,6 +180,26 @@ pub(crate) fn is_temporary_eac3_silence_frame(frame: &RDecodedFrame) -> bool {
         && frame.channel_count == LEGACY_AC3_CHANNEL_COUNT
         && frame.metadata.is_empty()
         && frame.pcm.iter().all(|sample| *sample == 0)
+}
+
+static SHORT_PACKET_DUMPED: AtomicBool = AtomicBool::new(false);
+
+fn maybe_dump_short_packet_frame(frame: &[u8]) {
+    if std::env::var_os("HARLETTY_DUMP_EAC3_SHORT_PACKET").is_none() {
+        return;
+    }
+    if SHORT_PACKET_DUMPED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let path = "/tmp/eac3_short_packet.bin";
+    if let Err(err) = std::fs::write(path, frame) {
+        log::warn!("failed to dump short-packet frame to {path}: {err}");
+    } else {
+        log::warn!(
+            "dumped first short-packet E-AC3 frame ({} bytes) to {path}",
+            frame.len()
+        );
+    }
 }
 
 fn eac3_frame_reject_diag(frame: &[u8]) -> String {
