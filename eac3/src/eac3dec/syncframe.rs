@@ -1782,7 +1782,7 @@ fn parse_block(
     }
     let allocation = read_exponents(reader, block, fullband_channels, lfe_on, audio_frame, state)?;
 
-    read_bit_allocation_params(reader, audio_frame, state)?;
+    read_bit_allocation_params(reader, block, audio_frame, state)?;
     read_snr_offsets(
         reader,
         block,
@@ -2398,8 +2398,16 @@ fn read_exponents(
             });
         }
         if let Some(strategy) = audio_frame.coupling_exponent_strategy[block] {
-            let ncplgrps =
-                grouped_exponent_count(cplendmant.saturating_sub(cplstrtmant), strategy)?;
+            // Coupling uses (end - start) / (3 << (strategy - 1)) per FFmpeg ac3dec.c:1086,
+            // which differs from the fullband formula on D15 (no `+ group_size - 4` adjust).
+            let cpl_range = cplendmant.saturating_sub(cplstrtmant);
+            let group_size = match strategy {
+                ExpStrategy::Reuse => 0,
+                ExpStrategy::D15 => 3,
+                ExpStrategy::D25 => 6,
+                ExpStrategy::D45 => 12,
+            };
+            let ncplgrps = if group_size == 0 { 0 } else { cpl_range / group_size };
             state.coupling_allocation.read_coupling_exponents(
                 reader,
                 strategy,
@@ -2460,6 +2468,7 @@ fn read_exponents(
 
 fn read_bit_allocation_params(
     reader: &mut BitReader<'_>,
+    block: usize,
     audio_frame: &AudioFrameInfo,
     state: &mut BlockSyntaxState,
 ) -> Result<(), ParseError> {
@@ -2473,8 +2482,17 @@ fn read_bit_allocation_params(
                 floor_code: reader.read_bits(3).ok_or(ParseError::ShortPacket)? as usize,
             };
         }
-    } else {
-        state.bit_allocation_params = BitAllocationParams::default();
+    } else if block == 0 {
+        // Per FFmpeg eac3dec.c:387-394 — when bit_allocation_syntax is disabled at
+        // frame level, set default bit-allocation parameters ONCE per frame using
+        // specific table indices (NOT the zero default).
+        state.bit_allocation_params = BitAllocationParams {
+            slow_decay_code: 2,
+            fast_decay_code: 1,
+            slow_gain_code: 1,
+            db_per_bit_code: 2,
+            floor_code: 7,
+        };
     }
     Ok(())
 }
@@ -2582,7 +2600,10 @@ fn read_frame_gain_codes(
         if lfe_on {
             state.lfe_fgain_code = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as u8;
         }
-    } else {
+    } else if block == 0 {
+        // Per FFmpeg ac3dec.c:1162 — for E-AC-3 with no per-block fast-gain flag,
+        // reset to default ONLY on block 0. Subsequent blocks keep the previous
+        // fgain values to allow them to persist across the frame.
         state.cpl_fgain_code = 4;
         for fgain in &mut state.channel_fgain_codes {
             *fgain = 4;
@@ -2984,7 +3005,7 @@ fn decode_block_core_pcm(
         audio_frame,
         state,
     )?;
-    read_bit_allocation_params(reader, audio_frame, state)?;
+    read_bit_allocation_params(reader, block, audio_frame, state)?;
     read_snr_offsets(
         reader,
         block,
