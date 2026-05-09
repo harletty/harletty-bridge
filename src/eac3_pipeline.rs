@@ -4,7 +4,8 @@ use eac3::{
     inspect_access_unit, AccessUnitInfo, CorePcmFrame, FrameType, OamdPayload, ObjectPcmPushResult,
     ParsedEmdfPayloadData,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 #[cfg(feature = "bridge-perf")]
 use std::time::Instant;
 
@@ -57,6 +58,7 @@ pub(crate) fn process_eac3_frame(
             bridge.eac3_total_samples += sample_count as u64;
             let rf = build_eac3_frame_from_object(result, base_sample_pos, bridge);
             bridge.perf.maybe_report(bridge.eac3_frame_count);
+            maybe_dump_ok_frame(frame, "obj");
             return Ok(rf);
         }
         Ok(None) => {}
@@ -73,11 +75,13 @@ pub(crate) fn process_eac3_frame(
             bridge.eac3_total_samples += sample_count as u64;
             let rf = build_eac3_frame_from_core(&pcm, &info, base_sample_pos, bridge);
             bridge.perf.maybe_report(bridge.eac3_frame_count);
+            maybe_dump_ok_frame(frame, "pcm");
             Ok(rf)
         }
         Err(e) => {
             let diag = eac3_frame_reject_diag(frame);
-            if format!("{e}") == "not-eac3" {
+            let err_str = format!("{e}");
+            if err_str == "not-eac3" {
                 if let Some(sample_rate) = legacy_ac3_sample_rate(frame) {
                     return Ok(build_silence_frame(
                         sample_rate,
@@ -86,18 +90,21 @@ pub(crate) fn process_eac3_frame(
                     ));
                 }
             }
-            if format!("{e}") == "unsupported-feature:non-independent-core-pcm" {
+            if err_str == "unsupported-feature:non-independent-core-pcm" {
                 if let Some((sample_rate, sample_count)) = eac3_frame_timing(frame) {
+                    maybe_dump_reject_frame(frame, "unsupported");
                     return Ok(build_silence_frame(sample_rate, sample_count, bridge));
                 }
             }
-            if format!("{e}") == "short-packet" {
+            if err_str == "short-packet" {
                 maybe_dump_short_packet_frame(frame);
                 if let Some((sample_rate, sample_count)) = eac3_frame_timing(frame) {
+                    maybe_dump_reject_frame(frame, "shortpkt");
                     bridge.eac3_diag_stats.short_packet_silence_frames += 1;
                     return Ok(build_silence_frame(sample_rate, sample_count, bridge));
                 }
             }
+            maybe_dump_reject_frame(frame, "parseerr");
             Err(format!("E-AC3 decode error: {e} {diag}"))
         }
     }
@@ -119,6 +126,7 @@ pub(crate) fn process_eac3_dependent_frame_with_core(
             bridge.eac3_total_samples += sample_count as u64;
             bridge.eac3_diag_stats.paired_object_frames += 1;
             bridge.perf.maybe_report(bridge.eac3_frame_count);
+            maybe_dump_ok_frame(frame, "depobj");
             Ok(Some(build_eac3_frame_from_object(
                 result,
                 base_sample_pos,
@@ -128,6 +136,7 @@ pub(crate) fn process_eac3_dependent_frame_with_core(
         Ok(None) => Ok(None),
         Err(err) => {
             let diag = eac3_frame_reject_diag(frame);
+            maybe_dump_reject_frame(frame, "depobj");
             Err(format!("E-AC3 dependent object decode error: {err} {diag}"))
         }
     }
@@ -197,6 +206,58 @@ fn maybe_dump_short_packet_frame(frame: &[u8]) {
     } else {
         log::warn!(
             "dumped first short-packet E-AC3 frame ({} bytes) to {path}",
+            frame.len()
+        );
+    }
+}
+
+static REJECT_DUMP_CAP: OnceLock<usize> = OnceLock::new();
+static REJECT_DUMP_INDEX: AtomicUsize = AtomicUsize::new(0);
+static OK_DUMP_CAP: OnceLock<usize> = OnceLock::new();
+static OK_DUMP_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+fn read_dump_cap_env(name: &str) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn maybe_dump_reject_frame(frame: &[u8], reason: &str) {
+    let cap = *REJECT_DUMP_CAP.get_or_init(|| read_dump_cap_env("HARLETTY_DUMP_EAC3_REJECTS"));
+    if cap == 0 {
+        return;
+    }
+    let idx = REJECT_DUMP_INDEX.fetch_add(1, Ordering::SeqCst);
+    if idx >= cap {
+        return;
+    }
+    let path = format!("/tmp/eac3_reject_{idx:04}_{reason}.bin");
+    if let Err(err) = std::fs::write(&path, frame) {
+        log::warn!("failed to dump rejected E-AC3 frame to {path}: {err}");
+    } else {
+        log::warn!(
+            "dumped rejected E-AC3 frame [{reason}] ({} bytes) to {path}",
+            frame.len()
+        );
+    }
+}
+
+fn maybe_dump_ok_frame(frame: &[u8], path_kind: &str) {
+    let cap = *OK_DUMP_CAP.get_or_init(|| read_dump_cap_env("HARLETTY_DUMP_EAC3_OK"));
+    if cap == 0 {
+        return;
+    }
+    let idx = OK_DUMP_INDEX.fetch_add(1, Ordering::SeqCst);
+    if idx >= cap {
+        return;
+    }
+    let path = format!("/tmp/eac3_ok_{idx:04}_{path_kind}.bin");
+    if let Err(err) = std::fs::write(&path, frame) {
+        log::warn!("failed to dump accepted E-AC3 frame to {path}: {err}");
+    } else {
+        log::warn!(
+            "dumped accepted E-AC3 frame [{path_kind}] ({} bytes) to {path}",
             frame.len()
         );
     }
