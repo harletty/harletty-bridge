@@ -38,3 +38,33 @@ fn pcm_decoder_decodes_fixture_without_short_packet() {
         "decoded PCM must be plausible, got max_abs={max_abs}"
     );
 }
+
+#[test]
+fn pcm_decoder_keeps_decoding_across_repeated_pushes_of_same_frame() {
+    // Streaming decoders carry coupling/SPX 'first time seen' flags across
+    // frames. If the decoder forgets to reset those at frame boundaries the
+    // SECOND push of the same access unit desyncs (reads a presence flag
+    // that the bitstream does not emit on a 'first block' position) and
+    // typically short-packets or produces garbage PCM. The IMDCT delay
+    // buffer legitimately makes the PCM samples differ across pushes, so
+    // we assert only that every push succeeds and stays in range — that's
+    // enough to catch the live-chain regression without over-fitting on
+    // overlap-add state.
+    let mut decoder = PcmDecoder::default();
+    for n in 1..=8 {
+        let pcm = decoder
+            .push_access_unit(FIXTURE)
+            .unwrap_or_else(|e| panic!("push #{n} must succeed, got {e:?}"))
+            .pcm;
+        let max_abs = pcm
+            .fullband_channels
+            .iter()
+            .chain(pcm.lfe_channel.iter())
+            .flat_map(|ch| ch.iter())
+            .fold(0.0_f32, |m, &s| m.max(s.abs()));
+        assert!(
+            max_abs.is_finite() && max_abs < 1.0,
+            "push #{n} produced implausible PCM: max_abs={max_abs}"
+        );
+    }
+}
