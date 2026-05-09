@@ -2922,6 +2922,26 @@ fn fullband_channel_order(channel_mode: u8) -> Result<&'static [BedChannel], Par
     }
 }
 
+fn bittrace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("HARLETTY_EAC3_BITTRACE").is_some())
+}
+
+#[inline]
+fn bittrace(tag: &str, block: usize, pos: usize) {
+    if bittrace_enabled() {
+        eprintln!("BITTRACE\tblk={block}\ttag={tag}\tbit_pos={pos}");
+    }
+}
+
+#[inline]
+pub(crate) fn bittrace_ch(tag: &str, block: usize, ch: i32, pos: usize) {
+    if bittrace_enabled() {
+        eprintln!("BITTRACE\tblk={block}\tch={ch}\ttag={tag}\tbit_pos={pos}");
+    }
+}
+
 fn decode_block_core_pcm(
     reader: &mut BitReader<'_>,
     block: usize,
@@ -2935,6 +2955,8 @@ fn decode_block_core_pcm(
 ) -> Result<(), ParseError> {
     let fullband_count = info.fullband_channels as usize;
     let mut block_switch = vec![false; fullband_count];
+
+    bittrace("audblk_start", block, reader.position());
 
     if audio_frame.block_switching_enabled {
         for flag in &mut block_switch {
@@ -2952,6 +2974,7 @@ fn decode_block_core_pcm(
     if info.channel_mode == 0 {
         skip_conditional_bits(reader, 8)?;
     }
+    bittrace("after_dynrng", block, reader.position());
 
     if matches!(info.frame_type, FrameType::LegacyAc3) {
         read_legacy_ac3_coupling_strategy(
@@ -2979,6 +3002,7 @@ fn decode_block_core_pcm(
         )?;
     } else {
         read_spx(reader, block, info.channel_mode, fullband_count, state)?;
+        bittrace("after_spx", block, reader.position());
         read_coupling_strategy(
             reader,
             block,
@@ -2987,6 +3011,7 @@ fn decode_block_core_pcm(
             audio_frame,
             state,
         )?;
+        bittrace("after_cpl_strategy", block, reader.position());
         read_coupling_coordinates(
             reader,
             block,
@@ -2995,6 +3020,7 @@ fn decode_block_core_pcm(
             audio_frame,
             state,
         )?;
+        bittrace("after_cpl_coords", block, reader.position());
     }
 
     let allocation = read_exponents(
@@ -3005,7 +3031,9 @@ fn decode_block_core_pcm(
         audio_frame,
         state,
     )?;
+    bittrace("after_exponents", block, reader.position());
     read_bit_allocation_params(reader, block, audio_frame, state)?;
+    bittrace("after_bit_alloc", block, reader.position());
     read_snr_offsets(
         reader,
         block,
@@ -3015,6 +3043,7 @@ fn decode_block_core_pcm(
         audio_frame,
         state,
     )?;
+    bittrace("after_snr", block, reader.position());
     if !matches!(info.frame_type, FrameType::LegacyAc3) {
         read_frame_gain_codes(
             reader,
@@ -3024,6 +3053,7 @@ fn decode_block_core_pcm(
             audio_frame,
             state,
         )?;
+        bittrace("after_fast_gain", block, reader.position());
     }
 
     if info.frame_type == FrameType::Independent
@@ -3031,14 +3061,17 @@ fn decode_block_core_pcm(
     {
         reader.skip_bits(10).ok_or(ParseError::ShortPacket)?;
     }
+    bittrace("after_convsnr", block, reader.position());
 
     if matches!(info.frame_type, FrameType::LegacyAc3) {
         read_legacy_ac3_coupling_leak_info(reader, audio_frame.coupling_in_use[block], state)?;
     } else {
         read_coupling_leak_info(reader, audio_frame.coupling_in_use[block], state)?;
     }
+    bittrace("after_cpl_leak", block, reader.position());
 
     read_delta_bit_allocation(reader, block, fullband_count, audio_frame, state)?;
+    bittrace("after_dba", block, reader.position());
 
     if audio_frame.skip_field_syntax_enabled && reader.read_bit().ok_or(ParseError::ShortPacket)? {
         let skip_length = reader.read_bits(9).ok_or(ParseError::ShortPacket)? as usize;
@@ -3046,10 +3079,12 @@ fn decode_block_core_pcm(
             .skip_bits(skip_length * 8)
             .ok_or(ParseError::ShortPacket)?;
     }
+    bittrace("after_skip", block, reader.position());
 
     let block_offset = block * 256;
     decode_block_pcm_mantissas(
         reader,
+        block,
         block_offset,
         info.lfe_on,
         state,
@@ -3059,12 +3094,15 @@ fn decode_block_core_pcm(
         lfe_imdct,
         fullband_channels,
         lfe_channel,
-    )
+    )?;
+    bittrace("audblk_end", block, reader.position());
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn decode_block_pcm_mantissas(
     reader: &mut BitReader<'_>,
+    block: usize,
     block_offset: usize,
     lfe_on: bool,
     state: &mut BlockSyntaxState,
@@ -3108,6 +3146,7 @@ fn decode_block_pcm_mantissas(
             )?;
         }
 
+        bittrace_ch("mantissas_ch_start", block, channel as i32, reader.position());
         let mut coeffs = [0.0f32; 256];
         state.channel_allocations[channel].decode_transform_coeffs(
             reader,
@@ -3117,6 +3156,7 @@ fn decode_block_pcm_mantissas(
             &mut mantissa_state,
         )?;
         if first_coupled_channel == Some(channel) {
+            bittrace_ch("mantissas_cpl_start", block, -1, reader.position());
             state.coupling_allocation.decode_transform_coeffs(
                 reader,
                 &mut coupling_coeffs,
@@ -3159,6 +3199,7 @@ fn decode_block_pcm_mantissas(
                 )?;
             }
 
+            bittrace_ch("mantissas_lfe_start", block, -2, reader.position());
             let mut coeffs = [0.0f32; 256];
             lfe_allocation.decode_transform_coeffs(
                 reader,
