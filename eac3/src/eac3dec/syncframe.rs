@@ -2849,6 +2849,23 @@ pub(crate) fn decode_core_pcm_frame_with_state_into(
         .as_mut()
         .ok_or(ParseError::InvalidHeader("core-decode-state"))?;
 
+    // Per FFmpeg eac3dec.c:507-511 — at the end of `eac3_decode_audio_frame_header`
+    // (i.e. once per access unit, before the block loop) reset the "first time
+    // we see this state in the frame" flags so the first block of every frame
+    // forces a fresh read of coupling coordinates / leak / SPX coordinates.
+    // Without this reset, after the first frame harletty starts reading 1-bit
+    // presence flags that FFmpeg unconditionally skips on block 0, accumulating
+    // a per-frame bit drift that re-introduces parser desync in stateful
+    // streaming decode (the live PipeWire chain) even when fresh per-frame
+    // decoding in tests passes.
+    for first in &mut block_syntax.first_cpl_coords {
+        *first = true;
+    }
+    block_syntax.first_cpl_leak = true;
+    for first in &mut block_syntax.first_spx_coords {
+        *first = true;
+    }
+
     let mut audio_frame = info.audio_frame.clone();
     for block in 0..info.num_blocks as usize {
         decode_block_core_pcm(
