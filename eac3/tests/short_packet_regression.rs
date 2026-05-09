@@ -1,14 +1,13 @@
 // Captured E-AC3 frame (Dolby Digital Plus + Atmos, 1792 bytes, bsid=16,
-// independent stream type 0, 5.1 side, 6 audio blocks). ffmpeg decodes it
-// without issue. Our PcmDecoder over-reads the audio block syntax by
-// ~600 bits per block and runs out of bits in block 4 channel 1
-// (allocation.rs decode_transform_coeffs default branch). Bug not yet
-// isolated to a single field; root cause is in the audblk parsing path.
-//
-// When the parser bug is fixed, flip `pcm_decoder_returns_short_packet`
-// to assert success.
+// independent stream type 0, 5.1 side, 6 audio blocks). ffmpeg decodes
+// it without issue, and the PcmDecoder now matches FFmpeg's bit-position
+// trace through the whole audblk syntax for this fixture. The chain of
+// coupling parser bugs that used to make this over-read by ~600 bits/block
+// (cplabsexp shift, exponent indexing, group-count formula, fast-gain
+// reset, bit-alloc defaults, and the absexp read on a Reuse strategy)
+// has been fixed; this test guards against any of those regressing.
 
-use eac3::{inspect_access_unit, AccessUnitParseError, PcmDecoder};
+use eac3::{inspect_access_unit, PcmDecoder};
 
 const FIXTURE: &[u8] = include_bytes!("data/short_packet_independent_joc.bin");
 
@@ -21,13 +20,21 @@ fn fixture_matches_expected_header() {
 }
 
 #[test]
-fn pcm_decoder_returns_short_packet() {
+fn pcm_decoder_decodes_fixture_without_short_packet() {
     let mut decoder = PcmDecoder::default();
-    let err = decoder
+    let result = decoder
         .push_access_unit(FIXTURE)
-        .expect_err("decoder must currently fail");
-    match err {
-        AccessUnitParseError::ShortPacket => {}
-        other => panic!("expected ShortPacket, got {other:?}"),
-    }
+        .expect("decoder must succeed once coupling parsing is correct");
+    assert_eq!(result.info.frame_size, 1792);
+    let max_abs = result
+        .pcm
+        .fullband_channels
+        .iter()
+        .chain(result.pcm.lfe_channel.iter())
+        .flat_map(|ch| ch.iter())
+        .fold(0.0_f32, |m, &s| m.max(s.abs()));
+    assert!(
+        max_abs.is_finite() && max_abs < 1.0,
+        "decoded PCM must be plausible, got max_abs={max_abs}"
+    );
 }

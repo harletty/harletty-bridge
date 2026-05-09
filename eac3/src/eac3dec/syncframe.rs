@@ -2398,23 +2398,29 @@ fn read_exponents(
             });
         }
         if let Some(strategy) = audio_frame.coupling_exponent_strategy[block] {
-            // Coupling uses (end - start) / (3 << (strategy - 1)) per FFmpeg ac3dec.c:1086,
-            // which differs from the fullband formula on D15 (no `+ group_size - 4` adjust).
-            let cpl_range = cplendmant.saturating_sub(cplstrtmant);
-            let group_size = match strategy {
-                ExpStrategy::Reuse => 0,
-                ExpStrategy::D15 => 3,
-                ExpStrategy::D25 => 6,
-                ExpStrategy::D45 => 12,
-            };
-            let ncplgrps = if group_size == 0 { 0 } else { cpl_range / group_size };
-            state.coupling_allocation.read_coupling_exponents(
-                reader,
-                strategy,
-                cplstrtmant,
-                cplendmant,
-                ncplgrps,
-            )?;
+            // Reuse means no exponent payload at all — neither the absolute
+            // exponent nor any grouped data. Per FFmpeg ac3dec.c:1109, the
+            // absexp + decode_exponents call is gated on `strategy != REUSE`.
+            if strategy != ExpStrategy::Reuse {
+                // Coupling uses (end - start) / (3 << (strategy - 1)) per FFmpeg
+                // ac3dec.c:1086, which differs from the fullband formula on D15
+                // (no `+ group_size - 4` adjust).
+                let cpl_range = cplendmant.saturating_sub(cplstrtmant);
+                let group_size = match strategy {
+                    ExpStrategy::Reuse => 0,
+                    ExpStrategy::D15 => 3,
+                    ExpStrategy::D25 => 6,
+                    ExpStrategy::D45 => 12,
+                };
+                let ncplgrps = if group_size == 0 { 0 } else { cpl_range / group_size };
+                state.coupling_allocation.read_coupling_exponents(
+                    reader,
+                    strategy,
+                    cplstrtmant,
+                    cplendmant,
+                    ncplgrps,
+                )?;
+            }
         }
     }
 
