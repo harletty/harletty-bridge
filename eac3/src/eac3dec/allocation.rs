@@ -257,7 +257,9 @@ impl AllocationState {
         end_mantissa: usize,
         groups: usize,
     ) -> Result<(), ParseError> {
-        let absolute_exponent = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
+        // ATSC A/52B §E.1.3.1.1: cplabsexp is a 4-bit field with an implicit LSB of 0,
+        // i.e. the actual absolute exponent is the encoded value scaled by 2.
+        let absolute_exponent = (reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32) << 1;
         self.grouped_scratch.clear();
         self.grouped_scratch.reserve(groups);
         for _ in 0..groups {
@@ -265,10 +267,13 @@ impl AllocationState {
                 .push(reader.read_bits(7).ok_or(ParseError::ShortPacket)? as i32);
         }
         let grouped = std::mem::take(&mut self.grouped_scratch);
+        // For coupling, cplabsexp is a base only and is NOT itself a usable exponent;
+        // the first decoded exponent at `start_mantissa` is `cplabsexp + delta0`.
+        // Pass `exponent_offset = start_mantissa` so the loop overwrites the placeholder.
         let result = self.decode_grouped_exponents(
             strategy,
             start_mantissa,
-            start_mantissa + 1,
+            start_mantissa,
             end_mantissa,
             absolute_exponent,
             &grouped,
