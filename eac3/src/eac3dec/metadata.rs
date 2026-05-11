@@ -109,7 +109,10 @@ pub struct OamdObjectBlock {
     pub differential_position: bool,
     pub position: Option<Vec3>,
     pub distance: Option<f32>,
-    pub size: Option<f32>,
+    /// Object spatial extent per axis (w, d, h), each in [0.0, 1.0].
+    /// Per ETSI TS 103 420 §5.2.2 / clauses 5.6.1.2.{1..5}.
+    /// `None` = property not transmitted in this block (preserve previous state).
+    pub size: Option<[f32; 3]>,
     pub screen_factor: Option<f32>,
     pub depth_factor: Option<f32>,
     pub additional_data_bytes: usize,
@@ -223,7 +226,7 @@ struct OamdObjectBlockParseState {
     differential_position: bool,
     position: Option<Vec3>,
     distance: Option<f32>,
-    size: Option<f32>,
+    size: Option<[f32; 3]>,
     screen_factor: Option<f32>,
     depth_factor: Option<f32>,
 }
@@ -824,14 +827,20 @@ fn parse_oamd_object_block(
         }
 
         if (blocks & 4) != 0 {
+            // Per ETSI TS 103 420 §5.2.2: size = (width, depth, height) along x/y/z.
+            // Mode 0: point source. Mode 1: isotropic scalar. Mode 2: anisotropic.
+            // Mode 3: reserved → preserve previous state (None).
             size = match read_bits(reader, 2, "oa_size_mode")? {
-                0 => Some(0.0),
-                1 => Some(read_bits(reader, 5, "oa_size_scalar")? as f32 * SIZE_SCALE),
+                0 => Some([0.0, 0.0, 0.0]),
+                1 => {
+                    let s = read_bits(reader, 5, "oa_size_scalar")? as f32 * SIZE_SCALE;
+                    Some([s, s, s])
+                }
                 2 => {
                     let x = read_bits(reader, 5, "oa_size_x")? as f32 * SIZE_SCALE;
                     let y = read_bits(reader, 5, "oa_size_y")? as f32 * SIZE_SCALE;
                     let z = read_bits(reader, 5, "oa_size_z")? as f32 * SIZE_SCALE;
-                    Some((x * x + y * y + z * z).sqrt())
+                    Some([x, y, z])
                 }
                 _ => None,
             };
@@ -1945,7 +1954,7 @@ mod tests {
                 differential_position: false,
                 position: Some(position),
                 distance: Some(4.0),
-                size: Some(0.25),
+                size: Some([0.25, 0.25, 0.25]),
                 screen_factor: Some(0.5),
                 depth_factor: Some(2.0),
                 ..OamdObjectBlock::default()
@@ -1972,7 +1981,7 @@ mod tests {
         assert!(!resolved.differential_position);
         assert_eq!(resolved.position, Some(position));
         assert_eq!(resolved.distance, Some(4.0));
-        assert_eq!(resolved.size, Some(0.25));
+        assert_eq!(resolved.size, Some([0.25, 0.25, 0.25]));
         assert_eq!(resolved.screen_factor, Some(0.5));
         assert_eq!(resolved.depth_factor, Some(2.0));
     }
@@ -1998,7 +2007,7 @@ mod tests {
                 differential_position: true,
                 position: Some(position),
                 distance: Some(3.2),
-                size: Some(0.4),
+                size: Some([0.4, 0.4, 0.4]),
                 screen_factor: Some(0.625),
                 depth_factor: Some(0.5),
                 ..OamdObjectBlock::default()
@@ -2010,7 +2019,7 @@ mod tests {
                 basic_info_status: 0,
                 render_info_status: 3,
                 render_info_blocks: Some(4),
-                size: Some(0.75),
+                size: Some([0.75, 0.75, 0.75]),
                 ..OamdObjectBlock::default()
             },
         ]]);
@@ -2027,7 +2036,7 @@ mod tests {
         assert!(resolved.differential_position);
         assert_eq!(resolved.position, Some(position));
         assert_eq!(resolved.distance, Some(3.2));
-        assert_eq!(resolved.size, Some(0.75));
+        assert_eq!(resolved.size, Some([0.75, 0.75, 0.75]));
         assert_eq!(resolved.screen_factor, Some(0.625));
         assert_eq!(resolved.depth_factor, Some(0.5));
     }

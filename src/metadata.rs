@@ -83,7 +83,7 @@ fn extract_eac3_events(
             has_pos: false,
             pos: [0.0; 3],
             gain_db: 0,
-            spread: 0.0,
+            size: [0.0, 0.0, 0.0],
             ramp_duration: 0,
         });
     }
@@ -127,7 +127,10 @@ fn extract_eac3_events(
             } else {
                 [0.0; 3]
             };
-            let spread = (block.size.unwrap_or(0.0) as f64 * 180.0).clamp(0.0, 180.0);
+            let size: [f64; 3] = block
+                .size
+                .map(|s| [s[0] as f64, s[1] as f64, s[2] as f64])
+                .unwrap_or([0.0, 0.0, 0.0]);
 
             let sample_offset = obj_element
                 .block_updates
@@ -146,7 +149,7 @@ fn extract_eac3_events(
                 has_pos,
                 pos,
                 gain_db: block.gain.unwrap_or(0.0) as i8,
-                spread,
+                size,
                 ramp_duration,
             });
         }
@@ -186,6 +189,71 @@ mod tests {
         assert_eq!(meta.name_updates.len(), 1);
         assert_eq!(meta.name_updates[0].id, 3);
         assert_eq!(meta.name_updates[0].name.as_str(), "LFE");
+    }
+
+    /// Anisotropic OAMD size [w, d, h] is preserved end-to-end without any
+    /// L2-norm or single-axis collapse.
+    #[test]
+    fn eac3_extract_events_preserves_anisotropic_size() {
+        use eac3::{OamdBlockUpdate, OamdElement, OamdElementKind, OamdObjectBlock,
+                   OamdObjectElement, ObjectAnchor, Vec3};
+
+        let block = OamdObjectBlock {
+            inactive: false,
+            basic_info_status: 0,
+            basic_info_blocks: None,
+            render_info_status: 0,
+            render_info_blocks: None,
+            anchor: ObjectAnchor::Room,
+            gain: Some(0.0),
+            priority: None,
+            valid_position: true,
+            differential_position: false,
+            position: Some(Vec3 { x: 0.5, y: 0.5, z: 0.5 }),
+            distance: None,
+            // Anisotropic: width=0.2, depth=0.5, height=0.9 — must survive.
+            size: Some([0.2, 0.5, 0.9]),
+            screen_factor: None,
+            depth_factor: None,
+            additional_data_bytes: 0,
+        };
+        let payload = OamdPayload {
+            version: 0,
+            object_count: 1,
+            alternate_object_present: false,
+            element_count: 1,
+            beds: 0,
+            bed_instances: 0,
+            bed_or_isf_objects: 0,
+            dynamic_objects: 1,
+            isf_in_use: false,
+            isf_index: None,
+            bed_assignment: Vec::new(),
+            elements: vec![OamdElement {
+                element_index: 1,
+                byte_length: 0,
+                kind: OamdElementKind::Object(OamdObjectElement {
+                    sample_offset: 0,
+                    block_updates: vec![OamdBlockUpdate {
+                        offset: 0,
+                        ramp_duration: 0,
+                    }],
+                    object_blocks: vec![vec![block]],
+                }),
+            }],
+        };
+
+        let events = extract_eac3_events(&payload, 0, &[], 1);
+        let dynamic = events.iter().find(|e| e.has_pos).expect("dynamic event");
+        let expected: [f64; 3] = [0.2_f32 as f64, 0.5_f32 as f64, 0.9_f32 as f64];
+        for axis in 0..3 {
+            assert!(
+                (dynamic.size[axis] - expected[axis]).abs() < 1e-6,
+                "axis {axis}: got {} expected {}",
+                dynamic.size[axis],
+                expected[axis]
+            );
+        }
     }
 }
 
@@ -392,22 +460,22 @@ fn extract_events(
         } else {
             (i + 10 - bed_index_vec.len()) as u32
         };
-        let (has_pos, pos, spread) = if !object_data.b_object_in_bed_or_isf {
+        let (has_pos, pos, size) = if !object_data.b_object_in_bed_or_isf {
             let render = &object_data.object_render_info;
             match pos_vec.get(i).and_then(|raw_blocks| raw_blocks.first()) {
                 Some(raw) if raw.len() >= 3 => (
                     true,
                     [raw[0], raw[1], raw[2]],
-                    (render.object_size[0] * 180.0).clamp(0.0, 180.0),
+                    render.object_size,
                 ),
-                Some(_) => (false, [0.0; 3], 0.0),
+                Some(_) => (false, [0.0; 3], [0.0; 3]),
                 None => {
                     missing_damf_pos += 1;
-                    (false, [0.0; 3], 0.0)
+                    (false, [0.0; 3], [0.0; 3])
                 }
             }
         } else {
-            (false, [0.0; 3], 0.0)
+            (false, [0.0; 3], [0.0; 3])
         };
 
         events.push(bridge_api::REvent {
@@ -416,7 +484,7 @@ fn extract_events(
             has_pos,
             pos,
             gain_db: object_data.object_basic_info.object_gain,
-            spread,
+            size,
             ramp_duration,
         });
     }
