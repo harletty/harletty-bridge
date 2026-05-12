@@ -9,7 +9,7 @@ use truehd::process::{
     parse::Parser,
 };
 
-use crate::bridge::AtmosBridge;
+use crate::bridge::{AtmosBridge, DrcMode};
 use crate::labels::channel_label_to_r;
 use crate::logging::panic_message;
 use crate::metadata::{ObjectNameKey, build_metadata_frame_from_oamd};
@@ -26,6 +26,7 @@ struct DrainContext<'a> {
     current_extended_substream_info: &'a mut Option<u8>,
     current_dialogue_level: &'a mut Option<i8>,
     recovering_until_major_sync: &'a mut bool,
+    drc_mode: DrcMode,
     total_samples: &'a mut u64,
     object_name_keys_by_id: &'a mut Vec<Option<ObjectNameKey>>,
     perf: &'a mut PerfStats,
@@ -189,6 +190,56 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
                 #[cfg(feature = "bridge-perf")]
                 ctx.perf.record_decode(decode_started.elapsed());
 
+                // Extract DRC parameters based on active mode. DRC updates are
+                // typically authored on substream 0 (the 2-channel downmix),
+                // even for full Atmos presentations, so scan from the active
+                // presentation down to 0 and use the first substream that has
+                // a DRC update for the selected mode.
+                let mut drc_gain = 1.0f32;
+                let mut drc_ramp_duration = 0u32;
+                let mut drc_source_ss: Option<usize> = None;
+                for i in (0..=ctx.presentation as usize).rev() {
+                    let Some(ss_state) = ctx.parser.substream_state(i) else {
+                        continue;
+                    };
+                    match ctx.drc_mode {
+                        DrcMode::Standard if ss_state.drc_active => {
+                            drc_gain = (ss_state.drc_gain_update as f32 * 0.015625).exp2();
+                            drc_ramp_duration =
+                                ((1 << ss_state.drc_time_update) * decoded.sample_length) as u32;
+                            drc_source_ss = Some(i);
+                            break;
+                        }
+                        DrcMode::Heavy if ss_state.heavy_drc_active => {
+                            drc_gain = (ss_state.heavy_drc_gain_update as f32 * 0.03125).exp2();
+                            drc_ramp_duration = ((1 << ss_state.heavy_drc_time_update)
+                                * decoded.sample_length) as u32;
+                            drc_source_ss = Some(i);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if *ctx.frame_count % 96 == 0 {
+                    let probe: Vec<_> = (0..=ctx.presentation as usize)
+                        .filter_map(|i| {
+                            ctx.parser.substream_state(i).map(|s| {
+                                (
+                                    i,
+                                    s.drc_active,
+                                    s.drc_gain_update,
+                                    s.heavy_drc_active,
+                                    s.heavy_drc_gain_update,
+                                )
+                            })
+                        })
+                        .collect();
+                    eprintln!(
+                        "[harletty][drc] mode={:?} src_ss={:?} gain={:.4} ramp={} state={:?}",
+                        ctx.drc_mode, drc_source_ss, drc_gain, drc_ramp_duration, probe
+                    );
+                }
+
                 if substream_info_changed {
                     decoded.substream_info_changed = true;
                 }
@@ -207,7 +258,13 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
 
                 #[cfg(feature = "bridge-perf")]
                 let build_started = Instant::now();
-                frames.push(build_thd_frame(ctx, &decoded, base_sample_pos));
+                frames.push(build_thd_frame(
+                    ctx,
+                    &decoded,
+                    base_sample_pos,
+                    drc_gain,
+                    drc_ramp_duration,
+                ));
                 #[cfg(feature = "bridge-perf")]
                 ctx.perf.record_build(build_started.elapsed());
                 ctx.perf.maybe_report(*ctx.frame_count);
@@ -243,6 +300,8 @@ fn build_thd_frame(
     ctx: &mut DrainContext<'_>,
     decoded: &DecodedAccessUnit,
     base_sample_pos: u64,
+    drc_gain: f32,
+    drc_ramp_duration: u32,
 ) -> RDecodedFrame {
     #[cfg(feature = "bridge-perf")]
     let pcm_started = Instant::now();
@@ -305,6 +364,8 @@ fn build_thd_frame(
         pcm,
         channel_labels,
         metadata,
+        drc_gain,
+        drc_ramp_duration,
         dialogue_level: (*ctx.current_dialogue_level).into(),
         is_new_segment: decoded.substream_info_changed,
     }
@@ -337,6 +398,7 @@ pub(crate) fn process_extractor_input(
             current_extended_substream_info: &mut bridge.current_extended_substream_info,
             current_dialogue_level: &mut bridge.current_dialogue_level,
             recovering_until_major_sync: &mut bridge.recovering_until_major_sync,
+            drc_mode: bridge.drc_mode,
             total_samples: &mut bridge.total_samples,
             object_name_keys_by_id: &mut bridge.object_name_keys_by_id,
             perf: &mut bridge.perf,

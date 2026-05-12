@@ -44,6 +44,14 @@ pub(crate) struct Eac3DiagStats {
     pub(crate) last_dependent_pair_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DrcMode {
+    #[default]
+    Off,
+    Standard,
+    Heavy,
+}
+
 pub(crate) struct AtmosBridge {
     // ── TrueHD pipeline ──────────────────────────────────────────────
     pub(crate) mat_stream: MatStream,
@@ -73,6 +81,7 @@ pub(crate) struct AtmosBridge {
     pub(crate) current_substream_info: Option<u8>,
     pub(crate) current_extended_substream_info: Option<u8>,
     pub(crate) recovering_until_major_sync: bool,
+    pub(crate) drc_mode: DrcMode,
     pub(crate) frame_count: u64,
     pub(crate) object_name_keys_by_id: Vec<Option<ObjectNameKey>>,
     pub(crate) perf: PerfStats,
@@ -134,6 +143,7 @@ impl AtmosBridge {
             current_substream_info: None,
             current_extended_substream_info: None,
             recovering_until_major_sync: false,
+            drc_mode: DrcMode::Off,
             frame_count: 0,
             object_name_keys_by_id: Vec::new(),
             perf: PerfStats::default(),
@@ -508,5 +518,32 @@ impl FormatBridge for AtmosBridge {
 
     fn preferred_vbap_table_mode(&self) -> RVbapTableMode {
         RVbapTableMode::Cartesian
+    }
+
+    fn supported_drc_modes(&self) -> RVec<RString> {
+        vec![
+            RString::from("Off"),
+            RString::from("Standard"),
+            RString::from("Heavy"),
+        ]
+        .into()
+    }
+
+    fn set_drc_mode(&mut self, mode: RStr<'_>) -> bool {
+        let new_mode = match mode.as_str() {
+            "Off" => DrcMode::Off,
+            "Standard" => DrcMode::Standard,
+            "Heavy" => DrcMode::Heavy,
+            _ => {
+                eprintln!("[harletty][drc] unknown drc_mode {:?}", mode.as_str());
+                return false;
+            }
+        };
+        eprintln!(
+            "[harletty][drc] set_drc_mode {:?} -> {:?}",
+            self.drc_mode, new_mode
+        );
+        self.drc_mode = new_mode;
+        true
     }
 }
