@@ -3,11 +3,19 @@ use bridge_api::RMetadataFrame;
 use eac3::OamdPayload;
 #[cfg(feature = "bridge-perf")]
 use std::time::Instant;
+use std::sync::OnceLock;
 use truehd::structs::oamd::{ObjectAudioMetadataPayload, SpeakerLabels};
 
 use crate::bridge::AtmosBridge;
 use crate::labels::speaker_to_id;
 use crate::perf::PerfStats;
+
+static EAC3_OBJECT_SIZE_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn eac3_object_size_trace_enabled() -> bool {
+    *EAC3_OBJECT_SIZE_TRACE_ENABLED
+        .get_or_init(|| std::env::var_os("HARLETTY_LOG_EAC3_OBJECT_SIZE").is_some())
+}
 
 /// Build an [`RMetadataFrame`] from an OAMD payload parsed from E-AC3.
 pub(crate) fn build_eac3_metadata_frame(
@@ -142,6 +150,21 @@ fn extract_eac3_events(
                 .first()
                 .map(|u| u.ramp_duration as u32)
                 .unwrap_or(0);
+
+            if eac3_object_size_trace_enabled() {
+                eprintln!(
+                    "[harletty][object-size][map] obj_idx={} dyn_idx={} id={} sample_pos={} sample_offset={} has_pos={} raw_size={:?} emitted_size={:?} ramp={}",
+                    obj_idx,
+                    dynamic_idx,
+                    id,
+                    base_sample_pos + sample_offset,
+                    sample_offset,
+                    has_pos,
+                    block.size,
+                    size,
+                    ramp_duration
+                );
+            }
 
             events.push(bridge_api::REvent {
                 id,
