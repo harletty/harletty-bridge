@@ -415,6 +415,8 @@ fn build_silence_frame(
         ]
         .into(),
         metadata: RVec::new(),
+        drc_gain: 1.0,
+        drc_ramp_duration: 0,
         dialogue_level: bridge.current_dialogue_level.into(),
         is_new_segment: false,
     }
@@ -476,6 +478,8 @@ fn build_eac3_frame_from_object(
         pcm,
         channel_labels,
         metadata,
+        drc_gain: 1.0,
+        drc_ramp_duration: 0,
         dialogue_level: bridge.current_dialogue_level.into(),
         is_new_segment: false,
     }
@@ -568,6 +572,8 @@ fn build_eac3_frame_from_core(
         pcm,
         channel_labels,
         metadata,
+        drc_gain: 1.0,
+        drc_ramp_duration: 0,
         dialogue_level: bridge.current_dialogue_level.into(),
         is_new_segment: false,
     }

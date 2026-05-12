@@ -80,6 +80,8 @@ mod tests {
                 .collect::<Vec<_>>()
                 .into(),
             metadata: RVec::new(),
+            drc_gain: 1.0,
+            drc_ramp_duration: 0,
             dialogue_level: None.into(),
             is_new_segment: false,
         }
