@@ -1,0 +1,168 @@
+diff --git a/libavcodec/ac3dec.c b/libavcodec/ac3dec.c
+index 2f0e7f5344..f3c0e453c3 100644
+--- a/libavcodec/ac3dec.c
++++ b/libavcodec/ac3dec.c
+@@ -28,6 +28,7 @@
+ 
+ #include <stdio.h>
+ #include <stddef.h>
++#include <stdlib.h>
+ #include <math.h>
+ #include <string.h>
+ 
+@@ -510,16 +511,28 @@ static inline void decode_transform_coeffs(AC3DecodeContext *s, int blk)
+     int ch, end;
+     int got_cplchan = 0;
+     mant_groups m;
++    int bittrace_enabled = getenv("HARLETTY_EAC3_BITTRACE") != NULL;
+ 
+     m.b1 = m.b2 = m.b4 = 0;
+ 
+     for (ch = 1; ch <= s->channels; ch++) {
++        if (bittrace_enabled) {
++            int trace_ch = (ch == s->lfe_ch) ? -2 : (ch - 1);
++            const char *tag = (ch == s->lfe_ch) ? "mantissas_lfe_start"
++                                                : "mantissas_ch_start";
++            fprintf(stderr, "BITTRACE\tblk=%d\tch=%d\ttag=%s\tbit_pos=%d\n",
++                    blk, trace_ch, tag, get_bits_count(&s->gbc));
++        }
+         /* transform coefficients for full-bandwidth channel */
+         decode_transform_coeffs_ch(s, blk, ch, &m);
+         /* transform coefficients for coupling channel come right after the
+            coefficients for the first coupled channel*/
+         if (s->channel_in_cpl[ch])  {
+             if (!got_cplchan) {
++                if (bittrace_enabled) {
++                    fprintf(stderr, "BITTRACE\tblk=%d\tch=-1\ttag=mantissas_cpl_start\tbit_pos=%d\n",
++                            blk, get_bits_count(&s->gbc));
++                }
+                 decode_transform_coeffs_ch(s, blk, CPL_CH, &m);
+                 calc_transform_coeffs_cpl(s);
+                 got_cplchan = 1;
+@@ -957,6 +970,15 @@ static int decode_audio_block(AC3DecodeContext *s, int blk, int offset)
+     int cpl_in_use;
+     GetBitContext *gbc = &s->gbc;
+     uint8_t bit_alloc_stages[AC3_MAX_CHANNELS] = { 0 };
++    int bittrace_enabled = getenv("HARLETTY_EAC3_BITTRACE") != NULL;
++#define BITTRACE(tag) do { if (bittrace_enabled) \
++    fprintf(stderr, "BITTRACE\tblk=%d\ttag=%s\tbit_pos=%d\n", blk, tag, get_bits_count(gbc)); \
++} while (0)
++#define BITTRACE_CH(tag, ch_id) do { if (bittrace_enabled) \
++    fprintf(stderr, "BITTRACE\tblk=%d\tch=%d\ttag=%s\tbit_pos=%d\n", blk, (int)(ch_id), tag, get_bits_count(gbc)); \
++} while (0)
++
++    BITTRACE("audblk_start");
+ 
+     /* block switch flags */
+     different_transforms = 0;
+@@ -992,6 +1014,8 @@ static int decode_audio_block(AC3DecodeContext *s, int blk, int offset)
+         }
+     } while (i--);
+ 
++    BITTRACE("after_dynrng");
++
+     /* spectral extension strategy */
+     if (s->eac3 && (!blk || get_bits1(gbc))) {
+         s->spx_in_use = get_bits1(gbc);
+@@ -1012,6 +1036,8 @@ static int decode_audio_block(AC3DecodeContext *s, int blk, int offset)
+     if (s->spx_in_use)
+         spx_coordinates(s);
+ 
++    BITTRACE("after_spx");
++
+     /* coupling strategy */
+     if (s->eac3 ? s->cpl_strategy_exists[blk] : get_bits1(gbc)) {
+         if ((ret = coupling_strategy(s, blk, bit_alloc_stages)) < 0)
+@@ -1027,12 +1053,16 @@ static int decode_audio_block(AC3DecodeContext *s, int blk, int offset)
+     }
+     cpl_in_use = s->cpl_in_use[blk];
+ 
++    BITTRACE("after_cpl_strategy");
++
+     /* coupling coordinates */
+     if (cpl_in_use) {
+         if ((ret = coupling_coordinates(s, blk)) < 0)
+             return ret;
+     }
+ 
++    BITTRACE("after_cpl_coords");
++
+     /* stereo rematrixing strategy and band structure */
+     if (channel_mode == AC3_CHMODE_STEREO) {
+         if ((s->eac3 && !blk) || get_bits1(gbc)) {
+@@ -1102,6 +1132,8 @@ static int decode_audio_block(AC3DecodeContext *s, int blk, int offset)
+         }
+     }
+ 
++    BITTRACE("after_exponents");
++
+     /* bit allocation information */
+     if (s->bit_allocation_syntax) {
+         if (get_bits1(gbc)) {
+@@ -1119,6 +1151,8 @@ static int decode_audio_block(AC3DecodeContext *s, int blk, int offset)
+         }
+     }
+ 
++    BITTRACE("after_bit_alloc");
++
+     /* signal-to-noise ratio offsets and fast gains (signal-to-mask ratios) */
+     if (!s->eac3 || !blk) {
+         if (s->snr_offset_strategy && get_bits1(gbc)) {
+@@ -1150,6 +1184,8 @@ static int decode_audio_block(AC3DecodeContext *s, int blk, int offset)
+         }
+     }
+ 
++    BITTRACE("after_snr");
++
+     /* fast gain (E-AC-3 only) */
+     if (s->fast_gain_syntax && get_bits1(gbc)) {
+         for (ch = !cpl_in_use; ch <= s->channels; ch++) {
+@@ -1164,11 +1200,15 @@ static int decode_audio_block(AC3DecodeContext *s, int blk, int offset)
+             s->fast_gain[ch] = ff_ac3_fast_gain_tab[4];
+     }
+ 
++    BITTRACE("after_fast_gain");
++
+     /* E-AC-3 to AC-3 converter SNR offset */
+     if (s->frame_type == EAC3_FRAME_TYPE_INDEPENDENT && get_bits1(gbc)) {
+         skip_bits(gbc, 10); // skip converter snr offset
+     }
+ 
++    BITTRACE("after_convsnr");
++
+     /* coupling leak information */
+     if (cpl_in_use) {
+         if (s->first_cpl_leak || get_bits1(gbc)) {
+@@ -1190,6 +1230,8 @@ static int decode_audio_block(AC3DecodeContext *s, int blk, int offset)
+         s->first_cpl_leak = 0;
+     }
+ 
++    BITTRACE("after_cpl_leak");
++
+     /* delta bit allocation information */
+     if (s->dba_syntax && get_bits1(gbc)) {
+         /* delta bit allocation exists (strategy) */
+@@ -1220,6 +1262,8 @@ static int decode_audio_block(AC3DecodeContext *s, int blk, int offset)
+         }
+     }
+ 
++    BITTRACE("after_dba");
++
+     /* Bit allocation */
+     for (ch = !cpl_in_use; ch <= s->channels; ch++) {
+         if (bit_alloc_stages[ch] > 2) {
+@@ -1259,10 +1303,14 @@ static int decode_audio_block(AC3DecodeContext *s, int blk, int offset)
+         skip_bits_long(gbc, 8 * skipl);
+     }
+ 
++    BITTRACE("after_skip");
++
+     /* unpack the transform coefficients
+        this also uncouples channels if coupling is in use. */
+     decode_transform_coeffs(s, blk);
+ 
++    BITTRACE("audblk_end");
++
+     /* TODO: generate enhanced coupling coordinates and uncouple */
+ 
+     /* recover coefficients if rematrixing is in use */

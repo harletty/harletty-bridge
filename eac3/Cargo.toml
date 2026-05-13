@@ -1,0 +1,18 @@
+[package]
+name = "eac3"
+version = "0.5.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Independent E-AC-3 bitstream parser and frame extractor"
+repository = "https://github.com/harletty/harletty-bridge"
+authors = ["Rainbaby"]
+rust-version = "1.87.0"
+
+[lib]
+name = "eac3"
+crate-type = ["lib"]
+
+[dependencies]
+log = "0.4"
+rustfft = "6.4"
+thiserror = "2.0"

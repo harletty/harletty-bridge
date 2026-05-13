@@ -51,6 +51,10 @@ impl Parser {
         self.state.last_parse_stats
     }
 
+    pub fn substream_state(&self, i: usize) -> Option<&ParserSubstreamState> {
+        self.state.substream_i_state(i).ok()
+    }
+
     pub fn set_required_presentations(
         &mut self,
         required_presentations: &[bool; MAX_PRESENTATIONS],
@@ -454,6 +458,11 @@ impl ParserState {
             drc_gain_update: ss_state.drc_gain_update,
             drc_time_update: ss_state.drc_time_update,
             drc_count: ss_state.drc_count,
+            heavy_drc_active: ss_state.heavy_drc_active,
+            heavy_drc_present: ss_state.heavy_drc_present,
+            heavy_drc_gain_update: ss_state.heavy_drc_gain_update,
+            heavy_drc_time_update: ss_state.heavy_drc_time_update,
+            heavy_drc_count: ss_state.heavy_drc_count,
             hires_output_timing_state: ss_state.hires_output_timing_state,
             latency: ss_state.latency,
             prev_latency: ss_state.prev_latency,
