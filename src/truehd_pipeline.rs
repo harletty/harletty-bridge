@@ -11,7 +11,7 @@ use truehd::process::{
 
 use crate::bridge::{AtmosBridge, DrcMode};
 use crate::labels::channel_label_to_r;
-use crate::logging::panic_message;
+use crate::logging::{bridge_diag_log, drc_diag_log_enabled, panic_message};
 use crate::metadata::{ObjectNameKey, build_metadata_frame_from_oamd};
 use crate::perf::PerfStats;
 
@@ -210,17 +210,26 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
                             drc_source_ss = Some(i);
                             break;
                         }
-                        DrcMode::Heavy if ss_state.heavy_drc_active => {
-                            drc_gain = (ss_state.heavy_drc_gain_update as f32 * 0.03125).exp2();
-                            drc_ramp_duration = ((1 << ss_state.heavy_drc_time_update)
-                                * decoded.sample_length) as u32;
+                        DrcMode::Heavy if ss_state.heavy_drc_active || ss_state.drc_active => {
+                            if ss_state.heavy_drc_active {
+                                drc_gain =
+                                    (ss_state.heavy_drc_gain_update as f32 * 0.03125).exp2();
+                                drc_ramp_duration = ((1 << ss_state.heavy_drc_time_update)
+                                    * decoded.sample_length)
+                                    as u32;
+                            } else {
+                                drc_gain = (ss_state.drc_gain_update as f32 * 0.015625).exp2();
+                                drc_ramp_duration =
+                                    ((1 << ss_state.drc_time_update) * decoded.sample_length)
+                                        as u32;
+                            }
                             drc_source_ss = Some(i);
                             break;
                         }
                         _ => {}
                     }
                 }
-                if *ctx.frame_count % 96 == 0 {
+                if drc_diag_log_enabled() && *ctx.frame_count % 96 == 0 {
                     let probe: Vec<_> = (0..=ctx.presentation as usize)
                         .filter_map(|i| {
                             ctx.parser.substream_state(i).map(|s| {
@@ -234,9 +243,12 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
                             })
                         })
                         .collect();
-                    eprintln!(
-                        "[harletty][drc] mode={:?} src_ss={:?} gain={:.4} ramp={} state={:?}",
-                        ctx.drc_mode, drc_source_ss, drc_gain, drc_ramp_duration, probe
+                    bridge_diag_log(
+                        log::Level::Info,
+                        &format!(
+                            "[harletty][drc] mode={:?} src_ss={:?} gain={:.4} ramp={} state={:?}",
+                            ctx.drc_mode, drc_source_ss, drc_gain, drc_ramp_duration, probe
+                        ),
                     );
                 }
 

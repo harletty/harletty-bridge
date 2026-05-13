@@ -18,22 +18,8 @@ fn main() {
     let path = PathBuf::from(&dir);
 
     let header = [
-        "file",
-        "bytes",
-        "bsid",
-        "sr",
-        "blk",
-        "ch",
-        "lfe",
-        "joc",
-        "oamd",
-        "snrstr",
-        "fgsyn",
-        "cplupd",
-        "obj_st",
-        "obj_max",
-        "pcm_st",
-        "pcm_max",
+        "file", "bytes", "bsid", "sr", "blk", "ch", "lfe", "joc", "oamd", "snrstr", "fgsyn",
+        "cplupd", "obj_st", "obj_max", "pcm_st", "pcm_max",
     ];
     println!("{}", header.join("\t"));
 
@@ -61,8 +47,16 @@ fn main() {
                 i.joc_payload_count().to_string(),
                 i.oamd_payload_count().to_string(),
                 i.audio_frame.snr_offset_strategy.to_string(),
-                (if i.audio_frame.frame_gain_syntax_enabled { "1" } else { "0" }).to_string(),
-                format!("upd={:?}/inuse={:?}", i.audio_frame.coupling_strategy_updates, i.audio_frame.coupling_in_use),
+                (if i.audio_frame.frame_gain_syntax_enabled {
+                    "1"
+                } else {
+                    "0"
+                })
+                .to_string(),
+                format!(
+                    "upd={:?}/inuse={:?}",
+                    i.audio_frame.coupling_strategy_updates, i.audio_frame.coupling_in_use
+                ),
             ),
             Err(e) => (
                 format!("ERR:{e}"),

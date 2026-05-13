@@ -1,11 +1,11 @@
 use abi_stable::std_types::RVec;
 use bridge_api::{RChannelLabel, RDecodedFrame, RMetadataFrame};
 use eac3::{
-    inspect_access_unit, AccessUnitInfo, CorePcmFrame, FrameType, OamdPayload, ObjectPcmPushResult,
-    ParsedEmdfPayloadData,
+    AccessUnitInfo, CorePcmFrame, FrameType, OamdPayload, ObjectPcmPushResult,
+    ParsedEmdfPayloadData, inspect_access_unit,
 };
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(feature = "bridge-perf")]
 use std::time::Instant;
 
@@ -53,6 +53,7 @@ pub(crate) fn process_eac3_frame(
 
     match bridge.eac3_object_decoder.push_access_unit(frame) {
         Ok(Some(result)) => {
+            update_eac3_dialogue_level(bridge, &result.info);
             let sample_count = result.pcm.samples_per_channel();
             let base_sample_pos = bridge.eac3_total_samples;
             bridge.eac3_total_samples += sample_count as u64;
@@ -68,6 +69,7 @@ pub(crate) fn process_eac3_frame(
     match bridge.eac3_pcm_decoder.push_access_unit(frame) {
         Ok(result) => {
             let info = result.info;
+            update_eac3_dialogue_level(bridge, &info);
             let pcm = result.pcm;
             let decoded_samples = pcm.samples_per_channel();
             let sample_count = decoded_samples as u32;
@@ -121,6 +123,7 @@ pub(crate) fn process_eac3_dependent_frame_with_core(
         .push_access_unit_with_core(frame, core)
     {
         Ok(Some(result)) => {
+            update_eac3_dialogue_level(bridge, &result.info);
             let sample_count = result.pcm.samples_per_channel();
             let base_sample_pos = bridge.eac3_total_samples;
             bridge.eac3_total_samples += sample_count as u64;
@@ -429,6 +432,7 @@ fn build_eac3_frame_from_object(
     bridge: &mut AtmosBridge,
 ) -> RDecodedFrame {
     let pcm_frame = &result.pcm;
+    let info = &result.info;
     let core = &pcm_frame.core;
     let sample_count = pcm_frame.samples_per_channel();
     let sampling_frequency = core.sample_rate;
@@ -471,6 +475,8 @@ fn build_eac3_frame_from_object(
             .note_built_frame(metadata.len(), metadata_events);
     }
 
+    let (drc_gain, drc_ramp_duration) = eac3_drc_params(bridge, info, sample_count as u32);
+
     RDecodedFrame {
         sampling_frequency,
         sample_count: sample_count as u32,
@@ -478,8 +484,8 @@ fn build_eac3_frame_from_object(
         pcm,
         channel_labels,
         metadata,
-        drc_gain: 1.0,
-        drc_ramp_duration: 0,
+        drc_gain,
+        drc_ramp_duration,
         dialogue_level: bridge.current_dialogue_level.into(),
         is_new_segment: false,
     }
@@ -565,6 +571,8 @@ fn build_eac3_frame_from_core(
         }
     }
 
+    let (drc_gain, drc_ramp_duration) = eac3_drc_params(bridge, info, sample_count as u32);
+
     RDecodedFrame {
         sampling_frequency,
         sample_count: sample_count as u32,
@@ -572,18 +580,70 @@ fn build_eac3_frame_from_core(
         pcm,
         channel_labels,
         metadata,
-        drc_gain: 1.0,
-        drc_ramp_duration: 0,
+        drc_gain,
+        drc_ramp_duration,
         dialogue_level: bridge.current_dialogue_level.into(),
         is_new_segment: false,
     }
+}
+
+fn update_eac3_dialogue_level(bridge: &mut AtmosBridge, info: &AccessUnitInfo) {
+    bridge.current_dialogue_level = Some(info.dialogue_normalization[0]);
+}
+
+fn eac3_drc_params(bridge: &AtmosBridge, info: &AccessUnitInfo, sample_count: u32) -> (f32, u32) {
+    match bridge.drc_mode {
+        crate::bridge::DrcMode::Off => (1.0, 0),
+        crate::bridge::DrcMode::Standard => {
+            let gain = info
+                .block_drc
+                .iter()
+                .rev()
+                .find_map(|block| {
+                    block.dynamic_range_exists[0]
+                        .then(|| decode_ac3_dynamic_range_word(block.dynamic_range_word[0]))
+                })
+                .unwrap_or(1.0);
+            let ramp = if gain != 1.0 { sample_count } else { 0 };
+            (gain, ramp)
+        }
+        crate::bridge::DrcMode::Heavy => {
+            let gain = if info.heavy_compression_exists[0] {
+                decode_ac3_heavy_range_word(info.heavy_compression_word[0])
+            } else {
+                info.block_drc
+                    .iter()
+                    .rev()
+                    .find_map(|block| {
+                        block.dynamic_range_exists[0]
+                            .then(|| decode_ac3_dynamic_range_word(block.dynamic_range_word[0]))
+                    })
+                    .unwrap_or(1.0)
+            };
+            let ramp = if gain != 1.0 { sample_count } else { 0 };
+            (gain, ramp)
+        }
+    }
+}
+
+fn decode_ac3_dynamic_range_word(word: u8) -> f32 {
+    let v = ((word >> 5) as i32) - (((word >> 7) as i32) << 3) - 5;
+    2.0f32.powi(v) * (((word & 0x1F) | 0x20) as f32)
+}
+
+fn decode_ac3_heavy_range_word(word: u8) -> f32 {
+    let v = ((word >> 4) as i32) - (((word >> 7) as i32) << 4) - 4;
+    2.0f32.powi(v) * (((word & 0x0F) | 0x10) as f32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::labels::eac3_object_output_bed_indices;
-    use eac3::{BedChannel, CorePcmFrame, JocPayload, ObjectPcmFrame};
+    use eac3::{
+        AccessUnitInfo, AudioFrameInfo, AuxParseStatus, BedChannel, BlockDrcInfo, CorePcmFrame,
+        EmdfSource, FrameType, JocPayload, ObjectPcmFrame,
+    };
 
     fn object_pcm_frame(core: CorePcmFrame, object_channels: Vec<Vec<f32>>) -> ObjectPcmFrame {
         ObjectPcmFrame {
@@ -599,6 +659,67 @@ mod tests {
                 objects: Vec::new(),
             },
             oamd_payloads: Vec::new(),
+        }
+    }
+
+    fn minimal_access_unit_info() -> AccessUnitInfo {
+        AccessUnitInfo {
+            frame_size: 0,
+            bitstream_id: 16,
+            frame_type: FrameType::Independent,
+            substreamid: 0,
+            sample_rate: 48_000,
+            num_blocks: 6,
+            channel_mode: 2,
+            channels: 2,
+            fullband_channels: 2,
+            lfe_on: false,
+            dialogue_normalization: [-31, -31],
+            heavy_compression_exists: [false, false],
+            heavy_compression_word: [0, 0],
+            addbsi_present: false,
+            extension_type_a: false,
+            complexity_index_type_a: 0,
+            mixing_metadata_present: false,
+            informational_metadata_present: false,
+            addbsi_bytes: Vec::new(),
+            body_start_bit_offset: 0,
+            audio_frame: AudioFrameInfo {
+                exponent_strategies_embedded: true,
+                adaptive_hybrid_transform_enabled: false,
+                snr_offset_strategy: 0,
+                transient_processing_enabled: false,
+                block_switching_enabled: false,
+                dithering_enabled: false,
+                bit_allocation_mode_enabled: false,
+                frame_gain_syntax_enabled: false,
+                delta_bit_allocation_enabled: false,
+                skip_field_syntax_enabled: false,
+                spectral_extension_attenuation_enabled: false,
+                coupling_strategy_updates: Vec::new(),
+                coupling_in_use: Vec::new(),
+                coupling_exponent_strategy: Vec::new(),
+                channel_exponent_strategy: Vec::new(),
+                lfe_exponent_strategy: Vec::new(),
+                converter_exponent_strategy_present: false,
+                converter_exponent_strategy: Vec::new(),
+                frame_csnr_offset: None,
+                frame_fsnr_offset: None,
+                transient_processors: Vec::new(),
+                spectral_extension_attenuation: Vec::new(),
+                block_start_info_present: false,
+                block_start_info_bit_len: 0,
+                block_payload_start_bit_offset: 0,
+            },
+            block_drc: Vec::new(),
+            skip_fields: Vec::new(),
+            trailing_aux_data: Vec::new(),
+            aux_data: Vec::new(),
+            aux_parse_status: AuxParseStatus::Disabled,
+            emdf_source: EmdfSource::None,
+            emdf_blocks: Vec::new(),
+            emdf_block_count: 0,
+            first_emdf_sync_offset: None,
         }
     }
 
@@ -724,5 +845,51 @@ mod tests {
 
         assert_eq!(frame_bsid(&frame), Some(16));
         assert_eq!(eac3_frame_timing(&frame), Some((48_000, 1536)));
+    }
+
+    #[test]
+    fn standard_drc_uses_last_block_dynamic_range_word() {
+        let mut bridge = AtmosBridge::new(false);
+        bridge.drc_mode = crate::bridge::DrcMode::Standard;
+        let mut info = minimal_access_unit_info();
+        info.block_drc = vec![
+            BlockDrcInfo {
+                dynamic_range_exists: [true, false],
+                dynamic_range_word: [0x00, 0x00],
+            },
+            BlockDrcInfo {
+                dynamic_range_exists: [true, false],
+                dynamic_range_word: [0x20, 0x00],
+            },
+        ];
+
+        let (gain, ramp) = eac3_drc_params(&bridge, &info, 1536);
+
+        assert!((gain - decode_ac3_dynamic_range_word(0x20)).abs() < 1e-6);
+        assert_eq!(ramp, 1536);
+    }
+
+    #[test]
+    fn heavy_drc_prefers_heavy_word_and_falls_back_to_standard_word() {
+        let mut bridge = AtmosBridge::new(false);
+        bridge.drc_mode = crate::bridge::DrcMode::Heavy;
+
+        let mut heavy_info = minimal_access_unit_info();
+        heavy_info.heavy_compression_exists = [true, false];
+        heavy_info.heavy_compression_word = [0x20, 0x00];
+        heavy_info.block_drc = vec![BlockDrcInfo {
+            dynamic_range_exists: [true, false],
+            dynamic_range_word: [0x40, 0x00],
+        }];
+        let (heavy_gain, _) = eac3_drc_params(&bridge, &heavy_info, 1536);
+        assert!((heavy_gain - decode_ac3_heavy_range_word(0x20)).abs() < 1e-6);
+
+        let mut fallback_info = minimal_access_unit_info();
+        fallback_info.block_drc = vec![BlockDrcInfo {
+            dynamic_range_exists: [true, false],
+            dynamic_range_word: [0x40, 0x00],
+        }];
+        let (fallback_gain, _) = eac3_drc_params(&bridge, &fallback_info, 1536);
+        assert!((fallback_gain - decode_ac3_dynamic_range_word(0x40)).abs() < 1e-6);
     }
 }

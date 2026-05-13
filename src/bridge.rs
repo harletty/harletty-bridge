@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::env;
 #[cfg(feature = "bridge-perf")]
 use std::time::Instant;
-use truehd::process::{decode::Decoder, extract::Extractor, parse::Parser, MAX_PRESENTATIONS};
+use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, parse::Parser};
 
 use crate::ac3_native::NativeAc3Decoder;
 use crate::eac3_pipeline::{
@@ -352,17 +352,17 @@ impl FormatBridge for AtmosBridge {
                                     Ok(decoded_frame) => {
                                         if let Err(reason) = PcmStats::from_frame(&decoded_frame) {
                                             bridge_diag_log(
-                                                    log::Level::Warn,
-                                                    &format!(
-                                                        "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={}",
-                                                        self.eac3_frame_count,
-                                                        reason,
-                                                        decoded_frame.sampling_frequency,
-                                                        decoded_frame.sample_count,
-                                                        decoded_frame.channel_count,
-                                                        decoded_frame.pcm.len()
-                                                    ),
-                                                );
+                                                log::Level::Warn,
+                                                &format!(
+                                                    "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={}",
+                                                    self.eac3_frame_count,
+                                                    reason,
+                                                    decoded_frame.sampling_frequency,
+                                                    decoded_frame.sample_count,
+                                                    decoded_frame.channel_count,
+                                                    decoded_frame.pcm.len()
+                                                ),
+                                            );
                                             continue;
                                         }
                                         if is_temporary_eac3_silence_frame(&decoded_frame) {
@@ -523,8 +523,8 @@ impl FormatBridge for AtmosBridge {
     fn supported_drc_modes(&self) -> RVec<RString> {
         vec![
             RString::from("Off"),
-            RString::from("Standard"),
-            RString::from("Heavy"),
+            RString::from("standard/line"),
+            RString::from("heavy/RF"),
         ]
         .into()
     }
@@ -532,16 +532,22 @@ impl FormatBridge for AtmosBridge {
     fn set_drc_mode(&mut self, mode: RStr<'_>) -> bool {
         let new_mode = match mode.as_str() {
             "Off" => DrcMode::Off,
-            "Standard" => DrcMode::Standard,
-            "Heavy" => DrcMode::Heavy,
+            "Standard" | "Line" | "standard/line" => DrcMode::Standard,
+            "Heavy" | "RF" | "heavy/RF" => DrcMode::Heavy,
             _ => {
-                eprintln!("[harletty][drc] unknown drc_mode {:?}", mode.as_str());
+                bridge_diag_log(
+                    log::Level::Warn,
+                    &format!("[harletty][drc] unknown drc_mode {:?}", mode.as_str()),
+                );
                 return false;
             }
         };
-        eprintln!(
-            "[harletty][drc] set_drc_mode {:?} -> {:?}",
-            self.drc_mode, new_mode
+        bridge_diag_log(
+            log::Level::Info,
+            &format!(
+                "[harletty][drc] set_drc_mode {:?} -> {:?}",
+                self.drc_mode, new_mode
+            ),
         );
         self.drc_mode = new_mode;
         true

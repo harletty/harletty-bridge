@@ -7,7 +7,7 @@
 // reset, bit-alloc defaults, and the absexp read on a Reuse strategy)
 // has been fixed; this test guards against any of those regressing.
 
-use eac3::{inspect_access_unit, PcmDecoder};
+use eac3::{PcmDecoder, inspect_access_unit};
 
 const FIXTURE: &[u8] = include_bytes!("data/short_packet_independent_joc.bin");
 
