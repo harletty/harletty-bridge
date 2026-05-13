@@ -171,7 +171,7 @@ impl Eac3SpdifStream {
             .collect::<Vec<_>>()
             .join(" ");
         bridge_external_log(
-            log::Level::Info,
+            log::Level::Debug,
             "harletty-bridge::eac3_spdif",
             &format!(
                 "Eac3SpdifStream push_payload: {} bytes, preview=[{}], pending_target={}, pending_consumed={}",
@@ -289,7 +289,7 @@ impl Eac3SpdifStream {
                         let looks_like_sync_swapped = b0 == 0x77 && b1 == 0x0B;
                         if looks_like_sync_be || looks_like_sync_swapped {
                             bridge_external_log(
-                                log::Level::Info,
+                                log::Level::Debug,
                                 "harletty-bridge::eac3_spdif",
                                 &format!(
                                     "Eac3SpdifStream: detected raw syncframe (no length prefix), bytes=0x{:02X} 0x{:02X} order={}",
@@ -367,7 +367,7 @@ impl Eac3SpdifStream {
                         let preview: Vec<String> =
                             frame.iter().take(8).map(|b| format!("{b:02X}")).collect();
                         bridge_external_log(
-                            log::Level::Info,
+                            log::Level::Debug,
                             "harletty-bridge::eac3_spdif",
                             &format!(
                                 "eac3_spdif_raw frame={}B need_unswap={} first8=[{}]",
@@ -397,7 +397,7 @@ impl Eac3SpdifStream {
                     let remaining = bytes_remaining.saturating_sub(2);
 
                     bridge_external_log(
-                        log::Level::Info,
+                        log::Level::Debug,
                         "harletty-bridge::eac3_spdif",
                         &format!(
                             "Eac3SpdifStream length_code: raw={} as_bits={}B remaining_in_payload={}",
@@ -476,7 +476,7 @@ impl Eac3SpdifStream {
                         let preview: Vec<String> =
                             frame.iter().take(8).map(|b| format!("{b:02X}")).collect();
                         bridge_external_log(
-                            log::Level::Info,
+                            log::Level::Debug,
                             "harletty-bridge::eac3_spdif",
                             &format!(
                                 "eac3_spdif_length_prefixed unswapped frame={}B first8=[{}]",
