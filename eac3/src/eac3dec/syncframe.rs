@@ -327,6 +327,12 @@ pub struct AudioFrameInfo {
     pub block_payload_start_bit_offset: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BlockDrcInfo {
+    pub dynamic_range_exists: [bool; 2],
+    pub dynamic_range_word: [u8; 2],
+}
+
 #[derive(Debug, Clone, PartialEq)]
 /// Parsed summary for one complete E-AC-3 access unit.
 ///
@@ -343,6 +349,9 @@ pub struct AccessUnitInfo {
     pub channels: u8,
     pub fullband_channels: u8,
     pub lfe_on: bool,
+    pub dialogue_normalization: [i8; 2],
+    pub heavy_compression_exists: [bool; 2],
+    pub heavy_compression_word: [u8; 2],
     pub addbsi_present: bool,
     pub extension_type_a: bool,
     pub complexity_index_type_a: u8,
@@ -351,6 +360,7 @@ pub struct AccessUnitInfo {
     pub addbsi_bytes: Vec<u8>,
     pub body_start_bit_offset: usize,
     pub audio_frame: AudioFrameInfo,
+    pub block_drc: Vec<BlockDrcInfo>,
     pub skip_fields: Vec<SkipFieldInfo>,
     pub trailing_aux_data: Vec<u8>,
     pub aux_data: Vec<u8>,
@@ -774,7 +784,10 @@ pub fn inspect_legacy_ac3_access_unit(data: &[u8]) -> Result<AccessUnitInfo, Par
     let fullband_channels = AC3_CHANNELS[channel_mode as usize];
     let channels = fullband_channels + u8::from(lfe_on);
 
-    skip_legacy_ac3_bsi_tail(&mut reader, channel_mode)?;
+    let (dialogue_normalization, heavy_compression_exists, heavy_compression_word) =
+        legacy_ac3_volume_control(&mut reader, channel_mode)?;
+
+    skip_legacy_ac3_bsi_tail_after_volume_control(&mut reader, channel_mode)?;
     let body_start_bit_offset = reader.position();
     let audio_frame =
         legacy_ac3_audio_frame_info(body_start_bit_offset, fullband_channels as usize, lfe_on);
@@ -790,6 +803,9 @@ pub fn inspect_legacy_ac3_access_unit(data: &[u8]) -> Result<AccessUnitInfo, Par
         channels,
         fullband_channels,
         lfe_on,
+        dialogue_normalization,
+        heavy_compression_exists,
+        heavy_compression_word,
         addbsi_present: false,
         extension_type_a: false,
         complexity_index_type_a: 0,
@@ -798,6 +814,7 @@ pub fn inspect_legacy_ac3_access_unit(data: &[u8]) -> Result<AccessUnitInfo, Par
         addbsi_bytes: Vec::new(),
         body_start_bit_offset,
         audio_frame,
+        block_drc: Vec::new(),
         skip_fields: Vec::new(),
         trailing_aux_data: Vec::new(),
         aux_data: Vec::new(),
@@ -883,10 +900,17 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
     reader.skip_bits(5).ok_or(ParseError::ShortPacket)?;
 
     let volume_programs = if channel_mode == 0 { 2 } else { 1 };
-    for _ in 0..volume_programs {
-        reader.skip_bits(5).ok_or(ParseError::ShortPacket)?;
-        if reader.read_bit().ok_or(ParseError::ShortPacket)? {
-            reader.skip_bits(8).ok_or(ParseError::ShortPacket)?;
+    let mut dialogue_normalization = [-31i8; 2];
+    let mut heavy_compression_exists = [false; 2];
+    let mut heavy_compression_word = [0u8; 2];
+    for program in 0..volume_programs {
+        let dialnorm = reader.read_bits(5).ok_or(ParseError::ShortPacket)? as i8;
+        dialogue_normalization[program] = if dialnorm == 0 { -31 } else { -dialnorm };
+        let compr_exists = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+        heavy_compression_exists[program] = compr_exists;
+        if compr_exists {
+            heavy_compression_word[program] =
+                reader.read_bits(8).ok_or(ParseError::ShortPacket)? as u8;
         }
     }
 
@@ -954,6 +978,7 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
     )?;
 
     let trailing_aux_data = extract_trailing_aux_data(frame);
+    let mut block_drc = Vec::with_capacity(num_blocks as usize);
     let mut skip_fields = Vec::new();
     let mut aux_parse_status = AuxParseStatus::Disabled;
     if audio_frame.info.skip_field_syntax_enabled {
@@ -969,6 +994,7 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                 audio_frame.block_start_bit_offsets.as_deref(),
                 trailing_aux_data.start_bit_offset,
                 sample_rate_index,
+                &mut block_drc,
             ) {
                 Ok(fields) => {
                     skip_fields = fields;
@@ -1003,6 +1029,7 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                 &audio_frame.info,
                 trailing_aux_data.start_bit_offset,
                 &mut walk_state,
+                &mut block_drc,
             ) {
                 Ok(fields) => {
                     skip_fields = fields;
@@ -1042,6 +1069,25 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                 Err(err) => return Err(err),
             }
         }
+    } else {
+        match collect_block_drc(
+            frame,
+            frame_type,
+            num_blocks as usize,
+            channel_mode,
+            fullband_channels as usize,
+            lfe_on,
+            &audio_frame.info,
+            audio_frame.block_start_bit_offsets.as_deref(),
+            trailing_aux_data.start_bit_offset,
+            sample_rate_index,
+            &mut block_drc,
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                emit_aux_debug(format_args!("block DRC parse error: {err}"));
+            }
+        }
     }
 
     let mut aux_data = Vec::new();
@@ -1073,6 +1119,9 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
         channels,
         fullband_channels,
         lfe_on,
+        dialogue_normalization,
+        heavy_compression_exists,
+        heavy_compression_word,
         addbsi_present,
         extension_type_a,
         complexity_index_type_a,
@@ -1081,6 +1130,7 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
         addbsi_bytes,
         body_start_bit_offset,
         audio_frame: audio_frame.info,
+        block_drc,
         skip_fields,
         trailing_aux_data: trailing_aux_data.bytes,
         aux_data,
@@ -1100,17 +1150,39 @@ fn legacy_ac3_frame_size(fscod: u8, frmsizecod: u8) -> Result<usize, ParseError>
     Ok(AC3_FRAME_SIZE_WORDS[bitrate_index][usize::from(fscod)] * 2)
 }
 
-fn skip_legacy_ac3_bsi_tail(
+fn legacy_ac3_volume_control(
+    reader: &mut BitReader<'_>,
+    channel_mode: u8,
+) -> Result<([i8; 2], [bool; 2], [u8; 2]), ParseError> {
+    let mut dialogue_normalization = [-31i8; 2];
+    let mut heavy_compression_exists = [false; 2];
+    let mut heavy_compression_word = [0u8; 2];
+
+    let volume_programs = if channel_mode == 0 { 2 } else { 1 };
+    for program in 0..volume_programs {
+        let dialnorm = reader.read_bits(5).ok_or(ParseError::ShortPacket)? as i8;
+        dialogue_normalization[program] = if dialnorm == 0 { -31 } else { -dialnorm };
+
+        let compr_exists = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+        heavy_compression_exists[program] = compr_exists;
+        if compr_exists {
+            heavy_compression_word[program] =
+                reader.read_bits(8).ok_or(ParseError::ShortPacket)? as u8;
+        }
+    }
+
+    Ok((
+        dialogue_normalization,
+        heavy_compression_exists,
+        heavy_compression_word,
+    ))
+}
+
+fn skip_legacy_ac3_bsi_tail_after_volume_control(
     reader: &mut BitReader<'_>,
     channel_mode: u8,
 ) -> Result<(), ParseError> {
     let dual_mono = channel_mode == 0;
-    reader.skip_bits(5).ok_or(ParseError::ShortPacket)?; // dialnorm
-    skip_conditional_bits(reader, 8)?; // compre/compr
-    if dual_mono {
-        reader.skip_bits(5).ok_or(ParseError::ShortPacket)?; // dialnorm2
-        skip_conditional_bits(reader, 8)?; // compr2e/compr2
-    }
     skip_conditional_bits(reader, 8)?; // langcode/langcod
     if dual_mono {
         skip_conditional_bits(reader, 8)?; // langcod2e/langcod2
@@ -1556,6 +1628,7 @@ fn collect_skip_fields(
     block_start_bit_offsets: Option<&[usize]>,
     audio_payload_end_bit: usize,
     sample_rate_index: usize,
+    block_drc: &mut Vec<BlockDrcInfo>,
 ) -> Result<Vec<SkipFieldInfo>, ParseError> {
     let block_starts = match (num_blocks, block_start_bit_offsets) {
         (1, _) => vec![audio_frame.block_payload_start_bit_offset],
@@ -1593,6 +1666,7 @@ fn collect_skip_fields(
             &mut audio_frame,
             &mut state,
             false,
+            Some(block_drc),
         )? {
             skip_fields.push(skip_field);
         }
@@ -1611,6 +1685,7 @@ fn collect_skip_fields_without_block_start(
     audio_frame: &AudioFrameInfo,
     audio_payload_end_bit: usize,
     state: &mut BlockSyntaxState,
+    block_drc: &mut Vec<BlockDrcInfo>,
 ) -> Result<Vec<SkipFieldInfo>, ParseError> {
     let mut audio_frame = audio_frame.clone();
     let mut reader = BitReader::with_offset(frame, audio_frame.block_payload_start_bit_offset);
@@ -1628,6 +1703,7 @@ fn collect_skip_fields_without_block_start(
             &mut audio_frame,
             state,
             true,
+            Some(block_drc),
         )? {
             skip_fields.push(skip_field);
         }
@@ -1664,6 +1740,51 @@ fn collect_skip_fields_without_block_start(
     // TODO: Replace this tail tolerance with a verified syncframe footer parser.
 
     Ok(skip_fields)
+}
+
+fn collect_block_drc(
+    frame: &[u8],
+    frame_type: FrameType,
+    num_blocks: usize,
+    channel_mode: u8,
+    fullband_channels: usize,
+    lfe_on: bool,
+    audio_frame: &AudioFrameInfo,
+    block_start_bit_offsets: Option<&[usize]>,
+    audio_payload_end_bit: usize,
+    sample_rate_index: usize,
+    block_drc: &mut Vec<BlockDrcInfo>,
+) -> Result<(), ParseError> {
+    if num_blocks == 1 || block_start_bit_offsets.is_some() {
+        let _ = collect_skip_fields(
+            frame,
+            frame_type,
+            num_blocks,
+            channel_mode,
+            fullband_channels,
+            lfe_on,
+            audio_frame,
+            block_start_bit_offsets,
+            audio_payload_end_bit,
+            sample_rate_index,
+            block_drc,
+        )?;
+    } else {
+        let mut state = BlockSyntaxState::new(fullband_channels, lfe_on, sample_rate_index);
+        let _ = collect_skip_fields_without_block_start(
+            frame,
+            frame_type,
+            num_blocks,
+            channel_mode,
+            fullband_channels,
+            lfe_on,
+            audio_frame,
+            audio_payload_end_bit,
+            &mut state,
+            block_drc,
+        )?;
+    }
+    Ok(())
 }
 
 fn recover_skip_fields_from_emdf_markers(frame: &[u8]) -> Option<Vec<SkipFieldInfo>> {
@@ -1725,6 +1846,7 @@ fn parse_block(
     audio_frame: &mut AudioFrameInfo,
     state: &mut BlockSyntaxState,
     consume_mantissas: bool,
+    block_drc: Option<&mut Vec<BlockDrcInfo>>,
 ) -> Result<Option<SkipFieldInfo>, ParseError> {
     let block_start = reader.position();
     if audio_frame.block_switching_enabled {
@@ -1738,9 +1860,21 @@ fn parse_block(
             .ok_or(ParseError::ShortPacket)?;
     }
 
-    skip_conditional_bits(reader, 8)?;
+    let mut drc_info = BlockDrcInfo::default();
+    drc_info.dynamic_range_exists[0] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+    if drc_info.dynamic_range_exists[0] {
+        drc_info.dynamic_range_word[0] =
+            reader.read_bits(8).ok_or(ParseError::ShortPacket)? as u8;
+    }
     if channel_mode == 0 {
-        skip_conditional_bits(reader, 8)?;
+        drc_info.dynamic_range_exists[1] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+        if drc_info.dynamic_range_exists[1] {
+            drc_info.dynamic_range_word[1] =
+                reader.read_bits(8).ok_or(ParseError::ShortPacket)? as u8;
+        }
+    }
+    if let Some(block_drc) = block_drc {
+        block_drc.push(drc_info);
     }
 
     if matches!(frame_type, FrameType::LegacyAc3) {
@@ -2412,7 +2546,11 @@ fn read_exponents(
                     ExpStrategy::D25 => 6,
                     ExpStrategy::D45 => 12,
                 };
-                let ncplgrps = if group_size == 0 { 0 } else { cpl_range / group_size };
+                let ncplgrps = if group_size == 0 {
+                    0
+                } else {
+                    cpl_range / group_size
+                };
                 state.coupling_allocation.read_coupling_exponents(
                     reader,
                     strategy,
@@ -3169,7 +3307,12 @@ fn decode_block_pcm_mantissas(
             )?;
         }
 
-        bittrace_ch("mantissas_ch_start", block, channel as i32, reader.position());
+        bittrace_ch(
+            "mantissas_ch_start",
+            block,
+            channel as i32,
+            reader.position(),
+        );
         let mut coeffs = [0.0f32; 256];
         state.channel_allocations[channel].decode_transform_coeffs(
             reader,
@@ -3721,6 +3864,7 @@ mod tests {
             None,
             block_payload.len() * 8,
             0,
+            &mut Vec::new(),
         )
         .expect("single-block payload should parse");
 
@@ -3749,6 +3893,7 @@ mod tests {
             &audio_frame,
             block_payload.len() * 8,
             &mut state,
+            &mut Vec::new(),
         )
         .expect("single-block payload with zero padding should parse");
 
@@ -3776,6 +3921,7 @@ mod tests {
             &audio_frame,
             block_payload.len() * 8,
             &mut state,
+            &mut Vec::new(),
         )
         .expect("single-block payload with footer prefix should parse");
 
@@ -3800,6 +3946,7 @@ mod tests {
             &audio_frame,
             block_payload.len() * 8,
             &mut state,
+            &mut Vec::new(),
         )
         .expect("single-block payload with coupling should parse");
 
@@ -3822,6 +3969,9 @@ mod tests {
             channels: 3,
             fullband_channels: 3,
             lfe_on: false,
+            dialogue_normalization: [-31, -31],
+            heavy_compression_exists: [false, false],
+            heavy_compression_word: [0, 0],
             addbsi_present: false,
             extension_type_a: false,
             complexity_index_type_a: 0,
@@ -3830,6 +3980,7 @@ mod tests {
             addbsi_bytes: Vec::new(),
             body_start_bit_offset: 0,
             audio_frame: audio_frame.clone(),
+            block_drc: Vec::new(),
             skip_fields: Vec::new(),
             trailing_aux_data: Vec::new(),
             aux_data: Vec::new(),
@@ -3909,6 +4060,9 @@ mod tests {
             channels: 1,
             fullband_channels: 1,
             lfe_on: false,
+            dialogue_normalization: [-31, -31],
+            heavy_compression_exists: [false, false],
+            heavy_compression_word: [0, 0],
             addbsi_present: false,
             extension_type_a: false,
             complexity_index_type_a: 0,
@@ -3917,6 +4071,7 @@ mod tests {
             addbsi_bytes: Vec::new(),
             body_start_bit_offset: 0,
             audio_frame: single_block_audio_frame(1, false),
+            block_drc: Vec::new(),
             skip_fields: Vec::new(),
             trailing_aux_data: Vec::new(),
             aux_data: Vec::new(),

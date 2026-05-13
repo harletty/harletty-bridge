@@ -19,6 +19,6 @@ pub use pcm::{
     CorePcmFrame, ObjectPcmDecoder, ObjectPcmFrame, ObjectPcmPushResult, PcmDecoder, PcmPushResult,
 };
 pub use syncframe::{
-    AccessUnitInfo, AuxParseStatus, EmdfBlockInfo, EmdfPayloadInfo, FrameType, ParseError,
-    PayloadInfo, SkipFieldInfo, inspect_access_unit,
+    AccessUnitInfo, AudioFrameInfo, AuxParseStatus, BlockDrcInfo, EmdfBlockInfo, EmdfPayloadInfo,
+    EmdfSource, FrameType, ParseError, PayloadInfo, SkipFieldInfo, inspect_access_unit,
 };

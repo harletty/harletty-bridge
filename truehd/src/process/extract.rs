@@ -259,9 +259,7 @@ impl Extractor {
 
     fn access_unit_len(&self) -> Option<usize> {
         let buffer = self.buffered();
-        Some(
-            ((u16::from_be_bytes([*buffer.first()?, *buffer.get(1)?]) & 0xFFF) << 1) as usize,
-        )
+        Some(((u16::from_be_bytes([*buffer.first()?, *buffer.get(1)?]) & 0xFFF) << 1) as usize)
     }
 
     fn major_sync_info_len(&self) -> Option<usize> {

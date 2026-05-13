@@ -12,6 +12,8 @@
 
 use log::warn;
 
+use crate::logging::bridge_external_log;
+
 /// IEC 61937 data type for E-AC-3.
 const IEC61937_EAC3_DATA_TYPE: u8 = 0x15;
 
@@ -168,7 +170,7 @@ impl Eac3SpdifStream {
             .map(|b| format!("{b:02X}"))
             .collect::<Vec<_>>()
             .join(" ");
-        sys::live_log::emit_external_record(
+        bridge_external_log(
             log::Level::Info,
             "harletty-bridge::eac3_spdif",
             &format!(
@@ -286,7 +288,7 @@ impl Eac3SpdifStream {
                         let looks_like_sync_be = b0 == 0x0B && b1 == 0x77;
                         let looks_like_sync_swapped = b0 == 0x77 && b1 == 0x0B;
                         if looks_like_sync_be || looks_like_sync_swapped {
-                            sys::live_log::emit_external_record(
+                            bridge_external_log(
                                 log::Level::Info,
                                 "harletty-bridge::eac3_spdif",
                                 &format!(
@@ -364,7 +366,7 @@ impl Eac3SpdifStream {
 
                         let preview: Vec<String> =
                             frame.iter().take(8).map(|b| format!("{b:02X}")).collect();
-                        sys::live_log::emit_external_record(
+                        bridge_external_log(
                             log::Level::Info,
                             "harletty-bridge::eac3_spdif",
                             &format!(
@@ -394,7 +396,7 @@ impl Eac3SpdifStream {
 
                     let remaining = bytes_remaining.saturating_sub(2);
 
-                    sys::live_log::emit_external_record(
+                    bridge_external_log(
                         log::Level::Info,
                         "harletty-bridge::eac3_spdif",
                         &format!(
@@ -421,7 +423,7 @@ impl Eac3SpdifStream {
                     let frame_bytes = if header_frame_bytes > length_code_bytes
                         && header_frame_bytes <= remaining
                     {
-                        sys::live_log::emit_external_record(
+                        bridge_external_log(
                             log::Level::Warn,
                             "harletty-bridge::eac3_spdif",
                             &format!(
@@ -473,7 +475,7 @@ impl Eac3SpdifStream {
                     if need_unswap {
                         let preview: Vec<String> =
                             frame.iter().take(8).map(|b| format!("{b:02X}")).collect();
-                        sys::live_log::emit_external_record(
+                        bridge_external_log(
                             log::Level::Info,
                             "harletty-bridge::eac3_spdif",
                             &format!(

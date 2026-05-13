@@ -3,19 +3,12 @@ use bridge_api::RMetadataFrame;
 use eac3::OamdPayload;
 #[cfg(feature = "bridge-perf")]
 use std::time::Instant;
-use std::sync::OnceLock;
 use truehd::structs::oamd::{ObjectAudioMetadataPayload, SpeakerLabels};
 
 use crate::bridge::AtmosBridge;
 use crate::labels::speaker_to_id;
+use crate::logging::bridge_diag_log;
 use crate::perf::PerfStats;
-
-static EAC3_OBJECT_SIZE_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
-
-fn eac3_object_size_trace_enabled() -> bool {
-    *EAC3_OBJECT_SIZE_TRACE_ENABLED
-        .get_or_init(|| std::env::var_os("HARLETTY_LOG_EAC3_OBJECT_SIZE").is_some())
-}
 
 /// Build an [`RMetadataFrame`] from an OAMD payload parsed from E-AC3.
 pub(crate) fn build_eac3_metadata_frame(
@@ -151,18 +144,42 @@ fn extract_eac3_events(
                 .map(|u| u.ramp_duration as u32)
                 .unwrap_or(0);
 
-            if eac3_object_size_trace_enabled() {
-                eprintln!(
-                    "[harletty][object-size][map] obj_idx={} dyn_idx={} id={} sample_pos={} sample_offset={} has_pos={} raw_size={:?} emitted_size={:?} ramp={}",
-                    obj_idx,
-                    dynamic_idx,
-                    id,
-                    base_sample_pos + sample_offset,
-                    sample_offset,
-                    has_pos,
-                    block.size,
-                    size,
-                    ramp_duration
+            if size != [0.0, 0.0, 0.0] {
+                bridge_diag_log(
+                    log::Level::Info,
+                    &format!(
+                        "[harletty][object-size] non-zero detected obj_idx={} dyn_idx={} id={} sample_pos={} sample_offset={} has_pos={} size={:?} ramp={}",
+                        obj_idx,
+                        dynamic_idx,
+                        id,
+                        base_sample_pos + sample_offset,
+                        sample_offset,
+                        has_pos,
+                        size,
+                        ramp_duration
+                    ),
+                );
+            }
+            if block.distance.is_some()
+                || block.screen_factor.is_some()
+                || block.depth_factor.is_some()
+                || block.anchor != eac3::ObjectAnchor::Room
+            {
+                bridge_diag_log(
+                    log::Level::Info,
+                    &format!(
+                        "[harletty][oamd] visual attrs obj_idx={} dyn_idx={} id={} sample_pos={} sample_offset={} anchor={:?} distance={:?} screen_factor={:?} depth_factor={:?} size={:?}",
+                        obj_idx,
+                        dynamic_idx,
+                        id,
+                        base_sample_pos + sample_offset,
+                        sample_offset,
+                        block.anchor,
+                        block.distance,
+                        block.screen_factor,
+                        block.depth_factor,
+                        size
+                    ),
                 );
             }
 
@@ -218,8 +235,10 @@ mod tests {
     /// L2-norm or single-axis collapse.
     #[test]
     fn eac3_extract_events_preserves_anisotropic_size() {
-        use eac3::{OamdBlockUpdate, OamdElement, OamdElementKind, OamdObjectBlock,
-                   OamdObjectElement, ObjectAnchor, Vec3};
+        use eac3::{
+            OamdBlockUpdate, OamdElement, OamdElementKind, OamdObjectBlock, OamdObjectElement,
+            ObjectAnchor, Vec3,
+        };
 
         let block = OamdObjectBlock {
             inactive: false,
@@ -232,7 +251,11 @@ mod tests {
             priority: None,
             valid_position: true,
             differential_position: false,
-            position: Some(Vec3 { x: 0.5, y: 0.5, z: 0.5 }),
+            position: Some(Vec3 {
+                x: 0.5,
+                y: 0.5,
+                z: 0.5,
+            }),
             distance: None,
             // Anisotropic: width=0.2, depth=0.5, height=0.9 — must survive.
             size: Some([0.2, 0.5, 0.9]),
@@ -486,11 +509,7 @@ fn extract_events(
         let (has_pos, pos, size) = if !object_data.b_object_in_bed_or_isf {
             let render = &object_data.object_render_info;
             match pos_vec.get(i).and_then(|raw_blocks| raw_blocks.first()) {
-                Some(raw) if raw.len() >= 3 => (
-                    true,
-                    [raw[0], raw[1], raw[2]],
-                    render.object_size,
-                ),
+                Some(raw) if raw.len() >= 3 => (true, [raw[0], raw[1], raw[2]], render.object_size),
                 Some(_) => (false, [0.0; 3], [0.0; 3]),
                 None => {
                     missing_damf_pos += 1;

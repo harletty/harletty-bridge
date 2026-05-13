@@ -4,7 +4,6 @@ use super::bitstream::BitReader;
 use super::syncframe::ParseError;
 use crate::{BedChannel, ObjectAnchor, Vec3};
 use std::fmt;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 const ISF_OBJECT_COUNT: [usize; 6] = [4, 8, 10, 14, 15, 30];
@@ -409,7 +408,6 @@ const LOG_LEVEL_DEBUG: u8 = 4;
 const LOG_LEVEL_TRACE: u8 = 5;
 
 static METADATA_LOG_LEVEL: AtomicU8 = AtomicU8::new(LOG_LEVEL_DEBUG);
-static OBJECT_SIZE_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 const fn encode_log_level(level: log::Level) -> u8 {
     match level {
@@ -445,11 +443,6 @@ fn emit_metadata_debug(args: fmt::Arguments<'_>) {
         metadata_log_level(),
         "{args}"
     );
-}
-
-fn object_size_trace_enabled() -> bool {
-    *OBJECT_SIZE_TRACE_ENABLED
-        .get_or_init(|| std::env::var_os("HARLETTY_LOG_EAC3_OBJECT_SIZE").is_some())
 }
 
 fn parse_oamd_payload(reader: &mut BitReader<'_>) -> Result<OamdPayload, ParseError> {
@@ -628,7 +621,6 @@ fn parse_oamd_element(
     } else {
         OamdElementKind::Unknown
     };
-
     if reader.position() > end_pos {
         emit_metadata_debug(format_args!(
             "oamd-element overrun idx={element_index} pos={} end={end_pos}",
@@ -852,16 +844,6 @@ fn parse_oamd_object_block(
                 }
                 _ => None,
             };
-            if object_size_trace_enabled() {
-                eprintln!(
-                    "[harletty][object-size][parse] obj={} blk={} mode={} render_blocks={:?} size={:?}",
-                    object_index,
-                    block_index,
-                    mode,
-                    render_info_blocks,
-                    size
-                );
-            }
         }
 
         if (blocks & 8) != 0 && read_bit(reader, "oa_screen_anchor")? {
@@ -894,7 +876,6 @@ fn parse_oamd_object_block(
         valid_position as u8,
         differential_position as u8,
     ));
-
     Ok(OamdObjectBlock {
         inactive,
         basic_info_status,

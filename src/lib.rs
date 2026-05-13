@@ -14,7 +14,7 @@ use abi_stable::{
     export_root_module, prefix_type::PrefixTypeTrait, sabi_trait::prelude::TD_Opaque,
 };
 use bridge::AtmosBridge;
-use bridge_api::{BridgeLib, BridgeLibRef, FormatBridgeBox, FormatBridge_TO};
+use bridge_api::{BridgeLib, BridgeLibRef, FormatBridge_TO, FormatBridgeBox};
 
 // Silence unused import warning — FormatBridge is used via the proc-macro generated impl.
 #[allow(unused_imports)]
@@ -25,10 +25,15 @@ use bridge_api::FormatBridge as _FormatBridgeTrait;
 fn get_library() -> BridgeLibRef {
     BridgeLib {
         new_bridge: create_bridge,
+        set_host_log_sink,
     }
     .leak_into_prefix()
 }
 
 extern "C" fn create_bridge(strict: bool) -> FormatBridgeBox {
     FormatBridge_TO::from_value(AtmosBridge::new(strict), TD_Opaque)
+}
+
+extern "C" fn set_host_log_sink(sink: usize) {
+    logging::register_host_log_sink(sink);
 }
