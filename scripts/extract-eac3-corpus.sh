@@ -20,7 +20,7 @@ mkv_path=$1
 track_id=$2
 forced_index=${3:-}
 
-for tool in mkvmerge ffmpeg ffprobe sha256sum jq; do
+for tool in mkvmerge ffmpeg ffprobe jq; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "missing required tool: $tool" >&2
         exit 69
@@ -68,16 +68,23 @@ echo "[extract] track_id=$track_id audio_index=$audio_index" >&2
 echo "[extract] source=$mkv_path" >&2
 echo "[extract] dest=$corpus_dir" >&2
 
-source_sha=$(sha256sum "$mkv_path" | awk '{print $1}')
-sha_file="$corpus_dir/track.sha256"
+# Fast fingerprint: size + mtime. sha256sum on an 80 GB source over NAS
+# easily exceeds 10 min, which is far slower than the rest of the pipeline.
+# We trade strong content integrity for speed — adequate for a regression
+# cache on a file we control locally. The track.info.txt header preserves
+# the input shape for forensic checks.
+source_size=$(stat -c %s "$mkv_path")
+source_mtime=$(stat -c %Y "$mkv_path")
+source_fp="size=${source_size} mtime=${source_mtime}"
+fp_file="$corpus_dir/track.fingerprint"
 track_file="$corpus_dir/track.eac3"
 info_file="$corpus_dir/track.info.txt"
 
 # Skip extraction if cached output is consistent.
-if [[ -f $sha_file && -f $track_file ]]; then
-    cached=$(awk '{print $1}' "$sha_file" 2>/dev/null || true)
-    if [[ $cached == "$source_sha" ]]; then
-        echo "[extract] cached output matches source sha256, skipping ffmpeg" >&2
+if [[ -f $fp_file && -f $track_file ]]; then
+    cached=$(cat "$fp_file" 2>/dev/null || true)
+    if [[ $cached == "$source_fp" ]]; then
+        echo "[extract] cached output matches source fingerprint, skipping ffmpeg" >&2
         exit 0
     fi
 fi
@@ -91,7 +98,7 @@ fi
     ffprobe -hide_banner -select_streams "a:$audio_index" -show_streams "$mkv_path" 2>&1 | head -80
     echo
     echo "# extraction time: $(date --iso-8601=seconds)"
-    echo "# source sha256: $source_sha"
+    echo "# source fingerprint: $source_fp"
 } >"$info_file"
 
 # Use ffmpeg to extract raw E-AC3 access units. -c:a copy preserves syncframes
@@ -102,7 +109,7 @@ ffmpeg -y -hide_banner -loglevel error \
     -c:a copy -f eac3 \
     "$track_file"
 
-echo "$source_sha  $(basename "$mkv_path")" >"$sha_file"
+echo "$source_fp" >"$fp_file"
 
 bytes=$(stat -c %s "$track_file")
 echo "[extract] wrote $track_file ($bytes bytes)" >&2
