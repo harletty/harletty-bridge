@@ -1,4 +1,4 @@
-use crate::parser::{FrameInfo, ParseError, SYNCWORD, parse_header, parse_legacy_ac3_header};
+use crate::parser::{FrameInfo, ParseError, SYNCWORD, parse_header};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExtractError {
@@ -72,27 +72,12 @@ impl Extractor {
             self.consume_front(sync_offset);
 
             let header = self.buffered();
-            let parsed = match parse_header(header) {
-                Ok(info) => Ok(info),
-                // Mixed dual-stream MKV tracks emit some legacy AC-3 frames
-                // (bsid ≤ 10) alongside E-AC-3; re-frame them with the AC-3
-                // header so the raw extractor doesn't abort the pipeline.
-                // Downstream is_legacy_ac3_frame dispatches AC-3 to the
-                // AC-3 core decoder.
-                Err(ParseError::UnsupportedBitstreamId(bsid)) if bsid <= 10 => {
-                    match parse_legacy_ac3_header(header) {
-                        Ok(info) => Ok(info),
-                        Err(ParseError::InsufficientData) => return Ok(None),
-                        Err(err) => Err(err),
-                    }
-                }
-                Err(err) => Err(err),
-            };
-            match parsed {
+            match parse_header(header) {
                 Ok(info) => {
                     if header.len() < info.frame_size {
                         return Ok(None);
                     }
+
                     let data = header[..info.frame_size].to_vec();
                     self.consume_front(info.frame_size);
                     return Ok(Some(Frame::new(data, info)));
@@ -199,24 +184,5 @@ mod tests {
             extractor.next_frame().unwrap().unwrap().as_bytes(),
             frame.as_slice()
         );
-    }
-
-    #[test]
-    fn extracts_legacy_ac3_frame() {
-        // AC-3 syncframe header: bytes 0-1 sync, 2-3 crc1, byte 4 packs
-        // fscod (2 MSB) + frmsizecod (6 LSB), byte 5 packs bsid (5 MSB) +
-        // bsmod (3 LSB). fscod=0 → 48 kHz; frmsizecod=0 → 64 words =
-        // 128 bytes; bsid=8 (legacy AC-3, well below E-AC-3's 11..=16).
-        let mut frame = vec![0x0B, 0x77, 0x00, 0x00, 0x00, 0x40, 0x00];
-        frame.resize(128, 0xAA);
-        let mut extractor = Extractor::default();
-        extractor.push_bytes(&frame);
-
-        let extracted = extractor.next_frame().unwrap().unwrap();
-        assert_eq!(extracted.info().frame_size, 128);
-        assert_eq!(extracted.info().bitstream_id, 8);
-        assert_eq!(extracted.info().sample_rate, 48_000);
-        assert_eq!(extracted.as_bytes(), frame.as_slice());
-        assert_eq!(extractor.next_frame().unwrap(), None);
     }
 }

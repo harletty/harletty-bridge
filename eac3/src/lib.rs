@@ -16,6 +16,6 @@ pub use eac3dec::{
 pub use extract::{ExtractError, Extractor, Frame};
 pub use parser::{
     ChannelMode, FrameInfo, ParseError as HeaderParseError, SYNCWORD, SampleRateCode, StreamType,
-    parse_header, parse_legacy_ac3_header,
+    parse_header,
 };
 pub use types::{BedChannel, ObjectAnchor, Vec3};
