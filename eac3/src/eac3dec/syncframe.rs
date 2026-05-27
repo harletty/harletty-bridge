@@ -547,7 +547,12 @@ struct BlockSyntaxState {
     nspxbnds: usize,
     spx_master: Vec<u8>,
     spx_gains: Vec<Vec<f32>>,
-    spx_noise_blend: Vec<bool>,
+    /// Per-channel SPX blend factor (`spxblnd[ch]`, 5 bits per
+    /// ATSC A/52 §E.1.3.1.8.2). Controls the mix between SPX-extended
+    /// content and noise blending during synthesis. Stored for future
+    /// noise-blend implementation; currently `apply_spx_extension` only
+    /// consumes `spx_gains`.
+    spx_blend: Vec<u8>,
 }
 
 impl BlockSyntaxState {
@@ -594,7 +599,7 @@ impl BlockSyntaxState {
             nspxbnds: 0,
             spx_master: Vec::new(),
             spx_gains: Vec::new(),
-            spx_noise_blend: Vec::new(),
+            spx_blend: Vec::new(),
         }
     }
 
@@ -606,7 +611,7 @@ impl BlockSyntaxState {
         self.spxbegf = 0;
         self.spx_master.clear();
         self.spx_gains.clear();
-        self.spx_noise_blend.clear();
+        self.spx_blend.clear();
         for in_use in &mut self.chinspx {
             *in_use = false;
         }
@@ -2302,11 +2307,16 @@ fn read_spx(
                     reader.read_bit().ok_or(ParseError::ShortPacket)?
                 };
                 if coordinates_present {
+                    // ATSC A/52 Annex E.1.3.1.8.2: spxblnd (5 bits) then
+                    // mstrspxco (2 bits) — total 7 bits unconditionally. The
+                    // previous code mis-parsed this as `master`(2) + a 1-bit
+                    // noise-blend flag with a conditional 4-bit follow-up,
+                    // which both desync'd subsequent audblk fields by 4 bits
+                    // (when the flag read 0) and used the wrong 2 bits as
+                    // the master coordinate scale → SPX gains at the wrong
+                    // dB scale.
+                    let spx_blend = reader.read_bits(5).ok_or(ParseError::ShortPacket)? as u8;
                     let master = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as u8;
-                    let noise_blend = reader.read_bit().ok_or(ParseError::ShortPacket)?;
-                    if noise_blend {
-                        reader.skip_bits(4).ok_or(ParseError::ShortPacket)?;
-                    }
                     let mut gains = Vec::with_capacity(state.nspxbnds);
                     for _ in 0..state.nspxbnds {
                         let exponent = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
@@ -2323,12 +2333,12 @@ fn read_spx(
                     while state.spx_gains.len() <= channel {
                         state.spx_gains.push(Vec::new());
                     }
-                    while state.spx_noise_blend.len() <= channel {
-                        state.spx_noise_blend.push(false);
+                    while state.spx_blend.len() <= channel {
+                        state.spx_blend.push(0);
                     }
                     state.spx_master[channel] = master;
                     state.spx_gains[channel] = gains;
-                    state.spx_noise_blend[channel] = noise_blend;
+                    state.spx_blend[channel] = spx_blend;
                 }
             } else {
                 state.first_spx_coords[channel] = true;
