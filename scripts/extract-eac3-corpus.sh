@@ -111,7 +111,7 @@ ffmpeg -y -hide_banner -loglevel error \
     -i "$mkv_path" \
     -map "0:a:$audio_index" \
     -c:a copy -f eac3 \
-    "$track_file"
+    "$track_file" </dev/null
 
 echo "$source_fp" >"$fp_file"
 

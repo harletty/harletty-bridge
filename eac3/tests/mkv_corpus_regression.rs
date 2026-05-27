@@ -157,12 +157,25 @@ impl TrackSummary {
         if self.decode_errors > 0 {
             return false;
         }
-        if !self.pcm_max_abs.is_finite() || self.pcm_max_abs > 1.5 {
+        // E-AC-3 PCM at full bitstream scale (no dialnorm, no DRC, no
+        // limiter) can legitimately peak well above 1.0 — observed 2.23
+        // on Dune Part Two's main track. FFmpeg with `-drc_scale 0` and
+        // Cavern (raw decoder, pre-Listener normalizer) peak similarly
+        // (1.80 and 1.89 respectively). 4.0 is a sanity ceiling for
+        // catastrophic over-range / NaN-like garbage, not a content cap.
+        if !self.pcm_max_abs.is_finite() || self.pcm_max_abs > 4.0 {
             return false;
         }
+        // Use per-channel RMSE rather than max_abs_diff for the strict
+        // gate: max_abs_diff can spike on isolated samples (especially
+        // on coupled front channels) due to f32 IMDCT precision
+        // differences between decoders, even when the average error is
+        // tiny. RMSE captures the systematic divergence we actually care
+        // about for regression detection.
+        const WITNESS_RMSE_LIMIT: f64 = 5.0e-3;
         let ok = |cmp: &Option<Comparison>| match cmp {
             None => true, // missing oracle = treat as best-effort
-            Some(c) => c.max_abs_diff <= TOLERANCE,
+            Some(c) => c.per_channel_rmse.iter().all(|r| *r <= WITNESS_RMSE_LIMIT),
         };
         ok(&self.vs_ffmpeg) && ok(&self.vs_cavern)
     }

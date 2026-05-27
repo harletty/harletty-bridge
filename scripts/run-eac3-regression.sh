@@ -110,7 +110,15 @@ run_step() {
     return 1
 }
 
-parse_manifest "$manifest" | while IFS=$'\t' read -r id role source; do
+# Read tracks into an array before iterating. The previous
+# `parse_manifest | while read` pattern put the loop body in a subshell
+# AND let inner commands inherit the pipe as stdin — ffmpeg (which reads
+# stdin for interactive controls) silently consumed the rest of the
+# manifest after the first track, so the second track was never processed.
+mapfile -t manifest_rows < <(parse_manifest "$manifest")
+
+for row in "${manifest_rows[@]}"; do
+    IFS=$'\t' read -r id role source <<<"$row"
     [[ -z $id ]] && continue
     echo
     echo "=== track: $id  role=$role ==="
