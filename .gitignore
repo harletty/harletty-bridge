@@ -2,3 +2,5 @@
 .idea/
 **/*.rs.bk
 *.zip
+tools/cavern_pcm_dump/bin/
+tools/cavern_pcm_dump/obj/

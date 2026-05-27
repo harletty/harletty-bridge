@@ -1019,6 +1019,22 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
             } else {
                 BlockSyntaxState::new(fullband_channels as usize, lfe_on, sample_rate_index)
             };
+            // Per FFmpeg eac3dec.c:507-511, the same per-frame state reset that
+            // decode_core_pcm_frame_with_state_into applies must also run here:
+            // reusing a stateful walk_state across access units (the aux-walk
+            // path inside push_access_unit) preserves first_cpl_coords /
+            // first_cpl_leak / first_spx_coords from the previous frame,
+            // accumulating a per-frame bit drift that misreads chbwcod on
+            // coupling-strategy-update-mid-frame patterns. Symptom: a frame
+            // that decodes cleanly with a fresh decoder errors on
+            // invalid-header:chbwcod when run through the live PipeWire chain.
+            for first in &mut walk_state.first_cpl_coords {
+                *first = true;
+            }
+            walk_state.first_cpl_leak = true;
+            for first in &mut walk_state.first_spx_coords {
+                *first = true;
+            }
             match collect_skip_fields_without_block_start(
                 frame,
                 frame_type,

@@ -3,7 +3,7 @@ use bridge_api::{
     FormatBridge, RCoordinateFormat, RInputTransport, RPushResult, RVbapCartesianDefaults,
     RVbapTableMode,
 };
-use eac3::{CorePcmFrame, ObjectPcmDecoder, PcmDecoder};
+use eac3::{CorePcmFrame, Extractor as Eac3RawExtractor, ObjectPcmDecoder, PcmDecoder};
 use std::collections::VecDeque;
 #[cfg(feature = "bridge-perf")]
 use std::env;
@@ -52,6 +52,35 @@ pub(crate) enum DrcMode {
     Heavy,
 }
 
+/// Codec carried by a [`RInputTransport::Raw`] packet, which (unlike the IEC
+/// 61937 transport) has no `data_type` to disambiguate TrueHD from E-AC3.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RawCodec {
+    TrueHd,
+    Eac3,
+}
+
+/// Best-effort codec detection on a raw access unit, used when the host did not
+/// declare the codec via `configure("input_codec", …)`. Checks the most
+/// specific pattern first: the TrueHD major-sync word `0xF8726FBA` at offset 4,
+/// then the E-AC3/AC-3 sync word `0x0B77` at offset 0 (incl. byte-swapped).
+fn sniff_raw_codec(data: &[u8]) -> Option<RawCodec> {
+    if data.len() >= 8
+        && data[4] == 0xF8
+        && data[5] == 0x72
+        && data[6] == 0x6F
+        && data[7] == 0xBA
+    {
+        return Some(RawCodec::TrueHd);
+    }
+    if data.len() >= 2
+        && ((data[0] == 0x0B && data[1] == 0x77) || (data[0] == 0x77 && data[1] == 0x0B))
+    {
+        return Some(RawCodec::Eac3);
+    }
+    None
+}
+
 pub(crate) struct AtmosBridge {
     // ── TrueHD pipeline ──────────────────────────────────────────────
     pub(crate) mat_stream: MatStream,
@@ -60,6 +89,8 @@ pub(crate) struct AtmosBridge {
     pub(crate) decoder: Decoder,
     // ── E-AC3 pipeline ───────────────────────────────────────────────
     pub(crate) eac3_spdif: Eac3SpdifStream,
+    /// Raw E-AC3 syncframe extractor (used by the `Raw` transport, e.g. mpv).
+    pub(crate) eac3_raw_extractor: Eac3RawExtractor,
     pub(crate) eac3_pcm_decoder: PcmDecoder,
     pub(crate) eac3_object_decoder: ObjectPcmDecoder,
     pub(crate) ac3_decoder: NativeAc3Decoder,
@@ -69,6 +100,12 @@ pub(crate) struct AtmosBridge {
     pub(crate) eac3_total_samples: u64,
     /// True when the most recent `push_packet` used the E-AC3 path.
     pub(crate) eac3_active: bool,
+    /// Codec forced by the host for the `Raw` transport via
+    /// `configure("input_codec", …)`. Persists across pipeline resets.
+    pub(crate) forced_raw_codec: Option<RawCodec>,
+    /// Codec locked for the current raw session (forced or sniffed). Cleared on
+    /// reset so a re-sniff happens after a seek / stream change.
+    pub(crate) raw_codec: Option<RawCodec>,
     pub(crate) eac3_diag_stats: Eac3DiagStats,
     // ── Shared ───────────────────────────────────────────────────────
     pub(crate) presentation: u8,
@@ -127,6 +164,7 @@ impl AtmosBridge {
             parser,
             decoder,
             eac3_spdif: Eac3SpdifStream::default(),
+            eac3_raw_extractor: Eac3RawExtractor::default(),
             eac3_pcm_decoder: eac3_pcm,
             eac3_object_decoder: eac3_obj,
             ac3_decoder: NativeAc3Decoder::default(),
@@ -135,6 +173,8 @@ impl AtmosBridge {
             eac3_frame_count: 0,
             eac3_total_samples: 0,
             eac3_active: false,
+            forced_raw_codec: None,
+            raw_codec: None,
             eac3_diag_stats: Eac3DiagStats::default(),
             presentation,
             strict,
@@ -174,6 +214,7 @@ impl AtmosBridge {
 
         // E-AC3 reset.
         self.eac3_spdif.reset();
+        self.eac3_raw_extractor = Eac3RawExtractor::default();
         self.eac3_pcm_decoder.reset();
         self.eac3_object_decoder.reset();
         self.ac3_decoder.reset();
@@ -181,6 +222,8 @@ impl AtmosBridge {
         self.pending_dependent_frames.clear();
         self.eac3_frame_count = 0;
         self.eac3_active = false;
+        // Re-sniff after reset, but keep any host-declared codec.
+        self.raw_codec = None;
 
         // Re-apply configuration to new parser/decoder instances.
         let fail_level = if self.strict {
@@ -203,8 +246,20 @@ impl AtmosBridge {
     }
 
     fn try_decode_pending_eac3_pair(&mut self) -> Option<bridge_api::RDecodedFrame> {
-        let core = self.pending_ac3_cores.pop_front()?;
-        let dependent = self.pending_dependent_frames.pop_front()?;
+        // Both queues must have a frame before we commit to popping either —
+        // otherwise an AC-3 core popped here without a partner is silently
+        // dropped when `?` short-circuits the function. On streams that
+        // deliver `[AC-3 core, E-AC-3 dep]` per packet (DD+ JOC with a
+        // backward-compat AC-3 core), the first try_pair after the core was
+        // queued ALWAYS hits the empty dep queue, losing the core. The next
+        // try_pair after the dep is queued then finds no core to pair with.
+        // Net effect: pair_attempts stays at 0 forever and is_spatial never
+        // flips to true.
+        if self.pending_ac3_cores.is_empty() || self.pending_dependent_frames.is_empty() {
+            return None;
+        }
+        let core = self.pending_ac3_cores.pop_front().unwrap();
+        let dependent = self.pending_dependent_frames.pop_front().unwrap();
         self.eac3_diag_stats.dependent_pair_attempts += 1;
         match process_eac3_dependent_frame_with_core(self, &dependent, core) {
             Ok(Some(decoded_frame)) => Some(decoded_frame),
@@ -222,6 +277,140 @@ impl AtmosBridge {
                     &format!("eac3_dependent_pair_failed error={err}"),
                 );
                 None
+            }
+        }
+    }
+
+    /// Resolve the codec for a `Raw` packet. A host-declared codec
+    /// (`configure("input_codec", …)`) wins; otherwise the first recognisable
+    /// sync word locks the session. An unrecognised first packet falls back to
+    /// TrueHD for that packet without locking, so a later syncful packet can
+    /// still pin the codec.
+    fn resolve_raw_codec(&mut self, data: &[u8]) -> RawCodec {
+        if let Some(c) = self.raw_codec {
+            return c;
+        }
+        if let Some(c) = self.forced_raw_codec {
+            self.raw_codec = Some(c);
+            return c;
+        }
+        if let Some(c) = sniff_raw_codec(data) {
+            self.raw_codec = Some(c);
+            return c;
+        }
+        RawCodec::TrueHd
+    }
+
+    /// Process one extracted E-AC3 access unit, shared by the IEC 61937 and raw
+    /// transports. Returns `Err(())` on a fatal decode error, in which case the
+    /// pipeline has been reset and `result` already carries the error — the
+    /// caller must stop draining and return.
+    fn process_eac3_access_unit(
+        &mut self,
+        frame: &[u8],
+        result: &mut RPushResult,
+        temporary_silence_pushed: &mut bool,
+    ) -> Result<(), ()> {
+        self.eac3_frame_count += 1;
+        if is_legacy_ac3_frame(frame) {
+            match self.ac3_decoder.decode_frame(frame) {
+                Ok(core) => {
+                    diagnose_eac3_frame(self, frame);
+                    self.eac3_diag_stats.ac3_core_decoded += 1;
+                    self.pending_ac3_cores.push_back(core);
+                    if let Some(decoded_frame) = self.try_decode_pending_eac3_pair() {
+                        result.frames.push(decoded_frame);
+                    }
+                    return Ok(());
+                }
+                Err(err) => {
+                    self.eac3_diag_stats.ac3_core_decode_failures += 1;
+                    self.eac3_diag_stats.last_ac3_core_decode_error = Some(err.clone());
+                    bridge_diag_log(
+                        log::Level::Warn,
+                        &format!(
+                            "ac3_core_decode_failed index={} error={}",
+                            self.eac3_frame_count, err
+                        ),
+                    );
+                }
+            }
+        }
+
+        let decode_result = if is_dependent_eac3_frame(frame) {
+            self.pending_dependent_frames.push_back(frame.to_vec());
+            match self.try_decode_pending_eac3_pair() {
+                Some(decoded_frame) => Ok(decoded_frame),
+                None => return Ok(()),
+            }
+        } else {
+            process_eac3_frame(self, frame)
+        };
+
+        match decode_result {
+            Ok(decoded_frame) => {
+                if let Err(reason) = PcmStats::from_frame(&decoded_frame) {
+                    bridge_diag_log(
+                        log::Level::Warn,
+                        &format!(
+                            "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={}",
+                            self.eac3_frame_count,
+                            reason,
+                            decoded_frame.sampling_frequency,
+                            decoded_frame.sample_count,
+                            decoded_frame.channel_count,
+                            decoded_frame.pcm.len()
+                        ),
+                    );
+                    return Ok(());
+                }
+                if is_temporary_eac3_silence_frame(&decoded_frame) {
+                    if *temporary_silence_pushed {
+                        return Ok(());
+                    }
+                    *temporary_silence_pushed = true;
+                }
+                result.frames.push(decoded_frame);
+                Ok(())
+            }
+            Err(msg) => {
+                log::warn!("{msg}");
+                self.reset_pipeline();
+                result.did_reset = true;
+                result.error_message = msg.into();
+                Err(())
+            }
+        }
+    }
+
+    /// Drain all complete E-AC3 access units currently buffered in the raw
+    /// extractor, rendering each through [`Self::process_eac3_access_unit`].
+    fn drain_eac3_raw(&mut self, result: &mut RPushResult) {
+        let mut temporary_silence_pushed = false;
+        loop {
+            match self.eac3_raw_extractor.next_frame() {
+                Ok(Some(frame)) => {
+                    if self
+                        .process_eac3_access_unit(
+                            frame.as_bytes(),
+                            result,
+                            &mut temporary_silence_pushed,
+                        )
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    let msg = format!("eac3_raw_extract_error={err:?}");
+                    bridge_diag_log(log::Level::Warn, &msg);
+                    log::warn!("{msg}");
+                    self.reset_pipeline();
+                    result.did_reset = true;
+                    result.error_message = msg.into();
+                    return;
+                }
             }
         }
     }
@@ -244,7 +433,22 @@ impl FormatBridge for AtmosBridge {
             RInputTransport::Raw => {
                 #[cfg(feature = "bridge-perf")]
                 self.perf.note_raw_packet(data.len());
-                process_extractor_input(self, data.as_slice(), &mut result);
+                // One-shot diagnostic: log the first raw packet's first 64 bytes so we
+                // can correlate what the host (e.g. mpv-omniphony's ad_orender) feeds
+                // us against what the SPDIF path receives. Triggered only until the
+                // first frame is successfully decoded; cleared on reset so post-seek
+                // packets log again.
+                match self.resolve_raw_codec(data.as_slice()) {
+                    RawCodec::Eac3 => {
+                        self.eac3_active = true;
+                        self.eac3_raw_extractor.push_bytes(data.as_slice());
+                        self.drain_eac3_raw(&mut result);
+                    }
+                    RawCodec::TrueHd => {
+                        self.eac3_active = false;
+                        process_extractor_input(self, data.as_slice(), &mut result);
+                    }
+                }
                 result
             }
             RInputTransport::Iec61937 => {
@@ -307,79 +511,15 @@ impl FormatBridge for AtmosBridge {
                     loop {
                         match self.eac3_spdif.next_frame() {
                             Ok(Some(frame)) => {
-                                self.eac3_frame_count += 1;
-                                if is_legacy_ac3_frame(&frame) {
-                                    match self.ac3_decoder.decode_frame(&frame) {
-                                        Ok(core) => {
-                                            diagnose_eac3_frame(self, &frame);
-                                            self.eac3_diag_stats.ac3_core_decoded += 1;
-                                            self.pending_ac3_cores.push_back(core);
-                                            if let Some(decoded_frame) =
-                                                self.try_decode_pending_eac3_pair()
-                                            {
-                                                result.frames.push(decoded_frame);
-                                            }
-                                            continue;
-                                        }
-                                        Err(err) => {
-                                            self.eac3_diag_stats.ac3_core_decode_failures += 1;
-                                            self.eac3_diag_stats.last_ac3_core_decode_error =
-                                                Some(err.clone());
-                                            bridge_diag_log(
-                                                log::Level::Warn,
-                                                &format!(
-                                                    "ac3_core_decode_failed index={} error={}",
-                                                    self.eac3_frame_count, err
-                                                ),
-                                            );
-                                        }
-                                    }
-                                }
-
-                                let decode_result = if is_dependent_eac3_frame(&frame) {
-                                    self.pending_dependent_frames.push_back(frame.clone());
-                                    if let Some(decoded_frame) = self.try_decode_pending_eac3_pair()
-                                    {
-                                        Ok(decoded_frame)
-                                    } else {
-                                        continue;
-                                    }
-                                } else {
-                                    process_eac3_frame(self, &frame)
-                                };
-
-                                match decode_result {
-                                    Ok(decoded_frame) => {
-                                        if let Err(reason) = PcmStats::from_frame(&decoded_frame) {
-                                            bridge_diag_log(
-                                                log::Level::Warn,
-                                                &format!(
-                                                    "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={}",
-                                                    self.eac3_frame_count,
-                                                    reason,
-                                                    decoded_frame.sampling_frequency,
-                                                    decoded_frame.sample_count,
-                                                    decoded_frame.channel_count,
-                                                    decoded_frame.pcm.len()
-                                                ),
-                                            );
-                                            continue;
-                                        }
-                                        if is_temporary_eac3_silence_frame(&decoded_frame) {
-                                            if temporary_silence_pushed {
-                                                continue;
-                                            }
-                                            temporary_silence_pushed = true;
-                                        }
-                                        result.frames.push(decoded_frame);
-                                    }
-                                    Err(msg) => {
-                                        log::warn!("{msg}");
-                                        self.reset_pipeline();
-                                        result.did_reset = true;
-                                        result.error_message = msg.into();
-                                        return result;
-                                    }
+                                if self
+                                    .process_eac3_access_unit(
+                                        &frame,
+                                        &mut result,
+                                        &mut temporary_silence_pushed,
+                                    )
+                                    .is_err()
+                                {
+                                    return result;
                                 }
                             }
                             Ok(None) => {
@@ -462,6 +602,21 @@ impl FormatBridge for AtmosBridge {
                 self.parser
                     .set_required_presentations(&required_presentations);
                 log::debug!("atmos-bridge: presentation set to {p}");
+                true
+            }
+            "input_codec" => {
+                self.forced_raw_codec = match value.as_str() {
+                    "eac3" | "ec3" | "e-ac3" | "ac3" => Some(RawCodec::Eac3),
+                    "truehd" | "mlp" => Some(RawCodec::TrueHd),
+                    "auto" | "" => None,
+                    s => {
+                        log::warn!("atmos-bridge: unknown input_codec {s:?}");
+                        return false;
+                    }
+                };
+                // Force re-resolution against the new codec on the next packet.
+                self.raw_codec = None;
+                log::debug!("atmos-bridge: input_codec set to {:?}", self.forced_raw_codec);
                 true
             }
             #[cfg(feature = "bridge-perf")]
@@ -551,5 +706,65 @@ impl FormatBridge for AtmosBridge {
         );
         self.drc_mode = new_mode;
         true
+    }
+}
+
+#[cfg(test)]
+mod raw_transport_tests {
+    use super::*;
+
+    #[test]
+    fn sniff_detects_eac3_syncword() {
+        assert_eq!(
+            sniff_raw_codec(&[0x0B, 0x77, 0x00, 0x00]),
+            Some(RawCodec::Eac3)
+        );
+        // Byte-swapped 16-bit order is still E-AC3.
+        assert_eq!(
+            sniff_raw_codec(&[0x77, 0x0B, 0x00, 0x00]),
+            Some(RawCodec::Eac3)
+        );
+    }
+
+    #[test]
+    fn sniff_detects_truehd_major_sync() {
+        let buf = [0x00, 0x00, 0x00, 0x00, 0xF8, 0x72, 0x6F, 0xBA];
+        assert_eq!(sniff_raw_codec(&buf), Some(RawCodec::TrueHd));
+    }
+
+    #[test]
+    fn sniff_unknown_is_none() {
+        assert_eq!(sniff_raw_codec(&[0x12, 0x34, 0x56, 0x78]), None);
+        assert_eq!(sniff_raw_codec(&[0x0B]), None); // too short
+    }
+
+    #[test]
+    fn resolve_prefers_forced_codec_and_locks() {
+        let mut bridge = AtmosBridge::new(false);
+        bridge.forced_raw_codec = Some(RawCodec::Eac3);
+        // Unrecognisable bytes, but the host-declared codec wins.
+        assert_eq!(bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]), RawCodec::Eac3);
+        assert_eq!(bridge.raw_codec, Some(RawCodec::Eac3));
+    }
+
+    #[test]
+    fn resolve_sniffs_when_unforced() {
+        let mut eac3 = AtmosBridge::new(false);
+        assert_eq!(eac3.resolve_raw_codec(&[0x0B, 0x77, 0, 0]), RawCodec::Eac3);
+        assert_eq!(eac3.raw_codec, Some(RawCodec::Eac3));
+
+        let mut thd = AtmosBridge::new(false);
+        let buf = [0, 0, 0, 0, 0xF8, 0x72, 0x6F, 0xBA];
+        assert_eq!(thd.resolve_raw_codec(&buf), RawCodec::TrueHd);
+        assert_eq!(thd.raw_codec, Some(RawCodec::TrueHd));
+    }
+
+    #[test]
+    fn resolve_unknown_first_packet_defaults_truehd_without_locking() {
+        let mut bridge = AtmosBridge::new(false);
+        // No recognisable sync → treat as TrueHD for this packet but do NOT
+        // lock, so a later syncful packet can still pin the codec.
+        assert_eq!(bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]), RawCodec::TrueHd);
+        assert_eq!(bridge.raw_codec, None);
     }
 }
