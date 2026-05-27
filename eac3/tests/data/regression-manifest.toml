@@ -1,0 +1,24 @@
+# E-AC3 regression corpus manifest.
+#
+# Tracked under git (text only); the heavy binaries (track.eac3 and the PCM
+# dumps) live under <workspace>/dumps/eac3-regression/ and are regenerated
+# by harletty-bridge/scripts/run-eac3-regression.sh.
+#
+# Each [[track]] entry must declare:
+#   id        Short stem; doubles as the directory under dumps/eac3-regression/.
+#   role      "witness" -> must decode cleanly (test fails on regression).
+#             "failing" -> baseline only, report-only, never fails the test.
+#   source    Absolute path to the source MKV.
+#
+# When the corpus directory doesn't exist locally, the integration test
+# skips gracefully so CI without NAS access still passes.
+
+[[track]]
+id = "dune-part-two-vff-t1"
+role = "witness"
+source = "/mnt/nas/backup/Videos/EAC3_Atmos/Dune.Part.Two.2024.MULTi.VFF.2160p.UHD.BluRay.REMUX.HEVC.Dolby Vision.HDR.TrueHD Atmos.DDP Atmos-1544.mkv"
+
+[[track]]
+id = "dune-2021-vff"
+role = "failing"
+source = "/mnt/nas/backup/Videos/EAC3_Atmos/Dune.2021.MULTi.VFF.2160p.UHD.BluRay.REMUX.HEVC.Dolby Vision.HDR.TrueHD Atmos.DDP Atmos-1544.mkv"
