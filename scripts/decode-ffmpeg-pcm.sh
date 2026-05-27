@@ -34,7 +34,7 @@ ffmpeg -y -hide_banner -loglevel error \
     -i "$input" \
     -f f32le -c:a pcm_f32le \
     -channel_layout 5.1\(side\) -ac 6 \
-    "$output"
+    "$output" </dev/null
 
 bytes=$(stat -c %s "$output")
 samples=$(( bytes / 4 / 6 ))
