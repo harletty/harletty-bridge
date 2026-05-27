@@ -35,7 +35,7 @@ EOF
     esac
 done
 
-for tool in cargo dotnet ffmpeg mkvmerge jq sha256sum; do
+for tool in cargo dotnet ffmpeg mkvmerge jq; do
     command -v "$tool" >/dev/null 2>&1 || { echo "missing tool: $tool" >&2; exit 69; }
 done
 
@@ -123,7 +123,7 @@ parse_manifest "$manifest" | while IFS=$'\t' read -r id role source; do
     harletty_pcm="$corpus_root/harletty-pcm/$id.f32"
     report="$corpus_root/reports/$id.txt"
 
-    # 1. Extract from MKV (skips itself based on sha256 cache).
+    # 1. Extract from MKV (skips itself based on size+mtime fingerprint cache).
     if [[ ! -f $source ]]; then
         echo "[warn] source MKV not present, skipping track: $source" >&2
         continue
