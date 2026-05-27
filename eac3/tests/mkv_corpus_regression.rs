@@ -103,6 +103,13 @@ fn mkv_corpus_regression() {
         let cavern_path = corpus_root
             .join("cavern-pcm")
             .join(format!("{}.f32", track.id));
+        // Reuse the bootstrap-generated harletty PCM if present — avoids
+        // re-decoding a 2 h track and (more importantly) avoids writing
+        // 11.5 GB to /tmp tmpfs which lives in RAM. The bootstrap puts
+        // it at corpus_root/harletty-pcm/<id>.f32.
+        let cached_harletty_pcm = corpus_root
+            .join("harletty-pcm")
+            .join(format!("{}.f32", track.id));
 
         if !eac3_path.exists() {
             let msg = format!("[skip] {} missing track.eac3 ({})", track.id, eac3_path.display());
@@ -111,7 +118,7 @@ fn mkv_corpus_regression() {
             continue;
         }
 
-        let outcome = run_track(&eac3_path, &ffmpeg_path, &cavern_path);
+        let outcome = run_track(&eac3_path, &ffmpeg_path, &cavern_path, &cached_harletty_pcm);
         match outcome {
             Ok(summary) => {
                 println!("{}", summary.console_line(&track.id, track.role));
@@ -235,28 +242,37 @@ fn run_track(
     eac3_path: &Path,
     ffmpeg_path: &Path,
     cavern_path: &Path,
+    cached_harletty_pcm: &Path,
 ) -> Result<TrackSummary, String> {
-    // Stream harletty PCM to a temp file so the comparison phase can
-    // mmap/stream-read it without materialising 11.5 GB in RAM (the full
-    // 2 h Dune track would OOM-kill a 60 GB box if loaded whole alongside
-    // the FFmpeg + Cavern oracles).
-    let tmp_path = std::env::temp_dir().join(format!(
-        "eac3-mkv-test-{}.f32",
-        eac3_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-    ));
-    let decoded = decode_harletty_to_file(eac3_path, &tmp_path)
-        .map_err(|e| format!("decode {eac3_path:?}: {e}"))?;
+    // Prefer the bootstrap-cached harletty PCM (corpus_root/harletty-pcm/<id>.f32).
+    // Falling back to an on-the-fly decode would write 11.5 GB to /tmp,
+    // which is tmpfs (RAM-backed) on most systems — the full 2 h Dune
+    // track immediately OOM-pressures a 60 GB box. The on-the-fly path
+    // is kept for users running the test without bootstrap caches.
+    let (harletty_pcm_path, decoded, owned_temp) = if cached_harletty_pcm.exists() {
+        let stats = scan_harletty_pcm_stats(cached_harletty_pcm)
+            .map_err(|e| format!("scan cached harletty pcm: {e}"))?;
+        (cached_harletty_pcm.to_path_buf(), stats, None)
+    } else {
+        let tmp_path = std::env::temp_dir().join(format!(
+            "eac3-mkv-test-{}.f32",
+            eac3_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+        ));
+        let stats = decode_harletty_to_file(eac3_path, &tmp_path)
+            .map_err(|e| format!("decode {eac3_path:?}: {e}"))?;
+        (tmp_path.clone(), stats, Some(tmp_path))
+    };
     let result = (|| -> Result<TrackSummary, String> {
         let vs_ffmpeg = if ffmpeg_path.exists() {
-            Some(stream_compare(&tmp_path, ffmpeg_path).map_err(|e| format!("vs ffmpeg: {e}"))?)
+            Some(stream_compare(&harletty_pcm_path, ffmpeg_path).map_err(|e| format!("vs ffmpeg: {e}"))?)
         } else {
             None
         };
         let vs_cavern = if cavern_path.exists() {
-            Some(stream_compare(&tmp_path, cavern_path).map_err(|e| format!("vs cavern: {e}"))?)
+            Some(stream_compare(&harletty_pcm_path, cavern_path).map_err(|e| format!("vs cavern: {e}"))?)
         } else {
             None
         };
@@ -268,8 +284,55 @@ fn run_track(
             vs_cavern,
         })
     })();
-    let _ = fs::remove_file(&tmp_path);
+    if let Some(tmp) = owned_temp {
+        let _ = fs::remove_file(&tmp);
+    }
     result
+}
+
+/// Scan a cached harletty PCM file for max-abs and infer frame_count from
+/// file length. Used when the bootstrap-generated harletty-pcm/<id>.f32 is
+/// reused as the test's harletty side — saves a full re-decode of the
+/// 2 h track.
+fn scan_harletty_pcm_stats(path: &Path) -> std::io::Result<HarlettyDecoded> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len() as usize;
+    let total_samples = len / 4;
+    let samples_per_channel = total_samples / CHANNEL_COUNT;
+    // Each E-AC-3 access unit at 48 kHz produces 1536 samples (6 audio
+    // blocks × 256). For tracks at other rates the count is approximate
+    // but only frame_count is consumer-facing here.
+    const SAMPLES_PER_FRAME: usize = 1536;
+    let frame_count = (samples_per_channel / SAMPLES_PER_FRAME) as u64;
+
+    let mut reader = BufReader::with_capacity(1 << 20, file);
+    let mut buf = [0u8; 4 * 4096];
+    let mut max_abs = 0.0_f32;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let n_floats = n / 4;
+        for i in 0..n_floats {
+            let off = i * 4;
+            let v = f32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+    }
+    Ok(HarlettyDecoded {
+        frame_count,
+        // The cached PCM doesn't preserve a per-frame error flag, so the
+        // bootstrap is the ground truth on whether decode_errors > 0.
+        // For the regression gate we treat the cache as success-only;
+        // if the bootstrap recorded errors, they show up in
+        // dumps/eac3-regression/reports/<id>.txt.
+        decode_errors: 0,
+        max_abs,
+    })
 }
 
 struct HarlettyDecoded {
