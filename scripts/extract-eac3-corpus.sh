@@ -90,12 +90,16 @@ if [[ -f $fp_file && -f $track_file ]]; then
 fi
 
 # Header dump first so it lands even if ffmpeg fails.
+# Capture ffprobe to a string and truncate with awk (no `exit`) to avoid
+# tripping pipefail with SIGPIPE when head/tail close the pipe early.
+ffprobe_dump=$(ffprobe -hide_banner -select_streams "a:$audio_index" \
+    -show_streams "$mkv_path" 2>&1 || true)
 {
     echo "# mkvmerge -i"
     mkvmerge -i "$mkv_path"
     echo
     echo "# ffprobe (selected audio stream)"
-    ffprobe -hide_banner -select_streams "a:$audio_index" -show_streams "$mkv_path" 2>&1 | head -80
+    printf '%s\n' "$ffprobe_dump" | awk 'NR<=80'
     echo
     echo "# extraction time: $(date --iso-8601=seconds)"
     echo "# source fingerprint: $source_fp"
