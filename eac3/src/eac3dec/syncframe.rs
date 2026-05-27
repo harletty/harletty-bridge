@@ -704,6 +704,25 @@ impl CoreDecodeState {
         self.lfe_imdct = None;
     }
 
+    /// Snapshot of `state.spx_in_use` at the end of the most recently
+    /// decoded block. Used by tools (e.g. `spx_probe`) to detect whether
+    /// a stream actually exercises Spectral Extension.
+    pub(crate) fn spx_in_use_snapshot(&self) -> bool {
+        self.block_syntax
+            .as_ref()
+            .map(|b| b.spx_in_use)
+            .unwrap_or(false)
+    }
+
+    /// Snapshot of `state.chinspx[ch]` at the end of the most recently
+    /// decoded block. Empty slice if no block has been decoded yet.
+    pub(crate) fn chinspx_snapshot(&self) -> &[bool] {
+        self.block_syntax
+            .as_ref()
+            .map(|b| b.chinspx.as_slice())
+            .unwrap_or(&[])
+    }
+
     fn reconfigure(&mut self, fullband_channels: usize, lfe_on: bool, sample_rate_index: usize) {
         let needs_reset = self.sample_rate_index != Some(sample_rate_index)
             || self.fullband_channels != fullband_channels

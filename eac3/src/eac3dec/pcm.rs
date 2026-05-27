@@ -118,6 +118,19 @@ impl PcmDecoder {
         self.frames_seen
     }
 
+    /// Whether the most recently decoded block had Spectral Extension
+    /// active (`spxinu == 1`). Useful for picking content that exercises
+    /// the SPX synthesis path.
+    pub fn last_spx_in_use(&self) -> bool {
+        self.core_state.spx_in_use_snapshot()
+    }
+
+    /// Per-channel SPX participation flags (`chinspx[ch]`) at the end of
+    /// the most recently decoded block. Empty before the first frame.
+    pub fn last_chinspx(&self) -> &[bool] {
+        self.core_state.chinspx_snapshot()
+    }
+
     /// Configure the metadata / aux diagnostic log level for this decoder instance.
     pub fn set_debug_log_level(&mut self, level: log::Level) {
         self.debug_log_level = level;
