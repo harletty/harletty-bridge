@@ -236,51 +236,58 @@ fn run_track(
     ffmpeg_path: &Path,
     cavern_path: &Path,
 ) -> Result<TrackSummary, String> {
-    let harletty_pcm = decode_harletty(eac3_path).map_err(|e| format!("decode {eac3_path:?}: {e}"))?;
-
-    let frame_count = harletty_pcm.frame_count;
-    let decode_errors = harletty_pcm.decode_errors;
-    let pcm_max_abs = harletty_pcm.max_abs;
-
-    let pcm = harletty_pcm.samples;
-
-    let vs_ffmpeg = if ffmpeg_path.exists() {
-        let ff = load_f32(ffmpeg_path).map_err(|e| format!("load ffmpeg pcm: {e}"))?;
-        Some(compare(&pcm, &ff))
-    } else {
-        None
-    };
-    let vs_cavern = if cavern_path.exists() {
-        let cv = load_f32(cavern_path).map_err(|e| format!("load cavern pcm: {e}"))?;
-        Some(compare(&pcm, &cv))
-    } else {
-        None
-    };
-
-    Ok(TrackSummary {
-        frame_count,
-        decode_errors,
-        pcm_max_abs,
-        vs_ffmpeg,
-        vs_cavern,
-    })
+    // Stream harletty PCM to a temp file so the comparison phase can
+    // mmap/stream-read it without materialising 11.5 GB in RAM (the full
+    // 2 h Dune track would OOM-kill a 60 GB box if loaded whole alongside
+    // the FFmpeg + Cavern oracles).
+    let tmp_path = std::env::temp_dir().join(format!(
+        "eac3-mkv-test-{}.f32",
+        eac3_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+    ));
+    let decoded = decode_harletty_to_file(eac3_path, &tmp_path)
+        .map_err(|e| format!("decode {eac3_path:?}: {e}"))?;
+    let result = (|| -> Result<TrackSummary, String> {
+        let vs_ffmpeg = if ffmpeg_path.exists() {
+            Some(stream_compare(&tmp_path, ffmpeg_path).map_err(|e| format!("vs ffmpeg: {e}"))?)
+        } else {
+            None
+        };
+        let vs_cavern = if cavern_path.exists() {
+            Some(stream_compare(&tmp_path, cavern_path).map_err(|e| format!("vs cavern: {e}"))?)
+        } else {
+            None
+        };
+        Ok(TrackSummary {
+            frame_count: decoded.frame_count,
+            decode_errors: decoded.decode_errors,
+            pcm_max_abs: decoded.max_abs,
+            vs_ffmpeg,
+            vs_cavern,
+        })
+    })();
+    let _ = fs::remove_file(&tmp_path);
+    result
 }
 
 struct HarlettyDecoded {
-    samples: Vec<f32>,
     frame_count: u64,
     decode_errors: u64,
     max_abs: f32,
 }
 
-fn decode_harletty(eac3_path: &Path) -> std::io::Result<HarlettyDecoded> {
+fn decode_harletty_to_file(eac3_path: &Path, out_path: &Path) -> std::io::Result<HarlettyDecoded> {
     let file = File::open(eac3_path)?;
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut buf = [0u8; 64 * 1024];
 
+    let out_file = File::create(out_path)?;
+    let mut writer = BufWriter::with_capacity(1 << 20, out_file);
+
     let mut decoder = PcmDecoder::new();
     let mut extractor = Extractor::default();
-    let mut samples: Vec<f32> = Vec::new();
     let mut frame_count = 0u64;
     let mut decode_errors = 0u64;
     let mut max_abs = 0.0_f32;
@@ -298,10 +305,7 @@ fn decode_harletty(eac3_path: &Path) -> std::io::Result<HarlettyDecoded> {
                 Ok(None) => break,
                 Err(_) => {
                     decode_errors += 1;
-                    samples.extend(std::iter::repeat_n(
-                        0.0_f32,
-                        last_core_samples * CHANNEL_COUNT,
-                    ));
+                    write_silence(&mut writer, last_core_samples)?;
                     break;
                 }
             };
@@ -309,18 +313,14 @@ fn decode_harletty(eac3_path: &Path) -> std::io::Result<HarlettyDecoded> {
                 Ok(result) => {
                     frame_count += 1;
                     last_core_samples = result.pcm.samples_per_channel().max(1);
-                    if let Some(m) = append_core_interleaved(&result.pcm, &mut samples) {
-                        if m > max_abs {
-                            max_abs = m;
-                        }
+                    let local_max = write_core_interleaved(&mut writer, &result.pcm)?;
+                    if local_max > max_abs {
+                        max_abs = local_max;
                     }
                 }
                 Err(_) => {
                     decode_errors += 1;
-                    samples.extend(std::iter::repeat_n(
-                        0.0_f32,
-                        last_core_samples * CHANNEL_COUNT,
-                    ));
+                    write_silence(&mut writer, last_core_samples)?;
                 }
             }
         }
@@ -328,19 +328,22 @@ fn decode_harletty(eac3_path: &Path) -> std::io::Result<HarlettyDecoded> {
             break;
         }
     }
+    writer.flush()?;
 
     Ok(HarlettyDecoded {
-        samples,
         frame_count,
         decode_errors,
         max_abs,
     })
 }
 
-fn append_core_interleaved(frame: &CorePcmFrame, out: &mut Vec<f32>) -> Option<f32> {
+fn write_core_interleaved(
+    writer: &mut BufWriter<File>,
+    frame: &CorePcmFrame,
+) -> std::io::Result<f32> {
     let nsamples = frame.samples_per_channel();
     if nsamples == 0 {
-        return None;
+        return Ok(0.0);
     }
     let order = [
         BedChannel::FrontLeft,
@@ -369,68 +372,89 @@ fn append_core_interleaved(frame: &CorePcmFrame, out: &mut Vec<f32>) -> Option<f
         slots[5].unwrap_or(&zero),
     ];
     let mut local_max = 0.0_f32;
-    out.reserve(nsamples * CHANNEL_COUNT);
     for i in 0..nsamples {
         for ch in &resolved {
             let v = ch.get(i).copied().unwrap_or(0.0);
             if v.abs() > local_max {
                 local_max = v.abs();
             }
-            out.push(v);
+            writer.write_all(&v.to_le_bytes())?;
         }
     }
-    Some(local_max)
+    Ok(local_max)
 }
 
-fn load_f32(path: &Path) -> std::io::Result<Vec<f32>> {
-    let file = File::open(path)?;
-    let len = file.metadata()?.len() as usize;
-    if !len.is_multiple_of(4) {
-        return Err(std::io::Error::other(format!(
-            "{}: size {} not a multiple of 4 bytes",
-            path.display(),
-            len
-        )));
+fn write_silence(writer: &mut BufWriter<File>, samples_per_channel: usize) -> std::io::Result<()> {
+    let zero = 0.0f32.to_le_bytes();
+    for _ in 0..(samples_per_channel * CHANNEL_COUNT) {
+        writer.write_all(&zero)?;
     }
-    let mut reader = BufReader::with_capacity(1 << 20, file);
-    let nsamples = len / 4;
-    let mut out = Vec::with_capacity(nsamples);
-    let mut buf = [0u8; 4];
-    for _ in 0..nsamples {
-        reader.read_exact(&mut buf)?;
-        out.push(f32::from_le_bytes(buf));
-    }
-    Ok(out)
+    Ok(())
 }
 
-fn compare(a: &[f32], b: &[f32]) -> Comparison {
-    let aligned_samples = a.len().min(b.len()) / CHANNEL_COUNT * CHANNEL_COUNT;
+fn stream_compare(a_path: &Path, b_path: &Path) -> std::io::Result<Comparison> {
+    let a_file = File::open(a_path)?;
+    let b_file = File::open(b_path)?;
+    let a_total = a_file.metadata()?.len() as usize / 4;
+    let b_total = b_file.metadata()?.len() as usize / 4;
+    let aligned_samples = a_total.min(b_total) / CHANNEL_COUNT * CHANNEL_COUNT;
+
+    let mut a_reader = BufReader::with_capacity(1 << 20, a_file);
+    let mut b_reader = BufReader::with_capacity(1 << 20, b_file);
+    const CHUNK: usize = 16_384 * CHANNEL_COUNT;
+    let mut a_buf = vec![0u8; CHUNK * 4];
+    let mut b_buf = vec![0u8; CHUNK * 4];
+
     let mut sum_sq = [0.0_f64; CHANNEL_COUNT];
     let mut max_abs_diff = 0.0_f32;
     let mut first_div_idx: Option<usize> = None;
-    for i in 0..aligned_samples {
-        let d = a[i] - b[i];
-        let abs = d.abs();
-        let ch = i % CHANNEL_COUNT;
-        sum_sq[ch] += (d as f64) * (d as f64);
-        if abs > max_abs_diff {
-            max_abs_diff = abs;
+    let mut consumed: usize = 0;
+
+    while consumed < aligned_samples {
+        let remaining = aligned_samples - consumed;
+        let this_chunk = remaining.min(CHUNK);
+        let bytes = this_chunk * 4;
+        a_reader.read_exact(&mut a_buf[..bytes])?;
+        b_reader.read_exact(&mut b_buf[..bytes])?;
+        for i in 0..this_chunk {
+            let off = i * 4;
+            let av = f32::from_le_bytes([
+                a_buf[off],
+                a_buf[off + 1],
+                a_buf[off + 2],
+                a_buf[off + 3],
+            ]);
+            let bv = f32::from_le_bytes([
+                b_buf[off],
+                b_buf[off + 1],
+                b_buf[off + 2],
+                b_buf[off + 3],
+            ]);
+            let d = av - bv;
+            let abs = d.abs();
+            let ch = i % CHANNEL_COUNT;
+            sum_sq[ch] += (d as f64) * (d as f64);
+            if abs > max_abs_diff {
+                max_abs_diff = abs;
+            }
+            if first_div_idx.is_none() && abs > TOLERANCE {
+                first_div_idx = Some(consumed + i);
+            }
         }
-        if first_div_idx.is_none() && abs > TOLERANCE {
-            first_div_idx = Some(i);
-        }
+        consumed += this_chunk;
     }
+
     let nframes = (aligned_samples / CHANNEL_COUNT).max(1) as f64;
     let mut rmse = [0.0_f64; CHANNEL_COUNT];
     for ch in 0..CHANNEL_COUNT {
         rmse[ch] = (sum_sq[ch] / nframes).sqrt();
     }
-    Comparison {
+    Ok(Comparison {
         aligned_samples,
         max_abs_diff,
         first_div_idx,
         per_channel_rmse: rmse,
-    }
+    })
 }
 
 fn find_workspace_root() -> Option<PathBuf> {
