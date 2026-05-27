@@ -246,8 +246,20 @@ impl AtmosBridge {
     }
 
     fn try_decode_pending_eac3_pair(&mut self) -> Option<bridge_api::RDecodedFrame> {
-        let core = self.pending_ac3_cores.pop_front()?;
-        let dependent = self.pending_dependent_frames.pop_front()?;
+        // Both queues must have a frame before we commit to popping either —
+        // otherwise an AC-3 core popped here without a partner is silently
+        // dropped when `?` short-circuits the function. On streams that
+        // deliver `[AC-3 core, E-AC-3 dep]` per packet (DD+ JOC with a
+        // backward-compat AC-3 core), the first try_pair after the core was
+        // queued ALWAYS hits the empty dep queue, losing the core. The next
+        // try_pair after the dep is queued then finds no core to pair with.
+        // Net effect: pair_attempts stays at 0 forever and is_spatial never
+        // flips to true.
+        if self.pending_ac3_cores.is_empty() || self.pending_dependent_frames.is_empty() {
+            return None;
+        }
+        let core = self.pending_ac3_cores.pop_front().unwrap();
+        let dependent = self.pending_dependent_frames.pop_front().unwrap();
         self.eac3_diag_stats.dependent_pair_attempts += 1;
         match process_eac3_dependent_frame_with_core(self, &dependent, core) {
             Ok(Some(decoded_frame)) => Some(decoded_frame),
@@ -421,6 +433,11 @@ impl FormatBridge for AtmosBridge {
             RInputTransport::Raw => {
                 #[cfg(feature = "bridge-perf")]
                 self.perf.note_raw_packet(data.len());
+                // One-shot diagnostic: log the first raw packet's first 64 bytes so we
+                // can correlate what the host (e.g. mpv-omniphony's ad_orender) feeds
+                // us against what the SPDIF path receives. Triggered only until the
+                // first frame is successfully decoded; cleared on reset so post-seek
+                // packets log again.
                 match self.resolve_raw_codec(data.as_slice()) {
                     RawCodec::Eac3 => {
                         self.eac3_active = true;
