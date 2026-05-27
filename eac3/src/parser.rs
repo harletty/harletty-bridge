@@ -5,6 +5,30 @@ const SAMPLE_RATES: [u32; 3] = [48_000, 44_100, 32_000];
 const HALF_SAMPLE_RATES: [u32; 3] = [24_000, 22_050, 16_000];
 const BLOCKS_PER_SYNCFRAME: [u8; 4] = [1, 2, 3, 6];
 
+/// Legacy AC-3 (bsid ≤ 10) frame size in 16-bit words, indexed by
+/// `frmsizecod >> 1` then `fscod`. Per ATSC A/52 §5.4.1.4 Table 5.18.
+const LEGACY_AC3_FRAME_SIZE_WORDS: [[usize; 3]; 19] = [
+    [64, 69, 96],
+    [80, 87, 120],
+    [96, 104, 144],
+    [112, 121, 168],
+    [128, 139, 192],
+    [160, 174, 240],
+    [192, 208, 288],
+    [224, 243, 336],
+    [256, 278, 384],
+    [320, 348, 480],
+    [384, 417, 576],
+    [448, 487, 672],
+    [512, 557, 768],
+    [640, 696, 960],
+    [768, 835, 1152],
+    [896, 975, 1344],
+    [1024, 1114, 1536],
+    [1152, 1253, 1728],
+    [1280, 1393, 1920],
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
     InsufficientData,
@@ -102,6 +126,55 @@ impl FrameInfo {
     pub fn bitrate(self) -> u32 {
         ((self.frame_size as u64 * 8 * self.sample_rate as u64) / self.samples as u64) as u32
     }
+}
+
+/// Parse a legacy AC-3 syncframe header (bsid ≤ 10).
+///
+/// AC-3 and E-AC-3 share the 0x0B77 syncword and place `bsid` at the same
+/// bit position (40-44), but disagree on the fields before bit 40 — AC-3
+/// carries `crc1` + `fscod` + `frmsizecod` where E-AC-3 carries
+/// `strmtyp` + `substreamid` + `frmsiz`. This entry point exists so the
+/// raw transport extractor (which sees a mixed AC-3 / E-AC-3 stream from
+/// dual-stream MKV tracks) can frame both. Channel-shape fields are filled
+/// with placeholders; downstream consumers re-parse the full AC-3 header
+/// (see `is_legacy_ac3_frame` in the bridge) so this only has to be
+/// correct for the framing layer.
+pub fn parse_legacy_ac3_header(data: &[u8]) -> Result<FrameInfo, ParseError> {
+    if data.len() < MIN_HEADER_BYTES {
+        return Err(ParseError::InsufficientData);
+    }
+    if data[0] != ((SYNCWORD >> 8) as u8) || data[1] != (SYNCWORD as u8) {
+        return Err(ParseError::InvalidSyncword);
+    }
+    let bitstream_id = (data[5] >> 3) & 0x1F;
+    if bitstream_id > 10 {
+        return Err(ParseError::UnsupportedBitstreamId(bitstream_id));
+    }
+    let fscod = data[4] >> 6;
+    let frmsizecod = data[4] & 0x3F;
+    let bitrate_index = usize::from(frmsizecod >> 1);
+    let sample_rate = SAMPLE_RATES
+        .get(usize::from(fscod))
+        .copied()
+        .ok_or(ParseError::ReservedSampleRateCode)?;
+    let frame_size = LEGACY_AC3_FRAME_SIZE_WORDS
+        .get(bitrate_index)
+        .and_then(|row| row.get(usize::from(fscod)).copied())
+        .ok_or(ParseError::ReservedSampleRateCode)?
+        * 2;
+    Ok(FrameInfo {
+        stream_type: StreamType::Independent,
+        substream_id: 0,
+        frame_size,
+        sample_rate_code: SampleRateCode::Full(fscod),
+        sample_rate,
+        num_blocks: 6,
+        samples: 1536,
+        // Placeholders — downstream uses is_legacy_ac3_frame to re-parse.
+        channel_mode: ChannelMode::Mono,
+        lfe: false,
+        bitstream_id,
+    })
 }
 
 pub fn parse_header(data: &[u8]) -> Result<FrameInfo, ParseError> {
