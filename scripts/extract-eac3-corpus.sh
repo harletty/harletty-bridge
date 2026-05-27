@@ -49,9 +49,13 @@ if [[ -z $forced_index ]]; then
     fi
     # mkvmerge "id" is the track id within the matroska container; mapping to
     # ffmpeg stream index requires asking ffprobe directly.
-    audio_index=$(ffprobe -v error -select_streams a -show_entries 'stream=index,codec_name' \
-        -of csv=p=0 "$mkv_path" \
-        | awk -F, '$2=="eac3"{print NR-1; exit}')
+    # Note: awk's `exit` would close the pipe early and trip pipefail with
+    # ffprobe getting SIGPIPE (141). Read the whole list, then grep first.
+    ffprobe_streams=$(ffprobe -v error -select_streams a \
+        -show_entries 'stream=index,codec_name' \
+        -of csv=p=0 "$mkv_path")
+    audio_index=$(printf '%s\n' "$ffprobe_streams" \
+        | awk -F, 'BEGIN{i=0} $2=="eac3"{print i; found=1; exit} {i++} END{if(!found) exit 1}')
     if [[ -z $audio_index ]]; then
         echo "ffprobe could not find an eac3 stream in $mkv_path" >&2
         exit 65
