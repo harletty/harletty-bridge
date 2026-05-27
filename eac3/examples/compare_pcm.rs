@@ -16,6 +16,12 @@
 //! - global max-abs diff
 //! - first-divergence sample index above the tolerance
 //!
+//! Streaming: reads ~16384 samples per channel at a time from each file,
+//! computes diffs incrementally, never materialises the full vectors.
+//! Each pairing is a single pass over both files. The full 2h Dune track
+//! produces 11.5 GB f32 files, which would OOM a 60 GB box if loaded
+//! whole for all three pairings (34 GB Vec<f32> peak).
+//!
 //! Usage:
 //!     cargo run --release --example compare_pcm -p eac3 -- \
 //!         --harletty path/to/harletty.f32 \
@@ -27,6 +33,8 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+const CHUNK_SAMPLES_PER_CHANNEL: usize = 16_384;
 
 struct Args {
     harletty: PathBuf,
@@ -89,117 +97,149 @@ fn main() -> ExitCode {
         }
     };
 
-    let harletty = match load_f32(&args.harletty) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("load harletty: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let ffmpeg = match load_f32(&args.ffmpeg) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("load ffmpeg: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let cavern = match args.cavern.as_deref().map(load_f32).transpose() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("load cavern: {e}");
-            return ExitCode::FAILURE;
-        }
+    if args.channels == 0 {
+        eprintln!("--channels must be > 0");
+        return ExitCode::FAILURE;
+    }
+
+    let pairings: &[(&str, &Path, &Path)] = match args.cavern.as_deref() {
+        Some(cav) => &[
+            ("harletty vs ffmpeg", &args.harletty, &args.ffmpeg),
+            ("harletty vs cavern", &args.harletty, cav),
+            ("ffmpeg vs cavern", &args.ffmpeg, cav),
+        ],
+        None => &[("harletty vs ffmpeg", &args.harletty, &args.ffmpeg)],
     };
 
-    print_diff(
-        "harletty vs ffmpeg",
-        &harletty,
-        &ffmpeg,
-        args.channels,
-        args.tolerance,
-    );
-    if let Some(cav) = cavern.as_deref() {
-        print_diff(
-            "harletty vs cavern",
-            &harletty,
-            cav,
-            args.channels,
-            args.tolerance,
-        );
-        print_diff(
-            "ffmpeg vs cavern",
-            &ffmpeg,
-            cav,
-            args.channels,
-            args.tolerance,
-        );
+    for (label, a, b) in pairings {
+        match stream_diff(a, b, args.channels, args.tolerance) {
+            Ok(report) => print_report(label, &report, args.channels, args.tolerance),
+            Err(e) => {
+                eprintln!("[{label}] {e}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     ExitCode::SUCCESS
 }
 
-fn load_f32(path: &Path) -> std::io::Result<Vec<f32>> {
-    let file = File::open(path)?;
-    let len = file.metadata()?.len() as usize;
-    if !len.is_multiple_of(4) {
-        return Err(std::io::Error::other(format!(
-            "{}: size {} not a multiple of 4 bytes",
-            path.display(),
-            len
-        )));
-    }
-    let mut reader = BufReader::with_capacity(1 << 20, file);
-    let nsamples = len / 4;
-    let mut out = Vec::with_capacity(nsamples);
-    let mut buf = [0u8; 4];
-    for _ in 0..nsamples {
-        reader.read_exact(&mut buf)?;
-        out.push(f32::from_le_bytes(buf));
-    }
-    Ok(out)
+#[derive(Debug)]
+struct Report {
+    aligned_samples: usize,
+    a_excess: usize,
+    b_excess: usize,
+    max_abs_diff: f32,
+    max_abs_idx: usize,
+    first_div_idx: Option<usize>,
+    sum_sq_per_channel: Vec<f64>,
 }
 
-fn print_diff(label: &str, a: &[f32], b: &[f32], channels: usize, tolerance: f32) {
-    if channels == 0 {
-        eprintln!("{label}: channels=0, skipped");
-        return;
+fn stream_diff(
+    a_path: &Path,
+    b_path: &Path,
+    channels: usize,
+    tolerance: f32,
+) -> std::io::Result<Report> {
+    let a_file = File::open(a_path)?;
+    let b_file = File::open(b_path)?;
+    let a_len = a_file.metadata()?.len() as usize;
+    let b_len = b_file.metadata()?.len() as usize;
+    if !a_len.is_multiple_of(4) {
+        return Err(std::io::Error::other(format!(
+            "{}: size {} not multiple of 4",
+            a_path.display(),
+            a_len
+        )));
     }
-    let aligned_samples = a.len().min(b.len()) / channels * channels;
-    let nframes = aligned_samples / channels;
+    if !b_len.is_multiple_of(4) {
+        return Err(std::io::Error::other(format!(
+            "{}: size {} not multiple of 4",
+            b_path.display(),
+            b_len
+        )));
+    }
+    let a_samples_total = a_len / 4;
+    let b_samples_total = b_len / 4;
+    let aligned_samples = a_samples_total.min(b_samples_total) / channels * channels;
+
+    let mut a_reader = BufReader::with_capacity(1 << 20, a_file);
+    let mut b_reader = BufReader::with_capacity(1 << 20, b_file);
+
+    let chunk_samples = CHUNK_SAMPLES_PER_CHANNEL * channels;
+    let mut a_chunk = vec![0u8; chunk_samples * 4];
+    let mut b_chunk = vec![0u8; chunk_samples * 4];
+
     let mut sum_sq = vec![0.0_f64; channels];
     let mut max_abs_diff = 0.0_f32;
     let mut max_abs_idx = 0usize;
     let mut first_div_idx: Option<usize> = None;
+    let mut consumed: usize = 0;
 
-    for i in 0..aligned_samples {
-        let diff = a[i] - b[i];
-        let abs = diff.abs();
-        let ch = i % channels;
-        sum_sq[ch] += (diff as f64) * (diff as f64);
-        if abs > max_abs_diff {
-            max_abs_diff = abs;
-            max_abs_idx = i;
+    while consumed < aligned_samples {
+        let remaining = aligned_samples - consumed;
+        let this_chunk = remaining.min(chunk_samples);
+        let bytes = this_chunk * 4;
+        a_reader.read_exact(&mut a_chunk[..bytes])?;
+        b_reader.read_exact(&mut b_chunk[..bytes])?;
+
+        for i in 0..this_chunk {
+            let off = i * 4;
+            let av = f32::from_le_bytes([
+                a_chunk[off],
+                a_chunk[off + 1],
+                a_chunk[off + 2],
+                a_chunk[off + 3],
+            ]);
+            let bv = f32::from_le_bytes([
+                b_chunk[off],
+                b_chunk[off + 1],
+                b_chunk[off + 2],
+                b_chunk[off + 3],
+            ]);
+            let diff = av - bv;
+            let abs = diff.abs();
+            let ch = i % channels;
+            sum_sq[ch] += (diff as f64) * (diff as f64);
+            if abs > max_abs_diff {
+                max_abs_diff = abs;
+                max_abs_idx = consumed + i;
+            }
+            if first_div_idx.is_none() && abs > tolerance {
+                first_div_idx = Some(consumed + i);
+            }
         }
-        if first_div_idx.is_none() && abs > tolerance {
-            first_div_idx = Some(i);
-        }
+        consumed += this_chunk;
     }
 
-    let a_excess = a.len().saturating_sub(aligned_samples);
-    let b_excess = b.len().saturating_sub(aligned_samples);
+    Ok(Report {
+        aligned_samples,
+        a_excess: a_samples_total.saturating_sub(aligned_samples),
+        b_excess: b_samples_total.saturating_sub(aligned_samples),
+        max_abs_diff,
+        max_abs_idx,
+        first_div_idx,
+        sum_sq_per_channel: sum_sq,
+    })
+}
 
+fn print_report(label: &str, r: &Report, channels: usize, tolerance: f32) {
+    let nframes = r.aligned_samples / channels;
     println!("=== {label} ===");
-    println!("aligned samples: {aligned_samples} ({nframes} per-channel frames, {channels} ch)");
-    println!("trailing unmatched: a+{a_excess} b+{b_excess}");
+    println!(
+        "aligned samples: {} ({} per-channel frames, {} ch)",
+        r.aligned_samples, nframes, channels
+    );
+    println!("trailing unmatched: a+{} b+{}", r.a_excess, r.b_excess);
     println!("tolerance: {tolerance:.3e}");
     println!(
         "max |a-b|: {:.6e}  at sample {} (ch {}, frame {})",
-        max_abs_diff,
-        max_abs_idx,
-        max_abs_idx % channels,
-        max_abs_idx / channels
+        r.max_abs_diff,
+        r.max_abs_idx,
+        r.max_abs_idx % channels,
+        r.max_abs_idx / channels
     );
-    match first_div_idx {
+    match r.first_div_idx {
         Some(idx) => println!(
             "first divergence above tolerance: sample {} (ch {}, frame {})",
             idx,
@@ -209,9 +249,9 @@ fn print_diff(label: &str, a: &[f32], b: &[f32], channels: usize, tolerance: f32
         None => println!("no sample exceeds tolerance"),
     }
     print!("per-channel RMSE:");
+    let denom = (nframes as f64).max(1.0);
     for ch in 0..channels {
-        let denom = (nframes as f64).max(1.0);
-        let rmse = (sum_sq[ch] / denom).sqrt();
+        let rmse = (r.sum_sq_per_channel[ch] / denom).sqrt();
         print!(" ch{ch}={rmse:.6e}");
     }
     println!();
