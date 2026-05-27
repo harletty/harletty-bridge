@@ -6,6 +6,11 @@
 #   That matches harletty's CorePcmFrame order (fullband_channels +
 #   lfe_channel) for a 5.1 side bed.
 #
+# `-drc_scale 0` disables FFmpeg's default dynamic-range compression
+# (applied via the dynrng word per audblk). harletty and Cavern don't
+# apply DRC, so leaving it on inflates the cross-decoder RMSE by 1.7e-4
+# on LFE → 5.4e-4 on surrounds (verified on Dune Part Two 30 s slice).
+#
 # Usage:
 #   decode-ffmpeg-pcm.sh <input.eac3> <output.f32>
 
@@ -25,6 +30,7 @@ if [[ ! -f $input ]]; then
 fi
 
 ffmpeg -y -hide_banner -loglevel error \
+    -drc_scale 0 \
     -i "$input" \
     -f f32le -c:a pcm_f32le \
     -channel_layout 5.1\(side\) -ac 6 \
