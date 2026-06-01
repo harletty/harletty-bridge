@@ -23,6 +23,7 @@ spdif = { version = "0.1.0", path = "../Omniphony/omniphony-renderer/spdif" }
 sys = { version = "0.1.0", path = "../Omniphony/omniphony-renderer/sys" }
 truehd = { version = "0.5.0", path = "truehd" }
 eac3 = { version = "0.5.0", path = "eac3" }
+dca = { version = "0.1.0", path = "dca" }
 abi_stable = "0.11"
 log = "0.4"
 anyhow = "1.0"

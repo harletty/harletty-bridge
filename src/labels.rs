@@ -33,6 +33,25 @@ pub(crate) fn channel_label_to_r(label: &ChannelLabel) -> RChannelLabel {
 }
 
 /// Convert an E-AC3 `BedChannel` to its ABI-stable counterpart.
+/// Map a DCA (DTS) bed channel to the renderer's channel label. DTS core beds
+/// cover the 5.1/7.1 layout; the renderer places each at its canonical speaker.
+pub(crate) fn dca_bed_channel_to_r(ch: dca::BedChannel) -> RChannelLabel {
+    use dca::BedChannel;
+    match ch {
+        BedChannel::FrontLeft => RChannelLabel::L,
+        BedChannel::FrontRight => RChannelLabel::R,
+        BedChannel::Center => RChannelLabel::C,
+        BedChannel::LowFrequencyEffects => RChannelLabel::LFE,
+        BedChannel::SurroundLeft => RChannelLabel::Ls,
+        BedChannel::SurroundRight => RChannelLabel::Rs,
+        BedChannel::RearCenter => RChannelLabel::Cb,
+        BedChannel::RearLeft => RChannelLabel::Lb,
+        BedChannel::RearRight => RChannelLabel::Rb,
+        BedChannel::WideLeft => RChannelLabel::Lw,
+        BedChannel::WideRight => RChannelLabel::Rw,
+    }
+}
+
 pub(crate) fn bed_channel_to_r(ch: eac3::BedChannel) -> RChannelLabel {
     use eac3::BedChannel;
     match ch {
