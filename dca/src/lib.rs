@@ -11,6 +11,7 @@ mod bitstream;
 #[cfg(test)]
 mod bitstream_writer;
 
+mod dcadec;
 pub mod extract;
 pub mod parser;
 mod pcm;
