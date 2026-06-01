@@ -272,6 +272,7 @@ dependencies = [
  "abi_stable",
  "anyhow",
  "bridge_api",
+ "dca",
  "eac3",
  "libc",
  "log",
