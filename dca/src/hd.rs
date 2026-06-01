@@ -35,6 +35,15 @@ pub struct HdFrame {
     pub output_mask: u32,
     /// `samples[spkr]` = Some(f32 PCM in [-1, 1]) for active speakers.
     pub samples: Vec<Option<Vec<f32>>>,
+    /// DTS:X end-of-frame extension present (`0x02000850`).
+    pub x_present: bool,
+    /// DTS:X IMAX variant present.
+    pub x_imax: bool,
+    /// Raw DTS:X extension payload (syncword + data) for diagnostics. Empty when
+    /// no extension is present.
+    pub x_payload: Vec<u8>,
+    /// Byte offset of `x_payload` within the XLL frame.
+    pub x_payload_offset: usize,
 }
 
 /// Size in bytes of the EXSS substream starting at `data` (which must begin at
@@ -94,6 +103,10 @@ impl HdDecoder {
             sample_rate: self.xll.sample_rate,
             output_mask: self.xll.output_mask,
             samples,
+            x_present: self.xll.x_syncword_present,
+            x_imax: self.xll.x_imax_syncword_present,
+            x_payload: std::mem::take(&mut self.xll.x_payload),
+            x_payload_offset: self.xll.x_payload_offset,
         })
     }
 }
