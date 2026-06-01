@@ -1,5 +1,5 @@
 [workspace]
-members = ["truehd", "eac3"]
+members = ["truehd", "eac3", "dca"]
 resolver = "2"
 
 [package]
