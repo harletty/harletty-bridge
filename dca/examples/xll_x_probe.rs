@@ -50,6 +50,18 @@ fn main() {
     let mut word_count: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     // Recurring value per dword-offset within the payload (after the syncword).
     let mut per_off: Vec<std::collections::HashMap<u32, u64>> = Vec::new();
+    // Exact byte-level fixed prefix shared by ALL payloads, and per-byte modal
+    // value over the first PREFIX_SCAN positions (to locate the divergence point).
+    const PREFIX_SCAN: usize = 96;
+    let mut common: Vec<u8> = Vec::new(); // first payload's bytes (prefix shrinks into it)
+    let mut prefix_len = usize::MAX;
+    let mut per_byte: Vec<std::collections::HashMap<u8, u64>> = Vec::new();
+    // Per-frame audio energy of the decoded 7.1 bed, for size↔activity correlation.
+    // DCA speaker indices (from the regression mapping): 0=C 1=L 2=R 3=Ls 4=Rs
+    // 5=LFE 7=Lsr(BL) 8=Rsr(BR). Surround/back = {3,4,7,8} ≈ immersive activity.
+    const SURR: [usize; 4] = [3, 4, 7, 8];
+    let mut total_rms: Vec<f64> = Vec::new();
+    let mut surr_rms: Vec<f64> = Vec::new();
 
     while off + 18 < bytes.len() {
         let core = match parse_header(&bytes[off..]) {
@@ -77,6 +89,44 @@ fn main() {
                     let p = &fr.x_payload;
                     sizes.push(p.len());
                     offsets.push(fr.x_payload_offset);
+
+                    // Per-frame bed energy (RMS over active channels) + surround.
+                    let mut tot = 0f64;
+                    let mut sur = 0f64;
+                    let mut nsamp = 0usize;
+                    for (spk, ch) in fr.samples.iter().enumerate() {
+                        if let Some(v) = ch {
+                            nsamp = v.len();
+                            let e: f64 = v.iter().map(|&s| (s as f64) * (s as f64)).sum();
+                            tot += e;
+                            if SURR.contains(&spk) {
+                                sur += e;
+                            }
+                        }
+                    }
+                    let nn = nsamp.max(1) as f64;
+                    total_rms.push((tot / nn).sqrt());
+                    surr_rms.push((sur / nn).sqrt());
+
+                    // Exact fixed-prefix tracking + per-byte modal value.
+                    if common.is_empty() {
+                        common = p.clone();
+                        prefix_len = p.len();
+                    } else {
+                        let lim = prefix_len.min(p.len());
+                        let mut l = 0;
+                        while l < lim && p[l] == common[l] {
+                            l += 1;
+                        }
+                        prefix_len = l;
+                    }
+                    for (i, &b) in p.iter().take(PREFIX_SCAN).enumerate() {
+                        if per_byte.len() <= i {
+                            per_byte.resize(i + 1, std::collections::HashMap::new());
+                        }
+                        *per_byte[i].entry(b).or_insert(0) += 1;
+                    }
+
                     for &b in p {
                         byte_hist[b as usize] += 1;
                     }
@@ -182,6 +232,49 @@ fn main() {
         );
     }
 
+    // Exact fixed prefix shared by every payload.
+    println!(
+        "\n=== fixed header: {prefix_len} bytes identical in ALL {} frames ===",
+        sizes.len()
+    );
+    hexdump(&common[..prefix_len.min(common.len())], prefix_len.min(common.len()));
+    // Per-byte modal stability around the divergence point.
+    println!("per-byte modal value / stability (first {PREFIX_SCAN} positions):");
+    for (i, m) in per_byte.iter().enumerate() {
+        let (val, cnt) = m.iter().max_by_key(|(_, c)| **c).unwrap();
+        let frac = 100.0 * *cnt as f64 / sizes.len() as f64;
+        let mark = if i == prefix_len { "  <-- first byte that varies" } else { "" };
+        // Only print the boundary region + any near-constant bytes to keep it short.
+        if (prefix_len.saturating_sub(2)..prefix_len + 8).contains(&i) || frac > 95.0 {
+            println!("  byte {i:>3}: 0x{val:02x} in {frac:>5.1}% ({} distinct){mark}", m.len());
+        }
+    }
+
+    // Size ↔ scene-activity correlation.
+    println!("\n=== payload size ↔ audio activity ===");
+    let pr_tot = pearson(&sizes_f64(&sizes), &total_rms, 0);
+    let pr_sur = pearson(&sizes_f64(&sizes), &surr_rms, 0);
+    println!("Pearson r(payload_len, total bed RMS)      = {pr_tot:+.3}");
+    println!("Pearson r(payload_len, surround/back RMS)  = {pr_sur:+.3}");
+    println!("lag sweep r(payload_len, surround RMS), payload leading audio by k frames:");
+    for k in -4i64..=4 {
+        let r = pearson(&sizes_f64(&sizes), &surr_rms, k);
+        println!("  lag {k:+}: {r:+.3}");
+    }
+    // Terciles of surround energy → mean payload size (monotone relationship?).
+    {
+        let mut idx: Vec<usize> = (0..surr_rms.len()).collect();
+        idx.sort_by(|&a, &b| surr_rms[a].partial_cmp(&surr_rms[b]).unwrap());
+        let t = idx.len() / 3;
+        let mean = |sl: &[usize]| sl.iter().map(|&i| sizes[i] as f64).sum::<f64>() / sl.len() as f64;
+        println!(
+            "mean payload by surround-energy tercile: low={:.0}B  mid={:.0}B  high={:.0}B",
+            mean(&idx[..t]),
+            mean(&idx[t..2 * t]),
+            mean(&idx[2 * t..])
+        );
+    }
+
     // Hexdump first few payloads.
     println!("\n=== first {} payloads (hex) ===", first_payloads.len());
     for (k, p) in first_payloads.iter().enumerate() {
@@ -193,12 +286,43 @@ fn main() {
     if let Some(path) = csv_out {
         use std::io::Write;
         let mut w = std::fs::File::create(&path).expect("create csv");
-        writeln!(w, "frame_index,payload_len,payload_offset").unwrap();
-        for (i, (s, o)) in sizes.iter().zip(offsets.iter()).enumerate() {
-            writeln!(w, "{i},{s},{o}").unwrap();
+        writeln!(w, "frame_index,payload_len,payload_offset,total_rms,surr_rms").unwrap();
+        for i in 0..sizes.len() {
+            writeln!(
+                w,
+                "{i},{},{},{:.6e},{:.6e}",
+                sizes[i], offsets[i], total_rms[i], surr_rms[i]
+            )
+            .unwrap();
         }
         println!("\nwrote per-frame CSV to {path}");
     }
+}
+
+fn sizes_f64(sizes: &[usize]) -> Vec<f64> {
+    sizes.iter().map(|&s| s as f64).collect()
+}
+
+/// Pearson correlation of `x[i]` against `y[i+lag]` over the overlapping range.
+fn pearson(x: &[f64], y: &[f64], lag: i64) -> f64 {
+    let n = x.len().min(y.len());
+    let (mut sx, mut sy, mut sxx, mut syy, mut sxy, mut m) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+    for i in 0..n {
+        let j = i as i64 + lag;
+        if j < 0 || j as usize >= n {
+            continue;
+        }
+        let (a, b) = (x[i], y[j as usize]);
+        sx += a;
+        sy += b;
+        sxx += a * a;
+        syy += b * b;
+        sxy += a * b;
+        m += 1.0;
+    }
+    let cov = m * sxy - sx * sy;
+    let den = ((m * sxx - sx * sx) * (m * syy - sy * sy)).sqrt();
+    if den == 0.0 { 0.0 } else { cov / den }
 }
 
 fn hexdump(data: &[u8], max: usize) {
