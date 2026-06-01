@@ -2,33 +2,43 @@
 //
 // DCA core PCM decoder. The public shape mirrors `eac3::PcmDecoder` /
 // `eac3::CorePcmFrame` so the bridge can drive both through one code path.
-//
-// STATUS: framing + header parse + channel-layout mapping are implemented and
-// tested. The subband DSP decode (bit allocation, scale factors, high-frequency
-// VQ, ADPCM prediction, 32-band QMF synthesis) is ported in `dcadec/` and wired
-// here incrementally. Until that lands, `push_access_unit` returns a
-// correctly-shaped frame with `decoded == false` (silence), never fabricated
-// audio, so callers can gate on it.
+// Decodes the DTS core (5.1 lossy bed) end to end: header -> subband decode
+// (core.rs) -> fixed-point QMF synthesis (synth.rs) -> f32 PCM.
 
+use crate::dcadec::core::{CoreDecoder, CoreError, primary_bed_layout};
+use crate::dcadec::synth::SynthState;
 use crate::parser::{AudioMode, FrameInfo, ParseError, parse_header};
 use crate::types::BedChannel;
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
     #[error(transparent)]
     Header(#[from] ParseError),
+    #[error("bitstream underrun during core decode")]
+    Bitstream,
+    #[error("invalid core data: {0}")]
+    Invalid(&'static str),
+}
+
+impl From<CoreError> for DecodeError {
+    fn from(e: CoreError) -> Self {
+        match e {
+            CoreError::Bitstream => DecodeError::Bitstream,
+            CoreError::Invalid(s) => DecodeError::Invalid(s),
+        }
+    }
 }
 
 /// Decoded core-channel PCM for one access unit. Layout matches
-/// `eac3::CorePcmFrame`, plus a `decoded` flag (false while only the header has
-/// been parsed and the samples are silence placeholders).
+/// `eac3::CorePcmFrame`. `fullband_channels` are in DCA primary-channel order,
+/// each paired with its `fullband_channel_order` bed label.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorePcmFrame {
     pub sample_rate: u32,
     pub fullband_channel_order: Vec<BedChannel>,
     pub fullband_channels: Vec<Vec<f32>>,
     pub lfe_channel: Option<Vec<f32>>,
-    /// True once the subband DSP path produces real samples (not silence).
+    /// True once real samples were produced (always true on the decode path).
     pub decoded: bool,
 }
 
@@ -53,29 +63,18 @@ pub struct PcmPushResult {
     pub pcm: CorePcmFrame,
 }
 
-/// Map a DCA core audio mode to the bridge bed-channel order. ffmpeg emits WAV
-/// order via `ff_dca_set_channel_layout`; for the supported beds that is:
-///   5.1 (3F2R + LFE): FL FR FC LFE BL BR  (LFE handled separately)
-/// The non-LFE fullband order returned here is the per-channel decode order
-/// remapped to WAV speaker order.
+/// Map a DCA core audio mode to the (WAV-order) bed-channel set. Retained for
+/// callers that want the canonical layout; the decode path uses
+/// `core::primary_bed_layout` to match synthesized channel order.
 pub fn bed_layout(mode: AudioMode) -> Vec<BedChannel> {
-    use BedChannel::*;
-    match mode {
-        AudioMode::Mono => vec![Center],
-        AudioMode::MonoDual | AudioMode::Stereo | AudioMode::StereoSumDiff | AudioMode::StereoTotal => {
-            vec![FrontLeft, FrontRight]
-        }
-        AudioMode::ThreeF => vec![FrontLeft, FrontRight, Center],
-        AudioMode::TwoF1R => vec![FrontLeft, FrontRight, RearCenter],
-        AudioMode::ThreeF1R => vec![FrontLeft, FrontRight, Center, RearCenter],
-        AudioMode::TwoF2R => vec![FrontLeft, FrontRight, SurroundLeft, SurroundRight],
-        AudioMode::ThreeF2R => vec![FrontLeft, FrontRight, Center, SurroundLeft, SurroundRight],
-    }
+    primary_bed_layout(mode)
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct PcmDecoder {
     frames_seen: u64,
+    core: CoreDecoder,
+    synth: SynthState,
 }
 
 impl PcmDecoder {
@@ -85,33 +84,30 @@ impl PcmDecoder {
 
     pub fn reset(&mut self) {
         self.frames_seen = 0;
+        self.core.reset();
+        self.synth.reset();
     }
 
     pub fn frames_seen(&self) -> u64 {
         self.frames_seen
     }
 
-    /// Parse one core access unit and produce a PCM frame. See module status:
-    /// currently the frame is correctly shaped silence (`pcm.decoded == false`)
-    /// until the subband DSP decode is wired in.
+    /// Decode one core access unit into PCM.
     pub fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<PcmPushResult, DecodeError> {
         let info = parse_header(access_unit)?;
+        self.core.decode_frame(&info, access_unit)?;
+        let (fullband_channels, lfe_channel) = self.synth.synthesize(&mut self.core);
         self.frames_seen += 1;
-
-        let order = bed_layout(info.audio_mode);
-        let samples = info.samples_per_channel();
-        let fullband_channels = vec![vec![0.0f32; samples]; order.len()];
-        let lfe_channel = info.has_lfe().then(|| vec![0.0f32; samples]);
 
         Ok(PcmPushResult {
             frames_seen: self.frames_seen,
             info,
             pcm: CorePcmFrame {
                 sample_rate: info.sample_rate,
-                fullband_channel_order: order,
+                fullband_channel_order: primary_bed_layout(info.audio_mode),
                 fullband_channels,
                 lfe_channel,
-                decoded: false,
+                decoded: true,
             },
         })
     }

@@ -28,8 +28,9 @@ pub const SAMPLE_RATES: [u32; 16] = [
 pub const BITS_PER_SAMPLE: [u8; 8] = [16, 16, 20, 20, 0, 24, 24, 0];
 
 /// DCA core audio channel arrangement (`enum DCACoreAudioMode`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AudioMode {
+    #[default]
     Mono,        // 0: A
     MonoDual,    // 1: A + B
     Stereo,      // 2: L + R
