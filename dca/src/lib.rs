@@ -13,6 +13,7 @@ mod bitstream_writer;
 
 mod dcadec;
 pub mod extract;
+pub mod hd;
 pub mod parser;
 mod pcm;
 mod types;
@@ -22,5 +23,6 @@ pub use parser::{
     AudioMode, FrameInfo, ParseError as HeaderParseError, SYNCWORD_CORE_BE, SYNCWORD_SUBSTREAM,
     parse_header,
 };
+pub use hd::{HdDecoder, HdError, HdFrame};
 pub use pcm::{CorePcmFrame, DecodeError, PcmDecoder, PcmPushResult, bed_layout};
 pub use types::BedChannel;

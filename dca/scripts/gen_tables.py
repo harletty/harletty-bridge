@@ -77,6 +77,12 @@ DATA_TABLES = [
     ("LFE_FIR_64_FIXED", "ff_dca_lfe_fir_64_fixed", "[i32; 256]"),
     ("LFE_FIR_64_FLOAT", "ff_dca_lfe_fir_64", "[f32; 256]"),
     ("ADPCM_VB", "ff_dca_adpcm_vb", "[[i16; 4]; 4096]"),
+    # XLL (DTS-HD MA lossless) + downmix tables.
+    ("DMIX_PRIMARY_NCH", "ff_dca_dmix_primary_nch", "[u8; 8]"),
+    ("DMIXTABLE", "ff_dca_dmixtable", "[u16; 242]"),
+    ("INV_DMIXTABLE", "ff_dca_inv_dmixtable", "[u32; 201]"),
+    ("XLL_REFL_COEFF", "ff_dca_xll_refl_coeff", "[u16; 128]"),
+    ("XLL_BAND_COEFF", "ff_dca_xll_band_coeff", "[i32; 20]"),
 ]
 
 # Huffman metadata from dcahuff.c

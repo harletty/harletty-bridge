@@ -25,6 +25,62 @@ const DCA_CHANNELS: usize = 7;
 
 const BLOCK_CODE_NBITS: [u8; 7] = [7, 10, 12, 13, 15, 17, 19];
 
+// DCA speaker enum indices (`enum DCASpeaker`); mask bit = 1 << index.
+pub(crate) const DCA_SPEAKER_C: usize = 0;
+pub(crate) const DCA_SPEAKER_L: usize = 1;
+pub(crate) const DCA_SPEAKER_R: usize = 2;
+pub(crate) const DCA_SPEAKER_LS: usize = 3;
+pub(crate) const DCA_SPEAKER_RS: usize = 4;
+pub(crate) const DCA_SPEAKER_LFE1: usize = 5;
+pub(crate) const DCA_SPEAKER_CS: usize = 6;
+pub(crate) const DCA_SPEAKER_LSS: usize = 9;
+pub(crate) const DCA_SPEAKER_RSS: usize = 10;
+pub(crate) const DCA_SPEAKER_COUNT: usize = 32;
+
+/// `audio_mode_ch_mask` — speaker layout mask (excluding LFE) per audio mode.
+fn audio_mode_ch_mask(mode: AudioMode) -> u32 {
+    let c = 1 << DCA_SPEAKER_C;
+    let l = 1 << DCA_SPEAKER_L;
+    let r = 1 << DCA_SPEAKER_R;
+    let ls = 1 << DCA_SPEAKER_LS;
+    let rs = 1 << DCA_SPEAKER_RS;
+    let cs = 1 << DCA_SPEAKER_CS;
+    let stereo = l | r;
+    match mode {
+        AudioMode::Mono => c,
+        AudioMode::MonoDual
+        | AudioMode::Stereo
+        | AudioMode::StereoSumDiff
+        | AudioMode::StereoTotal => stereo,
+        AudioMode::ThreeF => stereo | c,
+        AudioMode::TwoF1R => stereo | cs,
+        AudioMode::ThreeF1R => stereo | c | cs,
+        AudioMode::TwoF2R => stereo | ls | rs,
+        AudioMode::ThreeF2R => stereo | c | ls | rs,
+    }
+}
+
+/// `prm_ch_to_spkr_map[mode][ch]` — DCA speaker for each primary channel.
+fn prm_ch_to_spkr(mode: AudioMode, ch: usize) -> usize {
+    use AudioMode::*;
+    let row: &[usize] = match mode {
+        Mono | MonoDual => &[DCA_SPEAKER_C],
+        Stereo | StereoSumDiff | StereoTotal => &[DCA_SPEAKER_L, DCA_SPEAKER_R],
+        ThreeF => &[DCA_SPEAKER_C, DCA_SPEAKER_L, DCA_SPEAKER_R],
+        TwoF1R => &[DCA_SPEAKER_L, DCA_SPEAKER_R, DCA_SPEAKER_CS],
+        ThreeF1R => &[DCA_SPEAKER_C, DCA_SPEAKER_L, DCA_SPEAKER_R, DCA_SPEAKER_CS],
+        TwoF2R => &[DCA_SPEAKER_L, DCA_SPEAKER_R, DCA_SPEAKER_LS, DCA_SPEAKER_RS],
+        ThreeF2R => &[
+            DCA_SPEAKER_C,
+            DCA_SPEAKER_L,
+            DCA_SPEAKER_R,
+            DCA_SPEAKER_LS,
+            DCA_SPEAKER_RS,
+        ],
+    };
+    row[ch]
+}
+
 // ───────────────────────── fixed-point helpers (dcamath.h) ─────────────────
 
 #[inline]
@@ -86,6 +142,7 @@ struct ChannelBands {
 #[derive(Default)]
 pub(crate) struct CoreDecoder {
     npcmblocks: usize,
+    sample_rate: u32,
     // coding header
     nsubframes: usize,
     nchannels: usize,
@@ -178,6 +235,7 @@ impl CoreDecoder {
     /// Decode one core access unit (header already validated by the caller).
     pub(crate) fn decode_frame(&mut self, info: &FrameInfo, data: &[u8]) -> R<()> {
         self.npcmblocks = info.npcmblocks as usize;
+        self.sample_rate = info.sample_rate;
         self.lfe_present = info.lfe_present;
         self.es_format = info.es_format;
         self.predictor_history = info.predictor_history;
@@ -654,11 +712,28 @@ impl CoreDecoder {
         self.filter_perfect
     }
 
+    /// Core speaker layout mask (incl. LFE), as `ff_dca_core` builds it.
+    pub(crate) fn ch_mask(&self) -> u32 {
+        let mut mask = audio_mode_ch_mask(self.audio_mode);
+        if self.lfe_present != 0 {
+            mask |= 1 << DCA_SPEAKER_LFE1;
+        }
+        mask
+    }
+
+    /// DCA speaker for primary channel `ch`.
+    pub(crate) fn primary_speaker(&self, ch: usize) -> usize {
+        prm_ch_to_spkr(self.audio_mode, ch)
+    }
+
     pub(crate) fn nchannels(&self) -> usize {
         self.nchannels
     }
     pub(crate) fn npcmblocks(&self) -> usize {
         self.npcmblocks
+    }
+    pub(crate) fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
     pub(crate) fn lfe_present(&self) -> u8 {
         self.lfe_present

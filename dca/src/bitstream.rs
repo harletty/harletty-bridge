@@ -115,6 +115,19 @@ impl<'a> BitReader<'a> {
         true
     }
 
+    /// Count leading 0 bits up to the first 1 (`get_unary(gb, 1, len)`), bounded
+    /// by `len`. Consumes the terminating 1 bit (or stops at `len`).
+    pub(crate) fn get_unary(&mut self, len: usize) -> usize {
+        for i in 0..len {
+            match self.read_bit() {
+                Some(true) => return i,
+                Some(false) => continue,
+                None => return i,
+            }
+        }
+        len
+    }
+
     /// Skip an arbitrary number of bits (may exceed 32; `skip_bits_long`).
     pub(crate) fn skip_bits_long(&mut self, bits: usize) -> Option<()> {
         if self.bits_left(bits) {
