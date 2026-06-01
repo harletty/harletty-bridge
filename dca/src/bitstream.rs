@@ -104,4 +104,24 @@ impl<'a> BitReader<'a> {
             self.bit_pos += n - rem;
         }
     }
+
+    /// Seek to an absolute bit position (`ff_dca_seek_bits`). Returns false if
+    /// the position is past the available data (caller treats as error).
+    pub(crate) fn seek(&mut self, pos: usize) -> bool {
+        if pos > self.bit_size {
+            return false;
+        }
+        self.bit_pos = pos;
+        true
+    }
+
+    /// Skip an arbitrary number of bits (may exceed 32; `skip_bits_long`).
+    pub(crate) fn skip_bits_long(&mut self, bits: usize) -> Option<()> {
+        if self.bits_left(bits) {
+            self.bit_pos += bits;
+            Some(())
+        } else {
+            None
+        }
+    }
 }
