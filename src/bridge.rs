@@ -116,8 +116,12 @@ pub(crate) struct AtmosBridge {
     pub(crate) raw_codec: Option<RawCodec>,
     pub(crate) eac3_diag_stats: Eac3DiagStats,
     // ── DTS (DCA) pipeline ───────────────────────────────────────────
-    pub(crate) dts_extractor: dca::Extractor,
+    /// Raw byte buffer for demuxing `[core][exss]` DTS-HD frames.
+    pub(crate) dts_buf: Vec<u8>,
+    /// Plain DTS core (5.1) decoder.
     pub(crate) dts_decoder: dca::PcmDecoder,
+    /// DTS-HD Master Audio lossless (5.1/7.1) decoder.
+    pub(crate) dts_hd_decoder: dca::HdDecoder,
     pub(crate) dts_frame_count: u64,
     /// True when the most recent `push_packet` used the DTS path.
     pub(crate) dts_active: bool,
@@ -190,8 +194,9 @@ impl AtmosBridge {
             forced_raw_codec: None,
             raw_codec: None,
             eac3_diag_stats: Eac3DiagStats::default(),
-            dts_extractor: dca::Extractor::default(),
+            dts_buf: Vec::new(),
             dts_decoder: dca::PcmDecoder::new(),
+            dts_hd_decoder: dca::HdDecoder::new(),
             dts_frame_count: 0,
             dts_active: false,
             presentation,
@@ -242,8 +247,9 @@ impl AtmosBridge {
         self.eac3_active = false;
 
         // DTS reset.
-        self.dts_extractor = dca::Extractor::default();
+        self.dts_buf.clear();
         self.dts_decoder.reset();
+        self.dts_hd_decoder.reset();
         self.dts_frame_count = 0;
         self.dts_active = false;
         // Re-sniff after reset, but keep any host-declared codec.
@@ -477,8 +483,8 @@ impl FormatBridge for AtmosBridge {
                     RawCodec::Dts => {
                         self.eac3_active = false;
                         self.dts_active = true;
-                        self.dts_extractor.push_bytes(data.as_slice());
-                        crate::dts_pipeline::drain_dts_raw(self, &mut result);
+                        self.dts_buf.extend_from_slice(data.as_slice());
+                        crate::dts_pipeline::drain_dts(self, &mut result);
                     }
                 }
                 result
@@ -852,5 +858,39 @@ mod raw_transport_tests {
         use bridge_api::RChannelLabel::*;
         let labels: Vec<_> = f.channel_labels.iter().copied().collect();
         assert_eq!(labels, vec![C, L, R, Ls, Rs, LFE]);
+    }
+
+    // End-to-end DTS-HD MA: feed the raw 7.1 dump and check it emits 8-channel
+    // lossless bed frames. Skips when the (uncommitted) dump is absent.
+    #[test]
+    fn dtshd_raw_transport_emits_7_1_bed() {
+        const DUMP: &str = "/home/user/dev/spatial-renderer/dumps/Ex.Machina.2014.dtsx.eng.dts";
+        if !std::path::Path::new(DUMP).exists() {
+            eprintln!("skipping: 7.1 dump not present");
+            return;
+        }
+        // Feed ~2 MB — enough for many frames past the silent intro.
+        let bytes = std::fs::read(DUMP).unwrap();
+        let chunk = &bytes[..bytes.len().min(2_000_000)];
+        let mut bridge = AtmosBridge::new(false);
+        bridge.configure("input_codec".into(), "dts".into());
+        let result = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(!result.frames.is_empty(), "no HD frames decoded");
+        assert!(bridge.is_spatial());
+
+        // Find a fully-populated 7.1 frame (some early frames may be 5.1 before
+        // the surround-back channels carry signal, but the bed is 8ch once XLL
+        // emits the full hierarchy).
+        let f = result
+            .frames
+            .iter()
+            .find(|f| f.channel_count == 8)
+            .expect("expected an 8-channel 7.1 frame");
+        assert_eq!(f.sampling_frequency, 48_000);
+        use bridge_api::RChannelLabel::*;
+        let labels: Vec<_> = f.channel_labels.iter().copied().collect();
+        // Active speakers ascending: C,L,R,Ls,Rs,LFE,Lsr,Rsr.
+        assert_eq!(labels, vec![C, L, R, Ls, Rs, LFE, Lb, Rb]);
     }
 }

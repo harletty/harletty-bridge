@@ -37,6 +37,12 @@ pub struct HdFrame {
     pub samples: Vec<Option<Vec<f32>>>,
 }
 
+/// Size in bytes of the EXSS substream starting at `data` (which must begin at
+/// the 0x64582025 syncword), for demuxing `[core][exss]` DTS-HD frames.
+pub fn exss_substream_size(data: &[u8]) -> Option<usize> {
+    ExssParser::parse(data).ok().map(|p| p.substream_size())
+}
+
 #[derive(Default)]
 pub struct HdDecoder {
     core: CoreDecoder,
