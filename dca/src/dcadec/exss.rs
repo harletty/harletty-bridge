@@ -57,6 +57,11 @@ fn seek(gb: &mut BitReader, pos: usize) -> R<()> {
     }
 }
 
+/// EXSS sample-rate table lookup (`ff_dca_sampling_freqs`).
+pub(crate) fn sampling_freq(idx: usize) -> u32 {
+    SAMPLING_FREQS[idx]
+}
+
 /// `ff_dca_count_chs_for_mask`.
 fn count_chs_for_mask(mask: u32) -> u32 {
     ((mask & 0xffff) | ((mask & 0xae66) << 16)).count_ones()
@@ -102,6 +107,13 @@ pub(crate) struct ExssParser {
     nmixoutchs: [u32; 4],
     pub(crate) nassets: usize,
     pub(crate) asset: ExssAsset,
+}
+
+impl ExssParser {
+    /// Total size of this extension substream in bytes (for demuxing).
+    pub(crate) fn substream_size(&self) -> usize {
+        self.exss_size
+    }
 }
 
 impl ExssParser {

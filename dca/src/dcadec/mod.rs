@@ -8,3 +8,4 @@ pub(crate) mod exss;
 pub(crate) mod huffman;
 pub(crate) mod synth;
 pub(crate) mod tables;
+pub(crate) mod xll;
