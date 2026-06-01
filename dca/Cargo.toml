@@ -1,0 +1,17 @@
+[package]
+name = "dca"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Independent DTS Coherent Acoustics (DCA) bitstream parser and decoder"
+repository = "https://github.com/harletty/harletty-bridge"
+rust-version = "1.87.0"
+
+[lib]
+name = "dca"
+crate-type = ["lib"]
+
+[dependencies]
+log = "0.4"
+thiserror = "2.0"
+rustfft = "6.4"
