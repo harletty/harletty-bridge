@@ -4,6 +4,7 @@
 // DSP decode (ported incrementally from ffmpeg's dca_core.c / dcadsp.c).
 
 pub(crate) mod core;
+pub(crate) mod exss;
 pub(crate) mod huffman;
 pub(crate) mod synth;
 pub(crate) mod tables;
