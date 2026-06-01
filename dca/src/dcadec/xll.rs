@@ -176,6 +176,14 @@ pub(crate) struct XllDecoder {
     pub(crate) output_mask: u32,
     pub(crate) sample_rate: u32,
     pub(crate) pcm_bit_res: usize,
+    // DTS:X end-of-frame extension (ffmpeg only flags it, never parses it).
+    // Captured here for offline characterization; not used in the audio path.
+    pub(crate) x_syncword_present: bool,
+    pub(crate) x_imax_syncword_present: bool,
+    /// Raw DTS:X extension payload (syncword + data) for the current frame.
+    pub(crate) x_payload: Vec<u8>,
+    /// Byte offset of `x_payload` within the XLL frame.
+    pub(crate) x_payload_offset: usize,
 }
 
 impl XllDecoder {
@@ -277,7 +285,38 @@ impl XllDecoder {
         self.parse_sub_headers(&mut gb)?;
         self.parse_navi_table(&mut gb)?;
         self.parse_band_data(&mut gb)?;
+        self.detect_x_extension(&mut gb, data);
         Ok(())
+    }
+
+    /// DTS:X end-of-frame extension detection (mirrors `dca_xll.c:1060`). ffmpeg
+    /// only dword-aligns, peeks the syncword, sets a profile flag, then seeks to
+    /// end of frame. We do the same, but additionally retain the raw payload
+    /// (syncword + remaining bytes up to `frame_size`) for offline analysis. This
+    /// runs after all band data is decoded, so it never affects the PCM output.
+    fn detect_x_extension(&mut self, gb: &mut BitReader, data: &[u8]) {
+        self.x_syncword_present = false;
+        self.x_imax_syncword_present = false;
+        self.x_payload.clear();
+        self.x_payload_offset = 0;
+
+        let frame_bits = self.frame_size * 8;
+        let aligned = (gb.position() + 31) & !31; // FFALIGN(get_bits_count, 32)
+        if frame_bits <= aligned {
+            return;
+        }
+        gb.align_bits(32);
+        match gb.show_bits(32) {
+            Some(0x0200_0850) => self.x_syncword_present = true,
+            Some(sw) if (sw >> 1) == (0xF140_00D0u32 >> 1) => self.x_imax_syncword_present = true,
+            _ => return,
+        }
+        let start = gb.position() / 8;
+        let end = self.frame_size.min(data.len());
+        if end > start {
+            self.x_payload_offset = start;
+            self.x_payload.extend_from_slice(&data[start..end]);
+        }
     }
 
     fn parse_common_header(&mut self, gb: &mut BitReader) -> R<()> {
