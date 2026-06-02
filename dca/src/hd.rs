@@ -116,7 +116,7 @@ mod tests {
     use super::*;
     use crate::dcadec::exss::ExssParser;
 
-    const DUMP: &str = "/home/user/dev/spatial-renderer/dumps/Ex.Machina.2014.dtsx.eng.dts";
+    const DUMP: &str = "/mnt/local/SSD_B-CT4000/Dumps/Ex.Machina.2014.dtsx.eng.dts";
     const REF: &str = "/home/user/dev/spatial-renderer/dumps/dtsx_ref8.f32";
     const CH: usize = 8;
 

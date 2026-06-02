@@ -403,7 +403,7 @@ mod tests {
     // Skips if the (uncommitted) dump is absent.
     #[test]
     fn parses_real_exss_locates_xll() {
-        const DUMP: &str = "/home/user/dev/spatial-renderer/dumps/Ex.Machina.2014.dtsx.eng.dts";
+        const DUMP: &str = "/mnt/local/SSD_B-CT4000/Dumps/Ex.Machina.2014.dtsx.eng.dts";
         if !std::path::Path::new(DUMP).exists() {
             eprintln!("skipping: 7.1 dump not present");
             return;
