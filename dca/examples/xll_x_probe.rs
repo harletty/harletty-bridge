@@ -62,6 +62,8 @@ fn main() {
     const SURR: [usize; 4] = [3, 4, 7, 8];
     let mut total_rms: Vec<f64> = Vec::new();
     let mut surr_rms: Vec<f64> = Vec::new();
+    // Candidate field right after the 22-byte header: byte 22 nibble (a count?).
+    let mut f22: Vec<f64> = Vec::new();
 
     while off + 18 < bytes.len() {
         let core = match parse_header(&bytes[off..]) {
@@ -107,6 +109,7 @@ fn main() {
                     let nn = nsamp.max(1) as f64;
                     total_rms.push((tot / nn).sqrt());
                     surr_rms.push((sur / nn).sqrt());
+                    f22.push(if p.len() > 22 { p[22] as f64 } else { -1.0 });
 
                     // Exact fixed-prefix tracking + per-byte modal value.
                     if common.is_empty() {
@@ -238,16 +241,28 @@ fn main() {
         sizes.len()
     );
     hexdump(&common[..prefix_len.min(common.len())], prefix_len.min(common.len()));
-    // Per-byte modal stability around the divergence point.
-    println!("per-byte modal value / stability (first {PREFIX_SCAN} positions):");
+    // Per-byte cardinality map (structured low-cardinality fields vs random
+    // payload) for the first PREFIX_SCAN positions, with value enumeration for
+    // low-cardinality (≤16 distinct) bytes — these are the parseable fields.
+    println!("per-byte cardinality / modal value (first {PREFIX_SCAN} positions):");
     for (i, m) in per_byte.iter().enumerate() {
         let (val, cnt) = m.iter().max_by_key(|(_, c)| **c).unwrap();
         let frac = 100.0 * *cnt as f64 / sizes.len() as f64;
-        let mark = if i == prefix_len { "  <-- first byte that varies" } else { "" };
-        // Only print the boundary region + any near-constant bytes to keep it short.
-        if (prefix_len.saturating_sub(2)..prefix_len + 8).contains(&i) || frac > 95.0 {
-            println!("  byte {i:>3}: 0x{val:02x} in {frac:>5.1}% ({} distinct){mark}", m.len());
+        let mark = if i == prefix_len { "  <-- first varying byte" } else { "" };
+        let mut line = format!(
+            "  byte {i:>3}: {:>3} distinct, modal 0x{val:02x} ({frac:>5.1}%){mark}",
+            m.len()
+        );
+        if m.len() <= 16 {
+            let mut vs: Vec<(u8, u64)> = m.iter().map(|(&k, &c)| (k, c)).collect();
+            vs.sort_by(|a, b| b.1.cmp(&a.1));
+            let parts: Vec<String> = vs
+                .iter()
+                .map(|(v, c)| format!("0x{v:02x}:{:.0}%", 100.0 * *c as f64 / sizes.len() as f64))
+                .collect();
+            line.push_str(&format!("   {{{}}}", parts.join(" ")));
         }
+        println!("{line}");
     }
 
     // Size ↔ scene-activity correlation.
@@ -273,6 +288,26 @@ fn main() {
             mean(&idx[t..2 * t]),
             mean(&idx[2 * t..])
         );
+    }
+
+    // Test the "byte 22 = object count" hypothesis: correlate it and group.
+    println!("\n=== byte-22 nibble field (count hypothesis) ===");
+    let r_sz = pearson(&f22, &sizes_f64(&sizes), 0);
+    let r_su = pearson(&f22, &surr_rms, 0);
+    println!("Pearson r(byte22, payload_len) = {r_sz:+.3}   r(byte22, surround RMS) = {r_su:+.3}");
+    {
+        use std::collections::BTreeMap;
+        let mut g: BTreeMap<i64, (usize, f64, f64)> = BTreeMap::new();
+        for i in 0..f22.len() {
+            let e = g.entry(f22[i] as i64).or_insert((0, 0.0, 0.0));
+            e.0 += 1;
+            e.1 += sizes[i] as f64;
+            e.2 += surr_rms[i];
+        }
+        println!("byte22 value: count  mean_payload  mean_surr_rms");
+        for (v, (c, sp, sr)) in g {
+            println!("  0x{v:02x} ({v:>2}): {c:>6}  {:>9.0}B  {:>10.3e}", sp / c as f64, sr / c as f64);
+        }
     }
 
     // Hexdump first few payloads.
