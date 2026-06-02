@@ -64,6 +64,9 @@ fn main() {
     let mut surr_rms: Vec<f64> = Vec::new();
     // Candidate field right after the 22-byte header: byte 22 nibble (a count?).
     let mut f22: Vec<f64> = Vec::new();
+    // Smallest payload seen for each count value (the "objects static" case —
+    // least entropy expansion → exposes the per-object record floor).
+    let mut min_by_count: std::collections::BTreeMap<u8, Vec<u8>> = std::collections::BTreeMap::new();
 
     while off + 18 < bytes.len() {
         let core = match parse_header(&bytes[off..]) {
@@ -110,6 +113,15 @@ fn main() {
                     total_rms.push((tot / nn).sqrt());
                     surr_rms.push((sur / nn).sqrt());
                     f22.push(if p.len() > 22 { p[22] as f64 } else { -1.0 });
+                    if p.len() > 22 {
+                        let c = p[22];
+                        match min_by_count.get(&c) {
+                            Some(prev) if prev.len() <= p.len() => {}
+                            _ => {
+                                min_by_count.insert(c, p.clone());
+                            }
+                        }
+                    }
 
                     // Exact fixed-prefix tracking + per-byte modal value.
                     if common.is_empty() {
@@ -310,6 +322,14 @@ fn main() {
         }
     }
 
+    // Minimal-payload exemplar per count value (static-object case): diff these
+    // to expose the per-object record floor right after the byte-26 prefix.
+    println!("\n=== smallest payload per count (static-object floor) ===");
+    for (c, p) in &min_by_count {
+        println!("-- count {c}: {} bytes --", p.len());
+        hexdump(p, 80);
+    }
+
     // Hexdump first few payloads.
     println!("\n=== first {} payloads (hex) ===", first_payloads.len());
     for (k, p) in first_payloads.iter().enumerate() {
@@ -321,12 +341,12 @@ fn main() {
     if let Some(path) = csv_out {
         use std::io::Write;
         let mut w = std::fs::File::create(&path).expect("create csv");
-        writeln!(w, "frame_index,payload_len,payload_offset,total_rms,surr_rms").unwrap();
+        writeln!(w, "frame_index,payload_len,payload_offset,count,total_rms,surr_rms").unwrap();
         for i in 0..sizes.len() {
             writeln!(
                 w,
-                "{i},{},{},{:.6e},{:.6e}",
-                sizes[i], offsets[i], total_rms[i], surr_rms[i]
+                "{i},{},{},{},{:.6e},{:.6e}",
+                sizes[i], offsets[i], f22[i] as i64, total_rms[i], surr_rms[i]
             )
             .unwrap();
         }
