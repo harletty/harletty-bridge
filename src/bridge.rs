@@ -864,7 +864,7 @@ mod raw_transport_tests {
     // lossless bed frames. Skips when the (uncommitted) dump is absent.
     #[test]
     fn dtshd_raw_transport_emits_7_1_bed() {
-        const DUMP: &str = "/home/user/dev/spatial-renderer/dumps/Ex.Machina.2014.dtsx.eng.dts";
+        const DUMP: &str = "/mnt/local/SSD_B-CT4000/Dumps/Ex.Machina.2014.dtsx.eng.dts";
         if !std::path::Path::new(DUMP).exists() {
             eprintln!("skipping: 7.1 dump not present");
             return;
