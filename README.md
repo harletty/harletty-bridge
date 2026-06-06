@@ -71,37 +71,6 @@ Done — skip to "Check it worked" below.
 That's it. Start mpv-omniphony or Omniphony Studio and your Atmos
 tracks now render in 3D.
 
-### 🐧 Linux
-
-1. Download **`libharletty_bridge.so`** from the releases page.
-2. Put it somewhere permanent, e.g.
-   `~/.local/lib/harletty/libharletty_bridge.so`.
-3. Edit `~/.config/omniphony/config.yaml` (create it if missing) so it
-   contains:
-
-   ```yaml
-   render:
-     bridge_path: /home/you/.local/lib/harletty/libharletty_bridge.so
-   ```
-
-> **Arch users:** there's nothing to copy by hand — install the
-> [`omniphony-bridge`](https://github.com/mgth/Omniphony/tree/main/packaging/arch/omniphony-bridge)
-> package and it lands at `/usr/lib/orender/omniphony_bridge.so`,
-> which every renderer host picks up automatically.
-
-### 🍎 macOS
-
-1. Download **`libharletty_bridge.dylib`** from the releases page.
-2. Put it somewhere permanent, e.g.
-   `~/Library/Application Support/omniphony/libharletty_bridge.dylib`.
-3. Edit `~/.config/omniphony/config.yaml` (create it if missing) so it
-   contains:
-
-   ```yaml
-   render:
-     bridge_path: /Users/you/Library/Application Support/omniphony/libharletty_bridge.dylib
-   ```
-
 ### Check it worked
 
 Play any TrueHD/Atmos file:
@@ -132,6 +101,47 @@ Play any TrueHD/Atmos file:
 If the bridge isn't found, the host falls back to the normal
 (non-object) audio and the config save log / Studio status will say so
 — double-check the `bridge_path` points at the file you downloaded.
+
+### 🐧 Linux
+
+1. Download **`libharletty_bridge.so`** from the releases page.
+2. Put it somewhere permanent, e.g.
+   `~/.local/lib/harletty/libharletty_bridge.so`.
+3. Edit `~/.config/omniphony/config.yaml` (create it if missing) so it
+   contains:
+
+   ```yaml
+   render:
+     bridge_path: /home/you/.local/lib/harletty/libharletty_bridge.so
+   ```
+
+   (Or drop the file next to the `orender` binary and skip this step —
+   the host auto-loads any `*_bridge.so` in its own folder.)
+
+Then verify it with the [Check it worked](#check-it-worked) steps above.
+
+> **Arch users:** there's nothing to copy by hand — install the
+> [`omniphony-bridge`](https://github.com/mgth/Omniphony/tree/main/packaging/arch/omniphony-bridge)
+> package and it lands at `/usr/lib/orender/omniphony_bridge.so`,
+> which every renderer host picks up automatically.
+
+### 🍎 macOS
+
+1. Download **`libharletty_bridge.dylib`** from the releases page.
+2. Put it somewhere permanent, e.g.
+   `~/Library/Application Support/omniphony/libharletty_bridge.dylib`.
+3. Edit `~/.config/omniphony/config.yaml` (create it if missing) so it
+   contains:
+
+   ```yaml
+   render:
+     bridge_path: /Users/you/Library/Application Support/omniphony/libharletty_bridge.dylib
+   ```
+
+   (Or drop the file next to the `orender` binary and skip this step —
+   the host auto-loads any `*_bridge.dylib` in its own folder.)
+
+Then verify it with the [Check it worked](#check-it-worked) steps above.
 
 ---
 
