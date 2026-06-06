@@ -78,7 +78,7 @@ Play any TrueHD/Atmos file:
 - **mpv** —
 
   ```sh
-  mpv --ad=orender --ad-orender-osc=yes film.mkv
+  mpv --ad=orender --ad-orender-osc film.mkv
   ```
 
   `--ad=orender` is what switches mpv over to object rendering for this
@@ -86,7 +86,7 @@ Play any TrueHD/Atmos file:
   (FFmpeg downmix) and the bridge is never used — so if you hear sound
   but it's flat, you forgot this flag.
 
-  `--ad-orender-osc=yes` forces the OSC broadcast on for this run so
+  `--ad-orender-osc` forces the OSC broadcast on for this run so
   Studio can attach (otherwise OSC follows `render.osc` in the config).
   It's optional for plain playback, but **required the first time you
   set things up through Studio** — that's how Studio sees the stream and
@@ -94,7 +94,7 @@ Play any TrueHD/Atmos file:
 
 - **CLI** — `orender --input film.mlp ...`
 - **Studio** — start it and it shows the objects move in 3D as soon as
-  an OSC-enabled host (mpv with `--ad-orender-osc=yes`, or the CLI) is
+  an OSC-enabled host (mpv with `--ad-orender-osc`, or the CLI) is
   playing.
 
 If the bridge isn't found, the host falls back to the normal
