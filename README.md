@@ -75,23 +75,22 @@ tracks now render in 3D.
 
 Play any TrueHD/Atmos file:
 
-- **mpv** — `mpv --ad=orender film.mkv`
+- **mpv** —
+
+  ```sh
+  mpv --ad=orender --ad-orender-osc=yes film.mkv
+  ```
 
   `--ad=orender` is what switches mpv over to object rendering for this
   file. It's **opt-in**: without it, mpv plays the track normally
   (FFmpeg downmix) and the bridge is never used — so if you hear sound
   but it's flat, you forgot this flag.
 
-  To watch the objects move in Studio at the same time, add OSC:
-
-  ```sh
-  mpv --ad=orender --ad-orender-osc=yes film.mkv
-  ```
-
   `--ad-orender-osc=yes` forces the OSC broadcast on for this run so
   Studio can attach (otherwise OSC follows `render.osc` in the config).
-  You only need it if you want the live 3D view; playback works without
-  it.
+  It's optional for plain playback, but **required the first time you
+  set things up through Studio** — that's how Studio sees the stream and
+  the live 3D view.
 
 - **CLI** — `orender --input film.mlp ...`
 - **Studio** — start it and it shows the objects move in 3D as soon as
