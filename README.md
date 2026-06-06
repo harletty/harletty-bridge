@@ -208,7 +208,22 @@ OBJECT_SIZE_NOTES.md # notes on OAMD object_size handling
 .github/workflows/   # CI: release builds (Linux + Windows) on `v*` tags
 ```
 
+## Credits
+
+The hard part of this project — actually decoding a TrueHD bitstream —
+is **not** our work. The `truehd/` crate is vendored, essentially
+unchanged, from [**truehdd**](https://github.com/truehdd/truehdd) by
+[**Rainbaby**](https://github.com/truehdd), a clean-room Rust parser and
+decoder for Dolby TrueHD. Without that decoder this bridge would have
+nothing to hand to the renderer.
+
+So: huge thanks to Rainbaby and the `truehdd` project. All the credit
+for the TrueHD decode path belongs there; we just wrap it in the
+`bridge_api` ABI and bolt on the OAMD plumbing the renderer needs. If
+this plugin is useful to you, go star [`truehdd`](https://github.com/truehdd/truehdd)
+too.
+
 ## License
 
 Apache-2.0. The vendored TrueHD decoder under `truehd/` ships its own
-upstream `LICENSE`.
+upstream `LICENSE` and remains © its original author.
