@@ -40,17 +40,26 @@ and follow the three steps for your OS below.
 ### 🪟 Windows
 
 1. Download **`harletty_bridge.dll`** from the releases page.
-2. Put it somewhere permanent, e.g. create a folder
-   `C:\Omniphony\` and drop the file in it →
-   `C:\Omniphony\harletty_bridge.dll`.
+2. Put it somewhere permanent. Two options, pick whichever suits you:
+   - **Next to `orender.exe`** (simplest — no path to type later).
+     To find that folder, right-click your Omniphony / mpv-omniphony
+     shortcut → *Open file location*; or search `orender.exe` in the
+     Start menu, right-click the result → *Open file location*. Drop
+     the `.dll` in that same folder.
+   - **In a folder of your choice**, e.g. create `C:\Omniphony\` and
+     drop the file in it → `C:\Omniphony\harletty_bridge.dll`.
 3. Tell Omniphony where it is. Open (or create) the file
-   `%APPDATA%\omniphony\config.yaml` — paste this in the address bar
-   of Explorer to find the folder — and make sure it contains:
+   `%APPDATA%\omniphony\config.yaml` — paste that into the address bar
+   of Explorer to find the folder — and make sure it contains the full
+   path to the file you just placed:
 
    ```yaml
    render:
      bridge_path: C:\Omniphony\harletty_bridge.dll
    ```
+
+   (If you dropped it next to `orender.exe`, use that path instead,
+   e.g. `bridge_path: C:\Program Files\Omniphony\harletty_bridge.dll`.)
 
 That's it. Start mpv-omniphony or Omniphony Studio and your Atmos
 tracks now render in 3D.
