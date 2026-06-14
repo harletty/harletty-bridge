@@ -586,6 +586,16 @@ impl FormatBridge for AtmosBridge {
                     return result;
                 }
 
+                // ── DTS (data types 0x0B/0x0C/0x0D/0x11) ──────────────
+                if crate::dts_spdif::accepts_data_type(data_type) {
+                    self.eac3_active = false;
+                    self.dts_active = true;
+                    let payload = crate::dts_spdif::normalise_payload(data.as_slice());
+                    self.dts_buf.extend_from_slice(&payload);
+                    crate::dts_pipeline::drain_dts(self, &mut result);
+                    return result;
+                }
+
                 // Unsupported data type.
                 let msg =
                     format!("Unsupported IEC 61937 data type for this bridge: 0x{data_type:02X}");
