@@ -39,6 +39,8 @@ pub(crate) struct Eac3DiagStats {
     pub(crate) dependent_pair_no_object: u64,
     pub(crate) dependent_pair_failures: u64,
     pub(crate) paired_object_frames: u64,
+    /// Non-JOC AC-3-core + dependent pairs emitted as plain channel beds.
+    pub(crate) dependent_pair_channel_beds: u64,
     pub(crate) short_packet_silence_frames: u64,
     pub(crate) last_ac3_core_decode_error: Option<String>,
     pub(crate) last_dependent_pair_error: Option<String>,
@@ -92,6 +94,10 @@ pub(crate) struct AtmosBridge {
     /// Raw E-AC3 syncframe extractor (used by the `Raw` transport, e.g. mpv).
     pub(crate) eac3_raw_extractor: Eac3RawExtractor,
     pub(crate) eac3_pcm_decoder: PcmDecoder,
+    /// Separate PCM decoder for the dependent substream of a non-JOC 7.1
+    /// channel-extension pair (kept apart from the core decoder so their
+    /// per-stream state never interferes).
+    pub(crate) eac3_dependent_pcm_decoder: PcmDecoder,
     pub(crate) eac3_object_decoder: ObjectPcmDecoder,
     pub(crate) ac3_decoder: NativeAc3Decoder,
     pub(crate) pending_ac3_cores: VecDeque<CorePcmFrame>,
@@ -154,6 +160,8 @@ impl AtmosBridge {
         };
         let mut eac3_pcm = PcmDecoder::new();
         eac3_pcm.set_debug_log_level(eac3_log_level);
+        let mut eac3_dependent_pcm = PcmDecoder::new();
+        eac3_dependent_pcm.set_debug_log_level(eac3_log_level);
         let mut eac3_obj = ObjectPcmDecoder::new();
         eac3_obj.set_debug_log_level(eac3_log_level);
 
@@ -166,6 +174,7 @@ impl AtmosBridge {
             eac3_spdif: Eac3SpdifStream::default(),
             eac3_raw_extractor: Eac3RawExtractor::default(),
             eac3_pcm_decoder: eac3_pcm,
+            eac3_dependent_pcm_decoder: eac3_dependent_pcm,
             eac3_object_decoder: eac3_obj,
             ac3_decoder: NativeAc3Decoder::default(),
             pending_ac3_cores: VecDeque::new(),
@@ -216,6 +225,7 @@ impl AtmosBridge {
         self.eac3_spdif.reset();
         self.eac3_raw_extractor = Eac3RawExtractor::default();
         self.eac3_pcm_decoder.reset();
+        self.eac3_dependent_pcm_decoder.reset();
         self.eac3_object_decoder.reset();
         self.ac3_decoder.reset();
         self.pending_ac3_cores.clear();
