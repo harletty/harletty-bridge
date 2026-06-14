@@ -838,6 +838,55 @@ mod tests {
         );
     }
 
+    /// Local-only end-to-end check: decode a real DTS (DTS-HD MA / DTS:X) stream
+    /// through the bridge's raw path and confirm it emits a non-silent
+    /// multichannel bed (the 2D core/HD path; DTS:X objects are ignored). Skips
+    /// when the local capture is absent; dumps PCM for `compare_pcm` vs ffmpeg.
+    #[test]
+    fn dts_decodes_nonsilent_bed() {
+        use crate::bridge::AtmosBridge;
+        use abi_stable::std_types::RSlice;
+        use bridge_api::{FormatBridge, RInputTransport};
+
+        let path = "/tmp/dts/sample.dts";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skip: {path} not present");
+            return;
+        };
+
+        let mut bridge = AtmosBridge::new(false);
+        let mut pcm_f32: Vec<f32> = Vec::new();
+        let mut channels = 0u32;
+        let mut frames = 0u64;
+        let mut labels = String::new();
+        for chunk in bytes.chunks(4096) {
+            let r = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+            for f in r.frames.iter() {
+                frames += 1;
+                channels = f.channel_count;
+                if labels.is_empty() {
+                    labels = format!("{:?}", f.channel_labels);
+                }
+                for &s in f.pcm.iter() {
+                    pcm_f32.push(s as f32 / 8_388_607.0);
+                }
+            }
+        }
+        eprintln!("dts labels: {labels}");
+
+        assert!(frames > 0, "no frames decoded from the DTS stream");
+        assert!(channels >= 6, "expected >= 5.1, got {channels} channels");
+        let peak = pcm_f32.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(peak > 1e-4, "decoded DTS bed is silent (peak={peak})");
+        eprintln!("dts decoded {frames} frames, {channels} ch, peak={peak:.4}");
+        let _ = std::fs::write(
+            "/tmp/dts/harletty_bridge.f32",
+            pcm_f32
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+    }
 
     #[test]
     fn chanmap_0x1a00_maps_to_side_and_back_surrounds() {

@@ -1,6 +1,7 @@
 mod ac3_native;
 mod bridge;
 mod dts_pipeline;
+mod dts_spdif;
 mod eac3_pipeline;
 mod eac3_spdif;
 mod frame_builders;
