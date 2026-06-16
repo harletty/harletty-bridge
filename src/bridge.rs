@@ -39,6 +39,10 @@ pub(crate) struct Eac3DiagStats {
     pub(crate) dependent_pair_no_object: u64,
     pub(crate) dependent_pair_failures: u64,
     pub(crate) paired_object_frames: u64,
+    /// Non-JOC AC-3-core + dependent pairs emitted as plain channel beds.
+    pub(crate) dependent_pair_channel_beds: u64,
+    /// Standalone AC-3 cores (plain AC-3, no dependent) emitted as 5.1 beds.
+    pub(crate) standalone_ac3_core_beds: u64,
     pub(crate) short_packet_silence_frames: u64,
     pub(crate) last_ac3_core_decode_error: Option<String>,
     pub(crate) last_dependent_pair_error: Option<String>,
@@ -58,6 +62,7 @@ pub(crate) enum DrcMode {
 pub(crate) enum RawCodec {
     TrueHd,
     Eac3,
+    Dts,
 }
 
 /// Best-effort codec detection on a raw access unit, used when the host did not
@@ -72,6 +77,13 @@ fn sniff_raw_codec(data: &[u8]) -> Option<RawCodec> {
         && data[7] == 0xBA
     {
         return Some(RawCodec::TrueHd);
+    }
+    // DTS core (0x7FFE8001) or extension substream (0x64582025) at offset 0.
+    if data.len() >= 4 {
+        let w = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        if w == 0x7FFE_8001 || w == 0x6458_2025 {
+            return Some(RawCodec::Dts);
+        }
     }
     if data.len() >= 2
         && ((data[0] == 0x0B && data[1] == 0x77) || (data[0] == 0x77 && data[1] == 0x0B))
@@ -92,9 +104,17 @@ pub(crate) struct AtmosBridge {
     /// Raw E-AC3 syncframe extractor (used by the `Raw` transport, e.g. mpv).
     pub(crate) eac3_raw_extractor: Eac3RawExtractor,
     pub(crate) eac3_pcm_decoder: PcmDecoder,
+    /// Separate PCM decoder for the dependent substream of a non-JOC 7.1
+    /// channel-extension pair (kept apart from the core decoder so their
+    /// per-stream state never interferes).
+    pub(crate) eac3_dependent_pcm_decoder: PcmDecoder,
     pub(crate) eac3_object_decoder: ObjectPcmDecoder,
     pub(crate) ac3_decoder: NativeAc3Decoder,
-    pub(crate) pending_ac3_cores: VecDeque<CorePcmFrame>,
+    /// Decoded AC-3 cores awaiting either a following E-AC3 dependent (→ paired
+    /// 7.1 bed / object frame) or, if none arrives, a standalone-core flush
+    /// (→ plain 5.1 bed). The `Vec<u8>` keeps the original AC-3 access unit so
+    /// the standalone flush can recover its DRC/dialnorm.
+    pub(crate) pending_ac3_cores: VecDeque<(CorePcmFrame, Vec<u8>)>,
     pub(crate) pending_dependent_frames: VecDeque<Vec<u8>>,
     pub(crate) eac3_frame_count: u64,
     pub(crate) eac3_total_samples: u64,
@@ -107,6 +127,16 @@ pub(crate) struct AtmosBridge {
     /// reset so a re-sniff happens after a seek / stream change.
     pub(crate) raw_codec: Option<RawCodec>,
     pub(crate) eac3_diag_stats: Eac3DiagStats,
+    // ── DTS (DCA) pipeline ───────────────────────────────────────────
+    /// Raw byte buffer for demuxing `[core][exss]` DTS-HD frames.
+    pub(crate) dts_buf: Vec<u8>,
+    /// Plain DTS core (5.1) decoder.
+    pub(crate) dts_decoder: dca::PcmDecoder,
+    /// DTS-HD Master Audio lossless (5.1/7.1) decoder.
+    pub(crate) dts_hd_decoder: dca::HdDecoder,
+    pub(crate) dts_frame_count: u64,
+    /// True when the most recent `push_packet` used the DTS path.
+    pub(crate) dts_active: bool,
     // ── Shared ───────────────────────────────────────────────────────
     pub(crate) presentation: u8,
     pub(crate) strict: bool,
@@ -154,6 +184,8 @@ impl AtmosBridge {
         };
         let mut eac3_pcm = PcmDecoder::new();
         eac3_pcm.set_debug_log_level(eac3_log_level);
+        let mut eac3_dependent_pcm = PcmDecoder::new();
+        eac3_dependent_pcm.set_debug_log_level(eac3_log_level);
         let mut eac3_obj = ObjectPcmDecoder::new();
         eac3_obj.set_debug_log_level(eac3_log_level);
 
@@ -166,6 +198,7 @@ impl AtmosBridge {
             eac3_spdif: Eac3SpdifStream::default(),
             eac3_raw_extractor: Eac3RawExtractor::default(),
             eac3_pcm_decoder: eac3_pcm,
+            eac3_dependent_pcm_decoder: eac3_dependent_pcm,
             eac3_object_decoder: eac3_obj,
             ac3_decoder: NativeAc3Decoder::default(),
             pending_ac3_cores: VecDeque::new(),
@@ -176,6 +209,11 @@ impl AtmosBridge {
             forced_raw_codec: None,
             raw_codec: None,
             eac3_diag_stats: Eac3DiagStats::default(),
+            dts_buf: Vec::new(),
+            dts_decoder: dca::PcmDecoder::new(),
+            dts_hd_decoder: dca::HdDecoder::new(),
+            dts_frame_count: 0,
+            dts_active: false,
             presentation,
             strict,
             total_samples: 0,
@@ -216,12 +254,20 @@ impl AtmosBridge {
         self.eac3_spdif.reset();
         self.eac3_raw_extractor = Eac3RawExtractor::default();
         self.eac3_pcm_decoder.reset();
+        self.eac3_dependent_pcm_decoder.reset();
         self.eac3_object_decoder.reset();
         self.ac3_decoder.reset();
         self.pending_ac3_cores.clear();
         self.pending_dependent_frames.clear();
         self.eac3_frame_count = 0;
         self.eac3_active = false;
+
+        // DTS reset.
+        self.dts_buf.clear();
+        self.dts_decoder.reset();
+        self.dts_hd_decoder.reset();
+        self.dts_frame_count = 0;
+        self.dts_active = false;
         // Re-sniff after reset, but keep any host-declared codec.
         self.raw_codec = None;
 
@@ -245,6 +291,19 @@ impl AtmosBridge {
         self.recovering_until_major_sync = false;
     }
 
+    /// Emit any AC-3 cores buffered without a following E-AC3 dependent as plain
+    /// 5.1 channel beds. Called before processing a non-dependent access unit
+    /// (the buffered core had no partner) so plain AC-3 streams are not silent.
+    fn flush_pending_standalone_ac3_cores(&mut self, result: &mut RPushResult) {
+        while let Some((core, au)) = self.pending_ac3_cores.pop_front() {
+            result
+                .frames
+                .push(crate::eac3_pipeline::build_standalone_ac3_core_frame(
+                    self, &core, &au,
+                ));
+        }
+    }
+
     fn try_decode_pending_eac3_pair(&mut self) -> Option<bridge_api::RDecodedFrame> {
         // Both queues must have a frame before we commit to popping either —
         // otherwise an AC-3 core popped here without a partner is silently
@@ -258,7 +317,7 @@ impl AtmosBridge {
         if self.pending_ac3_cores.is_empty() || self.pending_dependent_frames.is_empty() {
             return None;
         }
-        let core = self.pending_ac3_cores.pop_front().unwrap();
+        let (core, _core_au) = self.pending_ac3_cores.pop_front().unwrap();
         let dependent = self.pending_dependent_frames.pop_front().unwrap();
         self.eac3_diag_stats.dependent_pair_attempts += 1;
         match process_eac3_dependent_frame_with_core(self, &dependent, core) {
@@ -312,12 +371,21 @@ impl AtmosBridge {
         temporary_silence_pushed: &mut bool,
     ) -> Result<(), ()> {
         self.eac3_frame_count += 1;
+        // A buffered AC-3 core is only ever paired with an *immediately*
+        // following E-AC3 dependent access unit. If the next access unit is not a
+        // dependent, the buffered core had no partner (plain AC-3, which never
+        // carries dependents) — flush it as a standalone 5.1 bed before handling
+        // this unit, otherwise the core sits queued forever and the track is
+        // silent.
+        if !is_dependent_eac3_frame(frame) {
+            self.flush_pending_standalone_ac3_cores(result);
+        }
         if is_legacy_ac3_frame(frame) {
             match self.ac3_decoder.decode_frame(frame) {
                 Ok(core) => {
                     diagnose_eac3_frame(self, frame);
                     self.eac3_diag_stats.ac3_core_decoded += 1;
-                    self.pending_ac3_cores.push_back(core);
+                    self.pending_ac3_cores.push_back((core, frame.to_vec()));
                     if let Some(decoded_frame) = self.try_decode_pending_eac3_pair() {
                         result.frames.push(decoded_frame);
                     }
@@ -441,12 +509,20 @@ impl FormatBridge for AtmosBridge {
                 match self.resolve_raw_codec(data.as_slice()) {
                     RawCodec::Eac3 => {
                         self.eac3_active = true;
+                        self.dts_active = false;
                         self.eac3_raw_extractor.push_bytes(data.as_slice());
                         self.drain_eac3_raw(&mut result);
                     }
                     RawCodec::TrueHd => {
                         self.eac3_active = false;
+                        self.dts_active = false;
                         process_extractor_input(self, data.as_slice(), &mut result);
+                    }
+                    RawCodec::Dts => {
+                        self.eac3_active = false;
+                        self.dts_active = true;
+                        self.dts_buf.extend_from_slice(data.as_slice());
+                        crate::dts_pipeline::drain_dts(self, &mut result);
                     }
                 }
                 result
@@ -538,6 +614,16 @@ impl FormatBridge for AtmosBridge {
                     return result;
                 }
 
+                // ── DTS (data types 0x0B/0x0C/0x0D/0x11) ──────────────
+                if crate::dts_spdif::accepts_data_type(data_type) {
+                    self.eac3_active = false;
+                    self.dts_active = true;
+                    let payload = crate::dts_spdif::normalise_payload(data.as_slice());
+                    self.dts_buf.extend_from_slice(&payload);
+                    crate::dts_pipeline::drain_dts(self, &mut result);
+                    return result;
+                }
+
                 // Unsupported data type.
                 let msg =
                     format!("Unsupported IEC 61937 data type for this bridge: 0x{data_type:02X}");
@@ -560,14 +646,29 @@ impl FormatBridge for AtmosBridge {
     }
 
     fn is_ready(&self) -> bool {
-        self.frame_count > 0 || self.eac3_frame_count > 0
+        self.frame_count > 0 || self.eac3_frame_count > 0 || self.dts_frame_count > 0
     }
 
     fn is_spatial(&self) -> bool {
+        if self.dts_active {
+            // DTS core is plain channel-based audio (a 5.1/7.1 bed), not true
+            // objects. Whether it is placed at canonical speaker positions
+            // (host) or rendered through the virtual bed is the host's
+            // channel-render-mode choice, exactly as for AC-3 — so report it as
+            // non-spatial and let that mode decide. (DTS:X height objects live
+            // in a proprietary blob the bridge does not decode, so the core
+            // never exposes real objects here.)
+            return false;
+        }
         if self.eac3_active {
-            // E-AC3/JOC is spatial when we've decoded object channels.
-            // The object decoder count acts as a proxy.
-            self.eac3_object_decoder.frames_seen() > 0
+            // E-AC3/AC-3 is spatial only when it actually carries JOC object
+            // payloads (Atmos). `frames_seen` counts every decoded frame, so it
+            // is true for plain AC-3 / E-AC3 multichannel too — gating on it
+            // would wrongly mark non-object streams as spatial, and host mode
+            // could then never hand them back to the native decoder (it would
+            // render silence instead). `joc_frames` only increments on frames
+            // with a JOC payload, so it is the correct "has real objects" probe.
+            self.eac3_diag_stats.joc_frames > 0
         } else {
             // Presentations 0–(MAX-2) are pure downmixes; the top presentation carries objects.
             self.presentation >= (MAX_PRESENTATIONS as u8) - 1
@@ -608,6 +709,7 @@ impl FormatBridge for AtmosBridge {
                 self.forced_raw_codec = match value.as_str() {
                     "eac3" | "ec3" | "e-ac3" | "ac3" => Some(RawCodec::Eac3),
                     "truehd" | "mlp" => Some(RawCodec::TrueHd),
+                    "dts" | "dca" | "dtsx" | "dts:x" | "dts-hd" | "dtshd" => Some(RawCodec::Dts),
                     "auto" | "" => None,
                     s => {
                         log::warn!("atmos-bridge: unknown input_codec {s:?}");
@@ -766,5 +868,92 @@ mod raw_transport_tests {
         // lock, so a later syncful packet can still pin the codec.
         assert_eq!(bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]), RawCodec::TrueHd);
         assert_eq!(bridge.raw_codec, None);
+    }
+
+    #[test]
+    fn sniff_detects_dts_syncwords() {
+        // Core syncword 0x7FFE8001.
+        assert_eq!(
+            sniff_raw_codec(&[0x7F, 0xFE, 0x80, 0x01]),
+            Some(RawCodec::Dts)
+        );
+        // Extension substream syncword 0x64582025.
+        assert_eq!(
+            sniff_raw_codec(&[0x64, 0x58, 0x20, 0x25]),
+            Some(RawCodec::Dts)
+        );
+    }
+
+    #[test]
+    fn configure_input_codec_accepts_dts() {
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("input_codec".into(), "dts".into()));
+        assert_eq!(bridge.forced_raw_codec, Some(RawCodec::Dts));
+    }
+
+    // End-to-end: feed a raw DTS core stream through the FormatBridge and check
+    // it emits 5.1 bed frames with the expected channel labels. Skips when the
+    // (uncommitted) corpus is absent.
+    #[test]
+    fn dts_raw_transport_emits_bed_frames() {
+        const DTS: &str = "/home/user/dev/spatial-renderer/dumps/dts51_core.dts";
+        if !std::path::Path::new(DTS).exists() {
+            eprintln!("skipping: DTS corpus not present");
+            return;
+        }
+        let bytes = std::fs::read(DTS).unwrap();
+        let mut bridge = AtmosBridge::new(false);
+        let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(!result.frames.is_empty(), "no frames decoded");
+        // DTS core is plain channel-based audio, not objects: it reports
+        // non-spatial and lets the host's channel-render mode place/virtualise
+        // the bed (same as AC-3).
+        assert!(!bridge.is_spatial());
+        assert!(bridge.is_ready());
+
+        let f = &result.frames[0];
+        assert_eq!(f.channel_count, 6, "expected 5.1 bed");
+        assert_eq!(f.sampling_frequency, 48_000);
+        // DCA primary order for 3F2R is C,L,R,Ls,Rs then LFE.
+        use bridge_api::RChannelLabel::*;
+        let labels: Vec<_> = f.channel_labels.iter().copied().collect();
+        assert_eq!(labels, vec![C, L, R, Ls, Rs, LFE]);
+    }
+
+    // End-to-end DTS-HD MA: feed the raw 7.1 dump and check it emits 8-channel
+    // lossless bed frames. Skips when the (uncommitted) dump is absent.
+    #[test]
+    fn dtshd_raw_transport_emits_7_1_bed() {
+        const DUMP: &str = "/mnt/local/SSD_B-CT4000/Dumps/Ex.Machina.2014.dtsx.eng.dts";
+        if !std::path::Path::new(DUMP).exists() {
+            eprintln!("skipping: 7.1 dump not present");
+            return;
+        }
+        // Feed ~2 MB — enough for many frames past the silent intro.
+        let bytes = std::fs::read(DUMP).unwrap();
+        let chunk = &bytes[..bytes.len().min(2_000_000)];
+        let mut bridge = AtmosBridge::new(false);
+        bridge.configure("input_codec".into(), "dts".into());
+        let result = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(!result.frames.is_empty(), "no HD frames decoded");
+        // DTS (incl. HD) core is channel-based, not objects → non-spatial; the
+        // channel-render mode decides how the bed is placed/virtualised.
+        assert!(!bridge.is_spatial());
+
+        // Find a fully-populated 7.1 frame (some early frames may be 5.1 before
+        // the surround-back channels carry signal, but the bed is 8ch once XLL
+        // emits the full hierarchy).
+        let f = result
+            .frames
+            .iter()
+            .find(|f| f.channel_count == 8)
+            .expect("expected an 8-channel 7.1 frame");
+        assert_eq!(f.sampling_frequency, 48_000);
+        use bridge_api::RChannelLabel::*;
+        let labels: Vec<_> = f.channel_labels.iter().copied().collect();
+        // Active speakers ascending: C,L,R,Ls,Rs,LFE,Lsr,Rsr.
+        assert_eq!(labels, vec![C, L, R, Ls, Rs, LFE, Lb, Rb]);
     }
 }

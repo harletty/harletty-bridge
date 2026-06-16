@@ -349,6 +349,11 @@ pub struct AccessUnitInfo {
     pub channels: u8,
     pub fullband_channels: u8,
     pub lfe_on: bool,
+    /// Dependent-substream custom channel map (16-bit `chanmap`), when present
+    /// (`strmtyp == dependent` and `chanmape == 1`). Identifies the extra
+    /// speaker positions this dependent substream carries (e.g. the back
+    /// surrounds for a 7.1 extension). `None` for independent / AC-3 frames.
+    pub dependent_channel_map: Option<u16>,
     pub dialogue_normalization: [i8; 2],
     pub heavy_compression_exists: [bool; 2],
     pub heavy_compression_word: [u8; 2],
@@ -822,6 +827,7 @@ pub fn inspect_legacy_ac3_access_unit(data: &[u8]) -> Result<AccessUnitInfo, Par
         channels,
         fullband_channels,
         lfe_on,
+        dependent_channel_map: None,
         dialogue_normalization,
         heavy_compression_exists,
         heavy_compression_word,
@@ -933,10 +939,11 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
         }
     }
 
+    let mut dependent_channel_map: Option<u16> = None;
     if matches!(frame_type, FrameType::Dependent)
         && reader.read_bit().ok_or(ParseError::ShortPacket)?
     {
-        reader.skip_bits(16).ok_or(ParseError::ShortPacket)?;
+        dependent_channel_map = Some(reader.read_bits(16).ok_or(ParseError::ShortPacket)? as u16);
     }
 
     let mixing_metadata_present = read_mixing_metadata(
@@ -1154,6 +1161,7 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
         channels,
         fullband_channels,
         lfe_on,
+        dependent_channel_map,
         dialogue_normalization,
         heavy_compression_exists,
         heavy_compression_word,
@@ -2980,12 +2988,9 @@ pub(crate) fn decode_core_pcm_frame_with_state_into(
     state: &mut CoreDecodeState,
     pcm: &mut CorePcmFrame,
 ) -> Result<(), ParseError> {
-    if info.frame_type == FrameType::Dependent {
-        // TODO: Merge dependent substreams with their associated independent substream before
-        // exposing a general PCM path.
-        return Err(ParseError::UnsupportedFeature("non-independent-core-pcm"));
-    }
-
+    // Dependent substreams are decoded here too (4 coded channels for a 7.1
+    // extension); the caller remaps them to their real speaker positions via the
+    // `dependent_channel_map` and merges them with the independent/AC-3 core.
     let sample_rate_index =
         sample_rate_index(info.sample_rate).ok_or(ParseError::InvalidHeader("sample-rate"))?;
     let trailing_aux = extract_trailing_aux_data(frame);
@@ -4004,6 +4009,7 @@ mod tests {
             channels: 3,
             fullband_channels: 3,
             lfe_on: false,
+            dependent_channel_map: None,
             dialogue_normalization: [-31, -31],
             heavy_compression_exists: [false, false],
             heavy_compression_word: [0, 0],
@@ -4095,6 +4101,7 @@ mod tests {
             channels: 1,
             fullband_channels: 1,
             lfe_on: false,
+            dependent_channel_map: None,
             dialogue_normalization: [-31, -31],
             heavy_compression_exists: [false, false],
             heavy_compression_word: [0, 0],
