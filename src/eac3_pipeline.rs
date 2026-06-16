@@ -1,7 +1,7 @@
 use abi_stable::std_types::RVec;
 use bridge_api::{RChannelLabel, RDecodedFrame, RMetadataFrame};
 use eac3::{
-    AccessUnitInfo, CorePcmFrame, FrameType, OamdPayload, ObjectPcmPushResult,
+    AccessUnitInfo, BedChannel, CorePcmFrame, FrameType, OamdPayload, ObjectPcmPushResult,
     ParsedEmdfPayloadData, inspect_access_unit,
 };
 use std::sync::OnceLock;
@@ -112,12 +112,105 @@ pub(crate) fn process_eac3_frame(
     }
 }
 
+/// Speaker positions a dependent-substream `chanmap` carries, in coded-channel
+/// order (MSB→LSB; pair bits emit left then right). Only the bits that map to a
+/// concrete bed position are emitted — enough for the common 5.1/7.1 channel
+/// extensions (e.g. 0x1A00 = Ls, Rs, Lrs/Rrs).
+fn dependent_chanmap_positions(chanmap: u16) -> Vec<BedChannel> {
+    use BedChannel::*;
+    const TABLE: &[(u16, &[BedChannel])] = &[
+        (1 << 15, &[FrontLeft]),
+        (1 << 14, &[Center]),
+        (1 << 13, &[FrontRight]),
+        (1 << 12, &[SurroundLeft]),
+        (1 << 11, &[SurroundRight]),
+        (1 << 9, &[RearLeft, RearRight]), // Lrs/Rrs (back surrounds)
+        (1 << 8, &[RearCenter]),          // Cs
+        (1 << 5, &[WideLeft, WideRight]), // Lw/Rw
+    ];
+    let mut out = Vec::new();
+    for &(bit, chans) in TABLE {
+        if chanmap & bit != 0 {
+            out.extend_from_slice(chans);
+        }
+    }
+    out
+}
+
+/// Merge a decoded core (5.1) with its dependent E-AC3 substream — the discrete
+/// surround/back channels of a 7.1 extension — into one bed, placing the
+/// dependent's channels by its `chanmap`. Returns `None` (caller falls back to
+/// the core alone) when the dependent can't be decoded or doesn't line up.
+fn merge_eac3_core_with_dependent(
+    bridge: &mut AtmosBridge,
+    core: &CorePcmFrame,
+    dependent_frame: &[u8],
+) -> Option<CorePcmFrame> {
+    let dep = bridge
+        .eac3_dependent_pcm_decoder
+        .push_access_unit(dependent_frame)
+        .ok()?;
+    let positions = dependent_chanmap_positions(dep.info.dependent_channel_map?);
+    let dep_pcm = dep.pcm;
+    if positions.len() != dep_pcm.fullband_channels.len()
+        || dep_pcm.samples_per_channel() != core.samples_per_channel()
+    {
+        return None;
+    }
+
+    // Start from the core's fullband channels, then overlay the dependent's:
+    // replace a position the core also carried (discrete side surrounds) or
+    // append a new one (the back pair).
+    let mut order: Vec<BedChannel> = core.fullband_channel_order.clone();
+    let mut chans: Vec<Vec<f32>> = core.fullband_channels.clone();
+    for (i, &pos) in positions.iter().enumerate() {
+        match order.iter().position(|&b| b == pos) {
+            Some(idx) => chans[idx] = dep_pcm.fullband_channels[i].clone(),
+            None => {
+                order.push(pos);
+                chans.push(dep_pcm.fullband_channels[i].clone());
+            }
+        }
+    }
+
+    Some(CorePcmFrame {
+        sample_rate: core.sample_rate,
+        fullband_channel_order: order,
+        fullband_channels: chans,
+        lfe_channel: core.lfe_channel.clone(),
+    })
+}
+
 pub(crate) fn process_eac3_dependent_frame_with_core(
     bridge: &mut AtmosBridge,
     frame: &[u8],
     core: CorePcmFrame,
 ) -> Result<Option<RDecodedFrame>, String> {
     emit_eac3_frame_diagnostic(bridge, frame);
+
+    // Non-JOC dependent pair = a plain channel-extension bed (AC-3 core +
+    // dependent E-AC3 for 7.1), not objects. Emit the channel bed instead of
+    // dropping it (which left these streams silent), so the renderer's
+    // channel-render modes spatialise it. The AC-3 core (5.1) is already decoded
+    // and in hand; the dependent's 7.1 extension is merged on top below once
+    // available. Skip the object decoder entirely for this case.
+    let dep_has_joc = inspect_access_unit(frame)
+        .map(|i| i.joc_payload_count() > 0)
+        .unwrap_or(false);
+    if !dep_has_joc {
+        let dep_info = inspect_access_unit(frame).map_err(|e| format!("{e}"))?;
+        update_eac3_dialogue_level(bridge, &dep_info);
+        // Merge the dependent's discrete surround/back channels onto the core for
+        // a full 7.1 bed; fall back to the 5.1 core alone if the dependent can't
+        // be merged (never silent).
+        let bed = merge_eac3_core_with_dependent(bridge, &core, frame).unwrap_or(core);
+        let sample_count = bed.samples_per_channel();
+        bridge.eac3_total_samples += sample_count as u64;
+        bridge.eac3_diag_stats.dependent_pair_channel_beds += 1;
+        bridge.perf.maybe_report(bridge.eac3_frame_count);
+        return Ok(Some(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge)));
+    }
+
     match bridge
         .eac3_object_decoder
         .push_access_unit_with_core(frame, core)
@@ -587,6 +680,76 @@ fn build_eac3_frame_from_core(
     }
 }
 
+/// Build a pure channel-bed frame (PCM + labels, **empty metadata**) from a
+/// decoded core. Used for non-object content (a plain 5.1 / 7.1 bed) so the
+/// renderer's channel-render modes (virtual / direct / host) spatialise it,
+/// rather than the object path. Unlike [`build_eac3_frame_from_core`] this never
+/// derives OAMD/object metadata. DRC and dialogue level are still carried.
+/// Emit a standalone AC-3 core (no E-AC3 dependent followed it) as a plain 5.1
+/// channel bed, so the renderer's channel-render modes can spatialise it. Plain
+/// AC-3 streams never deliver a dependent, so without this the buffered core
+/// would sit unpaired forever and the track would be silent. DRC/dialnorm come
+/// from the AC-3 frame itself (`frame`).
+pub(crate) fn build_standalone_ac3_core_frame(
+    bridge: &mut AtmosBridge,
+    core: &CorePcmFrame,
+    frame: &[u8],
+) -> RDecodedFrame {
+    let info = inspect_access_unit(frame).ok();
+    if let Some(info) = info.as_ref() {
+        update_eac3_dialogue_level(bridge, info);
+    }
+    let sample_count = core.samples_per_channel();
+    bridge.eac3_total_samples += sample_count as u64;
+    bridge.eac3_diag_stats.standalone_ac3_core_beds += 1;
+    bridge.perf.maybe_report(bridge.eac3_frame_count);
+    build_eac3_channel_bed_frame(core, info.as_ref(), bridge)
+}
+
+fn build_eac3_channel_bed_frame(
+    core: &CorePcmFrame,
+    info: Option<&AccessUnitInfo>,
+    bridge: &mut AtmosBridge,
+) -> RDecodedFrame {
+    let sample_count = core.samples_per_channel();
+    let total_channel_count = core.total_channels();
+
+    let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * total_channel_count);
+    for s in 0..sample_count {
+        for ch in &core.fullband_channels {
+            pcm.push(float_to_pcm_i32(ch[s]));
+        }
+        if let Some(lfe) = &core.lfe_channel {
+            pcm.push(float_to_pcm_i32(lfe[s]));
+        }
+    }
+
+    let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
+    for bed in &core.fullband_channel_order {
+        channel_labels.push(bed_channel_to_r(*bed));
+    }
+    if core.lfe_channel.is_some() {
+        channel_labels.push(RChannelLabel::LFE);
+    }
+
+    let (drc_gain, drc_ramp_duration) = info
+        .map(|info| eac3_drc_params(bridge, info, sample_count as u32))
+        .unwrap_or((1.0, 0));
+
+    RDecodedFrame {
+        sampling_frequency: core.sample_rate,
+        sample_count: sample_count as u32,
+        channel_count: total_channel_count as u32,
+        pcm,
+        channel_labels,
+        metadata: RVec::new(),
+        drc_gain,
+        drc_ramp_duration,
+        dialogue_level: bridge.current_dialogue_level.into(),
+        is_new_segment: false,
+    }
+}
+
 fn update_eac3_dialogue_level(bridge: &mut AtmosBridge, info: &AccessUnitInfo) {
     bridge.current_dialogue_level = Some(info.dialogue_normalization[0]);
 }
@@ -645,6 +808,123 @@ mod tests {
         EmdfSource, FrameType, JocPayload, ObjectPcmFrame,
     };
 
+    /// Local-only end-to-end check: decode a real non-JOC E-AC3 7.1 stream
+    /// (AC-3 core + dependent) through the full bridge and confirm it now emits a
+    /// non-silent multichannel bed (it used to drop the pair → silence). Skips
+    /// gracefully when the local capture is absent. Writes the decoded PCM to
+    /// `/tmp/aladdin/harletty_bridge.f32` for `compare_pcm` against ffmpeg.
+    #[test]
+    fn aladdin_eac3_pair_emits_nonsilent_bed() {
+        use crate::bridge::AtmosBridge;
+        use abi_stable::std_types::RSlice;
+        use bridge_api::{FormatBridge, RInputTransport};
+
+        let path = "/tmp/aladdin/fr.eac3";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skip: {path} not present");
+            return;
+        };
+
+        let mut bridge = AtmosBridge::new(false);
+        let mut pcm_f32: Vec<f32> = Vec::new();
+        let mut channels = 0u32;
+        let mut frames = 0u64;
+        let mut labels = String::new();
+        // Feed in mpv-sized chunks so the raw extractor frames it like the host.
+        for chunk in bytes.chunks(4096) {
+            let r = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+            for f in r.frames.iter() {
+                frames += 1;
+                channels = f.channel_count;
+                if labels.is_empty() {
+                    labels = format!("{:?}", f.channel_labels);
+                }
+                // Bridge PCM is i32 scaled to 24-bit (see `float_to_pcm_i32`).
+                for &s in f.pcm.iter() {
+                    pcm_f32.push(s as f32 / 8_388_607.0);
+                }
+            }
+        }
+        eprintln!("labels: {labels}");
+
+        assert!(frames > 0, "no frames decoded from the E-AC3 pair stream");
+        assert!(channels >= 6, "expected >= 5.1, got {channels} channels");
+        let peak = pcm_f32.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(peak > 1e-4, "decoded bed is silent (peak={peak})");
+        eprintln!("decoded {frames} frames, {channels} ch, peak={peak:.4}");
+        let _ = std::fs::write(
+            "/tmp/aladdin/harletty_bridge.f32",
+            pcm_f32
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+    }
+
+    /// Local-only end-to-end check: decode a real DTS (DTS-HD MA / DTS:X) stream
+    /// through the bridge's raw path and confirm it emits a non-silent
+    /// multichannel bed (the 2D core/HD path; DTS:X objects are ignored). Skips
+    /// when the local capture is absent; dumps PCM for `compare_pcm` vs ffmpeg.
+    #[test]
+    fn dts_decodes_nonsilent_bed() {
+        use crate::bridge::AtmosBridge;
+        use abi_stable::std_types::RSlice;
+        use bridge_api::{FormatBridge, RInputTransport};
+
+        let path = "/tmp/dts/sample.dts";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skip: {path} not present");
+            return;
+        };
+
+        let mut bridge = AtmosBridge::new(false);
+        let mut pcm_f32: Vec<f32> = Vec::new();
+        let mut channels = 0u32;
+        let mut frames = 0u64;
+        let mut labels = String::new();
+        for chunk in bytes.chunks(4096) {
+            let r = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+            for f in r.frames.iter() {
+                frames += 1;
+                channels = f.channel_count;
+                if labels.is_empty() {
+                    labels = format!("{:?}", f.channel_labels);
+                }
+                for &s in f.pcm.iter() {
+                    pcm_f32.push(s as f32 / 8_388_607.0);
+                }
+            }
+        }
+        eprintln!("dts labels: {labels}");
+
+        assert!(frames > 0, "no frames decoded from the DTS stream");
+        assert!(channels >= 6, "expected >= 5.1, got {channels} channels");
+        let peak = pcm_f32.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(peak > 1e-4, "decoded DTS bed is silent (peak={peak})");
+        eprintln!("dts decoded {frames} frames, {channels} ch, peak={peak:.4}");
+        let _ = std::fs::write(
+            "/tmp/dts/harletty_bridge.f32",
+            pcm_f32
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+    }
+
+    #[test]
+    fn chanmap_0x1a00_maps_to_side_and_back_surrounds() {
+        // The common 7.1 channel-extension chanmap (Ls, Rs, Lrs/Rrs).
+        assert_eq!(
+            dependent_chanmap_positions(0x1A00),
+            vec![
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::RearLeft,
+                BedChannel::RearRight,
+            ]
+        );
+    }
+
     fn object_pcm_frame(core: CorePcmFrame, object_channels: Vec<Vec<f32>>) -> ObjectPcmFrame {
         ObjectPcmFrame {
             core,
@@ -674,6 +954,7 @@ mod tests {
             channels: 2,
             fullband_channels: 2,
             lfe_on: false,
+            dependent_channel_map: None,
             dialogue_normalization: [-31, -31],
             heavy_compression_exists: [false, false],
             heavy_compression_word: [0, 0],
