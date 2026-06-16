@@ -208,7 +208,7 @@ pub(crate) fn process_eac3_dependent_frame_with_core(
         bridge.eac3_total_samples += sample_count as u64;
         bridge.eac3_diag_stats.dependent_pair_channel_beds += 1;
         bridge.perf.maybe_report(bridge.eac3_frame_count);
-        return Ok(Some(build_eac3_channel_bed_frame(&bed, &dep_info, bridge)));
+        return Ok(Some(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge)));
     }
 
     match bridge
@@ -685,9 +685,30 @@ fn build_eac3_frame_from_core(
 /// renderer's channel-render modes (virtual / direct / host) spatialise it,
 /// rather than the object path. Unlike [`build_eac3_frame_from_core`] this never
 /// derives OAMD/object metadata. DRC and dialogue level are still carried.
+/// Emit a standalone AC-3 core (no E-AC3 dependent followed it) as a plain 5.1
+/// channel bed, so the renderer's channel-render modes can spatialise it. Plain
+/// AC-3 streams never deliver a dependent, so without this the buffered core
+/// would sit unpaired forever and the track would be silent. DRC/dialnorm come
+/// from the AC-3 frame itself (`frame`).
+pub(crate) fn build_standalone_ac3_core_frame(
+    bridge: &mut AtmosBridge,
+    core: &CorePcmFrame,
+    frame: &[u8],
+) -> RDecodedFrame {
+    let info = inspect_access_unit(frame).ok();
+    if let Some(info) = info.as_ref() {
+        update_eac3_dialogue_level(bridge, info);
+    }
+    let sample_count = core.samples_per_channel();
+    bridge.eac3_total_samples += sample_count as u64;
+    bridge.eac3_diag_stats.standalone_ac3_core_beds += 1;
+    bridge.perf.maybe_report(bridge.eac3_frame_count);
+    build_eac3_channel_bed_frame(core, info.as_ref(), bridge)
+}
+
 fn build_eac3_channel_bed_frame(
     core: &CorePcmFrame,
-    info: &AccessUnitInfo,
+    info: Option<&AccessUnitInfo>,
     bridge: &mut AtmosBridge,
 ) -> RDecodedFrame {
     let sample_count = core.samples_per_channel();
@@ -711,7 +732,9 @@ fn build_eac3_channel_bed_frame(
         channel_labels.push(RChannelLabel::LFE);
     }
 
-    let (drc_gain, drc_ramp_duration) = eac3_drc_params(bridge, info, sample_count as u32);
+    let (drc_gain, drc_ramp_duration) = info
+        .map(|info| eac3_drc_params(bridge, info, sample_count as u32))
+        .unwrap_or((1.0, 0));
 
     RDecodedFrame {
         sampling_frequency: core.sample_rate,
