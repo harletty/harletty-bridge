@@ -78,8 +78,44 @@ jobs:
           name: harletty-bridge-windows-x86_64
           path: harletty-bridge/target/release/harletty-bridge-*-windows-x86_64.zip
 
+  build-macos:
+    runs-on: macos-14
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout harletty-bridge
+        uses: actions/checkout@v4
+        with:
+          path: harletty-bridge
+
+      - name: Checkout Omniphony (path dependencies)
+        uses: actions/checkout@v4
+        with:
+          repository: mgth/Omniphony
+          path: Omniphony
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release)
+        run: cargo build --release
+        working-directory: harletty-bridge
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: Package (zip)
+        run: |
+          cd harletty-bridge/target/release
+          zip "harletty-bridge-${GITHUB_REF_NAME}-macos-arm64.zip" libharletty_bridge.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: harletty-bridge-macos-arm64
+          path: harletty-bridge/target/release/harletty-bridge-*-macos-arm64.zip
+
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -96,6 +132,11 @@ jobs:
         with:
           name: harletty-bridge-windows-x86_64
 
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: harletty-bridge-macos-arm64
+
       - name: Create draft release
         uses: softprops/action-gh-release@v2
         with:
@@ -103,3 +144,4 @@ jobs:
           files: |
             harletty-bridge-*-linux-x86_64.zip
             harletty-bridge-*-windows-x86_64.zip
+            harletty-bridge-*-macos-arm64.zip
