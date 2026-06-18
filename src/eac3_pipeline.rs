@@ -533,7 +533,15 @@ fn build_eac3_frame_from_object(
     let object_channels = pcm_frame.object_channels.len();
     let total_channel_count = bed_channels + object_channels;
 
-    let (pcm, channel_labels) = build_eac3_object_output_pcm_and_labels(pcm_frame);
+    // A bed-only presentation carries no positional object metadata: the
+    // reconstructed channels ARE the 7.1.x bed. When present, label the channels
+    // (so the channel-render path spatialises them) and skip OAMD event
+    // generation — emitting dynamic-object events for bed channels would route
+    // nothing (no matching object channel in the renderer) and the whole bed
+    // would render silent.
+    let bed_object_labels = eac3_pure_bed_object_labels(pcm_frame);
+    let (pcm, channel_labels) =
+        build_eac3_object_output_pcm_and_labels(pcm_frame, bed_object_labels.as_deref());
 
     // Metadata from OAMD payloads.
     #[cfg(feature = "bridge-perf")]
@@ -541,23 +549,25 @@ fn build_eac3_frame_from_object(
     let mut metadata: RVec<RMetadataFrame> = RVec::new();
     #[cfg(feature = "bridge-perf")]
     let mut metadata_events = 0usize;
-    let bed_indices = eac3_object_output_bed_indices(core);
-    for (oamd, sample_offset) in &pcm_frame.oamd_payloads {
-        let evo_base = base_sample_pos + sample_offset.unwrap_or(0) as u64;
-        let oamd_ref: &OamdPayload = oamd;
-        let meta = build_eac3_metadata_frame(
-            oamd_ref,
-            evo_base,
-            base_sample_pos,
-            &bed_indices,
-            object_channels,
-            bridge,
-        );
-        #[cfg(feature = "bridge-perf")]
-        {
-            metadata_events += meta.events.len();
+    if bed_object_labels.is_none() {
+        let bed_indices = eac3_object_output_bed_indices(core);
+        for (oamd, sample_offset) in &pcm_frame.oamd_payloads {
+            let evo_base = base_sample_pos + sample_offset.unwrap_or(0) as u64;
+            let oamd_ref: &OamdPayload = oamd;
+            let meta = build_eac3_metadata_frame(
+                oamd_ref,
+                evo_base,
+                base_sample_pos,
+                &bed_indices,
+                object_channels,
+                bridge,
+            );
+            #[cfg(feature = "bridge-perf")]
+            {
+                metadata_events += meta.events.len();
+            }
+            metadata.push(meta);
         }
-        metadata.push(meta);
     }
     #[cfg(feature = "bridge-perf")]
     {
@@ -584,8 +594,42 @@ fn build_eac3_frame_from_object(
     }
 }
 
+/// For a *bed-only* OAMD presentation — every object is a bed/ISF channel and
+/// there are no dynamic objects (common in broadcast Atmos, e.g. live sport) —
+/// return the bed-channel label of each JOC-reconstructed object channel, in
+/// PCM order.
+///
+/// The labels come from the program's bed assignment with the LFE removed: the
+/// LFE is carried by the core (`CorePcmFrame::lfe_channel`), not reconstructed
+/// by JOC, so it is not one of the `object_channels`. The remaining bed channels
+/// line up 1:1 with the reconstructed objects.
+///
+/// Returns `None` when the stream is not a pure bed, or when the assignment does
+/// not line up with the reconstructed channel count — the caller then keeps the
+/// regular dynamic-object path untouched.
+fn eac3_pure_bed_object_labels(pcm_frame: &eac3::ObjectPcmFrame) -> Option<Vec<BedChannel>> {
+    let (oamd, _) = pcm_frame.oamd_payloads.first()?;
+    if oamd.dynamic_objects != 0 {
+        return None;
+    }
+    let labels: Vec<BedChannel> = oamd
+        .bed_assignment
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|ch| {
+            !matches!(
+                ch,
+                BedChannel::LowFrequencyEffects | BedChannel::LowFrequencyEffects2
+            )
+        })
+        .collect();
+    (labels.len() == pcm_frame.object_channels.len()).then_some(labels)
+}
+
 fn build_eac3_object_output_pcm_and_labels(
     pcm_frame: &eac3::ObjectPcmFrame,
+    bed_object_labels: Option<&[BedChannel]>,
 ) -> (RVec<i32>, RVec<RChannelLabel>) {
     let core = &pcm_frame.core;
     let sample_count = pcm_frame.samples_per_channel();
@@ -612,8 +656,21 @@ fn build_eac3_object_output_pcm_and_labels(
     if core.lfe_channel.is_some() {
         channel_labels.push(RChannelLabel::LFE);
     }
-    for _ in 0..object_channels {
-        channel_labels.push(RChannelLabel::Unknown);
+    match bed_object_labels {
+        // Bed-only presentation: tag each reconstructed channel with its bed
+        // speaker so the engine's channel-render (virtual-bed) path spatialises
+        // it. `eac3_pure_bed_object_labels` guarantees one label per object.
+        Some(labels) => {
+            for &ch in labels {
+                channel_labels.push(bed_channel_to_r(ch));
+            }
+        }
+        // Dynamic objects: positions come from per-frame OAMD events, not labels.
+        None => {
+            for _ in 0..object_channels {
+                channel_labels.push(RChannelLabel::Unknown);
+            }
+        }
     }
 
     (pcm, channel_labels)
@@ -805,7 +862,7 @@ mod tests {
     use crate::labels::eac3_object_output_bed_indices;
     use eac3::{
         AccessUnitInfo, AudioFrameInfo, AuxParseStatus, BedChannel, BlockDrcInfo, CorePcmFrame,
-        EmdfSource, FrameType, JocPayload, ObjectPcmFrame,
+        EmdfSource, FrameType, JocPayload, OamdPayload, ObjectPcmFrame,
     };
 
     /// Local-only end-to-end check: decode a real non-JOC E-AC3 7.1 stream
@@ -1026,7 +1083,7 @@ mod tests {
         };
         let frame = object_pcm_frame(core.clone(), vec![vec![0.71, 0.72], vec![0.81, 0.82]]);
 
-        let (pcm, labels) = build_eac3_object_output_pcm_and_labels(&frame);
+        let (pcm, labels) = build_eac3_object_output_pcm_and_labels(&frame, None);
 
         assert_eq!(
             labels.as_slice(),
@@ -1060,7 +1117,7 @@ mod tests {
         };
         let frame = object_pcm_frame(core.clone(), vec![vec![0.31], vec![0.41]]);
 
-        let (pcm, labels) = build_eac3_object_output_pcm_and_labels(&frame);
+        let (pcm, labels) = build_eac3_object_output_pcm_and_labels(&frame, None);
 
         assert_eq!(
             labels.as_slice(),
@@ -1071,6 +1128,117 @@ mod tests {
             &[float_to_pcm_i32(0.31), float_to_pcm_i32(0.41)]
         );
         assert!(eac3_object_output_bed_indices(&core).is_empty());
+    }
+
+    /// A 7.1.4 bed-only OAMD payload: 12 bed channels, no dynamic objects.
+    fn bed_only_oamd(bed: Vec<BedChannel>) -> OamdPayload {
+        let object_count = bed.len();
+        OamdPayload {
+            version: 0,
+            object_count,
+            alternate_object_present: false,
+            element_count: 0,
+            beds: object_count,
+            bed_instances: 1,
+            bed_or_isf_objects: object_count,
+            dynamic_objects: 0,
+            isf_in_use: false,
+            isf_index: None,
+            bed_assignment: vec![bed],
+            elements: Vec::new(),
+        }
+    }
+
+    fn full_714_bed() -> Vec<BedChannel> {
+        vec![
+            BedChannel::FrontLeft,
+            BedChannel::FrontRight,
+            BedChannel::Center,
+            BedChannel::LowFrequencyEffects,
+            BedChannel::SurroundLeft,
+            BedChannel::SurroundRight,
+            BedChannel::RearLeft,
+            BedChannel::RearRight,
+            BedChannel::TopFrontLeft,
+            BedChannel::TopFrontRight,
+            BedChannel::TopRearLeft,
+            BedChannel::TopRearRight,
+        ]
+    }
+
+    #[test]
+    fn pure_bed_labels_skip_lfe_and_match_reconstructed_objects() {
+        let core = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![BedChannel::FrontLeft, BedChannel::FrontRight],
+            fullband_channels: vec![vec![0.0], vec![0.0]],
+            lfe_channel: Some(vec![0.0]),
+        };
+        // 11 reconstructed channels = the 12-channel 7.1.4 bed minus the LFE
+        // (carried by the core, not reconstructed by JOC).
+        let mut frame = object_pcm_frame(core, vec![vec![0.0]; 11]);
+        frame.oamd_payloads = vec![(bed_only_oamd(full_714_bed()), None)];
+
+        let labels = eac3_pure_bed_object_labels(&frame).expect("pure bed labels");
+        assert_eq!(
+            labels,
+            vec![
+                BedChannel::FrontLeft,
+                BedChannel::FrontRight,
+                BedChannel::Center,
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::RearLeft,
+                BedChannel::RearRight,
+                BedChannel::TopFrontLeft,
+                BedChannel::TopFrontRight,
+                BedChannel::TopRearLeft,
+                BedChannel::TopRearRight,
+            ]
+        );
+
+        // The output channels carry their real bed labels (LFE first, then the
+        // reconstructed bed channels) so the engine spatialises them.
+        let (_pcm, channel_labels) = build_eac3_object_output_pcm_and_labels(&frame, Some(&labels));
+        assert_eq!(
+            channel_labels.as_slice(),
+            &[
+                RChannelLabel::LFE,
+                RChannelLabel::L,
+                RChannelLabel::R,
+                RChannelLabel::C,
+                RChannelLabel::Ls,
+                RChannelLabel::Rs,
+                RChannelLabel::Lb,
+                RChannelLabel::Rb,
+                RChannelLabel::Tfl,
+                RChannelLabel::Tfr,
+                RChannelLabel::Tbl,
+                RChannelLabel::Tbr,
+            ]
+        );
+    }
+
+    #[test]
+    fn pure_bed_detection_declines_dynamic_objects_and_count_mismatch() {
+        let core = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![BedChannel::FrontLeft, BedChannel::FrontRight],
+            fullband_channels: vec![vec![0.0], vec![0.0]],
+            lfe_channel: Some(vec![0.0]),
+        };
+
+        // Has a dynamic object → not a pure bed.
+        let mut dynamic = object_pcm_frame(core.clone(), vec![vec![0.0]; 11]);
+        let mut oamd = bed_only_oamd(full_714_bed());
+        oamd.dynamic_objects = 1;
+        dynamic.oamd_payloads = vec![(oamd, None)];
+        assert!(eac3_pure_bed_object_labels(&dynamic).is_none());
+
+        // Bed assignment does not line up with the reconstructed channel count.
+        let mut mismatch = object_pcm_frame(core, vec![vec![0.0]; 5]);
+        mismatch.oamd_payloads = vec![(bed_only_oamd(full_714_bed()), None)];
+        assert!(eac3_pure_bed_object_labels(&mismatch).is_none());
     }
 
     #[test]
