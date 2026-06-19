@@ -994,9 +994,14 @@ impl XllDecoder {
 
         // Map output: speaker -> channel buffer, with the Lss/Rss -> Ls/Rs
         // normalization ffmpeg applies for a regular 5.1/7.1 layout.
+        //
+        // `output` is a 24-bit container (see its doc) and hd.rs normalizes f32 by
+        // 2^23, so always upshift to 24-bit regardless of storage resolution. The
+        // 16-bit-storage path used to stop at a 16-bit scale, which made 16-bit
+        // DTS-HD MA masters play ~48 dB (1/256) too quiet. storage_bit_res is
+        // already validated to 16/20/24 at parse time.
         let shift = match p_storage {
-            16 => 16 - p_pcm_bit_res,
-            20 | 24 => 24 - p_pcm_bit_res,
+            16 | 20 | 24 => 24 - p_pcm_bit_res,
             _ => return Err(XllError::Invalid("XLL storage bit res")),
         };
         for chs in 0..self.nactivechsets {
