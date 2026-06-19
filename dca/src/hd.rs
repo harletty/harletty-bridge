@@ -116,18 +116,18 @@ mod tests {
     use super::*;
     use crate::dcadec::exss::ExssParser;
 
-    const DUMP: &str = "/mnt/local/SSD_B-CT4000/Dumps/Ex.Machina.2014.dtsx.eng.dts";
-    const REF: &str = "/home/user/dev/spatial-renderer/dumps/dtsx_ref8.f32";
-    const CH: usize = 8;
-
-    #[test]
-    fn xll_7_1_matches_ffmpeg_lossless() {
-        if !std::path::Path::new(DUMP).exists() || !std::path::Path::new(REF).exists() {
-            eprintln!("skipping: 7.1 corpus not present");
+    // Decode `dump` (a `[core][exss]` DTS-HD MA elementary stream) through the full
+    // HD decoder and assert the lossless PCM matches ffmpeg's f32 reference
+    // (`refpath`, interleaved `ch` channels). Each ffmpeg channel is auto-matched to
+    // its best-fitting decoded speaker, so channel order doesn't matter; a wrong
+    // output scale (e.g. the 16-bit-storage bug) blows up the RMSE far past 1e-5.
+    fn check_xll_lossless(dump: &str, refpath: &str, ch: usize) {
+        if !std::path::Path::new(dump).exists() || !std::path::Path::new(refpath).exists() {
+            eprintln!("skipping: corpus not present ({dump})");
             return;
         }
-        let bytes = std::fs::read(DUMP).unwrap();
-        let rbytes = std::fs::read(REF).unwrap();
+        let bytes = std::fs::read(dump).unwrap();
+        let rbytes = std::fs::read(refpath).unwrap();
         let reference: Vec<f32> = rbytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -155,17 +155,9 @@ mod tests {
             match dec.decode(&bytes[off..exss_off], exss_bytes) {
                 Ok(f) => {
                     active_mask = f.output_mask;
-                    let n = f
-                        .samples
-                        .iter()
-                        .find_map(|o| o.as_ref().map(|v| v.len()))
-                        .unwrap_or(0);
                     for s in 0..32 {
                         if let Some(v) = &f.samples[s] {
                             spk[s].extend_from_slice(v);
-                        } else {
-                            // keep arrays aligned in length for active speakers only
-                            let _ = n;
                         }
                     }
                     frames += 1;
@@ -184,7 +176,7 @@ mod tests {
         assert!(frames >= 20, "too few XLL frames decoded ({frames})");
 
         let nsamp = spk.iter().filter(|v| !v.is_empty()).map(|v| v.len()).min().unwrap();
-        let ref_n = reference.len() / CH;
+        let ref_n = reference.len() / ch;
         let cmp = nsamp.min(ref_n);
         assert!(cmp > 5000, "too little to compare ({cmp})");
 
@@ -193,7 +185,7 @@ mod tests {
         let active: Vec<usize> = (0..32).filter(|&s| !spk[s].is_empty()).collect();
         eprintln!("active speakers: {active:?}");
         let mut worst = 0f64;
-        for rc in 0..CH {
+        for rc in 0..ch {
             let mut best = f64::INFINITY;
             let mut best_spk = 0usize;
             let mut best_max = 0f32;
@@ -201,7 +193,7 @@ mod tests {
                 let mut sq = 0f64;
                 let mut mx = 0f32;
                 for i in 0..cmp {
-                    let d = (spk[s][i] - reference[i * CH + rc]).abs();
+                    let d = (spk[s][i] - reference[i * ch + rc]).abs();
                     sq += (d as f64) * (d as f64);
                     mx = mx.max(d);
                 }
@@ -216,5 +208,26 @@ mod tests {
             worst = worst.max(best);
         }
         assert!(worst < 1e-5, "not lossless (worst rmse {worst:.3e})");
+    }
+
+    #[test]
+    fn xll_7_1_matches_ffmpeg_lossless() {
+        // Ex Machina (2014): 24-bit DTS-HD MA 7.1.
+        check_xll_lossless(
+            "/mnt/local/SSD_B-CT4000/Dumps/Ex.Machina.2014.dtsx.eng.dts",
+            "/home/user/dev/spatial-renderer/dumps/dtsx_ref8.f32",
+            8,
+        );
+    }
+
+    #[test]
+    fn xll_5_1_16bit_matches_ffmpeg_lossless() {
+        // Dark Crystal (1982): 16-bit DTS-HD MA 5.1. Regression guard for the
+        // 16-bit-storage output-scale bug (the bed was ~48 dB / 256x too quiet).
+        check_xll_lossless(
+            "/home/user/dev/spatial-renderer/dumps/darkcrystal_dts51_16b.dts",
+            "/home/user/dev/spatial-renderer/dumps/darkcrystal_ref6.f32",
+            6,
+        );
     }
 }
