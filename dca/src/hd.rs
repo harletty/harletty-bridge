@@ -52,6 +52,14 @@ pub fn exss_substream_size(data: &[u8]) -> Option<usize> {
     ExssParser::parse(data).ok().map(|p| p.substream_size())
 }
 
+/// True when the EXSS at `data` carries an XLL (DTS-HD MA, lossless) asset, i.e.
+/// [`HdDecoder`] can reconstruct the lossless bed. DTS-HD HRA and other lossy
+/// extensions parse but expose no XLL asset; callers should decode the DTS core
+/// instead for those.
+pub fn exss_has_xll(data: &[u8]) -> bool {
+    ExssParser::parse(data).map(|p| p.has_xll()).unwrap_or(false)
+}
+
 #[derive(Default)]
 pub struct HdDecoder {
     core: CoreDecoder,

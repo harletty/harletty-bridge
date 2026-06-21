@@ -9,7 +9,7 @@
 use abi_stable::std_types::{RString, RVec};
 use bridge_api::{RChannelLabel, RDecodedFrame};
 use bridge_api::RPushResult;
-use dca::{exss_substream_size, parse_header, CorePcmFrame, HdError, HdFrame};
+use dca::{exss_has_xll, exss_substream_size, parse_header, CorePcmFrame, HdError, HdFrame};
 
 use crate::bridge::AtmosBridge;
 use crate::frame_builders::float_to_pcm_i32;
@@ -54,24 +54,48 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
             if rest.len() < fs + es {
                 break;
             }
-            let base = bridge.total_samples;
-            match bridge.dts_hd_decoder.decode(&rest[..fs], &rest[fs..fs + es]) {
-                Ok(hd) => {
-                    let n = hd_samples(&hd);
-                    result.frames.push(build_hd_frame(&hd));
-                    bridge.total_samples += n as u64;
-                    bridge.dts_frame_count += 1;
+            if exss_has_xll(&rest[fs..fs + es]) {
+                let base = bridge.total_samples;
+                match bridge.dts_hd_decoder.decode(&rest[..fs], &rest[fs..fs + es]) {
+                    Ok(hd) => {
+                        let n = hd_samples(&hd);
+                        result.frames.push(build_hd_frame(&hd));
+                        bridge.total_samples += n as u64;
+                        bridge.dts_frame_count += 1;
+                    }
+                    Err(HdError::Pending) => {} // PBR buffering; no frame this packet
+                    Err(e) => {
+                        let msg = format!("dts_hd_decode_error={e:?}");
+                        log::warn!("{msg}");
+                        let _ = base;
+                        if bridge.strict {
+                            result.error_message = RString::from(msg);
+                            bridge.reset_pipeline();
+                            result.did_reset = true;
+                            return;
+                        }
+                    }
                 }
-                Err(HdError::Pending) => {} // PBR buffering; no frame this packet
-                Err(e) => {
-                    let msg = format!("dts_hd_decode_error={e:?}");
-                    log::warn!("{msg}");
-                    let _ = base;
-                    if bridge.strict {
-                        result.error_message = RString::from(msg);
-                        bridge.reset_pipeline();
-                        result.did_reset = true;
-                        return;
+            } else {
+                // No XLL asset: DTS-HD HRA (and other lossy EXSS extensions) layer
+                // only high-frequency detail on top of an ordinary DTS core. We do
+                // not decode that extension, so render the core (5.1) and drop it,
+                // instead of failing the whole track.
+                match bridge.dts_decoder.push_access_unit(&rest[..fs]) {
+                    Ok(push) => {
+                        result.frames.push(build_core_frame(&push.pcm));
+                        bridge.total_samples += push.pcm.samples_per_channel() as u64;
+                        bridge.dts_frame_count += 1;
+                    }
+                    Err(err) => {
+                        let msg = format!("dts_decode_error={err}");
+                        log::warn!("{msg}");
+                        if bridge.strict {
+                            result.error_message = RString::from(msg);
+                            bridge.reset_pipeline();
+                            result.did_reset = true;
+                            return;
+                        }
                     }
                 }
             }
