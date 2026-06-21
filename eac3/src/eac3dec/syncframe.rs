@@ -51,6 +51,10 @@ const DEF_CPL_BNDSTRC: [bool; 18] = [
     false, false, false, false, false, false, false, false, true, false, true, true, false, true,
     true, true, true, true,
 ];
+/// Stereo rematrixing band boundaries in transform-coefficient bins
+/// (A/52 Table; matches FFmpeg `ff_ac3_rematrix_band_tab`). Band `b` spans
+/// `[REMATRIX_BAND_TAB[b], REMATRIX_BAND_TAB[b + 1])`.
+const REMATRIX_BAND_TAB: [usize; 5] = [13, 25, 37, 61, 253];
 const ECPL_SUBBAND_TAB: [usize; 23] = [
     13, 19, 25, 31, 37, 49, 61, 73, 85, 97, 109, 121, 133, 145, 157, 169, 181, 193, 205, 217, 229,
     241, 253,
@@ -544,6 +548,11 @@ struct BlockSyntaxState {
     ncplbnd: usize,
     ncplsubnd: usize,
     phsflginu: bool,
+    /// Stereo rematrixing (2/0 mode only): number of active rematrixing bands
+    /// and the per-band flags. Persist across blocks (reused when a block omits
+    /// the strategy); re-established by block 0 of every frame.
+    num_rematrixing_bands: usize,
+    rematrixing_flags: [bool; REMATRIX_BAND_TAB.len() - 1],
     sample_rate_index: usize,
     spxbegf: usize,
     spx_begin_subbnd: usize,
@@ -591,6 +600,8 @@ impl BlockSyntaxState {
             ncplbnd: 0,
             ncplsubnd: 0,
             phsflginu: false,
+            num_rematrixing_bands: 0,
+            rematrixing_flags: [false; REMATRIX_BAND_TAB.len() - 1],
             sample_rate_index,
             spxbegf: 0,
             spx_begin_subbnd: 0,
@@ -2060,14 +2071,12 @@ fn read_legacy_ac3_coupling_strategy(
         audio_frame.coupling_in_use[block] = in_use;
         state.ecplinu = false;
         if in_use {
-            if channel_mode == 2 {
-                for in_use in &mut state.chincpl {
-                    *in_use = true;
-                }
-            } else {
-                for channel in 0..fullband_channels {
-                    state.chincpl[channel] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
-                }
+            // Legacy AC-3 transmits `chincpl` per fbw channel even in 2/0 stereo;
+            // only E-AC-3 forces both stereo channels into coupling without a bit
+            // (FFmpeg ac3dec.c gates the no-read force path on `s->eac3`). Reading
+            // it unconditionally here keeps the bitstream aligned for 2/0 AC-3.
+            for channel in 0..fullband_channels {
+                state.chincpl[channel] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
             }
 
             state.phsflginu = if channel_mode == 2 {
@@ -2502,10 +2511,7 @@ fn read_coupling_coordinates(
         }
     }
 
-    if channel_mode == 2 && state.phsflginu && stereo_phase_flags_required {
-        // TODO: Walk stereo coupling phase flags instead of falling back to frame-scan.
-        return Err(ParseError::UnsupportedFeature("stereo-coupling-phase"));
-    }
+    read_stereo_coupling_phase_flags(reader, channel_mode, stereo_phase_flags_required, state)?;
 
     Ok(())
 }
@@ -2539,11 +2545,72 @@ fn read_legacy_ac3_coupling_coordinates(
         }
     }
 
-    if channel_mode == 2 && state.phsflginu && stereo_phase_flags_required {
-        // TODO: Walk stereo coupling phase flags instead of falling back.
-        return Err(ParseError::UnsupportedFeature("stereo-coupling-phase"));
-    }
+    read_stereo_coupling_phase_flags(reader, channel_mode, stereo_phase_flags_required, state)?;
 
+    Ok(())
+}
+
+/// Consume the stereo coupling phase flags and apply them (A/52 §5.4.3.7).
+///
+/// In 2/0 mode with `phsflginu` set and at least one channel's coupling
+/// coordinates present this block, the bitstream carries one `phsflg` bit per
+/// coupling band. A set flag phase-inverts the right channel's (index 1)
+/// coupling coordinate for that band, so the channel is multiplied by a negative
+/// gain in `apply_standard_coupling`. The bits must be consumed even when no
+/// inversion is applied, to keep the block bit-aligned.
+fn read_stereo_coupling_phase_flags(
+    reader: &mut BitReader<'_>,
+    channel_mode: u8,
+    stereo_phase_flags_required: bool,
+    state: &mut BlockSyntaxState,
+) -> Result<(), ParseError> {
+    if channel_mode != 2 || !state.phsflginu || !stereo_phase_flags_required {
+        return Ok(());
+    }
+    for band in 0..state.ncplbnd {
+        let invert = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+        if invert {
+            if let Some(coord) = state.coupling_coordinates.get_mut(1).and_then(|c| c.get_mut(band))
+            {
+                *coord = -*coord;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stereo rematrixing strategy + band flags (A/52 §7.5.4), present only in 2/0
+/// mode. Mirrors FFmpeg `ac3dec.c` decode_audio_block: legacy AC-3 carries a
+/// `rematstr` bit every block; E-AC-3 omits it in block 0 (the flags are always
+/// present there). When the strategy is absent in a later block the previous
+/// bands/flags are reused; an absent strategy in block 0 means "no rematrixing".
+fn read_rematrixing(
+    reader: &mut BitReader<'_>,
+    block: usize,
+    channel_mode: u8,
+    is_eac3: bool,
+    audio_frame: &AudioFrameInfo,
+    state: &mut BlockSyntaxState,
+) -> Result<(), ParseError> {
+    if channel_mode != 2 {
+        return Ok(());
+    }
+    let strategy = (is_eac3 && block == 0) || reader.read_bit().ok_or(ParseError::ShortPacket)?;
+    if strategy {
+        let mut bands = REMATRIX_BAND_TAB.len() - 1; // 4
+        let cpl_start_freq = state.cplbegf * 12 + 37;
+        if audio_frame.coupling_in_use[block] && cpl_start_freq <= 61 {
+            bands -= 1 + usize::from(cpl_start_freq == 37);
+        } else if state.spx_in_use && state.spx_begin_subbnd * 12 + 25 <= 61 {
+            bands -= 1;
+        }
+        state.num_rematrixing_bands = bands;
+        for band in 0..bands {
+            state.rematrixing_flags[band] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+        }
+    } else if block == 0 {
+        state.num_rematrixing_bands = 0;
+    }
     Ok(())
 }
 
@@ -3186,6 +3253,7 @@ fn decode_block_core_pcm(
             audio_frame,
             state,
         )?;
+        bittrace("after_cpl_strategy", block, reader.position());
         read_legacy_ac3_coupling_coordinates(
             reader,
             block,
@@ -3194,6 +3262,9 @@ fn decode_block_core_pcm(
             audio_frame,
             state,
         )?;
+        bittrace("after_cpl_coords", block, reader.position());
+        read_rematrixing(reader, block, info.channel_mode, false, audio_frame, state)?;
+        bittrace("after_rematrixing", block, reader.position());
         read_legacy_ac3_exponent_strategies(
             reader,
             block,
@@ -3222,6 +3293,8 @@ fn decode_block_core_pcm(
             state,
         )?;
         bittrace("after_cpl_coords", block, reader.position());
+        read_rematrixing(reader, block, info.channel_mode, true, audio_frame, state)?;
+        bittrace("after_rematrixing", block, reader.position());
     }
 
     let allocation = read_exponents(
@@ -3323,6 +3396,13 @@ fn decode_block_pcm_mantissas(
         None
     };
 
+    // Stereo rematrixing mixes the two channels' coefficients before the IMDCT,
+    // so in 2/0 mode (exactly two fullband channels) the per-channel transforms
+    // are deferred: decode both channels' coeffs into `stereo_coeffs`, rematrix,
+    // then IMDCT. Other modes IMDCT each channel immediately (no extra buffer).
+    let stereo = allocation.channel_end_mantissas.len() == 2;
+    let mut stereo_coeffs = [[0.0f32; 256]; 2];
+
     for channel in 0..allocation.channel_end_mantissas.len() {
         let end_mantissa = allocation.channel_end_mantissas[channel];
         if end_mantissa > 256 {
@@ -3377,11 +3457,26 @@ fn decode_block_pcm_mantissas(
         if state.spx_in_use && state.chinspx[channel] {
             apply_spx_extension(&mut coeffs, end_mantissa, state, channel);
         }
-        imdct[channel].apply(
-            &coeffs,
-            block_switch.get(channel).copied().unwrap_or(false),
-            &mut fullband_channels[channel][block_offset..block_offset + 256],
-        );
+        if stereo {
+            stereo_coeffs[channel] = coeffs;
+        } else {
+            imdct[channel].apply(
+                &coeffs,
+                block_switch.get(channel).copied().unwrap_or(false),
+                &mut fullband_channels[channel][block_offset..block_offset + 256],
+            );
+        }
+    }
+
+    if stereo {
+        apply_rematrixing(&mut stereo_coeffs, allocation, state);
+        for channel in 0..2 {
+            imdct[channel].apply(
+                &stereo_coeffs[channel],
+                block_switch.get(channel).copied().unwrap_or(false),
+                &mut fullband_channels[channel][block_offset..block_offset + 256],
+            );
+        }
     }
 
     if lfe_on {
@@ -3423,6 +3518,31 @@ fn decode_block_pcm_mantissas(
     }
 
     Ok(())
+}
+
+/// Apply stereo rematrixing to the two fullband channels' transform
+/// coefficients in place (A/52 §7.5.4). On each flagged band the channels are
+/// reconstructed from their transmitted sum/difference form: `L = c0 + c1`,
+/// `R = c0 - c1`. Only bins below the smaller of the two channels' end mantissas
+/// are touched (the coupled / SPX region above is shared, not rematrixed).
+/// Mirrors FFmpeg `do_rematrixing`.
+fn apply_rematrixing(
+    coeffs: &mut [[f32; 256]; 2],
+    allocation: &BlockAllocationInfo,
+    state: &BlockSyntaxState,
+) {
+    let end = allocation.channel_end_mantissas[0].min(allocation.channel_end_mantissas[1]);
+    for band in 0..state.num_rematrixing_bands {
+        if !state.rematrixing_flags[band] {
+            continue;
+        }
+        let band_end = end.min(REMATRIX_BAND_TAB[band + 1]);
+        for bin in REMATRIX_BAND_TAB[band]..band_end {
+            let left_in = coeffs[0][bin];
+            coeffs[0][bin] += coeffs[1][bin];
+            coeffs[1][bin] = left_in - coeffs[1][bin];
+        }
+    }
 }
 
 /// Apply spectral extension to fill the high-frequency bins of `coeffs`.
