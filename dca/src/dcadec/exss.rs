@@ -114,6 +114,13 @@ impl ExssParser {
     pub(crate) fn substream_size(&self) -> usize {
         self.exss_size
     }
+
+    /// True when the (single) audio asset carries an XLL component — i.e. this is
+    /// DTS-HD Master Audio (lossless). False for HRA / lossy-extension streams,
+    /// which have only a core plus an XBR/X96/etc component.
+    pub(crate) fn has_xll(&self) -> bool {
+        self.asset.extension_mask & DCA_EXSS_XLL != 0
+    }
 }
 
 impl ExssParser {
@@ -347,10 +354,15 @@ impl ExssParser {
         let mut offs = a.asset_offset;
         let mut size = a.asset_size as isize;
 
-        // We only retain CORE and XLL component sizes. XBR/XXCH/X96/LBR would sit
-        // between them and shift the XLL offset; reject if present rather than
-        // miscompute. (Ex Machina uses CORE+XLL or XLL-only, no intervening exts.)
-        if a.extension_mask & (DCA_EXSS_XBR | DCA_EXSS_XXCH | DCA_EXSS_X96 | DCA_EXSS_LBR) != 0 {
+        // We only retain CORE and XLL component sizes. When XLL is present, an
+        // intervening XBR/XXCH/X96/LBR component would sit before it and shift the
+        // XLL offset; reject rather than miscompute. When there is NO XLL (e.g.
+        // DTS-HD HRA, which carries CORE + a lossy XBR extension), nothing reads
+        // the XLL offset, so let the EXSS parse succeed — the caller falls back to
+        // the DTS core for these.
+        if a.extension_mask & DCA_EXSS_XLL != 0
+            && a.extension_mask & (DCA_EXSS_XBR | DCA_EXSS_XXCH | DCA_EXSS_X96 | DCA_EXSS_LBR) != 0
+        {
             return Err(ExssError::Unsupported("intervening EXSS extension before XLL"));
         }
 
