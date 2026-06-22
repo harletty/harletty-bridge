@@ -6,7 +6,9 @@
 // the fixed-point core output. Two frequency bands and embedded hierarchical
 // downmix are not supported (rejected) — they don't occur in 48 kHz 7.1 MA.
 
+use super::core::DCA_SPEAKER_L;
 use super::core::DCA_SPEAKER_LSS;
+use super::core::DCA_SPEAKER_R;
 use super::core::DCA_SPEAKER_RSS;
 use super::exss::{sampling_freq, ExssAsset};
 use super::synth::CoreOutput;
@@ -168,6 +170,9 @@ pub(crate) struct XllDecoder {
     nchannels: usize,
     nactivechsets: usize,
     hd_stream_id: u32,
+    /// Asset-level `one_to_one_map_ch_to_spkr` flag, copied from the EXSS asset
+    /// each decode. False selects the Lt/Rt-style stereo channel-set parse.
+    one_to_one: bool,
     // PBR smoothing
     pbr_buffer: Vec<u8>,
     pbr_delay: u32,
@@ -211,6 +216,7 @@ impl XllDecoder {
             self.clear_pbr();
             self.hd_stream_id = asset.hd_stream_id;
         }
+        self.one_to_one = asset.one_to_one_map_ch_to_spkr;
         let xll = &data[asset.xll_offset..asset.xll_offset + asset.xll_size];
         if self.pbr_delay > 0 || !self.pbr_buffer.is_empty() {
             self.parse_frame_pbr(xll)?;
@@ -409,44 +415,62 @@ impl XllDecoder {
             return Err(XllError::Unsupported("XLL replacement set"));
         }
 
-        // We only support one_to_one_map_ch_to_spkr (the normal multichannel
-        // case). The 2-channel LtRt mapping path is not handled.
-        c.primary_chset = rb1(gb)?;
-        if c.primary_chset != is_primary {
-            return Err(XllError::Invalid("first XLL chset must be primary"));
-        }
-        c.dmix_coeffs_present = rb1(gb)?;
-        c.dmix_embedded = c.dmix_coeffs_present && rb1(gb)?;
-        if c.dmix_coeffs_present && c.primary_chset {
-            c.dmix_type = rb(gb, 3)? as usize;
-            if c.dmix_type >= 7 {
-                return Err(XllError::Invalid("XLL primary downmix type"));
+        // The channel-set layout depends on the asset's one_to_one_map_ch_to_spkr
+        // flag (mirrors FFmpeg dca_xll.c chs_parse_header).
+        if self.one_to_one {
+            // Normal one-to-one channel→speaker mapping (multichannel beds).
+            c.primary_chset = rb1(gb)?;
+            if c.primary_chset != is_primary {
+                return Err(XllError::Invalid("first XLL chset must be primary"));
             }
-        }
-        c.hier_chset = rb1(gb)?;
-        if !c.hier_chset && self.nchsets != 1 {
-            return Err(XllError::Unsupported("XLL chset outside hierarchy"));
-        }
-        if c.dmix_coeffs_present {
-            self.parse_dmix_coeffs(gb, c)?;
-        }
-        // A primary chset's embedded downmix is only used for stereo-downmix
-        // requests; it is NOT undone for full multichannel output. Non-primary
-        // hierarchical embedded downmix (undo_down_mix) is unsupported and
-        // rejected after sub-header parsing.
-        if !rb1(gb)? {
-            return Err(XllError::Unsupported("disabled XLL channel mask"));
-        }
-        c.ch_mask = rb(gb, self.ch_mask_nbits)?;
-        if c.ch_mask.count_ones() as usize != c.nchannels {
-            return Err(XllError::Invalid("XLL channel mask popcount"));
-        }
-        let mut j = 0;
-        for i in 0..self.ch_mask_nbits {
-            if c.ch_mask & (1 << i) != 0 {
-                c.ch_remap[j] = i;
-                j += 1;
+            c.dmix_coeffs_present = rb1(gb)?;
+            c.dmix_embedded = c.dmix_coeffs_present && rb1(gb)?;
+            if c.dmix_coeffs_present && c.primary_chset {
+                c.dmix_type = rb(gb, 3)? as usize;
+                if c.dmix_type >= 7 {
+                    return Err(XllError::Invalid("XLL primary downmix type"));
+                }
             }
+            c.hier_chset = rb1(gb)?;
+            if !c.hier_chset && self.nchsets != 1 {
+                return Err(XllError::Unsupported("XLL chset outside hierarchy"));
+            }
+            if c.dmix_coeffs_present {
+                self.parse_dmix_coeffs(gb, c)?;
+            }
+            // A primary chset's embedded downmix is only used for stereo-downmix
+            // requests; it is NOT undone for full multichannel output. Non-primary
+            // hierarchical embedded downmix (undo_down_mix) is unsupported and
+            // rejected after sub-header parsing.
+            if !rb1(gb)? {
+                return Err(XllError::Unsupported("disabled XLL channel mask"));
+            }
+            c.ch_mask = rb(gb, self.ch_mask_nbits)?;
+            if c.ch_mask.count_ones() as usize != c.nchannels {
+                return Err(XllError::Invalid("XLL channel mask popcount"));
+            }
+            let mut j = 0;
+            for i in 0..self.ch_mask_nbits {
+                if c.ch_mask & (1 << i) != 0 {
+                    c.ch_remap[j] = i;
+                    j += 1;
+                }
+            }
+        } else {
+            // Non one-to-one mapping (e.g. an Lt/Rt 2.0 set). Only the plain
+            // stereo case is handled: a single 2-channel set with no custom
+            // mapping coefficients, fixed to L/R.
+            let mapping_coeffs_present = rb1(gb)?;
+            if c.nchannels != 2 || self.nchsets != 1 || mapping_coeffs_present {
+                return Err(XllError::Unsupported("custom XLL channel-to-speaker mapping"));
+            }
+            c.primary_chset = true;
+            c.dmix_coeffs_present = false;
+            c.dmix_embedded = false;
+            c.hier_chset = false;
+            c.ch_mask = (1 << DCA_SPEAKER_L) | (1 << DCA_SPEAKER_R);
+            c.ch_remap[0] = DCA_SPEAKER_L;
+            c.ch_remap[1] = DCA_SPEAKER_R;
         }
 
         if c.freq > 96000 {
