@@ -112,6 +112,8 @@ fn main() {
     let mut exact_basic_fields: HashMap<(usize, usize, usize, u32), usize> = HashMap::new();
     let mut first_candidates = Vec::new();
     let mut decoded_audio_frames = 0usize;
+    let mut descriptor_navigation_frames = 0usize;
+    let mut first_descriptor_fallbacks = Vec::new();
     let mut decode_errors: HashMap<String, usize> = HashMap::new();
     let mut navigation_deltas: HashMap<isize, usize> = HashMap::new();
     let mut trailer_crc_valid = [0usize; 3];
@@ -210,6 +212,16 @@ fn main() {
                         .entry(frame.x_header_tail_bits)
                         .or_default() += 1;
                     decoded_audio_frames += 1;
+                    descriptor_navigation_frames += usize::from(frame.x_descriptor_navigation_used);
+                    if !frame.x_descriptor_navigation_used && first_descriptor_fallbacks.len() < 8 {
+                        first_descriptor_fallbacks.push((
+                            frames,
+                            frame.x_descriptor_offset,
+                            frame.x_payload_offset,
+                            frame.x_descriptor_size,
+                            frame.x_payload.len(),
+                        ));
+                    }
                     trailing_bits.push(payload.len() * 8 - frame.x_bits_consumed);
                     for (channel, samples) in frame.x_samples.iter().enumerate() {
                         let energy = samples
@@ -298,6 +310,13 @@ fn main() {
          {exact_offset_crc_valid}/{exact_offset_frames}"
     );
     println!("decoded four-channel audio frames: {decoded_audio_frames}/{payloads}");
+    println!(
+        "frames located through EXSS descriptor navigation: {descriptor_navigation_frames}/{payloads}"
+    );
+    println!(
+        "first descriptor fallbacks (frame, hinted/actual offset, hinted/actual size): \
+         {first_descriptor_fallbacks:?}"
+    );
     println!("extension decode errors: {decode_errors:?}");
     let mut navigation_deltas = navigation_deltas.into_iter().collect::<Vec<_>>();
     navigation_deltas.sort_unstable_by_key(|&(delta, _)| delta);

@@ -68,6 +68,12 @@ pub struct HdFrame {
     /// metadata research. Only the first `exss_descriptor_tail_bits` are valid.
     pub exss_descriptor_tail: Vec<u8>,
     pub exss_descriptor_tail_bits: usize,
+    /// Parsed profile-specific navigation for the XLL-X block.
+    pub x_descriptor_offset: Option<usize>,
+    pub x_descriptor_size: Option<usize>,
+    /// True when the decoder used the descriptor navigation rather than only
+    /// locating the syncword after the decoded XLL band data.
+    pub x_descriptor_navigation_used: bool,
 }
 
 /// Size in bytes of the EXSS substream starting at `data` (which must begin at
@@ -167,6 +173,9 @@ impl HdDecoder {
             xll_scalable_lsbs: self.xll.scalable_lsbs,
             exss_descriptor_tail: exssp.asset.descriptor_tail.clone(),
             exss_descriptor_tail_bits: exssp.asset.descriptor_tail_bits,
+            x_descriptor_offset: exssp.asset.xll_x_offset,
+            x_descriptor_size: exssp.asset.xll_x_size,
+            x_descriptor_navigation_used: self.xll.x_descriptor_navigation_used,
         })
     }
 }
@@ -330,6 +339,9 @@ mod tests {
             assert_eq!(frame.x_samples.len(), 4);
             assert!(frame.x_samples.iter().all(|channel| channel.len() == 512));
             assert_eq!(frame.x_decode_error, None);
+            assert!(frame.x_descriptor_navigation_used);
+            assert_eq!(frame.x_descriptor_offset, Some(frame.x_payload_offset));
+            assert_eq!(frame.x_descriptor_size, Some(frame.x_payload.len()));
             frames += 1;
             offset += core.frame_size + exss_size;
         }

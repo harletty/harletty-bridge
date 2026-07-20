@@ -76,20 +76,24 @@ The 18-byte profile wrapper is constant across frames and titles. Direct
 bit-aligned searches also found no MDA frame signature or MDA URI markers, so
 this is not a byte-for-byte MDA packet encapsulation.
 
-The EXSS audio-asset descriptor does contain a 64-bit profile-specific reserved
-region per frame. After parsing the later standard TS 102 114 fields, this
-region has two rapidly varying 8-bit quantities embedded in otherwise fixed
-bits. Their behaviour currently looks more like two 256-sample DRC/level values
-than object positions:
+The EXSS audio-asset descriptor contains a 64-bit profile-specific word per
+frame. Corpus analysis now identifies it as XLL-X navigation, not DRC or
+spatial coordinates. Its observed bit layout is:
 
-- they fluctuate every 10.67 ms even in stationary opening material;
-- their deltas are noise-like rather than smooth trajectories;
-- they diverge between the two language mixes whenever their audio diverges;
-- they correlate moderately with decoded half-frame peak level.
+- 8-bit marker `0x18`;
+- 11-bit XLL-X payload offset divided by four, followed by 13 zero bits;
+- 16-bit marker `0x8a28`;
+- 10-bit `(payload size - 24) / 4`, followed by 6 zero bits.
 
-This is evidence, not yet a decoded grammar. `xll_x_meta` captures and measures
-the field. The next spatial question is therefore whether the four waveforms
-are:
+The decoded offset and size exactly match the XLL-X block located after the
+regular XLL band data: 93,243/93,243 frames across 64 MiB from each of the nine
+available streams. `xll_x_meta` checks this identity over the corpus. The
+decoder now prefers these values to locate the block, while validating its
+bounds and syncword and retaining the legacy aligned band-end probe as a
+fallback. This makes extension extraction more robust, but supplies neither a
+gain curve nor an object trajectory.
+
+The remaining spatial question is therefore whether the four waveforms are:
 
 1. fixed height feeds (most economical explanation);
 2. a four-component sound-field representation;

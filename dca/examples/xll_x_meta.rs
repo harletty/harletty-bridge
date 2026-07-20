@@ -24,7 +24,8 @@ fn main() {
     let mut decoder = HdDecoder::new();
     let mut offset = 0usize;
     let mut words = Vec::new();
-    let mut half_peaks = Vec::new();
+    let mut x_payload_offsets = Vec::new();
+    let mut x_payload_sizes = Vec::new();
     let mut tail_lengths = HashMap::new();
 
     while offset + 18 < bytes.len() {
@@ -51,17 +52,8 @@ fn main() {
                 words.push(u64::from_be_bytes(
                     frame.exss_descriptor_tail[..8].try_into().unwrap(),
                 ));
-                let mut peaks = [0.0f64; 2];
-                for samples in frame.samples.iter().flatten().chain(&frame.x_samples) {
-                    for (half, peak) in peaks.iter_mut().enumerate() {
-                        let start = half * samples.len() / 2;
-                        let end = (half + 1) * samples.len() / 2;
-                        for &sample in &samples[start..end] {
-                            *peak = peak.max((sample as f64).abs());
-                        }
-                    }
-                }
-                half_peaks.push(peaks);
+                x_payload_offsets.push(frame.x_payload_offset);
+                x_payload_sizes.push(frame.x_payload.len());
             }
         }
         offset += core.frame_size + exss_len;
@@ -73,7 +65,69 @@ fn main() {
         words.len(),
         words.iter().copied().collect::<HashSet<_>>().len()
     );
-    println!("first words (frame, seconds, u64, four u16 lanes):");
+    let navigation_matches = words
+        .iter()
+        .enumerate()
+        .filter(|&(index, &word)| {
+            let offset = ((word >> 45) & 0x7ff) as usize * 4;
+            let size = ((word >> 6) & 0x3ff) as usize * 4 + 24;
+            offset == x_payload_offsets[index] && size == x_payload_sizes[index]
+        })
+        .count();
+    let syntax_matches = words
+        .iter()
+        .filter(|&&word| {
+            let high = (word >> 32) as u32;
+            let low = word as u32;
+            high & !0x00ff_e000 == 0x1800_0000 && low & !0x0000_ffc0 == 0x8a28_0000
+        })
+        .count();
+    println!(
+        "XLL-X navigation syntax matches: {syntax_matches}/{}",
+        words.len()
+    );
+    println!(
+        "XLL-X navigation identity matches: {navigation_matches}/{}",
+        words.len()
+    );
+    let first_mismatches = words
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &word)| {
+            let encoded_offset = ((word >> 45) & 0x7ff) as usize * 4;
+            let encoded_size = ((word >> 6) & 0x3ff) as usize * 4 + 24;
+            let actual_offset = x_payload_offsets[index];
+            let actual_size = x_payload_sizes[index];
+            (encoded_offset != actual_offset || encoded_size != actual_size).then_some((
+                index,
+                encoded_offset,
+                actual_offset,
+                encoded_size,
+                actual_size,
+            ))
+        })
+        .take(12)
+        .collect::<Vec<_>>();
+    println!("first navigation mismatches (frame, encoded/actual offset, encoded/actual size): {first_mismatches:?}");
+    println!("navigation matches by decoded-frame lag (actual index = metadata index + lag):");
+    for lag in -4isize..=4 {
+        let mut matches = 0usize;
+        let mut compared = 0usize;
+        for (index, &word) in words.iter().enumerate() {
+            let actual = index as isize + lag;
+            if !(0..words.len() as isize).contains(&actual) {
+                continue;
+            }
+            let actual = actual as usize;
+            let offset = ((word >> 45) & 0x7ff) as usize * 4;
+            let size = ((word >> 6) & 0x3ff) as usize * 4 + 24;
+            matches +=
+                usize::from(offset == x_payload_offsets[actual] && size == x_payload_sizes[actual]);
+            compared += 1;
+        }
+        println!("  {lag:+}: {matches}/{compared}");
+    }
+    println!("first words (frame, seconds, u64, four u16 lanes, bed/ext bytes):");
     for (frame, &word) in words.iter().take(32).enumerate() {
         let lanes = [
             (word >> 48) as u16,
@@ -82,8 +136,10 @@ fn main() {
             word as u16,
         ];
         println!(
-            "  {frame:>5} {:>9.5}  {word:016x}  {lanes:04x?}",
-            frame as f64 * 512.0 / 48_000.0
+            "  {frame:>5} {:>9.5}  {word:016x}  {lanes:04x?}  {:>5}/{:>4}",
+            frame as f64 * 512.0 / 48_000.0,
+            x_payload_offsets[frame],
+            x_payload_sizes[frame]
         );
     }
 
@@ -120,59 +176,4 @@ fn main() {
         }
         println!("  lane {lane}: {minimum}..{maximum}, unchanged {zero}");
     }
-
-    let field_a = words
-        .iter()
-        .map(|&word| ((word >> 45) & 0xff) as f64)
-        .collect::<Vec<_>>();
-    let field_b = words
-        .iter()
-        .map(|&word| ((word >> 6) & 0xff) as f64)
-        .collect::<Vec<_>>();
-    let peak_a = half_peaks.iter().map(|peaks| peaks[0]).collect::<Vec<_>>();
-    let peak_b = half_peaks.iter().map(|peaks| peaks[1]).collect::<Vec<_>>();
-    let peak_db_a = peak_a
-        .iter()
-        .map(|&peak| 20.0 * peak.max(1e-12).log10())
-        .collect::<Vec<_>>();
-    let peak_db_b = peak_b
-        .iter()
-        .map(|&peak| 20.0 * peak.max(1e-12).log10())
-        .collect::<Vec<_>>();
-    println!(
-        "candidate 8-bit fields A/B ranges: {:?}/{:?}",
-        field_a
-            .iter()
-            .fold((255.0f64, 0.0f64), |(lo, hi), &v| (lo.min(v), hi.max(v))),
-        field_b
-            .iter()
-            .fold((255.0f64, 0.0f64), |(lo, hi), &v| (lo.min(v), hi.max(v)))
-    );
-    println!(
-        "correlation with decoded half-frame peak A/B: {:.6}/{:.6}",
-        pearson(&field_a, &peak_a),
-        pearson(&field_b, &peak_b)
-    );
-    println!(
-        "correlation matrix fields A/B vs peak dB halves A/B: [[{:.6}, {:.6}], [{:.6}, {:.6}]]",
-        pearson(&field_a, &peak_db_a),
-        pearson(&field_a, &peak_db_b),
-        pearson(&field_b, &peak_db_a),
-        pearson(&field_b, &peak_db_b)
-    );
-}
-
-fn pearson(a: &[f64], b: &[f64]) -> f64 {
-    let n = a.len().min(b.len());
-    let am = a[..n].iter().sum::<f64>() / n as f64;
-    let bm = b[..n].iter().sum::<f64>() / n as f64;
-    let mut covariance = 0.0;
-    let mut av = 0.0;
-    let mut bv = 0.0;
-    for (&x, &y) in a[..n].iter().zip(&b[..n]) {
-        covariance += (x - am) * (y - bm);
-        av += (x - am).powi(2);
-        bv += (y - bm).powi(2);
-    }
-    covariance / (av * bv).sqrt()
 }

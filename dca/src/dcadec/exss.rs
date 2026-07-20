@@ -100,6 +100,10 @@ pub(crate) struct ExssAsset {
     pub(crate) descriptor_tail_bits: usize,
     pub(crate) decode_in_secondary: bool,
     pub(crate) drc_rev2_present: bool,
+    /// Profile-specific XLL-X navigation: byte offset from the start of the
+    /// logical XLL frame, and full extension size in bytes.
+    pub(crate) xll_x_offset: Option<usize>,
+    pub(crate) xll_x_size: Option<usize>,
 }
 
 #[derive(Default)]
@@ -389,6 +393,10 @@ impl ExssParser {
                 a.descriptor_tail[bit / 8] |= 1 << (7 - bit % 8);
             }
         }
+        if let Some((offset, size)) = parse_xll_x_navigation(&a.descriptor_tail) {
+            a.xll_x_offset = Some(offset);
+            a.xll_x_size = Some(size);
+        }
         seek(gb, descr_end)
     }
 
@@ -429,6 +437,27 @@ impl ExssParser {
     }
 }
 
+/// Decode the profile-specific 64-bit XLL-X navigation word carried in the
+/// otherwise reserved asset-descriptor tail.
+///
+/// Observed syntax across the corpus:
+///   8-bit marker, 11-bit `offset / 4`, 13 zero bits,
+///   16-bit marker, 10-bit `(size - 24) / 4`, 6 zero bits.
+fn parse_xll_x_navigation(tail: &[u8]) -> Option<(usize, usize)> {
+    let bytes: [u8; 8] = tail.get(..8)?.try_into().ok()?;
+    let word = u64::from_be_bytes(bytes);
+    let high = (word >> 32) as u32;
+    let low = word as u32;
+    const OFFSET_FIELD_MASK: u32 = 0x00ff_e000;
+    const SIZE_FIELD_MASK: u32 = 0x0000_ffc0;
+    if high & !OFFSET_FIELD_MASK != 0x1800_0000 || low & !SIZE_FIELD_MASK != 0x8a28_0000 {
+        return None;
+    }
+    let offset = ((high & OFFSET_FIELD_MASK) >> 13) as usize * 4;
+    let size = ((low & SIZE_FIELD_MASK) >> 6) as usize * 4 + 24;
+    Some((offset, size))
+}
+
 fn parse_xll_parameters(gb: &mut BitReader, a: &mut ExssAsset, exss_size_nbits: usize) -> R<()> {
     a.xll_size = rb(gb, exss_size_nbits)? as usize + 1;
     a.xll_sync_present = rb1(gb)?;
@@ -455,6 +484,19 @@ fn parse_lbr_parameters(gb: &mut BitReader) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_xll_x_navigation_word() {
+        // offset 1400 = 350 * 4; size 648 = 156 * 4 + 24.
+        assert_eq!(
+            parse_xll_x_navigation(&0x182b_c000_8a28_2700u64.to_be_bytes()),
+            Some((1400, 648))
+        );
+        // 4188 = 1047 * 4 uses the eleventh offset bit.
+        let large = 0x1882_e000_8a28_3cc0u64.to_be_bytes();
+        assert_eq!(parse_xll_x_navigation(&large), Some((4188, 996)));
+        assert_eq!(parse_xll_x_navigation(&[0; 8]), None);
+    }
 
     // Validate EXSS parsing on the real Ex Machina DTS-HD MA stream (7.1).
     // Skips if the (uncommitted) dump is absent.

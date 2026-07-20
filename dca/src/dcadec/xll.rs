@@ -199,6 +199,9 @@ pub(crate) struct XllDecoder {
     pub(crate) x_bits_consumed: usize,
     pub(crate) x_decode_error: Option<String>,
     pub(crate) x_header_tail_bits: usize,
+    x_descriptor_offset: Option<usize>,
+    x_descriptor_size: Option<usize>,
+    pub(crate) x_descriptor_navigation_used: bool,
 }
 
 impl XllDecoder {
@@ -227,6 +230,8 @@ impl XllDecoder {
             self.hd_stream_id = asset.hd_stream_id;
         }
         self.one_to_one = asset.one_to_one_map_ch_to_spkr;
+        self.x_descriptor_offset = asset.xll_x_offset;
+        self.x_descriptor_size = asset.xll_x_size;
         let xll = &data[asset.xll_offset..asset.xll_offset + asset.xll_size];
         if self.pbr_delay > 0 || !self.pbr_buffer.is_empty() {
             self.parse_frame_pbr(xll)?;
@@ -323,23 +328,42 @@ impl XllDecoder {
         self.x_bits_consumed = 0;
         self.x_decode_error = None;
         self.x_header_tail_bits = 0;
+        self.x_descriptor_navigation_used = false;
 
-        let frame_bits = self.frame_size * 8;
+        let frame_end = self.frame_size.min(data.len());
+        let frame_bits = frame_end * 8;
         let aligned = (gb.position() + 31) & !31; // FFALIGN(get_bits_count, 32)
         if frame_bits <= aligned {
             return;
         }
-        gb.align_bits(32);
+        let mut start = aligned / 8;
+
+        // The profile-specific asset-descriptor word provides the XLL-X size
+        // and its DWORD offset. Prefer that navigation when its
+        // markers, bounds and syncword all agree; retain the legacy aligned
+        // band-end probe as a fallback for other profiles.
+        if let (Some(offset), Some(size)) = (self.x_descriptor_offset, self.x_descriptor_size) {
+            if let Some(hinted_start) = frame_end.checked_sub(size) {
+                if hinted_start == offset
+                    && data.get(hinted_start..hinted_start + 4)
+                        == Some(&0x0200_0850u32.to_be_bytes())
+                {
+                    start = hinted_start;
+                    self.x_descriptor_navigation_used = true;
+                }
+            }
+        }
+        if !gb.seek(start * 8) {
+            return;
+        }
         match gb.show_bits(32) {
             Some(0x0200_0850) => self.x_syncword_present = true,
             Some(sw) if (sw >> 1) == (0xF140_00D0u32 >> 1) => self.x_imax_syncword_present = true,
             _ => return,
         }
-        let start = gb.position() / 8;
-        let end = self.frame_size.min(data.len());
-        if end > start {
+        if frame_end > start {
             self.x_payload_offset = start;
-            self.x_payload.extend_from_slice(&data[start..end]);
+            self.x_payload.extend_from_slice(&data[start..frame_end]);
         }
     }
 
