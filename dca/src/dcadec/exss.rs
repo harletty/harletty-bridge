@@ -94,6 +94,12 @@ pub(crate) struct ExssAsset {
     pub(crate) xll_delay_nframes: u32,
     pub(crate) xll_sync_offset: usize,
     pub(crate) hd_stream_id: u32,
+    /// Unspecified tail of the audio asset descriptor. Newer profiles can put
+    /// metadata here while legacy decoders skip to `nuAssetDescriptFsize`.
+    pub(crate) descriptor_tail: Vec<u8>,
+    pub(crate) descriptor_tail_bits: usize,
+    pub(crate) decode_in_secondary: bool,
+    pub(crate) drc_rev2_present: bool,
 }
 
 #[derive(Default)]
@@ -102,6 +108,7 @@ pub(crate) struct ExssParser {
     exss_size_nbits: usize,
     exss_size: usize,
     static_fields_present: bool,
+    frame_duration_samples: usize,
     mix_metadata_enabled: bool,
     nmixoutconfigs: usize,
     nmixoutchs: [u32; 4],
@@ -144,7 +151,7 @@ impl ExssParser {
         s.static_fields_present = rb1(&mut gb)?;
         if s.static_fields_present {
             skip(&mut gb, 2)?; // reference clock code
-            skip(&mut gb, 3)?; // frame duration
+            s.frame_duration_samples = 512 * (rb(&mut gb, 3)? as usize + 1);
             if rb1(&mut gb)? {
                 skip(&mut gb, 36)?; // timecode
             }
@@ -258,7 +265,8 @@ impl ExssParser {
         if drc_present && a.embedded_stereo {
             skip(gb, 8)?;
         }
-        if self.mix_metadata_enabled && rb1(gb)? {
+        let mix_metadata_present = self.mix_metadata_enabled && rb1(gb)?;
+        if mix_metadata_present {
             skip(gb, 1)?; // external mixing flag
             skip(gb, 6)?; // post mixing gain
             if rb(gb, 2)? == 3 {
@@ -346,7 +354,42 @@ impl ExssParser {
             a.hd_stream_id = rb(gb, 3)?;
         }
 
-        seek(gb, descr_pos + descr_size * 8)
+        // Fields added after the decoder navigation block in later revisions
+        // of ETSI TS 102 114. Parsing these keeps the remaining descriptor tail
+        // limited to genuinely reserved/profile-specific metadata.
+        if a.one_to_one_map_ch_to_spkr && self.mix_metadata_enabled && !mix_metadata_present {
+            let one_to_one_mixing = rb1(gb)?;
+            if one_to_one_mixing {
+                let per_channel_scale = rb1(gb)?;
+                for config in 0..self.nmixoutconfigs {
+                    let values = if per_channel_scale {
+                        self.nmixoutchs[config] as usize
+                    } else {
+                        1
+                    };
+                    skip(gb, 6 * values)?;
+                }
+            }
+        }
+        a.decode_in_secondary = rb1(gb)?;
+        a.drc_rev2_present = rb1(gb)?;
+        if a.drc_rev2_present {
+            skip(gb, 4)?; // DRCversion_Rev2
+            skip(gb, 8 * (self.frame_duration_samples / 256))?;
+        }
+
+        let descr_end = descr_pos + descr_size * 8;
+        if gb.position() > descr_end {
+            return Err(ExssError::Invalid("asset descriptor fields exceed size"));
+        }
+        a.descriptor_tail_bits = descr_end - gb.position();
+        a.descriptor_tail = vec![0; a.descriptor_tail_bits.div_ceil(8)];
+        for bit in 0..a.descriptor_tail_bits {
+            if rb1(gb)? {
+                a.descriptor_tail[bit / 8] |= 1 << (7 - bit % 8);
+            }
+        }
+        seek(gb, descr_end)
     }
 
     fn set_exss_offsets(&mut self) -> R<()> {
@@ -363,7 +406,9 @@ impl ExssParser {
         if a.extension_mask & DCA_EXSS_XLL != 0
             && a.extension_mask & (DCA_EXSS_XBR | DCA_EXSS_XXCH | DCA_EXSS_X96 | DCA_EXSS_LBR) != 0
         {
-            return Err(ExssError::Unsupported("intervening EXSS extension before XLL"));
+            return Err(ExssError::Unsupported(
+                "intervening EXSS extension before XLL",
+            ));
         }
 
         if a.extension_mask & DCA_EXSS_CORE != 0 {
@@ -427,7 +472,11 @@ mod tests {
         let core = crate::parser::parse_header(&bytes).expect("core header");
         let pos = core.frame_size;
         let sync = 0x6458_2025u32.to_be_bytes();
-        assert_eq!(&bytes[pos..pos + 4], &sync, "EXSS not right after core frame");
+        assert_eq!(
+            &bytes[pos..pos + 4],
+            &sync,
+            "EXSS not right after core frame"
+        );
         let s = ExssParser::parse(&bytes[pos..]).expect("parse exss");
         let a = &s.asset;
         eprintln!(

@@ -149,19 +149,20 @@ struct XllChSet {
     bitalloc_part_a: [usize; DCA_XLL_CHANNELS_MAX],
     bitalloc_part_b: [usize; DCA_XLL_CHANNELS_MAX],
     nsamples_part_a: [usize; DCA_XLL_CHANNELS_MAX],
+    header_tail_bits: usize,
 }
 
 #[derive(Default)]
 pub(crate) struct XllDecoder {
     frame_size: usize,
     nchsets: usize,
-    nframesegs: usize,
+    pub(crate) nframesegs: usize,
     nsegsamples_log2: usize,
-    nsegsamples: usize,
+    pub(crate) nsegsamples: usize,
     nframesamples: usize,
-    seg_size_nbits: usize,
-    band_crc_present: u32,
-    scalable_lsbs: bool,
+    pub(crate) seg_size_nbits: usize,
+    pub(crate) band_crc_present: u32,
+    pub(crate) scalable_lsbs: bool,
     ch_mask_nbits: usize,
     fixed_lsb_width: usize,
     chset: Vec<XllChSet>,
@@ -189,6 +190,15 @@ pub(crate) struct XllDecoder {
     pub(crate) x_payload: Vec<u8>,
     /// Byte offset of `x_payload` within the XLL frame.
     pub(crate) x_payload_offset: usize,
+    /// Decoded, speaker-unmapped waveforms from the bare XLL channel set in the
+    /// DTS:X extension. These are kept separate from the 7.1 bed because the
+    /// extension does not carry a one-to-one speaker map in its channel-set
+    /// header.
+    pub(crate) x_output: Vec<Vec<i32>>,
+    pub(crate) x_pcm_bit_res: usize,
+    pub(crate) x_bits_consumed: usize,
+    pub(crate) x_decode_error: Option<String>,
+    pub(crate) x_header_tail_bits: usize,
 }
 
 impl XllDecoder {
@@ -234,7 +244,9 @@ impl XllDecoder {
     fn parse_frame_no_pbr(&mut self, data: &[u8], asset: &ExssAsset) -> R<()> {
         match self.parse_frame(data) {
             Ok(()) => {}
-            Err(XllError::Eagain) if asset.xll_sync_present && asset.xll_sync_offset < data.len() => {
+            Err(XllError::Eagain)
+                if asset.xll_sync_present && asset.xll_sync_offset < data.len() =>
+            {
                 let d = &data[asset.xll_sync_offset..];
                 if asset.xll_delay_nframes > 0 {
                     self.pbr_buffer.clear();
@@ -292,6 +304,7 @@ impl XllDecoder {
         self.parse_navi_table(&mut gb)?;
         self.parse_band_data(&mut gb)?;
         self.detect_x_extension(&mut gb, data);
+        self.decode_x_extension_audio();
         Ok(())
     }
 
@@ -305,6 +318,11 @@ impl XllDecoder {
         self.x_imax_syncword_present = false;
         self.x_payload.clear();
         self.x_payload_offset = 0;
+        self.x_output.clear();
+        self.x_pcm_bit_res = 0;
+        self.x_bits_consumed = 0;
+        self.x_decode_error = None;
+        self.x_header_tail_bits = 0;
 
         let frame_bits = self.frame_size * 8;
         let aligned = (gb.position() + 31) & !31; // FFALIGN(get_bits_count, 32)
@@ -323,6 +341,116 @@ impl XllDecoder {
             self.x_payload_offset = start;
             self.x_payload.extend_from_slice(&data[start..end]);
         }
+    }
+
+    fn decode_x_extension_audio(&mut self) {
+        if !self.x_syncword_present {
+            return;
+        }
+        let payload = std::mem::take(&mut self.x_payload);
+        let result = self.try_decode_x_extension_audio(&payload);
+        self.x_payload = payload;
+        if let Err(error) = result {
+            self.x_output.clear();
+            self.x_decode_error = Some(format!("{error:?}"));
+        }
+    }
+
+    /// Decode the bare XLL channel set following the 22-byte DTS:X wrapper.
+    ///
+    /// The channel-set header is normative XLL syntax and has its own valid
+    /// CRC16. It deliberately has no one-to-one speaker mapping: the four
+    /// decoded waveforms therefore stay separate from the regular bed output.
+    fn try_decode_x_extension_audio(&mut self, payload: &[u8]) -> R<()> {
+        const X_CHSET_OFFSET: usize = 22;
+        const X_CHANNELS: usize = 4;
+
+        if payload.len() <= X_CHSET_OFFSET {
+            return Err(XllError::Invalid("short XLL-X payload"));
+        }
+        let mut gb = BitReader::with_offset(payload, X_CHSET_OFFSET * 8);
+        let mut chset = XllChSet::default();
+        self.chs_parse_header(&mut gb, &mut chset, true, true)?;
+        if chset.nchannels != X_CHANNELS {
+            return Err(XllError::Invalid("unexpected XLL-X channel count"));
+        }
+        let full_mask = (1u32 << chset.nchannels) - 1;
+        if chset.residual_encode != full_mask {
+            return Err(XllError::Unsupported("XLL-X core-referenced channels"));
+        }
+        self.x_header_tail_bits = chset.header_tail_bits;
+
+        // The bare sub-header is followed by the standard XLL navigation
+        // table: one segment-size entry per inherited frame segment, followed
+        // by byte alignment and CRC16. The segment data then runs up to the
+        // final DWORD padding.
+        let navi_payload_bits = self.nframesegs * self.seg_size_nbits;
+        let navi_size = navi_payload_bits.div_ceil(8) + 2;
+        let navi_start = gb.position() / 8;
+        if payload.len() < navi_start + navi_size {
+            return Err(XllError::Invalid("short XLL-X navigation table"));
+        }
+        let mut navi_reader = BitReader::with_offset(payload, navi_start * 8);
+        let mut navi = Vec::with_capacity(self.nframesegs);
+        for _ in 0..self.nframesegs {
+            navi.push(rb(&mut navi_reader, self.seg_size_nbits)? as usize + 1);
+        }
+        navi_reader.align_bits(8);
+        rb(&mut navi_reader, 16)?;
+        let data_start = navi_start + navi_size;
+        let data_bytes = navi.iter().sum::<usize>();
+        // The extension carries a two-byte trailer after the channel-set data,
+        // then zero to three bytes of DWORD padding.
+        if data_start + data_bytes > payload.len() || payload.len() - (data_start + data_bytes) > 5
+        {
+            return Err(XllError::Invalid("XLL-X navigation size mismatch"));
+        }
+        seek(&mut gb, data_start * 8)?;
+
+        self.chset.push(chset);
+        let chset_index = self.chset.len() - 1;
+        let decode_result = (|| {
+            let channels = self.chset[chset_index].nchannels;
+            self.chset[chset_index].band.msb = vec![vec![0i32; self.nframesamples]; channels];
+            self.chset[chset_index].band.lsb = if self.chset[chset_index].band.lsb_section_size != 0
+            {
+                vec![vec![0i32; self.nframesamples]; channels]
+            } else {
+                Vec::new()
+            };
+
+            let mut band_end = gb.position();
+            for (segment, &segment_bytes) in navi.iter().enumerate() {
+                band_end += segment_bytes * 8;
+                self.chs_parse_band_data(&mut gb, chset_index, segment, band_end)?;
+                seek(&mut gb, band_end)?;
+            }
+            self.chs_filter_band_data(chset_index);
+            if self.scalable_lsbs {
+                self.chs_assemble_msbs_lsbs(chset_index);
+            }
+            Ok(())
+        })();
+        let chset = self.chset.pop().expect("temporary XLL-X channel set");
+        decode_result?;
+
+        let shift = 24usize
+            .checked_sub(chset.pcm_bit_res)
+            .ok_or(XllError::Invalid("XLL-X PCM resolution"))?;
+        self.x_output = chset
+            .band
+            .msb
+            .into_iter()
+            .map(|samples| {
+                samples
+                    .into_iter()
+                    .map(|sample| clip23(sample.wrapping_mul(1 << shift)))
+                    .collect()
+            })
+            .collect();
+        self.x_pcm_bit_res = chset.pcm_bit_res;
+        self.x_bits_consumed = gb.position();
+        Ok(())
     }
 
     fn parse_common_header(&mut self, gb: &mut BitReader) -> R<()> {
@@ -372,7 +500,7 @@ impl XllDecoder {
             let hier_ofs = self.nchannels;
             let mut c = std::mem::take(&mut self.chset[i]);
             c.hier_ofs = hier_ofs;
-            self.chs_parse_header(gb, &mut c, i == 0)?;
+            self.chs_parse_header(gb, &mut c, i == 0, false)?;
             if c.nfreqbands > self.nfreqbands {
                 self.nfreqbands = c.nfreqbands;
             }
@@ -388,7 +516,13 @@ impl XllDecoder {
         Ok(())
     }
 
-    fn chs_parse_header(&mut self, gb: &mut BitReader, c: &mut XllChSet, is_primary: bool) -> R<()> {
+    fn chs_parse_header(
+        &mut self,
+        gb: &mut BitReader,
+        c: &mut XllChSet,
+        is_primary: bool,
+        allow_unmapped: bool,
+    ) -> R<()> {
         let header_pos = gb.position();
         let header_size = rb(gb, 10)? as usize + 1;
         c.nchannels = rb(gb, 4)? as usize + 1;
@@ -417,7 +551,7 @@ impl XllDecoder {
 
         // The channel-set layout depends on the asset's one_to_one_map_ch_to_spkr
         // flag (mirrors FFmpeg dca_xll.c chs_parse_header).
-        if self.one_to_one {
+        if self.one_to_one && !allow_unmapped {
             // Normal one-to-one channel→speaker mapping (multichannel beds).
             c.primary_chset = rb1(gb)?;
             if c.primary_chset != is_primary {
@@ -461,16 +595,26 @@ impl XllDecoder {
             // stereo case is handled: a single 2-channel set with no custom
             // mapping coefficients, fixed to L/R.
             let mapping_coeffs_present = rb1(gb)?;
-            if c.nchannels != 2 || self.nchsets != 1 || mapping_coeffs_present {
-                return Err(XllError::Unsupported("custom XLL channel-to-speaker mapping"));
+            if mapping_coeffs_present
+                || (!allow_unmapped && (c.nchannels != 2 || self.nchsets != 1))
+            {
+                return Err(XllError::Unsupported(
+                    "custom XLL channel-to-speaker mapping",
+                ));
             }
             c.primary_chset = true;
             c.dmix_coeffs_present = false;
             c.dmix_embedded = false;
-            c.hier_chset = false;
-            c.ch_mask = (1 << DCA_SPEAKER_L) | (1 << DCA_SPEAKER_R);
-            c.ch_remap[0] = DCA_SPEAKER_L;
-            c.ch_remap[1] = DCA_SPEAKER_R;
+            c.hier_chset = allow_unmapped;
+            if allow_unmapped {
+                for ch in 0..c.nchannels {
+                    c.ch_remap[ch] = ch;
+                }
+            } else {
+                c.ch_mask = (1 << DCA_SPEAKER_L) | (1 << DCA_SPEAKER_R);
+                c.ch_remap[0] = DCA_SPEAKER_L;
+                c.ch_remap[1] = DCA_SPEAKER_R;
+            }
         }
 
         if c.freq > 96000 {
@@ -571,7 +715,12 @@ impl XllDecoder {
             }
         }
 
-        seek(gb, header_pos + header_size * 8)
+        let header_end = header_pos + header_size * 8;
+        if gb.position() > header_end {
+            return Err(XllError::Invalid("XLL channel-set fields exceed header"));
+        }
+        c.header_tail_bits = header_end - gb.position();
+        seek(gb, header_end)
     }
 
     fn parse_dmix_coeffs(&mut self, gb: &mut BitReader, c: &mut XllChSet) -> R<()> {
@@ -833,8 +982,8 @@ impl XllDecoder {
                     // dst = msb[2i+1], src = msb[2i]
                     for n in 0..nsamples {
                         let s = b.msb[i * 2][n];
-                        b.msb[i * 2 + 1][n] =
-                            b.msb[i * 2 + 1][n].wrapping_add((s.wrapping_mul(coeff) + (1 << 2)) >> 3);
+                        b.msb[i * 2 + 1][n] = b.msb[i * 2 + 1][n]
+                            .wrapping_add((s.wrapping_mul(coeff) + (1 << 2)) >> 3);
                     }
                 }
             }
@@ -956,8 +1105,9 @@ impl XllDecoder {
             if self.chset[chs].residual_encode & (1 << ch) != 0 {
                 continue;
             }
-            let spkr = map_core_spkr(core.ch_mask, self.chset[chs].ch_remap[ch])
-                .ok_or(XllError::Invalid("residual references missing core channel"))?;
+            let spkr = map_core_spkr(core.ch_mask, self.chset[chs].ch_remap[ch]).ok_or(
+                XllError::Invalid("residual references missing core channel"),
+            )?;
             let shift = 24 - self.chset[chs].pcm_bit_res + self.chs_get_lsb_width(chs, ch);
             if shift > 24 {
                 return Err(XllError::Invalid("invalid core shift"));
@@ -1033,7 +1183,10 @@ impl XllDecoder {
             for ch in 0..nchannels {
                 let spkr = self.chset[chs].ch_remap[ch];
                 let buf = std::mem::take(&mut self.chset[chs].band.msb[ch]);
-                let scaled: Vec<i32> = buf.iter().map(|&s| clip23(s.wrapping_mul(1 << shift))).collect();
+                let scaled: Vec<i32> = buf
+                    .iter()
+                    .map(|&s| clip23(s.wrapping_mul(1 << shift)))
+                    .collect();
                 self.output[spkr] = Some(scaled);
             }
         }
