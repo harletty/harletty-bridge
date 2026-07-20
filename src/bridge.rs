@@ -927,7 +927,7 @@ mod raw_transport_tests {
     }
 
     // End-to-end DTS-HD MA + XLL-X: feed a raw dump and check it emits the
-    // provisional 7.1 bed + four fixed height objects. Skips without the dump.
+    // reconstructed 7.1 bed + four fixed height objects. Skips without the dump.
     #[test]
     fn dtshd_raw_transport_emits_fixed_7_1_4_objects() {
         use std::io::Read;
@@ -960,7 +960,7 @@ mod raw_transport_tests {
         assert_eq!(f.sampling_frequency, 48_000);
         use bridge_api::RChannelLabel::*;
         let labels: Vec<_> = f.channel_labels.iter().copied().collect();
-        // Active speakers ascending, followed by the provisional XLL-X order.
+        // Active speakers ascending, followed by the fixed XLL-X height order.
         assert_eq!(
             labels,
             vec![C, L, R, Ls, Rs, LFE, Lb, Rb, Tfl, Tfr, Tbl, Tbr]

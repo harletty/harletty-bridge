@@ -4,13 +4,14 @@
 // routes each frame to either the DTS-HD MA lossless decoder (5.1/7.1, when an
 // EXSS substream follows the core) or the plain DTS core decoder (5.1). Every
 // decoded core channel is emitted as a bed channel, placed at its canonical
-// speaker by the renderer. XLL-X's four additional waveforms are provisionally
-// mapped as fixed objects at the four 7.1.4 height positions.
+// speaker by the renderer. XLL-X's four additional waveforms are mapped as
+// fixed objects at the four 7.1.4 height positions after undoing their -3 dB
+// contribution to the backward-compatible 7.1 bed.
 
 use abi_stable::std_types::{RString, RVec};
 use bridge_api::RPushResult;
 use bridge_api::{RChannelLabel, RDecodedFrame, REvent, RMetadataFrame, RNameUpdate};
-use dca::{CorePcmFrame, HdError, HdFrame, exss_has_xll, exss_substream_size, parse_header};
+use dca::{exss_has_xll, exss_substream_size, parse_header, CorePcmFrame, HdError, HdFrame};
 
 use crate::bridge::AtmosBridge;
 use crate::frame_builders::float_to_pcm_i32;
@@ -31,6 +32,9 @@ const XLL_X_HEIGHT_POSITIONS: [[f64; 3]; 4] = [
     [1.0, -1.0, 1.0],
 ];
 const XLL_X_HEIGHT_NAMES: [&str; 4] = ["TFL", "TFR", "TBL", "TBR"];
+// Exact Q15 -3 dB coefficient used by the DTS downmix table. The regular 7.1
+// presentation contains this contribution from each corresponding height feed.
+const XLL_X_HEIGHT_DOWNMIX_GAIN: f32 = 23_170.0 / 32_768.0;
 
 /// Demux and decode all complete DTS frames buffered in `bridge.dts_buf`.
 pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
@@ -260,6 +264,18 @@ fn build_xll_x_metadata(
     })
 }
 
+#[inline]
+fn undo_xll_x_height_downmix(spkr: usize, bed: f32, height: &[f32; 4]) -> f32 {
+    let embedded_height = match spkr {
+        1 => height[0], // L  <- TFL
+        2 => height[1], // R  <- TFR
+        7 => height[2], // Lb <- TBL
+        8 => height[3], // Rb <- TBR
+        _ => return bed,
+    };
+    bed - embedded_height * XLL_X_HEIGHT_DOWNMIX_GAIN
+}
+
 /// Build a bed frame from a decoded DTS-HD frame (per-speaker f32).
 fn build_hd_frame(hd: &HdFrame, sample_pos: u64, emit_names: bool) -> RDecodedFrame {
     // Active speakers in ascending index order = stable channel order.
@@ -271,34 +287,50 @@ fn build_hd_frame(hd: &HdFrame, sample_pos: u64, emit_names: bool) -> RDecodedFr
     // speaker mask. Treat its stable stereo pairs as front-height L/R followed
     // by rear-height L/R. Keep the mapping isolated here so it can be replaced
     // without touching the lossless decoder if later metadata proves otherwise.
-    let height_samples = if hd.x_samples.len() == XLL_X_HEIGHT_LABELS.len()
-        && hd
-            .x_samples
-            .iter()
-            .all(|channel| channel.len() == sample_count)
-    {
-        hd.x_samples.as_slice()
-    } else {
-        &[]
-    };
-    let channel_count = active.len() + height_samples.len();
+    let height_samples: Option<&[Vec<f32>; 4]> =
+        hd.x_samples
+            .as_slice()
+            .try_into()
+            .ok()
+            .filter(|channels: &&[Vec<f32>; 4]| {
+                channels.iter().all(|channel| channel.len() == sample_count)
+            });
+    let height_count = height_samples.map_or(0, |_| XLL_X_HEIGHT_LABELS.len());
+    let channel_count = active.len() + height_count;
 
     let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * channel_count);
-    for s in 0..sample_count {
-        for &spkr in &active {
-            pcm.push(float_to_pcm_i32(hd.samples[spkr].as_ref().unwrap()[s]));
+    if let Some(height_samples) = height_samples {
+        for s in 0..sample_count {
+            let height = [
+                height_samples[0][s],
+                height_samples[1][s],
+                height_samples[2][s],
+                height_samples[3][s],
+            ];
+            for &spkr in &active {
+                let bed = hd.samples[spkr].as_ref().unwrap()[s];
+                pcm.push(float_to_pcm_i32(undo_xll_x_height_downmix(
+                    spkr, bed, &height,
+                )));
+            }
+            for sample in height {
+                pcm.push(float_to_pcm_i32(sample));
+            }
         }
-        for channel in height_samples {
-            pcm.push(float_to_pcm_i32(channel[s]));
+    } else {
+        for s in 0..sample_count {
+            for &spkr in &active {
+                pcm.push(float_to_pcm_i32(hd.samples[spkr].as_ref().unwrap()[s]));
+            }
         }
     }
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(channel_count);
     for &spkr in &active {
         channel_labels.push(speaker_to_label(spkr));
     }
-    channel_labels.extend(XLL_X_HEIGHT_LABELS[..height_samples.len()].iter().copied());
+    channel_labels.extend(XLL_X_HEIGHT_LABELS[..height_count].iter().copied());
 
-    let metadata = if height_samples.len() == XLL_X_HEIGHT_LABELS.len() {
+    let metadata = if height_samples.is_some() {
         build_xll_x_metadata(&active, sample_pos, emit_names)
             .into_iter()
             .collect()
@@ -353,5 +385,157 @@ fn build_core_frame(core: &CorePcmFrame) -> RDecodedFrame {
         drc_ramp_duration: 0,
         dialogue_level: None.into(),
         is_new_segment: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_COUNT: usize = 2;
+
+    fn hd_frame(samples: Vec<Option<Vec<f32>>>, x_samples: Vec<Vec<f32>>) -> HdFrame {
+        HdFrame {
+            sample_rate: 48_000,
+            output_mask: 0,
+            samples,
+            x_present: !x_samples.is_empty(),
+            x_imax: false,
+            x_payload: Vec::new(),
+            x_payload_offset: 0,
+            x_samples,
+            x_pcm_bit_res: 24,
+            x_bits_consumed: 0,
+            x_decode_error: None,
+            x_header_tail_bits: 0,
+            xll_frame_segments: 1,
+            xll_segment_samples: SAMPLE_COUNT,
+            xll_segment_size_bits: 0,
+            xll_band_crc_present: 0,
+            xll_scalable_lsbs: false,
+            exss_descriptor_tail: Vec::new(),
+            exss_descriptor_tail_bits: 0,
+            x_descriptor_offset: None,
+            x_descriptor_size: None,
+            x_descriptor_navigation_used: false,
+        }
+    }
+
+    fn assert_pcm_close(actual: i32, expected: f32) {
+        let expected = float_to_pcm_i32(expected);
+        assert!(
+            actual.abs_diff(expected) <= 1,
+            "actual={actual}, expected={expected}"
+        );
+    }
+
+    #[test]
+    fn xll_x_heights_are_removed_from_the_compatible_bed() {
+        let heights = [
+            vec![0.40, -0.20],
+            vec![-0.30, 0.10],
+            vec![0.20, -0.40],
+            vec![-0.10, 0.30],
+        ];
+        let dry = [
+            vec![0.05, -0.06],
+            vec![-0.07, 0.08],
+            vec![0.09, -0.10],
+            vec![-0.11, 0.12],
+        ];
+        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
+        samples[0] = Some(vec![0.01, -0.01]);
+        samples[1] = Some(
+            dry[0]
+                .iter()
+                .zip(&heights[0])
+                .map(|(&bed, &height)| bed + height * XLL_X_HEIGHT_DOWNMIX_GAIN)
+                .collect(),
+        );
+        samples[2] = Some(
+            dry[1]
+                .iter()
+                .zip(&heights[1])
+                .map(|(&bed, &height)| bed + height * XLL_X_HEIGHT_DOWNMIX_GAIN)
+                .collect(),
+        );
+        samples[3] = Some(vec![0.02, -0.02]);
+        samples[4] = Some(vec![0.03, -0.03]);
+        samples[5] = Some(vec![0.04, -0.04]);
+        samples[7] = Some(
+            dry[2]
+                .iter()
+                .zip(&heights[2])
+                .map(|(&bed, &height)| bed + height * XLL_X_HEIGHT_DOWNMIX_GAIN)
+                .collect(),
+        );
+        samples[8] = Some(
+            dry[3]
+                .iter()
+                .zip(&heights[3])
+                .map(|(&bed, &height)| bed + height * XLL_X_HEIGHT_DOWNMIX_GAIN)
+                .collect(),
+        );
+
+        let hd = hd_frame(samples, heights.into());
+        let frame = build_hd_frame(&hd, 123, true);
+
+        assert_eq!(frame.sample_count, SAMPLE_COUNT as u32);
+        assert_eq!(frame.channel_count, 12);
+        assert_eq!(
+            frame.channel_labels.as_slice(),
+            &[
+                RChannelLabel::C,
+                RChannelLabel::L,
+                RChannelLabel::R,
+                RChannelLabel::Ls,
+                RChannelLabel::Rs,
+                RChannelLabel::LFE,
+                RChannelLabel::Lb,
+                RChannelLabel::Rb,
+                RChannelLabel::Tfl,
+                RChannelLabel::Tfr,
+                RChannelLabel::Tbl,
+                RChannelLabel::Tbr,
+            ]
+        );
+        assert_eq!(frame.metadata.len(), 1);
+
+        for sample in 0..SAMPLE_COUNT {
+            let row = &frame.pcm[sample * 12..(sample + 1) * 12];
+            assert_pcm_close(row[1], dry[0][sample]);
+            assert_pcm_close(row[2], dry[1][sample]);
+            assert_pcm_close(row[6], dry[2][sample]);
+            assert_pcm_close(row[7], dry[3][sample]);
+            for height in 0..4 {
+                assert_pcm_close(row[8 + height], hd.x_samples[height][sample]);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_xll_x_quartet_keeps_the_compatible_bed_unchanged() {
+        let composite_left = vec![0.25, -0.25];
+        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
+        samples[0] = Some(vec![0.0; SAMPLE_COUNT]);
+        samples[1] = Some(composite_left.clone());
+        samples[2] = Some(vec![0.0; SAMPLE_COUNT]);
+        samples[3] = Some(vec![0.0; SAMPLE_COUNT]);
+        samples[4] = Some(vec![0.0; SAMPLE_COUNT]);
+        samples[5] = Some(vec![0.0; SAMPLE_COUNT]);
+        samples[7] = Some(vec![0.0; SAMPLE_COUNT]);
+        samples[8] = Some(vec![0.0; SAMPLE_COUNT]);
+        let hd = hd_frame(samples, vec![vec![0.5; SAMPLE_COUNT]; 3]);
+
+        let frame = build_hd_frame(&hd, 0, true);
+
+        assert_eq!(frame.channel_count, 8);
+        assert!(frame.metadata.is_empty());
+        for sample in 0..SAMPLE_COUNT {
+            assert_eq!(
+                frame.pcm[sample * 8 + 1],
+                float_to_pcm_i32(composite_left[sample])
+            );
+        }
     }
 }

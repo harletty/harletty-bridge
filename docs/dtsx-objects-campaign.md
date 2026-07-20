@@ -4,7 +4,7 @@ Date: 2026-07-20
 
 Branch: `research/spatial-object-layer`
 
-Status: **four height waveforms decoded; the compatible 7.1 bed still needs its -3 dB height downmix undone**
+Status: **four height waveforms decoded and their -3 dB contribution removed from the compatible 7.1 bed**
 
 ## Current result
 
@@ -13,13 +13,13 @@ audio grammar was wrong. Its variable block starts with a standard bare XLL
 channel-set header at byte 22. Reusing the existing XLL primitives now decodes
 four extra, speaker-unmapped waveforms in every tested frame.
 
-The regular 7.1 bed remains separate and bit-exact. The new waveforms are
-exposed as `HdFrame::x_samples`. At the bridge boundary they are provisionally
-appended as `Tfl`, `Tfr`, `Tbl`, `Tbr`, producing a fixed 7.1.4 channel bed.
-The mapping is now strongly supported, but the current bridge does not yet
-subtract their embedded -3 dB contribution from FL/FR/BL/BR. It therefore
-double-renders height content onto the lower plane. This reconstruction step is
-intentionally isolated from the lossless decoder.
+The decoder preserves the regular, backward-compatible 7.1 presentation and
+exposes the new waveforms separately as `HdFrame::x_samples`. At the bridge
+boundary they are provisionally appended as `Tfl`, `Tfr`, `Tbl`, `Tbr`, while
+their exact Q15 -3 dB contribution is subtracted from FL/FR/BL/BR. This produces
+the reconstructed fixed 7.1.4 presentation without double-rendering height
+content onto the lower plane. The reconstruction remains intentionally isolated
+from the lossless decoder.
 
 Validated on prefixes from all nine currently available tracks:
 
@@ -290,9 +290,8 @@ BR = bed.BR - rmul15(TBR, 23170)    TBR = X3
 
 A legacy 7.1 decoder ignores XLL-X and therefore retains all height content in
 the compatible bed. A 7.1.4 decoder must undo those four contributions before
-adding the height feeds. Simply appending X0..X3, as the current bridge does,
-leaves a -3 dB floor ghost of height-only sounds and is not the intended final
-presentation.
+adding the height feeds. The bridge now performs this reconstruction; its
+previous append-only behavior left a -3 dB floor ghost of height-only sounds.
 
 These tests disprove a fixed invertible 4x4 rematrix to raw FOA, but cannot
 disprove a nonlinear or signal-adaptive direction estimator applied by a
