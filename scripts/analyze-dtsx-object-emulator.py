@@ -29,6 +29,9 @@ HEIGHT = np.array((8, 9, 10, 11))
 LEFT = np.array((0, 4, 6, 8, 10))
 RIGHT = np.array((1, 5, 7, 9, 11))
 FLOOR = np.array((0, 1, 2, 4, 5, 6, 7))
+HEIGHT_DOWNMIX_Q15 = 23170
+HEIGHT_DOWNMIX_GAIN = HEIGHT_DOWNMIX_Q15 / 32768.0
+HEIGHT_BED_PAIRS = ((0, 8), (1, 9), (4, 10), (5, 11))
 
 
 @dataclass(frozen=True)
@@ -209,6 +212,62 @@ def print_fixed_rematrix_test(height: np.ndarray) -> None:
     print()
 
 
+def q15_downmix(samples: np.ndarray) -> np.ndarray:
+    pcm = np.rint(samples * 8_388_608.0).astype(np.int64)
+    return (pcm * HEIGHT_DOWNMIX_Q15 + (1 << 14)) >> 15
+
+
+def print_embedded_downmix_test(
+    audio: np.ndarray, rate: int, gains: np.ndarray, shares: np.ndarray
+) -> None:
+    selected = gains[shares >= 0.95]
+    print("Backward-compatible 7.1 height-downmix test")
+    print("--------------------------------------------")
+    print(
+        f"candidate coefficient: {HEIGHT_DOWNMIX_Q15}/32768 = "
+        f"{HEIGHT_DOWNMIX_GAIN:.9f} (-3 dB DTS table value)"
+    )
+    for lower, upper in HEIGHT_BED_PAIRS:
+        usable = selected[:, upper] > 0.03
+        ratio = selected[usable, lower] / selected[usable, upper]
+        unfolded = selected[usable, lower] - HEIGHT_DOWNMIX_GAIN * selected[usable, upper]
+        near_zero = float(np.mean(np.abs(unfolded) < 0.02))
+        print(
+            f"{CHANNELS[lower]}/{CHANNELS[upper]}: median ratio={np.median(ratio):.9f}; "
+            f"unfolded gain near zero in {near_zero:.1%} of usable windows"
+        )
+
+    print("Best 100 ms fixed-point reconstruction windows (bed - rmul15(height, 23170)):")
+    for lower, upper in HEIGHT_BED_PAIRS:
+        best = None
+        for time in np.arange(46.0, 68.9, 0.025):
+            samples = interval(audio, rate, float(time), float(time) + 0.1)
+            bed = np.rint(samples[:, lower] * 8_388_608.0).astype(np.int64)
+            height = q15_downmix(samples[:, upper])
+            bed_rms = float(np.sqrt(np.mean(np.square(bed.astype(np.float64)))))
+            height_rms = float(np.sqrt(np.mean(np.square(height.astype(np.float64)))))
+            if bed_rms < 10_000.0 or height_rms < 10_000.0:
+                continue
+            residual = bed - height
+            residual_rms = float(np.sqrt(np.mean(np.square(residual.astype(np.float64)))))
+            candidate = (
+                residual_rms / bed_rms,
+                float(time),
+                residual_rms,
+                int(np.max(np.abs(residual))),
+            )
+            best = candidate if best is None or candidate < best else best
+        if best is None:
+            continue
+        relative, time, residual_rms, maximum = best
+        print(
+            f"  {CHANNELS[lower]}-{CHANNELS[upper]}: t={time:.3f}s, residual/bed={relative:.3e}, "
+            f"residual RMS={residual_rms:.2f} LSB, max={maximum} LSB"
+        )
+    print("Result: the regular 7.1 contains a -3 dB copy of each height feed.")
+    print()
+
+
 def print_gain_model(audio: np.ndarray, rate: int) -> None:
     gains, shares = rank_one_gains(audio, rate)
     selected = gains[shares >= 0.95]
@@ -247,6 +306,7 @@ def print_gain_model(audio: np.ndarray, rate: int) -> None:
     print("Result: the four decoded waveforms are not raw W/X/Y/Z components.")
     print()
     print_fixed_rematrix_test(height)
+    print_embedded_downmix_test(audio, rate, gains, shares)
 
 
 def detect_bright_object(frame: np.ndarray) -> tuple[float, float] | None:

@@ -4,7 +4,7 @@ Date: 2026-07-20
 
 Branch: `research/spatial-object-layer`
 
-Status: **four additional lossless waveforms decoded and provisionally rendered as 7.1.4**
+Status: **four height waveforms decoded; the compatible 7.1 bed still needs its -3 dB height downmix undone**
 
 ## Current result
 
@@ -16,8 +16,10 @@ four extra, speaker-unmapped waveforms in every tested frame.
 The regular 7.1 bed remains separate and bit-exact. The new waveforms are
 exposed as `HdFrame::x_samples`. At the bridge boundary they are provisionally
 appended as `Tfl`, `Tfr`, `Tbl`, `Tbr`, producing a fixed 7.1.4 channel bed.
-This mapping is intentionally isolated from the lossless decoder so it can be
-replaced if the profile semantics are recovered later.
+The mapping is now strongly supported, but the current bridge does not yet
+subtract their embedded -3 dB contribution from FL/FR/BL/BR. It therefore
+double-renders height content onto the lower plane. This reconstruction step is
+intentionally isolated from the lossless decoder.
 
 Validated on prefixes from all nine currently available tracks:
 
@@ -93,7 +95,8 @@ bounds and syncword and retaining the legacy aligned band-end probe as a
 fallback. This makes extension extraction more robust, but supplies neither a
 gain curve nor an object trajectory.
 
-The remaining spatial question is therefore whether the four waveforms are:
+Before analysis of the Object Emulator control clip, the remaining spatial
+question was whether the four waveforms were:
 
 1. fixed height feeds (most economical explanation);
 2. a four-component sound-field representation;
@@ -105,13 +108,9 @@ it carries object metadata separately from bare XLL audio chunks, and one
 object may reference multiple consecutive waveforms. Four decoded waveforms
 therefore do not imply four objects.
 
-Until that is resolved, labeling the four outputs as individual moving objects
-would be premature. Treating them as a fixed 7.1.4 height bed is nevertheless a
-credible working interpretation: optical-disc DTS:X officially targets up to
-7.1.4 output, channels 0/1 and 2/3 repeatedly behave as stereo energy pairs,
-and no dynamic coordinate block has been found. It is not yet proof of the
-front/rear ordering, and some titles show cross-pair energy correlations that
-remain compatible with matrixed or sound-field content.
+The controlled tests below resolve this corpus in favour of fixed TFL, TFR,
+TBL and TBR feeds embedded into a backward-compatible 7.1 downmix. Labeling
+them as independently recoverable moving objects would still be premature.
 
 ### Atypical channel-coherence cases
 
@@ -251,6 +250,49 @@ from perspective projection, glow/occlusion errors and the use of screen-space
 coordinates instead of the undisclosed 3D animation coordinates. They are
 nevertheless strong enough to confirm that the visible trajectory and decoded
 speaker gains are synchronized.
+
+### Embedded 7.1 compatibility downmix
+
+The regular 7.1 presentation is not the final lower speaker plane when XLL-X is
+decoded. It contains a backward-compatible copy of each height feed mixed into
+the corresponding lower corner at -3 dB. The Object Emulator exposes this
+particularly clearly because it contains isolated single-source pans.
+
+The dominant lower/height gain ratio is `23170 / 32768 = 0.707092285`. This is
+not merely close to `1/sqrt(2)`: `23170` is the exact Q15 -3 dB coefficient in
+the DTS downmix table already used by the regular XLL decoder. Across reliable
+100/150 ms windows, subtracting that contribution makes the corresponding
+lower gain nearly zero in 80.7% of FL/X0 windows, 92.1% of FR/X1, 68.2% of
+BL/X2 and 65.5% of BR/X3. The remaining positive gain is consistent with an
+intentional simultaneous lower-plane component as the source moves between
+speakers.
+
+The fixed-point result is more decisive. In windows where the visible source
+is at an upper speaker, applying the same rounded multiply used by XLL,
+`bed - rmul15(height, 23170)`, leaves only:
+
+| Pair | residual / bed RMS | residual RMS | maximum residual |
+| --- | ---: | ---: | ---: |
+| FR - X1 | `1.06e-6` | 1.01 PCM LSB | 4 LSB |
+| BL - X2 | `1.17e-6` | 0.78 PCM LSB | 2 LSB |
+| BR - X3 | `8.80e-7` | 0.78 PCM LSB | 2 LSB |
+
+The trajectory does not include an equally isolated TFL interval; its best
+FL-X0 window still leaves only 0.236% of the bed RMS. This establishes the
+likely reconstruction matrix:
+
+```text
+FL = bed.FL - rmul15(TFL, 23170)    TFL = X0
+FR = bed.FR - rmul15(TFR, 23170)    TFR = X1
+BL = bed.BL - rmul15(TBL, 23170)    TBL = X2
+BR = bed.BR - rmul15(TBR, 23170)    TBR = X3
+```
+
+A legacy 7.1 decoder ignores XLL-X and therefore retains all height content in
+the compatible bed. A 7.1.4 decoder must undo those four contributions before
+adding the height feeds. Simply appending X0..X3, as the current bridge does,
+leaves a -3 dB floor ghost of height-only sounds and is not the intended final
+presentation.
 
 These tests disprove a fixed invertible 4x4 rematrix to raw FOA, but cannot
 disprove a nonlinear or signal-adaptive direction estimator applied by a
