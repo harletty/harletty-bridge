@@ -100,6 +100,11 @@ The remaining spatial question is therefore whether the four waveforms are:
 3. four object waveforms whose static mapping is defined by the constant
    profile wrapper or by metadata outside the elementary audio payload.
 
+The public DTS-UHD syntax is only an analogy, but it is an important warning:
+it carries object metadata separately from bare XLL audio chunks, and one
+object may reference multiple consecutive waveforms. Four decoded waveforms
+therefore do not imply four objects.
+
 Until that is resolved, labeling the four outputs as individual moving objects
 would be premature. Treating them as a fixed 7.1.4 height bed is nevertheless a
 credible working interpretation: optical-disc DTS:X officially targets up to
@@ -107,6 +112,44 @@ credible working interpretation: optical-disc DTS:X officially targets up to
 and no dynamic coordinate block has been found. It is not yet proof of the
 front/rear ordering, and some titles show cross-pair energy correlations that
 remain compatible with matrixed or sound-field content.
+
+### Atypical channel-coherence cases
+
+Sample-level measurements over the first 64 MiB of each stream identify three
+particularly useful counterexamples to four independent height feeds:
+
+- *Apollo 13*: channels 2 and 3 are exactly silent for 7,501 frames (about
+  80 seconds), leaving only two active extension waveforms;
+- *La La Land* English: channels 2 and 3 are sample-identical in aggregate and
+  exactly zero after the shared 564-frame introduction, for the rest of the
+  13,223-frame prefix (about 141 seconds);
+- *The Mummy* (1999): channels 0/3 and 1/2 have sample correlations of 0.9981
+  and 0.9975. A single gain-scaled copy explains each target with only 6.1%
+  and 7.0% residual RMS respectively.
+
+These observations do not prove object coding: fixed speaker feeds can share
+or duplicate content. A first time-local coherence test finds the two *Mummy*
+pairs in 6,388/6,582 and 6,362/6,582 frames respectively. Their normalized
+second-channel gain occupies narrow 10th-to-90th percentile ranges of
+0.5063..0.5189 and 0.4412..0.4599. This favours static duplicated stems over a
+moving pan in that prefix. The silent *La La Land* feeds carry zero PCM, not a
+frame-wise DC control value.
+
+The next test is frequency-local rather than whole-frame: isolate coherent
+components with a short-time covariance or source-separation pass, estimate
+each component's four-channel gain vector, normalize it, and track whether the
+vector moves smoothly. Under the provisional corner-speaker interpretation,
+the normalized gains give a rendered upper-plane barycentre. Stable gains
+would instead support fixed channels or static multichannel stems. This can
+recover only a rendered direction, not necessarily the original object
+coordinates, distance or spread.
+
+The paired *La La Land* language tracks provide a control: spatial gain
+trajectories belonging to shared music and effects should agree despite the
+different dialogue mix. A second useful comparison is coherence between the
+four extension waveforms and the 7.1 bed; strong shared components would be
+consistent with a pre-rendered 12-channel bus, while independent components
+would better support separately carried object waveforms.
 
 ## Public specifications used
 

@@ -16,6 +16,7 @@ use dca::{exss_substream_size, HdDecoder};
 
 const SEARCH_START: usize = 22 * 8;
 const SEARCH_END_BYTE: usize = 160;
+const CHANNEL_PAIRS: [(usize, usize); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
 
 fn read_bits(data: &[u8], position: &mut usize, width: usize) -> Option<u32> {
     if width > 32 || *position + width > data.len() * 8 {
@@ -124,6 +125,12 @@ fn main() {
     let mut channel_energy = [0f64; 4];
     let mut channel_samples = [0usize; 4];
     let mut frame_rms: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut sample_sum = [0f64; 4];
+    let mut sample_cross = [[0f64; 4]; 4];
+    let mut joint_samples = 0usize;
+    let mut frame_pair_correlation: [Vec<f64>; 6] = std::array::from_fn(|_| Vec::new());
+    let mut frame_pair_balance: [Vec<f64>; 6] = std::array::from_fn(|_| Vec::new());
+    let mut constant_frame_values: [Vec<Option<f32>>; 4] = std::array::from_fn(|_| Vec::new());
     let mut frame_geometry = None;
     let mut first_layout_bytes = None;
 
@@ -231,6 +238,50 @@ fn main() {
                         channel_energy[channel] += energy;
                         channel_samples[channel] += samples.len();
                         frame_rms[channel].push((energy / samples.len().max(1) as f64).sqrt());
+                        constant_frame_values[channel].push(samples.first().copied().filter(
+                            |first| {
+                                samples
+                                    .iter()
+                                    .all(|sample| sample.to_bits() == first.to_bits())
+                            },
+                        ));
+                    }
+                    let samples = frame.x_samples[0].len();
+                    if frame
+                        .x_samples
+                        .iter()
+                        .all(|channel| channel.len() == samples)
+                    {
+                        for sample in 0..samples {
+                            let values: [f64; 4] = std::array::from_fn(|channel| {
+                                frame.x_samples[channel][sample] as f64
+                            });
+                            for a in 0..4 {
+                                sample_sum[a] += values[a];
+                                for b in 0..4 {
+                                    sample_cross[a][b] += values[a] * values[b];
+                                }
+                            }
+                        }
+                        joint_samples += samples;
+                        for (pair, &(a, b)) in CHANNEL_PAIRS.iter().enumerate() {
+                            let correlation =
+                                pearson_samples(&frame.x_samples[a], &frame.x_samples[b]);
+                            let rms_a = (frame.x_samples[a]
+                                .iter()
+                                .map(|&value| (value as f64).powi(2))
+                                .sum::<f64>()
+                                / samples.max(1) as f64)
+                                .sqrt();
+                            let rms_b = (frame.x_samples[b]
+                                .iter()
+                                .map(|&value| (value as f64).powi(2))
+                                .sum::<f64>()
+                                / samples.max(1) as f64)
+                                .sqrt();
+                            frame_pair_correlation[pair].push(correlation);
+                            frame_pair_balance[pair].push(rms_b / (rms_a + rms_b));
+                        }
                     }
                 } else if let Some(error) = &frame.x_decode_error {
                     *decode_errors.entry(error.clone()).or_default() += 1;
@@ -362,6 +413,94 @@ fn main() {
                     .collect::<Vec<_>>()
             );
         }
+        println!("sample correlation matrix:");
+        for a in 0..4 {
+            println!(
+                "  {}: {:?}",
+                a,
+                (0..4)
+                    .map(|b| aggregate_pearson(
+                        sample_sum[a],
+                        sample_sum[b],
+                        sample_cross[a][a],
+                        sample_cross[b][b],
+                        sample_cross[a][b],
+                        joint_samples,
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+        println!("least-squares pair fits (A->B: gain, residual/B RMS):");
+        for a in 0..4 {
+            for b in a + 1..4 {
+                let gain = sample_cross[a][b] / sample_cross[a][a];
+                let residual_energy = (sample_cross[b][b] - gain * sample_cross[a][b]).max(0.0);
+                let residual_ratio = (residual_energy / sample_cross[b][b]).sqrt();
+                println!("  {a}->{b}: {gain:.9}, {residual_ratio:.9}");
+            }
+        }
+        println!("per-frame coherent pairs (|correlation| >= 0.98):");
+        for (pair, &(a, b)) in CHANNEL_PAIRS.iter().enumerate() {
+            let coherent = frame_pair_correlation[pair]
+                .iter()
+                .zip(&frame_pair_balance[pair])
+                .filter_map(|(&correlation, &balance)| {
+                    (correlation.abs() >= 0.98 && balance.is_finite()).then_some(balance)
+                })
+                .collect::<Vec<_>>();
+            let steps = frame_pair_correlation[pair]
+                .windows(2)
+                .zip(frame_pair_balance[pair].windows(2))
+                .filter_map(|(correlations, balances)| {
+                    (correlations[0].abs() >= 0.98
+                        && correlations[1].abs() >= 0.98
+                        && balances[0].is_finite()
+                        && balances[1].is_finite())
+                    .then_some((balances[1] - balances[0]).abs())
+                })
+                .collect::<Vec<_>>();
+            if !coherent.is_empty() {
+                println!(
+                    "  {a}/{b}: {}/{} frames, balance B p10/p50/p90={:.4}/{:.4}/{:.4}, \
+                     step p50/p90={:.5}/{:.5}",
+                    coherent.len(),
+                    frame_pair_correlation[pair].len(),
+                    percentile(&coherent, 0.1),
+                    percentile(&coherent, 0.5),
+                    percentile(&coherent, 0.9),
+                    percentile(&steps, 0.5),
+                    percentile(&steps, 0.9),
+                );
+            }
+        }
+        println!("constant-PCM frames by channel:");
+        for (channel, values) in constant_frame_values.iter().enumerate() {
+            let constant = values.iter().flatten().copied().collect::<Vec<_>>();
+            let distinct = constant
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<std::collections::HashSet<_>>();
+            let first_transitions = values
+                .iter()
+                .enumerate()
+                .filter_map(|(frame, value)| value.map(|value| (frame, value)))
+                .scan(None, |previous: &mut Option<u32>, (frame, value)| {
+                    let bits = value.to_bits();
+                    let changed = previous.is_none_or(|previous| previous != bits);
+                    *previous = Some(bits);
+                    Some(changed.then_some((frame, value * 8_388_608.0)))
+                })
+                .flatten()
+                .take(16)
+                .collect::<Vec<_>>();
+            println!(
+                "  {channel}: {}/{} frames, {} distinct; first transitions as 24-bit PCM: {:?}",
+                constant.len(),
+                values.len(),
+                distinct.len(),
+                first_transitions,
+            );
+        }
     }
     println!(
         "frames with candidate channels == byte22-3: {count_matching_frames} ({:.3}%)",
@@ -415,4 +554,47 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
         bv += (y - bm).powi(2);
     }
     covariance / (av * bv).sqrt()
+}
+
+fn aggregate_pearson(
+    sum_a: f64,
+    sum_b: f64,
+    square_a: f64,
+    square_b: f64,
+    cross: f64,
+    samples: usize,
+) -> f64 {
+    let n = samples.max(1) as f64;
+    let covariance = cross - sum_a * sum_b / n;
+    let variance_a = square_a - sum_a * sum_a / n;
+    let variance_b = square_b - sum_b * sum_b / n;
+    covariance / (variance_a * variance_b).sqrt()
+}
+
+fn pearson_samples(a: &[f32], b: &[f32]) -> f64 {
+    let samples = a.len().min(b.len());
+    let mut sum_a = 0.0;
+    let mut sum_b = 0.0;
+    let mut square_a = 0.0;
+    let mut square_b = 0.0;
+    let mut cross = 0.0;
+    for (&a, &b) in a[..samples].iter().zip(&b[..samples]) {
+        let a = a as f64;
+        let b = b as f64;
+        sum_a += a;
+        sum_b += b;
+        square_a += a * a;
+        square_b += b * b;
+        cross += a * b;
+    }
+    aggregate_pearson(sum_a, sum_b, square_a, square_b, cross, samples)
+}
+
+fn percentile(values: &[f64], quantile: f64) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable_by(f64::total_cmp);
+    sorted[((sorted.len() - 1) as f64 * quantile).round() as usize]
 }
