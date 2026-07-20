@@ -137,6 +137,11 @@ pub(crate) struct AtmosBridge {
     pub(crate) dts_frame_count: u64,
     /// True when the most recent `push_packet` used the DTS path.
     pub(crate) dts_active: bool,
+    /// True after a DTS stream has yielded the four decoded XLL-X waveforms.
+    /// Cleared with the pipeline so plain DTS/DTS-HD remains channel-based.
+    pub(crate) dts_spatial_active: bool,
+    /// Avoid rebuilding the same four static object names on every audio frame.
+    pub(crate) dts_spatial_names_emitted: bool,
     // ── Shared ───────────────────────────────────────────────────────
     pub(crate) presentation: u8,
     pub(crate) strict: bool,
@@ -214,6 +219,8 @@ impl AtmosBridge {
             dts_hd_decoder: dca::HdDecoder::new(),
             dts_frame_count: 0,
             dts_active: false,
+            dts_spatial_active: false,
+            dts_spatial_names_emitted: false,
             presentation,
             strict,
             total_samples: 0,
@@ -268,6 +275,8 @@ impl AtmosBridge {
         self.dts_hd_decoder.reset();
         self.dts_frame_count = 0;
         self.dts_active = false;
+        self.dts_spatial_active = false;
+        self.dts_spatial_names_emitted = false;
         // Re-sniff after reset, but keep any host-declared codec.
         self.raw_codec = None;
 
@@ -651,11 +660,10 @@ impl FormatBridge for AtmosBridge {
 
     fn is_spatial(&self) -> bool {
         if self.dts_active {
-            // DTS is emitted as a channel bed: 5.1/7.1 for core/MA, or a
-            // provisional fixed 7.1.4 bed when four XLL-X waveforms are
-            // available. These are canonical speaker positions, not dynamic
-            // object coordinates, so channel-render mode remains authoritative.
-            return false;
+            // Plain DTS and DTS-HD MA remain channel beds. Once the XLL-X
+            // decoder yields its four extra waveforms, however, the bridge
+            // publishes them as fixed spatial objects above the 7.1 bed.
+            return self.dts_spatial_active;
         }
         if self.eac3_active {
             // E-AC3/AC-3 is spatial only when it actually carries JOC object
@@ -919,9 +927,9 @@ mod raw_transport_tests {
     }
 
     // End-to-end DTS-HD MA + XLL-X: feed a raw dump and check it emits the
-    // provisional fixed 7.1.4 mapping. Skips when the local dump is absent.
+    // provisional 7.1 bed + four fixed height objects. Skips without the dump.
     #[test]
-    fn dtshd_raw_transport_emits_fixed_7_1_4_bed() {
+    fn dtshd_raw_transport_emits_fixed_7_1_4_objects() {
         use std::io::Read;
 
         const DUMP: &str = "/mnt/local/SSD_A-CT4000/DTS:X-Dumps/Ex.Machina.2014.dtsx.eng.dts";
@@ -941,9 +949,7 @@ mod raw_transport_tests {
         let result = bridge.push_packet(RSlice::from_slice(&chunk), RInputTransport::Raw, 0);
         assert!(result.error_message.is_empty(), "{}", result.error_message);
         assert!(!result.frames.is_empty(), "no HD frames decoded");
-        // The provisional 7.1.4 mapping is a fixed channel bed, not dynamic
-        // objects; channel-render mode decides how it is placed/virtualised.
-        assert!(!bridge.is_spatial());
+        assert!(bridge.is_spatial());
 
         // Find a fully populated 7.1.4 frame.
         let f = result
@@ -959,5 +965,39 @@ mod raw_transport_tests {
             labels,
             vec![C, L, R, Ls, Rs, LFE, Lb, Rb, Tfl, Tfr, Tbl, Tbr]
         );
+        assert_eq!(f.metadata.len(), 1);
+        let meta = &f.metadata[0];
+        assert_eq!(
+            meta.bed_indices.iter().copied().collect::<Vec<_>>(),
+            vec![2, 0, 1, 4, 5, 3, 6, 7]
+        );
+        assert_eq!(meta.events.len(), 12);
+        assert_eq!(
+            meta.name_updates
+                .iter()
+                .map(|update| (update.id, update.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(10, "TFL"), (11, "TFR"), (12, "TBL"), (13, "TBR")]
+        );
+        let expected_positions = [
+            [-1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [-1.0, -1.0, 1.0],
+            [1.0, -1.0, 1.0],
+        ];
+        for (idx, expected) in expected_positions.iter().enumerate() {
+            let event = &meta.events[8 + idx];
+            assert_eq!(event.id, 10 + idx as u32);
+            assert!(event.has_pos);
+            assert_eq!(&event.pos, expected);
+        }
+        if let Some(next) = result
+            .frames
+            .iter()
+            .filter(|f| f.channel_count == 12)
+            .nth(1)
+        {
+            assert!(next.metadata[0].name_updates.is_empty());
+        }
     }
 }

@@ -3,14 +3,14 @@
 // DTS (DCA) raw transport pipeline. Demuxes the `[core][exss]` byte stream and
 // routes each frame to either the DTS-HD MA lossless decoder (5.1/7.1, when an
 // EXSS substream follows the core) or the plain DTS core decoder (5.1). Every
-// decoded channel is emitted as a bed channel, placed at its canonical speaker
-// by the renderer (the layout is the "fixed object disposition"). XLL-X's four
-// additional waveforms are provisionally mapped as a fixed 7.1.4 height bed.
+// decoded core channel is emitted as a bed channel, placed at its canonical
+// speaker by the renderer. XLL-X's four additional waveforms are provisionally
+// mapped as fixed objects at the four 7.1.4 height positions.
 
 use abi_stable::std_types::{RString, RVec};
-use bridge_api::{RChannelLabel, RDecodedFrame};
 use bridge_api::RPushResult;
-use dca::{exss_has_xll, exss_substream_size, parse_header, CorePcmFrame, HdError, HdFrame};
+use bridge_api::{RChannelLabel, RDecodedFrame, REvent, RMetadataFrame, RNameUpdate};
+use dca::{CorePcmFrame, HdError, HdFrame, exss_has_xll, exss_substream_size, parse_header};
 
 use crate::bridge::AtmosBridge;
 use crate::frame_builders::float_to_pcm_i32;
@@ -24,6 +24,13 @@ const XLL_X_HEIGHT_LABELS: [RChannelLabel; 4] = [
     RChannelLabel::Tbl,
     RChannelLabel::Tbr,
 ];
+const XLL_X_HEIGHT_POSITIONS: [[f64; 3]; 4] = [
+    [-1.0, 1.0, 1.0],
+    [1.0, 1.0, 1.0],
+    [-1.0, -1.0, 1.0],
+    [1.0, -1.0, 1.0],
+];
+const XLL_X_HEIGHT_NAMES: [&str; 4] = ["TFL", "TFR", "TBL", "TBR"];
 
 /// Demux and decode all complete DTS frames buffered in `bridge.dts_buf`.
 pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
@@ -63,10 +70,18 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
             }
             if exss_has_xll(&rest[fs..fs + es]) {
                 let base = bridge.total_samples;
-                match bridge.dts_hd_decoder.decode(&rest[..fs], &rest[fs..fs + es]) {
+                match bridge
+                    .dts_hd_decoder
+                    .decode(&rest[..fs], &rest[fs..fs + es])
+                {
                     Ok(hd) => {
                         let n = hd_samples(&hd);
-                        result.frames.push(build_hd_frame(&hd));
+                        let frame = build_hd_frame(&hd, base, !bridge.dts_spatial_names_emitted);
+                        if !frame.metadata.is_empty() {
+                            bridge.dts_spatial_active = true;
+                            bridge.dts_spatial_names_emitted = true;
+                        }
+                        result.frames.push(frame);
                         bridge.total_samples += n as u64;
                         bridge.dts_frame_count += 1;
                     }
@@ -155,15 +170,98 @@ fn speaker_to_label(spkr: usize) -> RChannelLabel {
         3 => RChannelLabel::Ls,
         4 => RChannelLabel::Rs,
         5 => RChannelLabel::LFE,
-        6 => RChannelLabel::Cb,    // Cs (rear center)
-        7 => RChannelLabel::Lb,    // Lsr (rear surround left)
-        8 => RChannelLabel::Rb,    // Rsr (rear surround right)
+        6 => RChannelLabel::Cb, // Cs (rear center)
+        7 => RChannelLabel::Lb, // Lsr (rear surround left)
+        8 => RChannelLabel::Rb, // Rsr (rear surround right)
         _ => RChannelLabel::Unknown,
     }
 }
 
+/// DCA speaker index -> renderer bed ID. IDs below 10 are reserved for direct
+/// bed speakers; dynamic/object channels begin at ID 10.
+fn speaker_to_bed_id(spkr: usize) -> Option<usize> {
+    match spkr {
+        0 => Some(2),     // C
+        1 => Some(0),     // L
+        2 => Some(1),     // R
+        3 => Some(4),     // Ls
+        4 => Some(5),     // Rs
+        5 => Some(3),     // LFE
+        6 | 7 => Some(6), // Cs or Lsr
+        8 => Some(7),     // Rsr
+        _ => None,
+    }
+}
+
+/// Describe the provisional XLL-X height quartet as fixed spatial objects.
+///
+/// PCM ordering remains `[beds..., TFL, TFR, TBL, TBR]`. The renderer maps
+/// object IDs 10+ to channels immediately following the declared bed, so the
+/// four events below address the four XLL-X waveforms without copying audio.
+fn build_xll_x_metadata(
+    active: &[usize],
+    sample_pos: u64,
+    emit_names: bool,
+) -> Option<RMetadataFrame> {
+    let mut bed_indices: RVec<usize> = RVec::with_capacity(active.len());
+    for &spkr in active {
+        let id = speaker_to_bed_id(spkr)?;
+        // A 6.1 layout can contain both Cs and Lsr, which share the renderer's
+        // legacy bed ID. Do not claim an ambiguous spatial layout.
+        if bed_indices.contains(&id) {
+            return None;
+        }
+        bed_indices.push(id);
+    }
+
+    let mut events: RVec<REvent> = RVec::with_capacity(active.len() + 4);
+    for &id in bed_indices.iter() {
+        events.push(REvent {
+            id: id as u32,
+            sample_pos,
+            has_pos: false,
+            pos: [0.0; 3],
+            gain_db: 0,
+            size: [0.0; 3],
+            ramp_duration: 0,
+        });
+    }
+    for (idx, &pos) in XLL_X_HEIGHT_POSITIONS.iter().enumerate() {
+        events.push(REvent {
+            id: 10 + idx as u32,
+            sample_pos,
+            has_pos: true,
+            pos,
+            gain_db: 0,
+            size: [0.0; 3],
+            ramp_duration: 0,
+        });
+    }
+
+    let name_updates: RVec<RNameUpdate> = if emit_names {
+        XLL_X_HEIGHT_NAMES
+            .iter()
+            .enumerate()
+            .map(|(idx, &name)| RNameUpdate {
+                id: 10 + idx as u32,
+                name: name.into(),
+            })
+            .collect()
+    } else {
+        RVec::new()
+    };
+
+    Some(RMetadataFrame {
+        events,
+        bed_indices,
+        name_updates,
+        sample_pos,
+        ramp_duration: 0,
+    })
+}
+
 /// Build a bed frame from a decoded DTS-HD frame (per-speaker f32).
-fn build_hd_frame(hd: &HdFrame) -> RDecodedFrame {
+fn build_hd_frame(hd: &HdFrame, sample_pos: u64, emit_names: bool) -> RDecodedFrame {
     // Active speakers in ascending index order = stable channel order.
     let active: Vec<usize> = (0..hd.samples.len())
         .filter(|&s| hd.samples[s].is_some())
@@ -200,13 +298,21 @@ fn build_hd_frame(hd: &HdFrame) -> RDecodedFrame {
     }
     channel_labels.extend(XLL_X_HEIGHT_LABELS[..height_samples.len()].iter().copied());
 
+    let metadata = if height_samples.len() == XLL_X_HEIGHT_LABELS.len() {
+        build_xll_x_metadata(&active, sample_pos, emit_names)
+            .into_iter()
+            .collect()
+    } else {
+        RVec::new()
+    };
+
     RDecodedFrame {
         sampling_frequency: hd.sample_rate,
         sample_count: sample_count as u32,
         channel_count: channel_count as u32,
         pcm,
         channel_labels,
-        metadata: RVec::new(),
+        metadata,
         drc_gain: 1.0,
         drc_ramp_duration: 0,
         dialogue_level: None.into(),
