@@ -151,6 +151,81 @@ four extension waveforms and the 7.1 bed; strong shared components would be
 consistent with a pre-rendered 12-channel bus, while independent components
 would better support separately carried object waveforms.
 
+### DTS:X Object Emulator control
+
+The public DTS-authored *DTS:X Object Emulator* test clip is a much stronger
+control than a feature-film soundtrack because its picture explicitly shows a
+moving source, labels the signal as using 3D coordinates, displays changing
+azimuth/elevation/radius values, and then illustrates several playback layouts.
+The clip linked by the official Kodi sample catalogue is 95 seconds long and
+`ffprobe` identifies its audio as a 48 kHz, 7.1 DTS-HD MA + DTS:X stream.
+
+The complete elementary stream has the same representation as the film corpus:
+
+- 8,902/8,902 frames decode as the regular 7.1 bed plus exactly four full-coded
+  XLL-X waveforms;
+- the bare channel-set CRC is valid in every frame;
+- the XLL-X payload is completely consumed by header, navigation, lossless
+  audio and zero alignment;
+- no MDA URI or non-random MDA frame signature is present;
+- the varying EXSS descriptor bits again encode XLL-X offset and size, not
+  coordinates.
+
+The 7.1.4 portion of the demo also supplies a direct ordering clue. Over the
+49–70 second motion sequence, frame-energy correlation between each extension
+waveform and the regular bed is strongest for these pairs:
+
+| Extension | Bed reference | RMS-envelope correlation | Provisional position |
+| --- | --- | ---: | --- |
+| X0 | FL | 0.916 | top front left |
+| X1 | FR | 0.890 | top front right |
+| X2 | BL | 0.835 | top back left |
+| X3 | BR | 0.733 | top back right |
+
+Sample correlations for the same pairs are respectively 0.937, 0.917, 0.847
+and 0.754. The visible source moves continuously while coherent copies are
+gain-panned between the corresponding lower and upper feeds. No independently
+transmitted coordinate curve is needed to reproduce this particular stream.
+
+This is the strongest evidence so far that the current `Tfl/Tfr/Tbl/Tbr`
+mapping is correct and that this legacy optical-disc profile normally stores a
+pre-rendered fixed 7.1.4 presentation. It also resolves an apparent marketing
+contradiction: a mix may originate as 3D objects with coordinates while the
+consumer encode carries the result rendered to twelve fixed feeds.
+
+It does not prove that the profile can never append genuine dynamic objects.
+DTS stated at launch that an embedded object can be extracted, and independent
+technical reports identify the US Blu-ray of *Ip Man 3* as an unusual
+`7.1.4 + five dynamic objects` encode. A second forum source calls it the
+first DTS:X Blu-ray not locked to 7.1.4. These are useful acquisition leads,
+not primary-source proof. A dump from that exact US disc, or from the reported
+`7.1.4 + one object` *Independence Day* encode, is now the highest-value
+comparison: it should contain a structural element absent from both the nine
+films and the Object Emulator if the reports are accurate.
+
+Relevant public links:
+
+- Kodi test catalogue and Object Emulator link:
+  <https://kodi.wiki/view/Samples#HD/object-based_Audio_Test_Clips>
+- DTS patent application describing both a 7.1-channel presentation plus four
+  separate height inputs and an alternate 11.1-channel representation:
+  <https://patents.google.com/patent/US20170098452A1/en>
+- DTS launch statement distinguishing content rendered from channels from
+  objects that are actually embedded and extractable:
+  <https://dts.com/insights/welcome-to-dtsx-open-immersive-and-flexible-object-based-audio-coming-to-cinema-and-home/>
+- report of five dynamic objects on the US *Ip Man 3* disc:
+  <https://www.avforums.com/threads/lyngdorf-discussion.1580956/page-592>
+- independent recollection that *Ip Man 3* was the first non-locked DTS:X
+  Blu-ray:
+  <https://forum.blu-ray.com/showthread.php?p=20520575>
+
+By contrast, DTS's *Ex Machina* announcement says that DTS:X moves sound
+objects through mixer-selected locations, but it does not state that this
+specific disc retains time-varying object metadata. The local *Ex Machina*
+bitstream has the same fixed four-waveform structure, so that press wording is
+not sufficient evidence of dynamic objects in the title:
+<https://dts.com/insights/lionsgates-ex-machina-blu-ray-disc-is-first-to-feature-dtsx-audio/>.
+
 ## Public specifications used
 
 - ETSI TS 102 114 V1.6.1 describes the regular EXSS and XLL syntax reused by
