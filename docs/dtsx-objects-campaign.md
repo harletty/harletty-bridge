@@ -4,7 +4,7 @@ Date: 2026-07-20
 
 Branch: `research/spatial-object-layer`
 
-Status: **four additional lossless waveforms decoded; spatial semantics still under investigation**
+Status: **four additional lossless waveforms decoded and provisionally rendered as 7.1.4**
 
 ## Current result
 
@@ -14,8 +14,10 @@ channel-set header at byte 22. Reusing the existing XLL primitives now decodes
 four extra, speaker-unmapped waveforms in every tested frame.
 
 The regular 7.1 bed remains separate and bit-exact. The new waveforms are
-exposed as `HdFrame::x_samples`; they are not mixed into the speaker-indexed bed
-until their intended spatial representation is known.
+exposed as `HdFrame::x_samples`. At the bridge boundary they are provisionally
+appended as `Tfl`, `Tfr`, `Tbl`, `Tbr`, producing a fixed 7.1.4 channel bed.
+This mapping is intentionally isolated from the lossless decoder so it can be
+replaced if the profile semantics are recovered later.
 
 Validated on prefixes from all nine currently available tracks:
 
@@ -95,7 +97,12 @@ are:
    profile wrapper or by metadata outside the elementary audio payload.
 
 Until that is resolved, labeling the four outputs as individual moving objects
-would be premature.
+would be premature. Treating them as a fixed 7.1.4 height bed is nevertheless a
+credible working interpretation: optical-disc DTS:X officially targets up to
+7.1.4 output, channels 0/1 and 2/3 repeatedly behave as stereo energy pairs,
+and no dynamic coordinate block has been found. It is not yet proof of the
+front/rear ordering, and some titles show cross-pair energy correlations that
+remain compatible with matrixed or sound-field content.
 
 ## Public specifications used
 

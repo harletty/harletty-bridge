@@ -4,7 +4,8 @@
 // routes each frame to either the DTS-HD MA lossless decoder (5.1/7.1, when an
 // EXSS substream follows the core) or the plain DTS core decoder (5.1). Every
 // decoded channel is emitted as a bed channel, placed at its canonical speaker
-// by the renderer (the layout is the "fixed object disposition").
+// by the renderer (the layout is the "fixed object disposition"). XLL-X's four
+// additional waveforms are provisionally mapped as a fixed 7.1.4 height bed.
 
 use abi_stable::std_types::{RString, RVec};
 use bridge_api::{RChannelLabel, RDecodedFrame};
@@ -17,6 +18,12 @@ use crate::labels::dca_bed_channel_to_r;
 
 const CORE_SYNC: [u8; 4] = 0x7FFE_8001u32.to_be_bytes();
 const SUBSTREAM_SYNC: [u8; 4] = 0x6458_2025u32.to_be_bytes();
+const XLL_X_HEIGHT_LABELS: [RChannelLabel; 4] = [
+    RChannelLabel::Tfl,
+    RChannelLabel::Tfr,
+    RChannelLabel::Tbl,
+    RChannelLabel::Tbr,
+];
 
 /// Demux and decode all complete DTS frames buffered in `bridge.dts_buf`.
 pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
@@ -162,18 +169,36 @@ fn build_hd_frame(hd: &HdFrame) -> RDecodedFrame {
         .filter(|&s| hd.samples[s].is_some())
         .collect();
     let sample_count = hd_samples(hd);
-    let channel_count = active.len();
+    // The XLL-X channel set carries four full-coded waveforms but no one-to-one
+    // speaker mask. Treat its stable stereo pairs as front-height L/R followed
+    // by rear-height L/R. Keep the mapping isolated here so it can be replaced
+    // without touching the lossless decoder if later metadata proves otherwise.
+    let height_samples = if hd.x_samples.len() == XLL_X_HEIGHT_LABELS.len()
+        && hd
+            .x_samples
+            .iter()
+            .all(|channel| channel.len() == sample_count)
+    {
+        hd.x_samples.as_slice()
+    } else {
+        &[]
+    };
+    let channel_count = active.len() + height_samples.len();
 
     let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * channel_count);
     for s in 0..sample_count {
         for &spkr in &active {
             pcm.push(float_to_pcm_i32(hd.samples[spkr].as_ref().unwrap()[s]));
         }
+        for channel in height_samples {
+            pcm.push(float_to_pcm_i32(channel[s]));
+        }
     }
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(channel_count);
     for &spkr in &active {
         channel_labels.push(speaker_to_label(spkr));
     }
+    channel_labels.extend(XLL_X_HEIGHT_LABELS[..height_samples.len()].iter().copied());
 
     RDecodedFrame {
         sampling_frequency: hd.sample_rate,

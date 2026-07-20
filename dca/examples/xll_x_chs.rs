@@ -121,6 +121,7 @@ fn main() {
     let mut trailing_bits = Vec::new();
     let mut channel_energy = [0f64; 4];
     let mut channel_samples = [0usize; 4];
+    let mut frame_rms: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
     let mut frame_geometry = None;
     let mut first_layout_bytes = None;
 
@@ -211,11 +212,13 @@ fn main() {
                     decoded_audio_frames += 1;
                     trailing_bits.push(payload.len() * 8 - frame.x_bits_consumed);
                     for (channel, samples) in frame.x_samples.iter().enumerate() {
-                        channel_energy[channel] += samples
+                        let energy = samples
                             .iter()
                             .map(|&sample| (sample as f64).powi(2))
                             .sum::<f64>();
+                        channel_energy[channel] += energy;
                         channel_samples[channel] += samples.len();
+                        frame_rms[channel].push((energy / samples.len().max(1) as f64).sqrt());
                     }
                 } else if let Some(error) = &frame.x_decode_error {
                     *decode_errors.entry(error.clone()).or_default() += 1;
@@ -330,6 +333,16 @@ fn main() {
             .map(|(&energy, samples)| (energy / samples.max(1) as f64).sqrt())
             .collect();
         println!("decoded channel RMS: {rms:?}");
+        println!("frame-RMS correlation matrix:");
+        for a in 0..4 {
+            println!(
+                "  {}: {:?}",
+                a,
+                (0..4)
+                    .map(|b| pearson(&frame_rms[a], &frame_rms[b]))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
     println!(
         "frames with candidate channels == byte22-3: {count_matching_frames} ({:.3}%)",
@@ -368,4 +381,19 @@ fn main() {
         "top offsets regardless of channel count: {:?}",
         &any_offsets[..any_offsets.len().min(12)]
     );
+}
+
+fn pearson(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    let am = a[..n].iter().sum::<f64>() / n.max(1) as f64;
+    let bm = b[..n].iter().sum::<f64>() / n.max(1) as f64;
+    let mut covariance = 0.0;
+    let mut av = 0.0;
+    let mut bv = 0.0;
+    for (&x, &y) in a[..n].iter().zip(&b[..n]) {
+        covariance += (x - am) * (y - bm);
+        av += (x - am).powi(2);
+        bv += (y - bm).powi(2);
+    }
+    covariance / (av * bv).sqrt()
 }

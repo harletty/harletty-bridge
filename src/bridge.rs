@@ -651,13 +651,10 @@ impl FormatBridge for AtmosBridge {
 
     fn is_spatial(&self) -> bool {
         if self.dts_active {
-            // DTS core is plain channel-based audio (a 5.1/7.1 bed), not true
-            // objects. Whether it is placed at canonical speaker positions
-            // (host) or rendered through the virtual bed is the host's
-            // channel-render-mode choice, exactly as for AC-3 — so report it as
-            // non-spatial and let that mode decide. (DTS:X height objects live
-            // in a proprietary blob the bridge does not decode, so the core
-            // never exposes real objects here.)
+            // DTS is emitted as a channel bed: 5.1/7.1 for core/MA, or a
+            // provisional fixed 7.1.4 bed when four XLL-X waveforms are
+            // available. These are canonical speaker positions, not dynamic
+            // object coordinates, so channel-render mode remains authoritative.
             return false;
         }
         if self.eac3_active {
@@ -921,39 +918,46 @@ mod raw_transport_tests {
         assert_eq!(labels, vec![C, L, R, Ls, Rs, LFE]);
     }
 
-    // End-to-end DTS-HD MA: feed the raw 7.1 dump and check it emits 8-channel
-    // lossless bed frames. Skips when the (uncommitted) dump is absent.
+    // End-to-end DTS-HD MA + XLL-X: feed a raw dump and check it emits the
+    // provisional fixed 7.1.4 mapping. Skips when the local dump is absent.
     #[test]
-    fn dtshd_raw_transport_emits_7_1_bed() {
-        const DUMP: &str = "/mnt/local/SSD_B-CT4000/Dumps/Ex.Machina.2014.dtsx.eng.dts";
+    fn dtshd_raw_transport_emits_fixed_7_1_4_bed() {
+        use std::io::Read;
+
+        const DUMP: &str = "/mnt/local/SSD_A-CT4000/DTS:X-Dumps/Ex.Machina.2014.dtsx.eng.dts";
         if !std::path::Path::new(DUMP).exists() {
-            eprintln!("skipping: 7.1 dump not present");
+            eprintln!("skipping: 7.1.4 dump not present");
             return;
         }
         // Feed ~2 MB — enough for many frames past the silent intro.
-        let bytes = std::fs::read(DUMP).unwrap();
-        let chunk = &bytes[..bytes.len().min(2_000_000)];
+        let mut chunk = Vec::new();
+        std::fs::File::open(DUMP)
+            .unwrap()
+            .take(2_000_000)
+            .read_to_end(&mut chunk)
+            .unwrap();
         let mut bridge = AtmosBridge::new(false);
         bridge.configure("input_codec".into(), "dts".into());
-        let result = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+        let result = bridge.push_packet(RSlice::from_slice(&chunk), RInputTransport::Raw, 0);
         assert!(result.error_message.is_empty(), "{}", result.error_message);
         assert!(!result.frames.is_empty(), "no HD frames decoded");
-        // DTS (incl. HD) core is channel-based, not objects → non-spatial; the
-        // channel-render mode decides how the bed is placed/virtualised.
+        // The provisional 7.1.4 mapping is a fixed channel bed, not dynamic
+        // objects; channel-render mode decides how it is placed/virtualised.
         assert!(!bridge.is_spatial());
 
-        // Find a fully-populated 7.1 frame (some early frames may be 5.1 before
-        // the surround-back channels carry signal, but the bed is 8ch once XLL
-        // emits the full hierarchy).
+        // Find a fully populated 7.1.4 frame.
         let f = result
             .frames
             .iter()
-            .find(|f| f.channel_count == 8)
-            .expect("expected an 8-channel 7.1 frame");
+            .find(|f| f.channel_count == 12)
+            .expect("expected a 12-channel 7.1.4 frame");
         assert_eq!(f.sampling_frequency, 48_000);
         use bridge_api::RChannelLabel::*;
         let labels: Vec<_> = f.channel_labels.iter().copied().collect();
-        // Active speakers ascending: C,L,R,Ls,Rs,LFE,Lsr,Rsr.
-        assert_eq!(labels, vec![C, L, R, Ls, Rs, LFE, Lb, Rb]);
+        // Active speakers ascending, followed by the provisional XLL-X order.
+        assert_eq!(
+            labels,
+            vec![C, L, R, Ls, Rs, LFE, Lb, Rb, Tfl, Tfr, Tbl, Tbr]
+        );
     }
 }
