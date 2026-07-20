@@ -155,10 +155,12 @@ would better support separately carried object waveforms.
 
 The public DTS-authored *DTS:X Object Emulator* test clip is a much stronger
 control than a feature-film soundtrack because its picture explicitly shows a
-moving source, labels the signal as using 3D coordinates, displays changing
-azimuth/elevation/radius values, and then illustrates several playback layouts.
-The clip linked by the official Kodi sample catalogue is 95 seconds long and
-`ffprobe` identifies its audio as a 48 kHz, 7.1 DTS-HD MA + DTS:X stream.
+moving source, labels the signal as using 3D coordinates, and then illustrates
+several playback layouts. It does not print numerical azimuth, elevation or
+radius values; the visible source position can only be used as a screen-space
+proxy in shots where the camera is fixed. The clip linked by the official Kodi
+sample catalogue is 95 seconds long and `ffprobe` identifies its audio as a
+48 kHz, 7.1 DTS-HD MA + DTS:X stream.
 
 The complete elementary stream has the same representation as the film corpus:
 
@@ -186,6 +188,77 @@ Sample correlations for the same pairs are respectively 0.937, 0.917, 0.847
 and 0.754. The visible source moves continuously while coherent copies are
 gain-panned between the corresponding lower and upper feeds. No independently
 transmitted coordinate curve is needed to reproduce this particular stream.
+
+An additional controlled analysis makes the fixed-presentation interpretation
+substantially stronger. The picture successively labels its illustrated output
+layouts as 7.1.4, 5.1.2, 2.1, 5.1, 7.1 and 7.1.4. Although the elementary audio
+stream remains in the same 7.1 plus four-XLL-X container throughout, its actual
+decoded channel activity follows those labels:
+
+- during the 5.1.2 section, rear bed channels BL/BR and extension waveforms
+  X2/X3 are exactly zero while X0/X1 remain active;
+- during the 2.1, 5.1 and 7.1 sections, all four extension waveforms are
+  exactly zero;
+- all four extension waveforms become active again in the final 7.1.4 section.
+
+The demonstration therefore contains a sequence of layout-specific renders in
+a fixed 7.1.4 transport presentation. If X0..X3 were a layout-independent
+four-component object basis, changing the illustrated playback layout would
+not require two or all four transport components to become bit-identically
+zero in precisely this way.
+
+The moving-object audio is also almost ideal for a blind gain-vector test. In
+150 ms windows from the first 7.1.4 section, the median share of signal energy
+explained by the first covariance eigenvector is 0.9884: it is essentially one
+mono waveform distributed by changing gains. Among 247 reliable windows:
+
+- negative height-gain energy is only `4.4e-8` of total height-gain energy;
+- the median number of active height outputs is two out of four at a -26 dB
+  threshold;
+- 74.9% of windows use no more than two height outputs;
+- every possible raw-FOA W candidate drops out entirely in some positions; the
+  best candidate, X0, has a normalized coefficient variation of 0.786 and is
+  below 0.05 in 29.1% of the reliable windows.
+
+This rejects a direct W/X/Y/Z interpretation. Raw first-order ambisonics needs
+an omnidirectional W component whose normalized gain remains non-zero and
+constant for a single moving point source; it also does not naturally produce
+these non-negative, piecewise-sparse corner gains.
+
+A projective test also rejects an unknown fixed real 4x4 rematrix around raw
+FOA. A point-source vector `[W, X, Y, Z]` lies on the quadratic cone
+`W^2 = X^2 + Y^2 + Z^2`, whose matrix has signature (1,3). By Sylvester's law
+of inertia, an invertible real rematrix may rotate or scale that cone but cannot
+change its signature. The best homogeneous quadratic fitted on four fifths of
+the measured height-gain vectors and evaluated on the held-out fifth has:
+
+- eigenvalues `-0.514, -0.492, +0.494, +0.500`, hence signature (2,2);
+- a held-out normalized RMS residual of 0.0145;
+- almost exactly the simpler relation `X1*X2 = X0*X3`, with RMS residual
+  0.0129 over all reliable windows.
+
+That last relation is the expected separability constraint for four corner
+gains `[left*front, right*front, left*back, right*back]`. It is a much more
+specific match for two-dimensional speaker panning than for a hidden linear
+FOA basis.
+
+As an independent A/V synchronization check, a simple bright-object tracker
+finds 46 positions in the fixed-camera 5.1.2 shot. Screen X correlates at 0.671
+with decoded right-minus-left energy, while screen Y correlates at -0.667 with
+the decoded height-energy fraction (negative is expected because smaller image
+Y is higher on screen). The moderate rather than perfect values are expected
+from perspective projection, glow/occlusion errors and the use of screen-space
+coordinates instead of the undisclosed 3D animation coordinates. They are
+nevertheless strong enough to confirm that the visible trajectory and decoded
+speaker gains are synchronized.
+
+These tests disprove a fixed invertible 4x4 rematrix to raw FOA, but cannot
+disprove a nonlinear or signal-adaptive direction estimator applied by a
+receiver to the four height feeds. Such processing would be an upmixer
+operating on an already rendered speaker presentation, however. Without side
+information it cannot uniquely recover more than four arbitrary,
+simultaneously overlapping original object waveforms or their authoring
+trajectories.
 
 This is the strongest evidence so far that the current `Tfl/Tfr/Tbl/Tbr`
 mapping is correct and that this legacy optical-disc profile normally stores a
@@ -248,9 +321,20 @@ of the XLL frame; it does not parse this channel set.
 - `xll_x_meta.rs`: analyze the reserved 64-bit EXSS descriptor field;
 - `xll_x_pair.rs`: compare aligned language variants;
 - `xll_x_mda.rs`: bit-aligned MDA signature and URI scan;
+- `analyze-dtsx-object-emulator.py`: rank-one gain, raw-FOA, layout activity
+  and optional picture/audio trajectory tests for the public control clip;
 - older `xll_x_probe`, `xll_x_rice` and `xll_x_scan` diagnostics remain useful
   as historical/raw-payload tools, but their object-count hypothesis is
   obsolete.
+
+Run the control analysis after extracting the regular bed and XLL-X WAVs:
+
+```sh
+python3 scripts/analyze-dtsx-object-emulator.py \
+  --bed /tmp/dtsx-object-emulator-bed.wav \
+  --height /tmp/dtsx-object-emulator-x.wav \
+  --video /tmp/dtsx-object-emulator.mkv
+```
 
 ## Corpus
 
