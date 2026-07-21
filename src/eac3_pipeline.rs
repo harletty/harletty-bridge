@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use crate::bridge::AtmosBridge;
 use crate::frame_builders::float_to_pcm_i32;
-use crate::labels::{bed_channel_to_r, eac3_core_bed_indices, eac3_object_output_bed_indices};
+use crate::labels::bed_channel_to_r;
 use crate::metadata::build_eac3_metadata_frame;
 
 const LEGACY_AC3_SAMPLE_COUNT: u32 = 1536;
@@ -550,7 +550,7 @@ fn build_eac3_frame_from_object(
     #[cfg(feature = "bridge-perf")]
     let mut metadata_events = 0usize;
     if bed_object_labels.is_none() {
-        let bed_indices = eac3_object_output_bed_indices(core);
+        let num_bed_channels = usize::from(core.lfe_channel.is_some());
         for (oamd, sample_offset) in &pcm_frame.oamd_payloads {
             let evo_base = base_sample_pos + sample_offset.unwrap_or(0) as u64;
             let oamd_ref: &OamdPayload = oamd;
@@ -558,7 +558,7 @@ fn build_eac3_frame_from_object(
                 oamd_ref,
                 evo_base,
                 base_sample_pos,
-                &bed_indices,
+                num_bed_channels,
                 object_channels,
                 bridge,
             );
@@ -668,7 +668,7 @@ fn build_eac3_object_output_pcm_and_labels(
         // Dynamic objects: positions come from per-frame OAMD events, not labels.
         None => {
             for _ in 0..object_channels {
-                channel_labels.push(RChannelLabel::Unknown);
+                channel_labels.push(RChannelLabel::Object);
             }
         }
     }
@@ -711,12 +711,10 @@ fn build_eac3_frame_from_core(
 
     // Extract metadata from OAMD payloads in the access unit info.
     let mut metadata: RVec<RMetadataFrame> = RVec::new();
-    let bed_indices = eac3_core_bed_indices(core);
     for payload in info.payloads() {
         if let ParsedEmdfPayloadData::Oamd(oamd) = &payload.parsed {
             let evo_base = base_sample_pos + payload.info.sample_offset.unwrap_or(0) as u64;
-            let meta =
-                build_eac3_metadata_frame(oamd, evo_base, base_sample_pos, &bed_indices, 0, bridge);
+            let meta = build_eac3_metadata_frame(oamd, evo_base, base_sample_pos, 0, 0, bridge);
             metadata.push(meta);
         }
     }
@@ -859,7 +857,6 @@ fn decode_ac3_heavy_range_word(word: u8) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::labels::eac3_object_output_bed_indices;
     use eac3::{
         AccessUnitInfo, AudioFrameInfo, AuxParseStatus, BedChannel, BlockDrcInfo, CorePcmFrame,
         EmdfSource, FrameType, JocPayload, OamdPayload, ObjectPcmFrame,
@@ -1089,8 +1086,8 @@ mod tests {
             labels.as_slice(),
             &[
                 RChannelLabel::LFE,
-                RChannelLabel::Unknown,
-                RChannelLabel::Unknown
+                RChannelLabel::Object,
+                RChannelLabel::Object
             ]
         );
         assert_eq!(
@@ -1104,7 +1101,6 @@ mod tests {
                 float_to_pcm_i32(0.82),
             ]
         );
-        assert_eq!(eac3_object_output_bed_indices(&core), vec![3]);
     }
 
     #[test]
@@ -1121,13 +1117,12 @@ mod tests {
 
         assert_eq!(
             labels.as_slice(),
-            &[RChannelLabel::Unknown, RChannelLabel::Unknown]
+            &[RChannelLabel::Object, RChannelLabel::Object]
         );
         assert_eq!(
             pcm.as_slice(),
             &[float_to_pcm_i32(0.31), float_to_pcm_i32(0.41)]
         );
-        assert!(eac3_object_output_bed_indices(&core).is_empty());
     }
 
     /// A 7.1.4 bed-only OAMD payload: 12 bed channels, no dynamic objects.

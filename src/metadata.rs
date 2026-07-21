@@ -3,91 +3,77 @@ use bridge_api::RMetadataFrame;
 use eac3::OamdPayload;
 #[cfg(feature = "bridge-perf")]
 use std::time::Instant;
-use truehd::structs::oamd::{ObjectAudioMetadataPayload, SpeakerLabels};
+use truehd::structs::oamd::ObjectAudioMetadataPayload;
 
 use crate::bridge::AtmosBridge;
-use crate::labels::speaker_to_id;
 use crate::logging::bridge_diag_log;
-use crate::perf::PerfStats;
+
+/// Sparse-emit an object↔channel declaration: return it only when it differs
+/// from the cached one (or after a cache clear, i.e. pipeline reset).
+pub(crate) fn declare_object_channels(
+    cache: &mut Option<RVec<bridge_api::RObjectChannel>>,
+    current: RVec<bridge_api::RObjectChannel>,
+) -> RVec<bridge_api::RObjectChannel> {
+    if cache.as_deref() == Some(current.as_slice()) {
+        RVec::new()
+    } else {
+        *cache = Some(current.clone());
+        current
+    }
+}
 
 /// Build an [`RMetadataFrame`] from an OAMD payload parsed from E-AC3.
+///
+/// Fixed channels are described by the frame's channel labels; here we emit
+/// the dynamic-object events plus the sparse object↔channel declaration
+/// (objects sit after the `num_bed_channels` fixed channels, in PCM order).
+/// Names are not emitted: the engine derives fixed-channel names from labels
+/// and falls back to `Obj_<id>` for unnamed objects, which matches the
+/// legacy generated names exactly.
 pub(crate) fn build_eac3_metadata_frame(
     oamd: &OamdPayload,
     evo_base: u64,
     frame_sample_pos: u64,
-    bed_indices: &[usize],
+    num_bed_channels: usize,
     object_channel_count: usize,
     bridge: &mut AtmosBridge,
 ) -> RMetadataFrame {
-    let events = extract_eac3_events(oamd, evo_base, bed_indices, object_channel_count);
-    let bed_indices: RVec<usize> = bed_indices.iter().copied().collect();
-
-    let mut name_updates = RVec::new();
-    for &speaker_id in bed_indices.iter() {
-        let id = speaker_id as u32;
-        let key = ObjectNameKey::Bed(speaker_id as u8);
-        if name_key_changed(&mut bridge.object_name_keys_by_id, id, &key) {
-            name_updates.push(bridge_api::RNameUpdate {
-                id,
-                name: object_name_from_key(&key).into(),
-            });
-        }
-    }
+    let events = extract_eac3_events(oamd, evo_base, object_channel_count);
 
     let dynamic_objects = oamd
         .object_count
         .saturating_sub(oamd.bed_or_isf_objects)
         .min(object_channel_count);
-    for dynamic_idx in 0..dynamic_objects {
-        let id = (10 + dynamic_idx) as u32;
-        let key = ObjectNameKey::Dynamic(id as usize);
-        if name_key_changed(&mut bridge.object_name_keys_by_id, id, &key) {
-            name_updates.push(bridge_api::RNameUpdate {
-                id,
-                name: object_name_from_key(&key).into(),
-            });
-        }
-    }
+    let current: RVec<bridge_api::RObjectChannel> = (0..dynamic_objects)
+        .map(|k| bridge_api::RObjectChannel {
+            id: (10 + k) as u32,
+            channel: (num_bed_channels + k) as u32,
+        })
+        .collect();
+    let object_channels = declare_object_channels(&mut bridge.declared_object_channels, current);
 
     RMetadataFrame {
         events,
-        bed_indices,
-        name_updates,
+        object_channels,
+        channel_gains: RVec::new(),
+        name_updates: RVec::new(),
         sample_pos: frame_sample_pos,
         ramp_duration: 0,
     }
 }
 
-/// Convert an E-AC3 OAMD payload into the bridge event list.
-///
-/// Mirrors TrueHD's structure: bed events first (one per PCM bed channel,
-/// `has_pos=false`, `id=speaker_id`), then dynamic events (`id=10+dynamic_idx`).
-/// Studio displays slots ordered by `events[]` index, so the bed events keep
-/// the dynamic slots aligned with their position metadata.
+/// Convert an E-AC3 OAMD payload into the dynamic-object event list
+/// (`id = 10 + dynamic_idx`, matching the object↔channel declaration).
 fn extract_eac3_events(
     oamd: &OamdPayload,
     base_sample_pos: u64,
-    bed_indices: &[usize],
     object_channel_count: usize,
 ) -> RVec<bridge_api::REvent> {
     let dynamic_objects = oamd
         .object_count
         .saturating_sub(oamd.bed_or_isf_objects)
         .min(object_channel_count);
-    let mut events: RVec<bridge_api::REvent> =
-        RVec::with_capacity(bed_indices.len() + dynamic_objects);
-
-    for &speaker_id in bed_indices {
-        events.push(bridge_api::REvent {
-            id: speaker_id as u32,
-            sample_pos: base_sample_pos,
-            has_pos: false,
-            pos: [0.0; 3],
-            gain_db: 0,
-            size: [0.0, 0.0, 0.0],
-            ramp_duration: 0,
-        });
-    }
+    let mut events: RVec<bridge_api::REvent> = RVec::with_capacity(dynamic_objects);
 
     for element in &oamd.elements {
         let eac3::OamdElementKind::Object(ref obj_element) = element.kind else {
@@ -221,14 +207,26 @@ mod tests {
     }
 
     #[test]
-    fn eac3_metadata_names_lfe_bed() {
+    fn eac3_metadata_declares_objects_sparsely() {
         let mut bridge = AtmosBridge::new(false);
+        let mut payload = empty_oamd_payload();
+        payload.object_count = 3;
+        payload.dynamic_objects = 2;
 
-        let meta = build_eac3_metadata_frame(&empty_oamd_payload(), 0, 0, &[3], 0, &mut bridge);
+        // Two dynamic objects after one fixed (LFE) channel: ids 10/11 on
+        // channels 1/2, declared on the first frame only.
+        let meta = build_eac3_metadata_frame(&payload, 0, 0, 1, 2, &mut bridge);
+        let decl: Vec<(u32, u32)> = meta
+            .object_channels
+            .iter()
+            .map(|oc| (oc.id, oc.channel))
+            .collect();
+        assert_eq!(decl, vec![(10, 1), (11, 2)]);
+        assert!(meta.name_updates.is_empty());
 
-        assert_eq!(meta.name_updates.len(), 1);
-        assert_eq!(meta.name_updates[0].id, 3);
-        assert_eq!(meta.name_updates[0].name.as_str(), "LFE");
+        // Unchanged declaration → sparse (empty) re-emission.
+        let again = build_eac3_metadata_frame(&payload, 0, 0, 1, 2, &mut bridge);
+        assert!(again.object_channels.is_empty());
     }
 
     /// Anisotropic OAMD size [w, d, h] is preserved end-to-end without any
@@ -289,7 +287,7 @@ mod tests {
             }],
         };
 
-        let events = extract_eac3_events(&payload, 0, &[], 1);
+        let events = extract_eac3_events(&payload, 0, 1);
         let dynamic = events.iter().find(|e| e.has_pos).expect("dynamic event");
         let expected: [f64; 3] = [0.2_f32 as f64, 0.5_f32 as f64, 0.9_f32 as f64];
         for axis in 0..3 {
@@ -303,98 +301,35 @@ mod tests {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ObjectNameKey {
-    Bed(u8),
-    Isf(usize),
-    Dynamic(usize),
-}
-
-/// Build an [`RMetadataFrame`] from a parsed OAMD payload.
+/// Build an [`RMetadataFrame`] from a TrueHD OAMD payload.
 ///
-/// - `evo_base` = `total_samples + evo_sample_offset` (used for event sample_pos).
-/// - `frame_sample_pos` = `total_samples` (used for OSC timing, no evo offset).
-pub(crate) fn object_name_from_key(key: &ObjectNameKey) -> String {
-    match key {
-        ObjectNameKey::Bed(idx) => SpeakerLabels::from_u8(*idx)
-            .map(|l| format!("{:?}", l))
-            .unwrap_or_else(|| format!("Bed_{}", idx)),
-        ObjectNameKey::Isf(i) => format!("ISF_{}", i),
-        ObjectNameKey::Dynamic(i) => format!("Obj_{}", i),
-    }
-}
-
-#[inline]
-pub(crate) fn name_key_changed(
-    cache: &mut Vec<Option<ObjectNameKey>>,
-    id: u32,
-    key: &ObjectNameKey,
-) -> bool {
-    let idx = id as usize;
-    if idx >= cache.len() {
-        cache.resize(idx + 1, None);
-        cache[idx] = Some(key.clone());
-        return true;
-    }
-    match &cache[idx] {
-        Some(prev) if prev == key => false,
-        _ => {
-            cache[idx] = Some(key.clone());
-            true
-        }
-    }
-}
-
+/// Fixed channels are described by the frame's channel labels; the metadata
+/// carries the dynamic-object events, the sparse object↔channel declaration
+/// and the OAMD bed-gain automation. Names are not emitted: the engine
+/// derives fixed-channel names from labels and falls back to `Obj_<id>`,
+/// matching the legacy generated names.
 pub(crate) fn build_metadata_frame_from_oamd(
     oamd: &ObjectAudioMetadataPayload,
     evo_base: u64,
     frame_sample_pos: u64,
-    name_key_cache: &mut Vec<Option<ObjectNameKey>>,
-    _perf: &mut PerfStats,
+    declared_object_channels: &mut Option<RVec<bridge_api::RObjectChannel>>,
+    #[cfg(feature = "bridge-perf")] perf: &mut crate::perf::BridgePerf,
 ) -> RMetadataFrame {
     #[cfg(feature = "bridge-perf")]
-    let perf = _perf;
-    #[cfg(feature = "bridge-perf")]
     let events_started = Instant::now();
-    let events = extract_events(oamd, evo_base);
+    let extracted = extract_events(oamd, evo_base);
     #[cfg(feature = "bridge-perf")]
     perf.record_build_metadata_events(events_started.elapsed());
 
-    #[cfg(feature = "bridge-perf")]
-    let bed_indices_started = Instant::now();
-    let bed_index_vec: Vec<usize> = oamd
-        .program_assignment
-        .bed_assignment
-        .first()
-        .map(|bed| bed.to_index_vec())
-        .unwrap_or_default();
-    let bed_indices: RVec<usize> = bed_index_vec.iter().map(|&i| speaker_to_id(i)).collect();
-    #[cfg(feature = "bridge-perf")]
-    perf.record_build_metadata_bed_indices(bed_indices_started.elapsed());
-
-    #[cfg(feature = "bridge-perf")]
-    let name_updates_started = Instant::now();
-    let mut name_updates = RVec::new();
-    let num_isf_objects = oamd.program_assignment.num_isf_objects;
-    let num_dynamic_objects = oamd.program_assignment.num_dynamic_objects;
-    for (idx, event) in events.iter().enumerate() {
-        let id = event.id;
-        let key = object_name_key_for_index(
-            idx,
+    let current: RVec<bridge_api::RObjectChannel> = extracted
+        .objects
+        .iter()
+        .map(|&(id, channel)| bridge_api::RObjectChannel {
             id,
-            &bed_index_vec,
-            num_isf_objects,
-            num_dynamic_objects,
-        );
-        if name_key_changed(name_key_cache, id, &key) {
-            name_updates.push(bridge_api::RNameUpdate {
-                id,
-                name: object_name_from_key(&key).into(),
-            });
-        }
-    }
-    #[cfg(feature = "bridge-perf")]
-    perf.record_build_metadata_name_updates(name_updates_started.elapsed());
+            channel: channel as u32,
+        })
+        .collect();
+    let object_channels = declare_object_channels(declared_object_channels, current);
 
     let ramp_duration = oamd
         .object_element
@@ -404,47 +339,42 @@ pub(crate) fn build_metadata_frame_from_oamd(
         .unwrap_or(0);
 
     RMetadataFrame {
-        events,
-        bed_indices,
-        name_updates,
+        events: extracted.events,
+        object_channels,
+        channel_gains: extracted.channel_gains,
+        name_updates: RVec::new(),
         sample_pos: frame_sample_pos,
         ramp_duration,
     }
 }
 
-#[inline]
-fn object_name_key_for_index(
-    object_index: usize,
-    object_id: u32,
-    bed_index_vec: &[usize],
-    num_isf_objects: usize,
-    num_dynamic_objects: usize,
-) -> ObjectNameKey {
-    let bed_count = bed_index_vec.len();
-    if object_index < bed_count {
-        return ObjectNameKey::Bed(bed_index_vec[object_index] as u8);
-    }
-    let isf_start = bed_count;
-    let isf_end = isf_start + num_isf_objects;
-    if object_index < isf_end {
-        return ObjectNameKey::Isf(object_index - isf_start);
-    }
-    let dyn_start = isf_end;
-    let dyn_end = dyn_start + num_dynamic_objects;
-    if object_index < dyn_end {
-        return ObjectNameKey::Dynamic(object_id as usize);
-    }
-    ObjectNameKey::Dynamic(object_id as usize)
+/// Extract spatial events from a TrueHD OAMD frame.
+struct ExtractedTruehdMetadata {
+    /// Dynamic-object events (ids match `objects`).
+    events: RVec<bridge_api::REvent>,
+    /// OAMD gain automation for the bed members, by PCM channel.
+    channel_gains: RVec<bridge_api::RChannelGain>,
+    /// Dynamic-object declaration: (id, PCM channel).
+    objects: Vec<(u32, usize)>,
 }
 
-/// Extract spatial events from a TrueHD OAMD frame.
+impl ExtractedTruehdMetadata {
+    fn empty() -> Self {
+        Self {
+            events: RVec::new(),
+            channel_gains: RVec::new(),
+            objects: Vec::new(),
+        }
+    }
+}
+
 fn extract_events(
     oamd: &ObjectAudioMetadataPayload,
     base_sample_pos: u64,
-) -> RVec<bridge_api::REvent> {
+) -> ExtractedTruehdMetadata {
     let object_count = oamd.object_count;
     let Some(object_element) = &oamd.object_element else {
-        return RVec::new();
+        return ExtractedTruehdMetadata::empty();
     };
 
     if object_element.md_update_info.num_obj_info_blocks != 1 {
@@ -452,21 +382,21 @@ fn extract_events(
             "atmos-bridge: unsupported OAMD with num_obj_info_blocks={} (expected 1); skipping metadata frame",
             object_element.md_update_info.num_obj_info_blocks
         );
-        return RVec::new();
+        return ExtractedTruehdMetadata::empty();
     }
     if oamd.program_assignment.bed_assignment.len() != 1 {
         log::warn!(
             "atmos-bridge: unsupported OAMD with bed_assignment_count={} (expected 1); skipping metadata frame",
             oamd.program_assignment.bed_assignment.len()
         );
-        return RVec::new();
+        return ExtractedTruehdMetadata::empty();
     }
     if oamd.program_assignment.num_isf_objects != 0 {
         log::warn!(
             "atmos-bridge: unsupported OAMD with num_isf_objects={} (expected 0); skipping metadata frame",
             oamd.program_assignment.num_isf_objects
         );
-        return RVec::new();
+        return ExtractedTruehdMetadata::empty();
     }
 
     let sample_offset = object_element.md_update_info.sample_offset as u64;
@@ -482,6 +412,8 @@ fn extract_events(
         .unwrap_or_default();
 
     let mut events: RVec<bridge_api::REvent> = RVec::with_capacity(object_count);
+    let mut channel_gains: RVec<bridge_api::RChannelGain> = RVec::new();
+    let mut objects: Vec<(u32, usize)> = Vec::new();
     let mut missing_object_data = 0usize;
     let mut empty_object_blocks = 0usize;
     let mut bed_index_oob = 0usize;
@@ -497,17 +429,23 @@ fn extract_events(
             continue;
         };
 
-        let id = if object_data.b_object_in_bed_or_isf {
-            let Some(&bed_idx) = bed_index_vec.get(i) else {
+        if object_data.b_object_in_bed_or_isf {
+            // Bed member: its channel is fixed (described by the frame's
+            // labels); OAMD only contributes live gain automation.
+            if bed_index_vec.get(i).is_none() {
                 bed_index_oob += 1;
                 continue;
-            };
-            speaker_to_id(bed_idx) as u32
-        } else {
-            (i + 10 - bed_index_vec.len()) as u32
-        };
-        let (has_pos, pos, size) = if !object_data.b_object_in_bed_or_isf {
-            let render = &object_data.object_render_info;
+            }
+            channel_gains.push(bridge_api::RChannelGain {
+                channel: i as u32,
+                gain_db: object_data.object_basic_info.object_gain,
+            });
+            continue;
+        }
+
+        let id = (i + 10 - bed_index_vec.len()) as u32;
+        let render = &object_data.object_render_info;
+        let (has_pos, pos, size) =
             match pos_vec.get(i).and_then(|raw_blocks| raw_blocks.first()) {
                 Some(raw) if raw.len() >= 3 => (true, [raw[0], raw[1], raw[2]], render.object_size),
                 Some(_) => (false, [0.0; 3], [0.0; 3]),
@@ -515,11 +453,9 @@ fn extract_events(
                     missing_damf_pos += 1;
                     (false, [0.0; 3], [0.0; 3])
                 }
-            }
-        } else {
-            (false, [0.0; 3], [0.0; 3])
-        };
+            };
 
+        objects.push((id, i));
         events.push(bridge_api::REvent {
             id,
             sample_pos,
@@ -558,5 +494,9 @@ fn extract_events(
         );
     }
 
-    events
+    ExtractedTruehdMetadata {
+        events,
+        channel_gains,
+        objects,
+    }
 }
