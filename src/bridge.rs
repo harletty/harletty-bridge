@@ -20,7 +20,6 @@ use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::PcmStats;
 use crate::logging::bridge_diag_log;
 use crate::mat::MatStream;
-use crate::metadata::ObjectNameKey;
 use crate::perf::PerfStats;
 use crate::truehd_pipeline::process_extractor_input;
 
@@ -150,7 +149,12 @@ pub(crate) struct AtmosBridge {
     pub(crate) recovering_until_major_sync: bool,
     pub(crate) drc_mode: DrcMode,
     pub(crate) frame_count: u64,
-    pub(crate) object_name_keys_by_id: Vec<Option<ObjectNameKey>>,
+    /// Last object↔channel declaration emitted (sparse re-emission on change
+    /// and after reset). Shared by the TrueHD and E-AC3 metadata paths.
+    pub(crate) declared_object_channels: Option<abi_stable::std_types::RVec<bridge_api::RObjectChannel>>,
+    /// Fixed-channel labels of the active TrueHD spatial presentation
+    /// (bed labels from the OAMD bed assignment, then `Object` fillers).
+    pub(crate) truehd_spatial_labels: Option<abi_stable::std_types::RVec<bridge_api::RChannelLabel>>,
     pub(crate) perf: PerfStats,
 }
 
@@ -223,7 +227,8 @@ impl AtmosBridge {
             recovering_until_major_sync: false,
             drc_mode: DrcMode::Off,
             frame_count: 0,
-            object_name_keys_by_id: Vec::new(),
+            declared_object_channels: None,
+            truehd_spatial_labels: None,
             perf: PerfStats::default(),
         };
 
@@ -287,7 +292,8 @@ impl AtmosBridge {
             .for_each(|p| *p = true);
         self.parser
             .set_required_presentations(&required_presentations);
-        self.object_name_keys_by_id.clear();
+        self.declared_object_channels = None;
+        self.truehd_spatial_labels = None;
         self.recovering_until_major_sync = false;
     }
 
@@ -649,7 +655,7 @@ impl FormatBridge for AtmosBridge {
         self.frame_count > 0 || self.eac3_frame_count > 0 || self.dts_frame_count > 0
     }
 
-    fn is_spatial(&self) -> bool {
+    fn has_objects(&self) -> bool {
         if self.dts_active {
             // DTS core is plain channel-based audio (a 5.1/7.1 bed), not true
             // objects. Whether it is placed at canonical speaker positions
@@ -909,7 +915,7 @@ mod raw_transport_tests {
         // DTS core is plain channel-based audio, not objects: it reports
         // non-spatial and lets the host's channel-render mode place/virtualise
         // the bed (same as AC-3).
-        assert!(!bridge.is_spatial());
+        assert!(!bridge.has_objects());
         assert!(bridge.is_ready());
 
         let f = &result.frames[0];
@@ -940,7 +946,7 @@ mod raw_transport_tests {
         assert!(!result.frames.is_empty(), "no HD frames decoded");
         // DTS (incl. HD) core is channel-based, not objects → non-spatial; the
         // channel-render mode decides how the bed is placed/virtualised.
-        assert!(!bridge.is_spatial());
+        assert!(!bridge.has_objects());
 
         // Find a fully-populated 7.1 frame (some early frames may be 5.1 before
         // the surround-back channels carry signal, but the bed is 8ch once XLL
