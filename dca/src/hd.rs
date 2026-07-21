@@ -44,6 +44,37 @@ pub struct HdFrame {
     pub x_payload: Vec<u8>,
     /// Byte offset of `x_payload` within the XLL frame.
     pub x_payload_offset: usize,
+    /// Four decoded DTS:X extension waveforms. The XLL channel-set header does
+    /// not assign these channels to speakers, so they are deliberately not
+    /// mixed into `samples` or `output_mask` yet.
+    pub x_samples: Vec<Vec<f32>>,
+    pub x_pcm_bit_res: usize,
+    /// Bit position reached after decoding the four extension waveforms,
+    /// relative to `x_payload`.
+    pub x_bits_consumed: usize,
+    /// Diagnostic failure kind from the optional extension decode
+    /// (allocation-free). A failure here never invalidates the lossless 7.1
+    /// bed.
+    pub x_decode_error: Option<&'static str>,
+    /// Unparsed tail of the extension channel-set header, including byte
+    /// alignment and its mandatory CRC16.
+    pub x_header_tail_bits: usize,
+    /// XLL frame geometry inherited by the extension channel set.
+    pub xll_frame_segments: usize,
+    pub xll_segment_samples: usize,
+    pub xll_segment_size_bits: usize,
+    pub xll_band_crc_present: u32,
+    pub xll_scalable_lsbs: bool,
+    /// Unspecified tail of the EXSS asset descriptor, retained for spatial
+    /// metadata research. Only the first `exss_descriptor_tail_bits` are valid.
+    pub exss_descriptor_tail: Vec<u8>,
+    pub exss_descriptor_tail_bits: usize,
+    /// Parsed profile-specific navigation for the XLL-X block.
+    pub x_descriptor_offset: Option<usize>,
+    pub x_descriptor_size: Option<usize>,
+    /// True when the decoder used the descriptor navigation rather than only
+    /// locating the syncword after the decoded XLL band data.
+    pub x_descriptor_navigation_used: bool,
 }
 
 /// Size in bytes of the EXSS substream starting at `data` (which must begin at
@@ -57,7 +88,9 @@ pub fn exss_substream_size(data: &[u8]) -> Option<usize> {
 /// extensions parse but expose no XLL asset; callers should decode the DTS core
 /// instead for those.
 pub fn exss_has_xll(data: &[u8]) -> bool {
-    ExssParser::parse(data).map(|p| p.has_xll()).unwrap_or(false)
+    ExssParser::parse(data)
+        .map(|p| p.has_xll())
+        .unwrap_or(false)
 }
 
 #[derive(Default)]
@@ -86,11 +119,13 @@ impl HdDecoder {
     pub fn decode(&mut self, core_au: &[u8], exss: &[u8]) -> Result<HdFrame, HdError> {
         // 1) Core (residual base), fixed-point, indexed by speaker.
         let info = parse_header(core_au)?;
-        self.core.decode_frame(&info, core_au).map_err(|_| HdError::Core)?;
+        self.core
+            .decode_frame(&info, core_au)
+            .map_err(|_| HdError::Core)?;
         let core_out = self.synth.synthesize_fixed_by_speaker(&mut self.core);
 
         // 2) EXSS → locate XLL asset.
-        let exssp = ExssParser::parse(exss).map_err(|_| HdError::Exss)?;
+        let mut exssp = ExssParser::parse(exss).map_err(|_| HdError::Exss)?;
 
         // 3) XLL lossless decode, combined with the core residual.
         match self.xll.decode(exss, &exssp.asset, Some(&core_out)) {
@@ -104,7 +139,19 @@ impl HdDecoder {
             .xll
             .output
             .iter()
-            .map(|opt| opt.as_ref().map(|v| v.iter().map(|&s| s as f32 / PCM_SCALE).collect()))
+            .map(|opt| {
+                opt.as_ref()
+                    .map(|v| v.iter().map(|&s| s as f32 / PCM_SCALE).collect())
+            })
+            .collect();
+        let x_samples = std::mem::take(&mut self.xll.x_output)
+            .into_iter()
+            .map(|channel| {
+                channel
+                    .into_iter()
+                    .map(|sample| sample as f32 / PCM_SCALE)
+                    .collect()
+            })
             .collect();
 
         Ok(HdFrame {
@@ -115,6 +162,21 @@ impl HdDecoder {
             x_imax: self.xll.x_imax_syncword_present,
             x_payload: std::mem::take(&mut self.xll.x_payload),
             x_payload_offset: self.xll.x_payload_offset,
+            x_samples,
+            x_pcm_bit_res: self.xll.x_pcm_bit_res,
+            x_bits_consumed: self.xll.x_bits_consumed,
+            x_decode_error: self.xll.x_decode_error.take(),
+            x_header_tail_bits: self.xll.x_header_tail_bits,
+            xll_frame_segments: self.xll.nframesegs,
+            xll_segment_samples: self.xll.nsegsamples,
+            xll_segment_size_bits: self.xll.seg_size_nbits,
+            xll_band_crc_present: self.xll.band_crc_present,
+            xll_scalable_lsbs: self.xll.scalable_lsbs,
+            exss_descriptor_tail: std::mem::take(&mut exssp.asset.descriptor_tail),
+            exss_descriptor_tail_bits: exssp.asset.descriptor_tail_bits,
+            x_descriptor_offset: exssp.asset.xll_x_offset,
+            x_descriptor_size: exssp.asset.xll_x_size,
+            x_descriptor_navigation_used: self.xll.x_descriptor_navigation_used,
         })
     }
 }
@@ -183,7 +245,12 @@ mod tests {
         eprintln!("decoded {frames} XLL frames (pending={pending}), output_mask={active_mask:#x}");
         assert!(frames >= 20, "too few XLL frames decoded ({frames})");
 
-        let nsamp = spk.iter().filter(|v| !v.is_empty()).map(|v| v.len()).min().unwrap();
+        let nsamp = spk
+            .iter()
+            .filter(|v| !v.is_empty())
+            .map(|v| v.len())
+            .min()
+            .unwrap();
         let ref_n = reference.len() / ch;
         let cmp = nsamp.min(ref_n);
         assert!(cmp > 5000, "too little to compare ({cmp})");
@@ -222,7 +289,7 @@ mod tests {
     fn xll_7_1_matches_ffmpeg_lossless() {
         // Ex Machina (2014): 24-bit DTS-HD MA 7.1.
         check_xll_lossless(
-            "/mnt/local/SSD_B-CT4000/Dumps/Ex.Machina.2014.dtsx.eng.dts",
+            "/mnt/local/SSD_A-CT4000/DTS:X-Dumps/Ex.Machina.2014.dtsx.eng.dts",
             "/home/user/dev/spatial-renderer/dumps/dtsx_ref8.f32",
             8,
         );
@@ -237,5 +304,48 @@ mod tests {
             "/home/user/dev/spatial-renderer/dumps/darkcrystal_ref6.f32",
             6,
         );
+    }
+
+    #[test]
+    fn xll_x_decodes_four_unmapped_waveforms() {
+        use std::io::Read;
+
+        const DUMP: &str = "/mnt/local/SSD_A-CT4000/DTS:X-Dumps/Ex.Machina.2014.dtsx.eng.dts";
+        if !std::path::Path::new(DUMP).exists() {
+            eprintln!("skipping: spatial-layer corpus not present ({DUMP})");
+            return;
+        }
+        let mut bytes = Vec::new();
+        std::fs::File::open(DUMP)
+            .unwrap()
+            .take(2 * 1024 * 1024)
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        let mut decoder = HdDecoder::new();
+        let mut offset = 0usize;
+        let mut frames = 0usize;
+        while frames < 100 && offset + 18 < bytes.len() {
+            let core = parse_header(&bytes[offset..]).unwrap();
+            let exss_offset = offset + core.frame_size;
+            let exss = ExssParser::parse(&bytes[exss_offset..]).unwrap();
+            let exss_size = exss.substream_size();
+            let frame = decoder
+                .decode(
+                    &bytes[offset..exss_offset],
+                    &bytes[exss_offset..exss_offset + exss_size],
+                )
+                .unwrap();
+            assert!(frame.x_present);
+            assert_eq!(frame.x_samples.len(), 4);
+            assert!(frame.x_samples.iter().all(|channel| channel.len() == 512));
+            assert_eq!(frame.x_decode_error, None);
+            assert!(frame.x_descriptor_navigation_used);
+            assert_eq!(frame.x_descriptor_offset, Some(frame.x_payload_offset));
+            assert_eq!(frame.x_descriptor_size, Some(frame.x_payload.len()));
+            frames += 1;
+            offset += core.frame_size + exss_size;
+        }
+        assert_eq!(frames, 100);
     }
 }
