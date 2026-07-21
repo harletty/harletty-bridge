@@ -134,6 +134,10 @@ pub(crate) struct AtmosBridge {
     /// DTS-HD Master Audio lossless (5.1/7.1) decoder.
     pub(crate) dts_hd_decoder: dca::HdDecoder,
     pub(crate) dts_frame_count: u64,
+    /// Latches once a valid XLL-X height quartet has been emitted: fallback
+    /// frames then keep the 12-channel shape (composite bed + silent heights)
+    /// instead of renegotiating to 8 channels. Cleared with the pipeline.
+    pub(crate) dts_height_locked: bool,
     /// True when the most recent `push_packet` used the DTS path.
     pub(crate) dts_active: bool,
     // ── Shared ───────────────────────────────────────────────────────
@@ -217,6 +221,7 @@ impl AtmosBridge {
             dts_decoder: dca::PcmDecoder::new(),
             dts_hd_decoder: dca::HdDecoder::new(),
             dts_frame_count: 0,
+            dts_height_locked: false,
             dts_active: false,
             presentation,
             strict,
@@ -272,6 +277,7 @@ impl AtmosBridge {
         self.dts_decoder.reset();
         self.dts_hd_decoder.reset();
         self.dts_frame_count = 0;
+        self.dts_height_locked = false;
         self.dts_active = false;
         // Re-sniff after reset, but keep any host-declared codec.
         self.raw_codec = None;
@@ -930,10 +936,10 @@ mod raw_transport_tests {
     // End-to-end DTS-HD MA: feed the raw 7.1 dump and check it emits 8-channel
     // lossless bed frames. Skips when the (uncommitted) dump is absent.
     #[test]
-    fn dtshd_raw_transport_emits_7_1_bed() {
-        const DUMP: &str = "/mnt/local/SSD_B-CT4000/Dumps/Ex.Machina.2014.dtsx.eng.dts";
+    fn dtshd_raw_transport_emits_labeled_7_1_4_channels() {
+        const DUMP: &str = "/mnt/local/SSD_A-CT4000/DTS:X-Dumps/Ex.Machina.2014.dtsx.eng.dts";
         if !std::path::Path::new(DUMP).exists() {
-            eprintln!("skipping: 7.1 dump not present");
+            eprintln!("skipping: DTS:X dump not present");
             return;
         }
         // Feed ~2 MB — enough for many frames past the silent intro.
@@ -944,22 +950,22 @@ mod raw_transport_tests {
         let result = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
         assert!(result.error_message.is_empty(), "{}", result.error_message);
         assert!(!result.frames.is_empty(), "no HD frames decoded");
-        // DTS (incl. HD) core is channel-based, not objects → non-spatial; the
-        // channel-render mode decides how the bed is placed/virtualised.
+        // A DTS:X fixed 7.1.4 presentation is twelve labeled fixed channels —
+        // no dynamic objects, no fabricated metadata: the renderer decides
+        // placement (docs/channel-object-contract.md).
         assert!(!bridge.has_objects());
 
-        // Find a fully-populated 7.1 frame (some early frames may be 5.1 before
-        // the surround-back channels carry signal, but the bed is 8ch once XLL
-        // emits the full hierarchy).
+        // Once the XLL-X quartet locks, frames carry the fixed 7.1.4 shape.
         let f = result
             .frames
             .iter()
-            .find(|f| f.channel_count == 8)
-            .expect("expected an 8-channel 7.1 frame");
+            .find(|f| f.channel_count == 12)
+            .expect("expected a 12-channel 7.1.4 frame");
         assert_eq!(f.sampling_frequency, 48_000);
+        assert!(f.metadata.is_empty(), "fixed presentation must carry no metadata");
         use bridge_api::RChannelLabel::*;
         let labels: Vec<_> = f.channel_labels.iter().copied().collect();
-        // Active speakers ascending: C,L,R,Ls,Rs,LFE,Lsr,Rsr.
-        assert_eq!(labels, vec![C, L, R, Ls, Rs, LFE, Lb, Rb]);
+        // Active speakers ascending (C,L,R,Ls,Rs,LFE,Lsr,Rsr) + the height quartet.
+        assert_eq!(labels, vec![C, L, R, Ls, Rs, LFE, Lb, Rb, Tfl, Tfr, Tbl, Tbr]);
     }
 }
