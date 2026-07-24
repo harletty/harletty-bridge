@@ -9,7 +9,7 @@
 # `-drc_scale 0` disables FFmpeg's default dynamic-range compression
 # (applied via the dynrng word per audblk). harletty and Cavern don't
 # apply DRC, so leaving it on inflates the cross-decoder RMSE by 1.7e-4
-# on LFE → 5.4e-4 on surrounds (verified on Dune Part Two 30 s slice).
+# on LFE → 5.4e-4 on surrounds (verified on a 30 s witness slice).
 #
 # Usage:
 #   decode-ffmpeg-pcm.sh <input.eac3> <output.f32>

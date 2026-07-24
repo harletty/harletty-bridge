@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Classify the four XLL-X waveforms in the DTS:X Object Emulator clip.
+"""Classify four XLL-X waveforms in a controlled spatial-pan clip.
 
 The test uses the public clip as a controlled, mostly single-source pan.  It
 does not assume that the decoded XLL-X channels are speakers: their gain
@@ -390,7 +390,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bed", type=Path, required=True, help="decoded eight-channel bed WAV")
     parser.add_argument("--height", type=Path, required=True, help="decoded four-channel XLL-X WAV")
-    parser.add_argument("--video", type=Path, help="optional Object Emulator MKV for picture/audio alignment")
+    parser.add_argument("--video", type=Path, help="optional source MKV for picture/audio alignment")
     parser.add_argument(
         "--audio-start",
         type=float,

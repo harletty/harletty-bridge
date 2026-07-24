@@ -12,6 +12,7 @@ use std::time::Instant;
 use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, parse::Parser};
 
 use crate::ac3_native::NativeAc3Decoder;
+use crate::dts_pipeline::DtsFoldConfig;
 use crate::eac3_pipeline::{
     diagnose_eac3_frame, is_dependent_eac3_frame, is_legacy_ac3_frame,
     is_temporary_eac3_silence_frame, process_eac3_dependent_frame_with_core, process_eac3_frame,
@@ -140,6 +141,9 @@ pub(crate) struct AtmosBridge {
     pub(crate) dts_height_locked: bool,
     /// True when the most recent `push_packet` used the DTS path.
     pub(crate) dts_active: bool,
+    pub(crate) dts_fold_config: DtsFoldConfig,
+    /// Live stream fact: the latest DTS frame carried presented D3 objects.
+    pub(crate) dts_objects_active: bool,
     // ── Shared ───────────────────────────────────────────────────────
     pub(crate) presentation: u8,
     pub(crate) strict: bool,
@@ -196,7 +200,6 @@ impl AtmosBridge {
         eac3_dependent_pcm.set_debug_log_level(eac3_log_level);
         let mut eac3_obj = ObjectPcmDecoder::new();
         eac3_obj.set_debug_log_level(eac3_log_level);
-
         #[allow(unused_mut)]
         let mut bridge = Self {
             mat_stream: MatStream::default(),
@@ -223,6 +226,8 @@ impl AtmosBridge {
             dts_frame_count: 0,
             dts_height_locked: false,
             dts_active: false,
+            dts_fold_config: DtsFoldConfig::from_env(),
+            dts_objects_active: false,
             presentation,
             strict,
             total_samples: 0,
@@ -279,6 +284,7 @@ impl AtmosBridge {
         self.dts_frame_count = 0;
         self.dts_height_locked = false;
         self.dts_active = false;
+        self.dts_objects_active = false;
         // Re-sniff after reset, but keep any host-declared codec.
         self.raw_codec = None;
 
@@ -663,13 +669,13 @@ impl FormatBridge for AtmosBridge {
 
     fn has_objects(&self) -> bool {
         if self.dts_active {
-            // DTS core is plain channel-based audio (a 5.1/7.1 bed), not true
-            // objects. Whether it is placed at canonical speaker positions
-            // (host) or rendered through the virtual bed is the host's
-            // channel-render-mode choice, exactly as for AC-3 — so report it as
-            // non-spatial and let that mode decide. (DTS:X height objects live
-            // in a proprietary blob the bridge does not decode, so the core
-            // never exposes real objects here.)
+            if self.dts_objects_active {
+                return true;
+            }
+            // DTS core and the standard/D0/D1 extension presentations are
+            // labeled fixed channels. Whether they are placed directly or
+            // virtualized remains the renderer's channel-mode decision. D3 is
+            // the only current DTS presentation that declares object channels.
             return false;
         }
         if self.eac3_active {
@@ -826,6 +832,19 @@ impl FormatBridge for AtmosBridge {
 #[cfg(test)]
 mod raw_transport_tests {
     use super::*;
+    use std::io::Read;
+
+    fn read_prefix(path: &str, bytes: u64) -> Option<Vec<u8>> {
+        let mut input = std::fs::File::open(path).ok()?;
+        let mut prefix = Vec::with_capacity(bytes as usize);
+        input.by_ref().take(bytes).read_to_end(&mut prefix).ok()?;
+        Some(prefix)
+    }
+
+    fn corpus_path(variable: &str) -> Option<String> {
+        let path = std::env::var(variable).ok()?;
+        std::path::Path::new(&path).is_file().then_some(path)
+    }
 
     #[test]
     fn sniff_detects_eac3_syncword() {
@@ -908,12 +927,11 @@ mod raw_transport_tests {
     // (uncommitted) corpus is absent.
     #[test]
     fn dts_raw_transport_emits_bed_frames() {
-        const DTS: &str = "/home/user/dev/spatial-renderer/dumps/dts51_core.dts";
-        if !std::path::Path::new(DTS).exists() {
-            eprintln!("skipping: DTS corpus not present");
+        let Some(dts) = corpus_path("HARLETTY_DTS_CORE_CORPUS") else {
+            eprintln!("skipping: HARLETTY_DTS_CORE_CORPUS is not set to a readable file");
             return;
-        }
-        let bytes = std::fs::read(DTS).unwrap();
+        };
+        let bytes = std::fs::read(dts).unwrap();
         let mut bridge = AtmosBridge::new(false);
         let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
         assert!(result.error_message.is_empty(), "{}", result.error_message);
@@ -937,13 +955,12 @@ mod raw_transport_tests {
     // lossless bed frames. Skips when the (uncommitted) dump is absent.
     #[test]
     fn dtshd_raw_transport_emits_labeled_7_1_4_channels() {
-        const DUMP: &str = "/mnt/local/SSD_A-CT4000/DTS:X-Dumps/Ex.Machina.2014.dtsx.eng.dts";
-        if !std::path::Path::new(DUMP).exists() {
-            eprintln!("skipping: DTS:X dump not present");
+        let Some(dump) = corpus_path("HARLETTY_DTSX_STANDARD_CORPUS") else {
+            eprintln!("skipping: HARLETTY_DTSX_STANDARD_CORPUS is not set to a readable file");
             return;
-        }
+        };
         // Feed ~2 MB — enough for many frames past the silent intro.
-        let bytes = std::fs::read(DUMP).unwrap();
+        let bytes = std::fs::read(dump).unwrap();
         let chunk = &bytes[..bytes.len().min(2_000_000)];
         let mut bridge = AtmosBridge::new(false);
         bridge.configure("input_codec".into(), "dts".into());
@@ -967,5 +984,112 @@ mod raw_transport_tests {
         let labels: Vec<_> = f.channel_labels.iter().copied().collect();
         // Active speakers ascending (C,L,R,Ls,Rs,LFE,Lsr,Rsr) + the height quartet.
         assert_eq!(labels, vec![C, L, R, Ls, Rs, LFE, Lb, Rb, Tfl, Tfr, Tbl, Tbr]);
+    }
+
+    #[test]
+    fn alternate_profiles_emit_automatic_presentations() {
+        let Some(d0_path) = corpus_path("HARLETTY_D0_CORPUS") else {
+            eprintln!("skipping: HARLETTY_D0_CORPUS is not set to a readable file");
+            return;
+        };
+        let Some(bytes) = read_prefix(&d0_path, 2_000_000) else {
+            eprintln!("skipping: D0 corpus could not be read");
+            return;
+        };
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("input_codec".into(), "dts".into()));
+        let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(
+            !bridge.has_objects(),
+            "fixed D0 presentation must not set the object stream fact"
+        );
+        use bridge_api::RChannelLabel::*;
+        let frame = result
+            .frames
+            .iter()
+            .find(|frame| {
+                [Tfc, Tfl, Tfr, Tbl, Tbr]
+                    .iter()
+                    .all(|label| frame.channel_labels.contains(label))
+            })
+            .expect("no experimental fixed D0 declaration");
+        assert!(frame.metadata.is_empty());
+        assert!(
+            !frame.channel_labels.contains(&Object),
+            "fixed D0 presentation must not fabricate objects"
+        );
+
+        let Some(d1_path) = corpus_path("HARLETTY_D1_CORPUS") else {
+            eprintln!("skipping: HARLETTY_D1_CORPUS is not set to a readable file");
+            return;
+        };
+        let Some(bytes) = read_prefix(&d1_path, 2_000_000) else {
+            eprintln!("skipping: D1 corpus could not be read");
+            return;
+        };
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("input_codec".into(), "dts".into()));
+        let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(!bridge.has_objects(), "D1 must remain fixed-channel");
+
+        let frame = result
+            .frames
+            .iter()
+            .find(|frame| {
+                [Tfl, Tfr, Lw, Rw, Tbl, Tbr]
+                    .iter()
+                    .all(|label| frame.channel_labels.contains(label))
+            })
+            .expect("no experimental fixed D1 declaration");
+        assert!(frame.metadata.is_empty());
+        assert!(!frame.channel_labels.contains(&Object));
+
+        let Some(d3_path) = corpus_path("HARLETTY_D3_CORPUS") else {
+            eprintln!("skipping: HARLETTY_D3_CORPUS is not set to a readable file");
+            return;
+        };
+        let Some(bytes) = read_prefix(&d3_path, 2_000_000) else {
+            eprintln!("skipping D3: alternate-extension corpus not present: {d3_path}");
+            return;
+        };
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("input_codec".into(), "dts".into()));
+        let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(
+            bridge.has_objects(),
+            "D3 must expose object channels"
+        );
+
+        let frame = result
+            .frames
+            .iter()
+            .find(|frame| {
+                frame
+                    .channel_labels
+                    .iter()
+                    .filter(|&&label| label == Object)
+                    .count()
+                    == 8
+                    && frame
+                        .metadata
+                        .iter()
+                        .any(|metadata| metadata.name_updates.len() == 8)
+            })
+            .expect("no experimental D3 object declaration");
+        assert_eq!(frame.channel_count, 16);
+        let metadata = frame
+            .metadata
+            .iter()
+            .find(|metadata| metadata.name_updates.len() == 8)
+            .expect("no D3 name declaration");
+        for source in 0..8 {
+            assert_eq!(
+                metadata.name_updates[source].name.as_str(),
+                format!("X{source}")
+            );
+        }
     }
 }

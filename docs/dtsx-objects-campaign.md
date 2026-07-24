@@ -1,6 +1,6 @@
 # Spatial object layer reverse-engineering notes
 
-Date: 2026-07-20 (research campaign) / 2026-07-21 (landing)
+Date: 2026-07-20 (research campaign) / 2026-07-22 (alternate-profile follow-up)
 
 Status: **landed as twelve labeled fixed channels** — see Omniphony
 `docs/channel-object-contract.md`. The original campaign fabricated an
@@ -25,7 +25,7 @@ the reconstructed fixed 7.1.4 presentation without double-rendering height
 content onto the lower plane. The reconstruction remains intentionally isolated
 from the lossless decoder.
 
-Validated on prefixes from all nine currently available tracks:
+Validated on prefixes from the original nine standard-profile tracks:
 
 - 4,206/4,206 XLL-X frames decoded in the 2 MiB cross-corpus pass;
 - channel-set header CRC valid in every frame;
@@ -34,6 +34,195 @@ Validated on prefixes from all nine currently available tracks:
   signals; no core reconstruction is required);
 - 24-bit storage, with title-dependent source PCM resolutions of 16, 18 or
   24 bits.
+
+The twenty-three later-added standard-profile tracks, including all eight
+the standard-07 through standard-14 series, standard-15, and five later
+disk-inventory additions
+and three controlled clips, retain
+the same fixed 22-byte prefix and still contain
+exactly one four-channel XLL set, so they remain fixed 7.1.4 presentations
+rather than candidates for additional objects. The common prefix is unchanged:
+
+```text
+02 00 08 50 28 4b fa 71 0d 62 02 fa 02 dc 13 71 0d c8 37 3c f1 02
+```
+
+## Alternate `0xF14000D0/D1` extension profile
+
+Two newer corpus entries use a second extension envelope that the regular
+`0x02000850` path does not decode yet:
+
+- *D0 corpus A* uses `0xF14000D0`;
+- *D1 corpus A* uses `0xF14000D1`.
+
+This profile is not a wholly different audio codec. The initial discovery scan
+found exactly two byte-aligned XLL channel-set headers per frame, each protected
+by a valid CRC16-CCITT. The bounded control-derived resolver described below now
+reproduces those boundaries without scanning the whole payload:
+
+| Stream | First set | Second set | Active frames decoded in 64 MiB |
+| --- | --- | --- | ---: |
+| `D0` | 1 channel, PCM/storage 24/24, residual mask `0x1` | 4 channels, PCM/storage 24/24, residual mask `0xf` | 8,356/8,356 |
+| `D1` | 2 channels, PCM/storage 20/24, residual mask `0x3` | 4 channels, PCM/storage 20/24, residual mask `0xf` | 7,293/7,293 |
+
+The first header starts at byte 61 or 62 for `D0`; `D1` starts at byte 62 for
+its 7-byte `b2` control and byte 63 for its 8-byte `c3/c4/c5` controls. The
+second header moves with the compressed size of the first set. A
+compact 7- or 8-byte control word between the fixed profile prefix and the first
+header encodes both its NAVI geometry and the field needed to predict that
+boundary.
+
+Each channel set has its own CRC-valid XLL-shaped NAVI table; the two sets do
+not necessarily share segment geometry. Exact active-frame examples now show:
+
+- `D0` frame 187: a four-entry, 6-bit first-set candidate followed by a
+  two-segment, 8-bit terminal quartet (`160 + 114` bytes);
+- `D1` frame 191: four 10-bit first-set segments (`223, 253, 274, 286` bytes);
+- `D1` frame 192: two 8-bit terminal-quartet segments (`158 + 161` bytes).
+
+This corrects the earlier `D0 = 8 active segments` hypothesis, which came from
+a transition/sparse frame and does not describe the active quartet.
+
+The apparent varying channel-mask width was a false interpretation. After the
+36-bit standard XLL channel-set base, this profile carries exactly two
+profile-specific bits instead of the ordinary one-to-one speaker-mapping block.
+Skipping those two bits and resuming at the standard decorrelation/prediction
+syntax parses both headers in every frame of the measured 8 MiB samples (1,621
+D0 frames and 1,028 D1 frames), including a unique original-channel
+permutation. The rest of the lossless codec is unchanged.
+
+The D1 `b2/c3/c4/c5` control families expose the first channel set's segment
+geometry in a 13-bit XLL common-header prefix. Its start moves between control
+bits 18 and 25; the dominant `c5` form starts at bit 24. Across 7,293 active
+frames in the measured 64 MiB prefix it selects:
+
+- 7,130 frames with two segments and 10-bit NAVI sizes;
+- 119 with four segments and 10-bit NAVI sizes;
+- 32 with two segments and 9-bit sizes;
+- nine with two segments and 11-bit sizes;
+- two with four segments and 9-bit sizes;
+- one with eight segments and 10-bit sizes.
+
+The selector uniquely identifies an immediate CRC-valid NAVI geometry for
+7,293/7,293 first sets. The earlier 425/837 result was an artifact of allowing
+at most 16 bytes between the first set's NAVI-sized audio data and the second
+header. The actual interstitial span is 14..18 bytes; no trailing NAVI is
+present.
+
+The D1 channel-set boundaries can also be resolved without a full-payload CRC
+scan. If the first common prefix begins at control bit `C`, its preceding size
+field has width `C - 14`, starts at bit 9, and predicts
+`second_offset = field * 2 + 67`. The probe tests that byte and the single
+preceding byte, accepting only a structurally valid, CRC-protected four-channel
+XLL header. This bounded rule finds every measured D1 header, including the
+7-byte `b2`, shifted `c3/c4` and rare 11-bit `c5` forms.
+
+The bytes between the first set and terminal quartet are not arbitrary padding.
+They contain zero to three alignment bytes, the same constant six-byte suffix
+`02 34 38 8c 4f 00`, then a second 8- or 9-byte compact control word. Its own
+13-bit common prefix starts between bits 19 and 26 and uniquely selects the
+terminal quartet's geometry in 7,293/7,293 active D1 frames. The resulting
+distribution is 4,148 at 2 x 10 bits, 2,273 at 2 x 11, 823 at 4 x 10, 40 at
+4 x 11, four at 8 x 11, two at 2 x 8, and one each at 2 x 6, 4 x 9 and
+8 x 10.
+
+D0 uses the same two-control organization. Its first selector starts between
+bits 18 and 25 of the 7- or 8-byte outer control; its second selector occupies
+bits 20..26 of the interstitial 8- or 9-byte control. Each selector yields
+exactly one geometry on all 8,356 active frames. This removes the false
+dominant `2 x 6` first-set candidate: the control selects `2 x 5` on 7,791
+frames. D0's first header follows its control at byte 61 or 62. Its second
+header is predicted by the same field-width rule as D1, using
+`second_offset = field * 2 + 66` and the single preceding byte as the bounded
+CRC-validated alternative.
+
+The existing XLL primitives now reach PCM well beyond a one-frame probe. With
+the two-bit alternate header mode and self-consistent common parameters
+(`header size width = NAVI width`, band CRC 0, non-scalable LSBs), corpus-gated
+tests report:
+
+| Stream / measured run | First set | Terminal quartet |
+| --- | ---: | ---: |
+| D0, 8,356 active frames in 64 MiB | 8,356 | 8,356 |
+| D1, 7,293 active frames in 64 MiB | 7,293 | 7,293 |
+
+These counts include header CRC, NAVI CRC, bounded entropy decode, prediction,
+decorrelation and PCM reconstruction. They are not yet a reference comparison
+and do not establish speaker or object identity.
+
+Both alternate profiles now resolve both headers with bounded candidates and
+select exactly one NAVI geometry per channel set from their compact controls.
+The decoder path uses these rules directly: fixed-size layout/NAVI state,
+checked arithmetic, prefix/header/NAVI CRC validation, a maximum 24-byte suffix
+search and no full-payload header scan or segment/size enumeration. Malformed
+or truncated extension data clears only the optional extension output and does
+not invalidate the lossless bed.
+
+At the high-level decoder boundary, every frame of all three complete elementary
+streams now produces five speaker-unmapped sources for D0 or six for D1:
+
+| Complete stream | Frames | Sources per frame | PCM resolution | Decode errors |
+| --- | ---: | ---: | ---: | ---: |
+| *D0 corpus A* (`D0`) | 697,447 | 5 x 512 samples | 24 bits | 0 |
+| *D0 corpus B* (`D0`) | 557,057 | 5 x 512 samples | 24 bits | 0 |
+| *D1 corpus A* (`D1`) | 863,769 | 6 x 512 samples | 20 bits | 0 |
+
+The bounded-memory validation read both complete D0 streams (5,437,706,120 and
+3,930,678,152 bytes) and all 7,070,742,004 D1 bytes with no pending frame,
+non-finite sample or out-of-range PCM value. Ordinary inter-sample and
+frame-boundary RMS differences remain on the same scale; no gross
+mode-transition discontinuity was observed. The full runs include the D0 `c5`,
+D1 `b2/c3/c4/c5`, and rare internal `d6` controls.
+
+The bridge selects a presentation automatically after the extension profile
+has decoded successfully. There is no environment or bridge-configuration
+switch:
+
+- D0 emits X0–X4 as fixed `TFC,TFL,TFR,TBL,TBR` channels and applies only the
+  configured, explicitly experimental partial unfolds;
+- D1 emits all six sources as fixed `TFL,TFR,Lw,Rw,TBL,TBR` channels and
+  applies its configured partial unfolds;
+- D3 performs no bed subtraction and emits unchanged named objects X0–X7 at
+  the inferred two-wide plus six-top layout documented in
+  `dtsx-d1-wide-audition.md`.
+
+The D3 object-to-channel and name declarations are emitted sparsely and reset
+on seek or pipeline reset. A static position heartbeat is emitted twice per
+second so a newly registered Studio OSC client receives a complete spatial
+frame without a startup flood when one input packet contains many decoded
+audio frames. The renderer's OSC sender still delta-compresses unchanged
+object details. `has_objects` becomes true only after a frame containing
+actual object channels is emitted; fixed D0/D1 do not set it.
+
+The assignments remain experimental until reference decoding and the requested
+listening sign-off establish the exact profile matrices and confirm the
+inferred fixed-channel identities.
+
+It is nevertheless not yet safe to promote these experimental assignments to
+the normal presentation. Full-stream PCM range and coarse continuity are
+validated, but the channel semantics and fold matrices are inferred rather
+than carried by decoded mapping metadata. Reference decoding and A/B sign-off
+remain promotion gates.
+
+The CRC-protected fixed profile prefix is constant for every observed frame.
+For `D0`, bytes `0..48` have a zero CRC16 and are followed by the six-byte tail
+`03 34 38 8c 4f 00`; for `D1`, the zero-CRC range is `0..49` and the same tail
+follows. The compact control word then begins at byte 54 (`D0`) or 55 (`D1`).
+
+The public DTS-UHD organization is a useful structural analogy: ETSI TS
+103 491 defines persistent XLL frame-header chunks and XLL audio chunks that
+carry channel-set headers, data and navigation. It is not byte-for-byte the
+same wrapper, so its chunk ordering must not be imposed on these frames without
+corpus validation. In particular, a shared CRC-valid NAVI table at the payload
+end appears only on sparse/transition material (247/8,541 D0 frames and
+197/1,028 D1 frames) and does not describe the active corpus; the two immediate
+per-set NAVI tables remain the supported structural hypothesis.
+
+No presentation contract is inferred from `1 + 4` or `2 + 4`. Until the
+waveforms are decoded across the corpus and mapping metadata is understood,
+these remain extra source-channel candidates. They are not exposed to the
+renderer as labeled speakers or objects; all alternate-profile PCM work remains
+research-only and corpus-gated.
 
 ## Correct XLL-X payload structure
 
@@ -69,7 +258,7 @@ The optional final argument limits input to MiB. Classic RIFF output is capped
 below 4 GiB. A smoke test produced a valid 48 kHz, four-channel `pcm_f32le` WAV
 with 960/960 frames and no failures.
 
-The paired French/English *La La Land* analysis is also decisive: 564 initial
+The paired French/English the paired language control analysis is also decisive: 564 initial
 silent frames have bit-identical extension payloads, while the decoded
 waveforms then diverge with the two mixes. The block therefore carries real
 audio, not only spatial coordinates.
@@ -99,7 +288,7 @@ bounds and syncword and retaining the legacy aligned band-end probe as a
 fallback. This makes extension extraction more robust, but supplies neither a
 gain curve nor an object trajectory.
 
-Before analysis of the Object Emulator control clip, the remaining spatial
+Before analysis of standard pan control A, the remaining spatial
 question was whether the four waveforms were:
 
 1. fixed height feeds (most economical explanation);
@@ -123,7 +312,7 @@ particularly useful counterexamples to four independent height feeds:
 
 - *Apollo 13*: channels 2 and 3 are exactly silent for 7,501 frames (about
   80 seconds), leaving only two active extension waveforms;
-- *La La Land* English: channels 2 and 3 are sample-identical in aggregate and
+- *paired language control* English: channels 2 and 3 are sample-identical in aggregate and
   exactly zero after the shared 564-frame introduction, for the rest of the
   13,223-frame prefix (about 141 seconds);
 - *The Mummy* (1999): channels 0/3 and 1/2 have sample correlations of 0.9981
@@ -135,7 +324,7 @@ or duplicate content. A first time-local coherence test finds the two *Mummy*
 pairs in 6,388/6,582 and 6,362/6,582 frames respectively. Their normalized
 second-channel gain occupies narrow 10th-to-90th percentile ranges of
 0.5063..0.5189 and 0.4412..0.4599. This favours static duplicated stems over a
-moving pan in that prefix. The silent *La La Land* feeds carry zero PCM, not a
+moving pan in that prefix. The silent the paired language control feeds carry zero PCM, not a
 frame-wise DC control value.
 
 The next test is frequency-local rather than whole-frame: isolate coherent
@@ -147,16 +336,16 @@ would instead support fixed channels or static multichannel stems. This can
 recover only a rendered direction, not necessarily the original object
 coordinates, distance or spread.
 
-The paired *La La Land* language tracks provide a control: spatial gain
+Paired language variants provide a control: spatial gain
 trajectories belonging to shared music and effects should agree despite the
 different dialogue mix. A second useful comparison is coherence between the
 four extension waveforms and the 7.1 bed; strong shared components would be
 consistent with a pre-rendered 12-channel bus, while independent components
 would better support separately carried object waveforms.
 
-### DTS:X Object Emulator control
+### Standard pan control A
 
-The public DTS-authored *DTS:X Object Emulator* test clip is a much stronger
+The controlled *standard-control-A* clip is a much stronger
 control than a feature-film soundtrack because its picture explicitly shows a
 moving source, labels the signal as using 3D coordinates, and then illustrates
 several playback layouts. It does not print numerical azimuth, elevation or
@@ -255,11 +444,44 @@ coordinates instead of the undisclosed 3D animation coordinates. They are
 nevertheless strong enough to confirm that the visible trajectory and decoded
 speaker gains are synchronized.
 
+### Additional movement controls
+
+The complete *standard-control-B* and *standard-control-C* elementary streams add
+two more controlled clips with explicitly animated spatial motion. They retain
+the same representation as the standard pan control A:
+
+- all 3,117 *standard-control-B* frames and all 5,623 *standard-control-C* frames use
+  the standard four-source profile at 48 kHz/24-bit, with no decode error;
+- every frame retains the same fixed 22-byte prefix used by the film corpus
+  and standard pan control A;
+- the extracted elementary streams are bit-identical to the audio tracks in
+  their source containers;
+- after the decoded audio, every payload has only two to five zero bytes of
+  trailer/alignment padding;
+- no fifth waveform, D0/D1 layout, or payload-side coordinate record appears.
+
+A height-only 100 ms covariance analysis finds locally coherent, changing
+gain vectors in both clips. *standard-control-B* has 111 reliable windows with a
+median dominant-source share of 0.9648 and a four-corner separability residual
+of 0.0053. *standard-control-C* has 94 such windows, a median share of 0.9481 and
+a residual of 0.0267. In both, the reliable gain centroids span nearly the
+whole left/right and front/back height plane, normally using two of the four
+height feeds. Useful listening/inspection points are:
+
+- *standard-control-B*: 7.7 s, 9.5 s, 19.6 s, 21.6 s and 28.8–30.2 s;
+- *standard-control-C*: 16.7 s, 19.7 s, 23.9 s, 34.3–36.4 s and 54.8 s.
+
+These clips therefore provide excellent audible motion regressions, but not
+positive controls for retained object metadata. Their motion is observable as
+time-varying gains in the four fixed height waveforms. The analysis tool is
+`scripts/analyze-dtsx-fixed-pan.py`; it deliberately reports a rendered gain
+trajectory rather than calling that trajectory an authoring object.
+
 ### Embedded 7.1 compatibility downmix
 
 The regular 7.1 presentation is not the final lower speaker plane when XLL-X is
 decoded. It contains a backward-compatible copy of each height feed mixed into
-the corresponding lower corner at -3 dB. The Object Emulator exposes this
+the corresponding lower corner at -3 dB. The standard pan control A exposes this
 particularly clearly because it contains isolated single-source pans.
 
 The dominant lower/height gain ratio is `23170 / 32768 = 0.707092285`. This is
@@ -313,17 +535,17 @@ consumer encode carries the result rendered to twelve fixed feeds.
 
 It does not prove that the profile can never append genuine dynamic objects.
 DTS stated at launch that an embedded object can be extracted, and independent
-technical reports identify the US Blu-ray of *Ip Man 3* as an unusual
+technical reports identify an unusual published disc as a
 `7.1.4 + five dynamic objects` encode. A second forum source calls it the
 first DTS:X Blu-ray not locked to 7.1.4. These are useful acquisition leads,
 not primary-source proof. A dump from that exact US disc, or from the reported
-`7.1.4 + one object` *Independence Day* encode, is now the highest-value
+`7.1.4 + one object` *D1 corpus A* encode, is now the highest-value
 comparison: it should contain a structural element absent from both the nine
-films and the Object Emulator if the reports are accurate.
+films and the standard pan control A if the reports are accurate.
 
 Relevant public links:
 
-- Kodi test catalogue and Object Emulator link:
+- Public test catalogue:
   <https://kodi.wiki/view/Samples#HD/object-based_Audio_Test_Clips>
 - DTS patent application describing both a 7.1-channel presentation plus four
   separate height inputs and an alternate 11.1-channel representation:
@@ -331,18 +553,15 @@ Relevant public links:
 - DTS launch statement distinguishing content rendered from channels from
   objects that are actually embedded and extractable:
   <https://dts.com/insights/welcome-to-dtsx-open-immersive-and-flexible-object-based-audio-coming-to-cinema-and-home/>
-- report of five dynamic objects on the US *Ip Man 3* disc:
+- report of five dynamic objects on the unusual disc:
   <https://www.avforums.com/threads/lyngdorf-discussion.1580956/page-592>
-- independent recollection that *Ip Man 3* was the first non-locked DTS:X
+- independent recollection that it was the first non-locked DTS:X
   Blu-ray:
   <https://forum.blu-ray.com/showthread.php?p=20520575>
 
-By contrast, DTS's *Ex Machina* announcement says that DTS:X moves sound
-objects through mixer-selected locations, but it does not state that this
-specific disc retains time-varying object metadata. The local *Ex Machina*
-bitstream has the same fixed four-waveform structure, so that press wording is
-not sufficient evidence of dynamic objects in the title:
-<https://dts.com/insights/lionsgates-ex-machina-blu-ray-disc-is-first-to-feature-dtsx-audio/>.
+Format launch material says that DTS:X moves sound objects through
+mixer-selected locations, but that wording alone does not establish that a
+particular consumer bitstream retains time-varying object metadata.
 
 ## Public specifications used
 
@@ -363,10 +582,13 @@ of the XLL frame; it does not parse this channel set.
 
 - `xll_x_audio.rs`: decode the four waveforms to WAV;
 - `xll_x_chs.rs`: prove/characterize the bare XLL channel set and CRC;
+- `xll_alt_nav.rs`: map the compact control word and channel-set boundaries in
+  the alternate `D0/D1` profile (`[max_mb] quick` skips the expensive header
+  syntax enumeration for full-corpus control statistics);
 - `xll_x_meta.rs`: analyze the reserved 64-bit EXSS descriptor field;
 - `xll_x_pair.rs`: compare aligned language variants;
 - `xll_x_mda.rs`: bit-aligned MDA signature and URI scan;
-- `analyze-dtsx-object-emulator.py`: rank-one gain, raw-FOA, layout activity
+- `analyze-dtsx-pan-control.py`: rank-one gain, raw-FOA, layout activity
   and optional picture/audio trajectory tests for the public control clip;
 - older `xll_x_probe`, `xll_x_rice` and `xll_x_scan` diagnostics remain useful
   as historical/raw-payload tools, but their object-count hypothesis is
@@ -375,22 +597,29 @@ of the XLL frame; it does not parse this channel set.
 Run the control analysis after extracting the regular bed and XLL-X WAVs:
 
 ```sh
-python3 scripts/analyze-dtsx-object-emulator.py \
-  --bed /tmp/dtsx-object-emulator-bed.wav \
-  --height /tmp/dtsx-object-emulator-x.wav \
-  --video /tmp/dtsx-object-emulator.mkv
+python3 scripts/analyze-dtsx-pan-control.py \
+  --bed /tmp/pan-control-bed.wav \
+  --height /tmp/pan-control-x.wav \
+  --video /tmp/input.mkv
 ```
 
 ## Corpus
 
-Re-extracted elementary streams are in:
+The local corpus contains 34 elementary streams: 31 programme tracks plus
+three controlled clips. Source titles, source-container paths and staging
+locations are intentionally not recorded in the repository. Corpus-gated
+tests receive their inputs through environment variables:
 
-```text
-/mnt/local/SSD_A-CT4000/DTS:X-Dumps/
-```
+- `HARLETTY_DTSX_STANDARD_CORPUS`: standard four-source elementary stream;
+- `HARLETTY_D0_CORPUS`, `HARLETTY_D1_CORPUS`, `HARLETTY_D3_CORPUS`:
+  alternate-profile elementary streams;
+- `HARLETTY_DTS_CORE_CORPUS` and `HARLETTY_DTS_CORE_REFERENCE`: DTS core
+  stream and matching interleaved f32le reference;
+- `HARLETTY_DTSX_STANDARD_REFERENCE`: interleaved f32le reference used by the
+  standard lossless-bed regression;
+- `HARLETTY_DTSHD_16BIT_CORPUS` and `HARLETTY_DTSHD_16BIT_REFERENCE`:
+  optional 16-bit lossless-scale regression pair.
 
-Available: *Apollo 13*, *Carlito's Way*, *Ex Machina*, *Gladiator*, *La La
-Land* (English and French), *The Mummy* (1999), *The Mummy Returns*, and *The
-Mummy* (2008). `ffprobe` identifies every track as `DTS-HD MA + DTS:X`, 48 kHz,
-8-channel bed. The previously used *Harry Potter and the Deathly Hallows: Part
-1* source was not found and has not been re-extracted.
+The later D1 wide-fold system-identification experiment, retained tooling and
+automatic experimental presentations are documented in
+[`dtsx-d1-wide-audition.md`](dtsx-d1-wide-audition.md).

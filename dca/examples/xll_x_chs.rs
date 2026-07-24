@@ -106,6 +106,21 @@ fn main() {
     let mut candidate_frames = 0usize;
     let mut count_matching_frames = 0usize;
     let mut all_offsets: HashMap<usize, usize> = HashMap::new();
+    let mut all_fields: HashMap<(usize, usize, usize, usize, usize, u32), usize> = HashMap::new();
+    let mut all_crc_valid: HashMap<(usize, usize, usize, usize, usize, u32), usize> =
+        HashMap::new();
+    let mut crc_valid_layouts: HashMap<Vec<(usize, usize, usize, usize, usize, u32)>, usize> =
+        HashMap::new();
+    let mut full_crc_sequences: HashMap<Vec<(usize, usize, usize, u32)>, usize> = HashMap::new();
+    let mut full_crc_offsets: HashMap<(usize, usize, usize, u32), (usize, usize, usize)> =
+        HashMap::new();
+    let mut chunk_boundary_deltas: HashMap<(usize, usize, isize), usize> = HashMap::new();
+    let mut chunk_navi_crc_valid: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut chunk_navi_hypotheses: HashMap<(usize, usize, usize, usize, isize), usize> =
+        HashMap::new();
+    let mut first_full_crc_candidates = Vec::new();
+    let mut first_layout_payload_prefixes = Vec::new();
+    let mut last_full_crc_signature = None;
     let mut count_matching_offsets: HashMap<usize, usize> = HashMap::new();
     let mut header_sizes: HashMap<usize, usize> = HashMap::new();
     let mut exact_offset_frames = 0usize;
@@ -206,13 +221,15 @@ fn main() {
                     let header_size =
                         (((payload[22] as usize) << 2) | ((payload[23] as usize) >> 6)) + 1;
                     let data_start = 22 + header_size;
-                    first_layout_bytes = Some((
-                        payload.len(),
-                        header_size,
-                        data_start,
-                        payload[data_start..payload.len().min(data_start + 24)].to_vec(),
-                        payload[payload.len().saturating_sub(24)..].to_vec(),
-                    ));
+                    if data_start <= payload.len() {
+                        first_layout_bytes = Some((
+                            payload.len(),
+                            header_size,
+                            data_start,
+                            payload[data_start..payload.len().min(data_start + 24)].to_vec(),
+                            payload[payload.len().saturating_sub(24)..].to_vec(),
+                        ));
+                    }
                 }
                 if frame.x_samples.len() == 4 {
                     *channel_header_tails
@@ -299,8 +316,26 @@ fn main() {
                     candidate_frames += 1;
                 }
                 let mut count_match = false;
+                let mut crc_valid_layout = Vec::new();
                 for candidate in candidates {
+                    let candidate_fields = (
+                        candidate.bit_offset,
+                        candidate.header_size,
+                        candidate.channels,
+                        candidate.pcm_resolution,
+                        candidate.storage_resolution,
+                        candidate.residual_mask,
+                    );
                     *all_offsets.entry(candidate.bit_offset).or_default() += 1;
+                    *all_fields.entry(candidate_fields).or_default() += 1;
+                    if candidate.bit_offset % 8 == 0 {
+                        let start = candidate.bit_offset / 8;
+                        let end = start + candidate.header_size;
+                        if end <= payload.len() && crc16_ccitt(&payload[start..end]) == 0 {
+                            *all_crc_valid.entry(candidate_fields).or_default() += 1;
+                            crc_valid_layout.push(candidate_fields);
+                        }
+                    }
                     if candidate.bit_offset == SEARCH_START {
                         exact_offset_frames += 1;
                         *exact_basic_fields
@@ -338,6 +373,134 @@ fn main() {
                 }
                 if count_match {
                     count_matching_frames += 1;
+                }
+                if !crc_valid_layout.is_empty() {
+                    crc_valid_layout.sort_unstable();
+                    *crc_valid_layouts.entry(crc_valid_layout).or_default() += 1;
+                }
+                let mut full_crc_candidates = Vec::new();
+                for byte_offset in 0..payload.len() {
+                    let Some(candidate) = candidate_at(payload, byte_offset * 8) else {
+                        continue;
+                    };
+                    let end = byte_offset + candidate.header_size;
+                    if end > payload.len() || crc16_ccitt(&payload[byte_offset..end]) != 0 {
+                        continue;
+                    }
+                    let format = (
+                        candidate.channels,
+                        candidate.pcm_resolution,
+                        candidate.storage_resolution,
+                        candidate.residual_mask,
+                    );
+                    full_crc_candidates.push((
+                        byte_offset,
+                        candidate.header_size,
+                        candidate.channels,
+                        format,
+                    ));
+                    let entry = full_crc_offsets.entry(format).or_insert((0, usize::MAX, 0));
+                    entry.0 += 1;
+                    entry.1 = entry.1.min(byte_offset);
+                    entry.2 = entry.2.max(byte_offset);
+                }
+                let full_crc_sequence = full_crc_candidates
+                    .iter()
+                    .map(|candidate| candidate.3)
+                    .collect::<Vec<_>>();
+                if !full_crc_sequence.is_empty() {
+                    *full_crc_sequences.entry(full_crc_sequence).or_default() += 1;
+                }
+                let full_crc_signature = (payload.len(), full_crc_candidates.clone());
+                if last_full_crc_signature.as_ref() != Some(&full_crc_signature) {
+                    if first_full_crc_candidates.len() < 64 {
+                        first_full_crc_candidates.push((
+                            frames,
+                            payload.len(),
+                            full_crc_candidates.clone(),
+                        ));
+                    }
+                    if first_layout_payload_prefixes.len() < 8 {
+                        first_layout_payload_prefixes.push((
+                            frames,
+                            payload.len(),
+                            payload[..payload.len().min(96)].to_vec(),
+                        ));
+                    }
+                    last_full_crc_signature = Some(full_crc_signature);
+                }
+                if full_crc_candidates.len() == 2 {
+                    for (index, &(byte_offset, header_size, channels, _)) in
+                        full_crc_candidates.iter().enumerate()
+                    {
+                        let navi_start = byte_offset + header_size;
+                        let navi_payload_bits =
+                            frame.xll_frame_segments * frame.xll_segment_size_bits;
+                        let navi_size = navi_payload_bits.div_ceil(8) + 2;
+                        if navi_start + navi_size > payload.len() {
+                            continue;
+                        }
+                        let mut bit = navi_start * 8;
+                        let mut audio_bytes = 0usize;
+                        let mut valid_navi = true;
+                        for _ in 0..frame.xll_frame_segments {
+                            let Some(size) =
+                                read_bits(payload, &mut bit, frame.xll_segment_size_bits)
+                            else {
+                                valid_navi = false;
+                                break;
+                            };
+                            audio_bytes += size as usize + 1;
+                        }
+                        if !valid_navi {
+                            continue;
+                        }
+                        if crc16_ccitt(&payload[navi_start..navi_start + navi_size]) == 0 {
+                            *chunk_navi_crc_valid.entry((index, channels)).or_default() += 1;
+                        }
+                        let predicted_audio_end = navi_start + navi_size + audio_bytes;
+                        let boundary = full_crc_candidates
+                            .get(index + 1)
+                            .map(|candidate| candidate.0)
+                            .unwrap_or(payload.len());
+                        let delta = boundary as isize - predicted_audio_end as isize;
+                        *chunk_boundary_deltas
+                            .entry((index, channels, delta))
+                            .or_default() += 1;
+
+                        for segments in 1usize..=32 {
+                            for size_bits in 4usize..=20 {
+                                let navi_payload_bits = segments * size_bits;
+                                let navi_size = navi_payload_bits.div_ceil(8) + 2;
+                                if navi_start + navi_size > payload.len()
+                                    || crc16_ccitt(&payload[navi_start..navi_start + navi_size])
+                                        != 0
+                                {
+                                    continue;
+                                }
+                                let mut bit = navi_start * 8;
+                                let mut audio_bytes = 0usize;
+                                let mut valid = true;
+                                for _ in 0..segments {
+                                    let Some(size) = read_bits(payload, &mut bit, size_bits) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    audio_bytes += size as usize + 1;
+                                }
+                                if !valid {
+                                    continue;
+                                }
+                                let predicted_audio_end = navi_start + navi_size + audio_bytes;
+                                let delta = boundary as isize - predicted_audio_end as isize;
+                                if (0..=16).contains(&delta) {
+                                    *chunk_navi_hypotheses
+                                        .entry((index, channels, segments, size_bits, delta))
+                                        .or_default() += 1;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             frames += 1;
@@ -539,6 +702,64 @@ fn main() {
         "top offsets regardless of channel count: {:?}",
         &any_offsets[..any_offsets.len().min(12)]
     );
+    let mut all_fields = all_fields.into_iter().collect::<Vec<_>>();
+    all_fields.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    println!(
+        "top candidates as ((bit offset, header bytes, channels, PCM bits, storage bits, residual mask), frames, CRC-valid):"
+    );
+    for (fields, occurrences) in all_fields.into_iter().take(20) {
+        let crc_valid = all_crc_valid.get(&fields).copied().unwrap_or_default();
+        println!("  {fields:?}: {occurrences}, CRC {crc_valid}/{occurrences}");
+    }
+    let mut crc_valid_layouts = crc_valid_layouts.into_iter().collect::<Vec<_>>();
+    crc_valid_layouts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    println!("top per-frame CRC-valid candidate layouts:");
+    for (layout, occurrences) in crc_valid_layouts.into_iter().take(20) {
+        println!("  {occurrences}: {layout:?}");
+    }
+    let mut full_crc_sequences = full_crc_sequences.into_iter().collect::<Vec<_>>();
+    full_crc_sequences.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    println!(
+        "top full-payload CRC-valid channel sequences (channels, PCM bits, storage bits, residual mask):"
+    );
+    for (sequence, occurrences) in full_crc_sequences.into_iter().take(20) {
+        println!("  {occurrences}: {sequence:?}");
+    }
+    let mut full_crc_offsets = full_crc_offsets.into_iter().collect::<Vec<_>>();
+    full_crc_offsets.sort_unstable_by(|a, b| b.1.0.cmp(&a.1.0));
+    println!("full-payload CRC-valid formats as (format, frames, min/max byte offset):");
+    for (format, (occurrences, min_offset, max_offset)) in full_crc_offsets.into_iter().take(20) {
+        println!("  {format:?}: {occurrences}, {min_offset}..={max_offset}");
+    }
+    let mut chunk_boundary_deltas = chunk_boundary_deltas.into_iter().collect::<Vec<_>>();
+    chunk_boundary_deltas.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    println!("chunk NAVI landing as ((chunk index, channels, boundary-audio-end bytes), frames):");
+    for (key, occurrences) in chunk_boundary_deltas.into_iter().take(20) {
+        println!("  {key:?}: {occurrences}");
+    }
+    println!(
+        "chunk NAVI CRC-valid frames as ((chunk index, channels), frames): {chunk_navi_crc_valid:?}"
+    );
+    let mut chunk_navi_hypotheses = chunk_navi_hypotheses.into_iter().collect::<Vec<_>>();
+    chunk_navi_hypotheses.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    println!(
+        "top landing NAVI hypotheses as ((chunk index, channels, segments, size bits, trailing bytes), frames):"
+    );
+    for (key, occurrences) in chunk_navi_hypotheses.into_iter().take(100) {
+        println!("  {key:?}: {occurrences}");
+    }
+    println!(
+        "first full-payload CRC-valid candidates as (frame, payload bytes, [(byte offset, header bytes, channels, format)]):"
+    );
+    for entry in first_full_crc_candidates {
+        println!("  {entry:?}");
+    }
+    println!(
+        "first layout-change payload prefixes as (frame, payload bytes, first up-to-96 bytes):"
+    );
+    for entry in first_layout_payload_prefixes {
+        println!("  {entry:02x?}");
+    }
 }
 
 fn pearson(a: &[f64], b: &[f64]) -> f64 {
