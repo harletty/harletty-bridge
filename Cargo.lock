@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "harletty-bridge"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "abi_stable",
  "anyhow",
