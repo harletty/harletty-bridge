@@ -78,7 +78,7 @@ Play any TrueHD/Atmos file:
 - **mpv** —
 
   ```sh
-  mpv --ad=orender --ad-orender-osc film.mkv
+  mpv --ad=orender --ad-orender-osc input.mkv
   ```
 
   `--ad=orender` is what switches mpv over to object rendering for this
@@ -119,10 +119,23 @@ If the bridge isn't found, the host falls back to the normal
 
 Then verify it with the [Check it worked](#check-it-worked) steps above.
 
-> **Arch users:** there's nothing to copy by hand — install the
-> [`omniphony-bridge`](https://github.com/mgth/Omniphony/tree/main/packaging/arch/omniphony-bridge)
-> package and it lands at `/usr/lib/orender/omniphony_bridge.so`,
-> which every renderer host picks up automatically.
+> **Arch users:** there's nothing to download by hand — the bridge is on
+> the AUR as [`harletty-bridge`](https://aur.archlinux.org/packages/harletty-bridge):
+>
+> ```sh
+> paru -S harletty-bridge
+> ```
+>
+> It builds from this repo's release and lands at
+> `/usr/lib/orender/libharletty_bridge.so`. Hosts installed system-wide
+> (`/usr/bin/orender`, the AUR `mpv-omniphony`/`omniphony-studio`) don't
+> scan that directory, so point them at it once in
+> `~/.config/omniphony/config.yaml`:
+>
+> ```yaml
+> render:
+>   bridge_path: /usr/lib/orender/libharletty_bridge.so
+> ```
 
 ### 🍎 macOS
 

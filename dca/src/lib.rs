@@ -23,6 +23,6 @@ pub use parser::{
     AudioMode, FrameInfo, ParseError as HeaderParseError, SYNCWORD_CORE_BE, SYNCWORD_SUBSTREAM,
     parse_header,
 };
-pub use hd::{exss_substream_size, HdDecoder, HdError, HdFrame};
+pub use hd::{exss_has_xll, exss_substream_size, HdDecoder, HdError, HdFrame};
 pub use pcm::{CorePcmFrame, DecodeError, PcmDecoder, PcmPushResult, bed_layout};
 pub use types::BedChannel;

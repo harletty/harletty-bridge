@@ -1,5 +1,4 @@
 use bridge_api::RChannelLabel;
-use eac3::CorePcmFrame;
 use truehd::structs::channel::ChannelLabel;
 
 /// Convert a TrueHD `ChannelLabel` to its ABI-stable counterpart.
@@ -76,64 +75,30 @@ pub(crate) fn bed_channel_to_r(ch: eac3::BedChannel) -> RChannelLabel {
     }
 }
 
-/// Map a `BedChannel` to the speaker ID space used by the bridge.
-pub(crate) fn bed_channel_to_speaker_id(ch: eac3::BedChannel) -> usize {
-    use eac3::BedChannel;
-    match ch {
-        BedChannel::FrontLeft => 0,
-        BedChannel::FrontRight => 1,
-        BedChannel::Center => 2,
-        BedChannel::LowFrequencyEffects => 3,
-        BedChannel::SurroundLeft => 4,
-        BedChannel::SurroundRight => 5,
-        BedChannel::RearCenter => 6,
-        BedChannel::RearLeft => 6,
-        BedChannel::RearRight => 7,
-        BedChannel::TopFrontLeft => 8,
-        BedChannel::TopFrontRight => 9,
-        BedChannel::TopSurroundLeft => 8,
-        BedChannel::TopSurroundRight => 9,
-        BedChannel::TopRearLeft => 8,
-        BedChannel::TopRearRight => 9,
-        BedChannel::WideLeft => 0,
-        BedChannel::WideRight => 1,
-        BedChannel::LowFrequencyEffects2 => 3,
-    }
-}
 
-pub(crate) fn eac3_core_bed_indices(core: &CorePcmFrame) -> Vec<usize> {
-    let mut bed_indices = Vec::with_capacity(core.total_channels());
-    bed_indices.extend(
-        core.fullband_channel_order
-            .iter()
-            .copied()
-            .map(bed_channel_to_speaker_id),
-    );
-    if core.lfe_channel.is_some() {
-        bed_indices.push(bed_channel_to_speaker_id(
-            eac3::BedChannel::LowFrequencyEffects,
-        ));
-    }
-    bed_indices
-}
 
-pub(crate) fn eac3_object_output_bed_indices(core: &CorePcmFrame) -> Vec<usize> {
-    if core.lfe_channel.is_some() {
-        vec![bed_channel_to_speaker_id(
-            eac3::BedChannel::LowFrequencyEffects,
-        )]
-    } else {
-        Vec::new()
-    }
-}
 
-/// Remap a speaker index to the Atmos channel-ID space.
-/// IDs 0-9 are bed channels; 10+ are dynamic objects.
-pub(crate) fn speaker_to_id(speaker_index: usize) -> usize {
+/// Channel label for an OAMD bed-assignment speaker index
+/// (`truehd::structs::oamd::SpeakerLabels` order).
+pub(crate) fn oamd_speaker_to_label(speaker_index: usize) -> RChannelLabel {
     match speaker_index {
-        0..8 => speaker_index,
-        8..10 => speaker_index + 122,
-        10..12 => speaker_index - 2,
-        _ => speaker_index + 120,
+        0 => RChannelLabel::L,
+        1 => RChannelLabel::R,
+        2 => RChannelLabel::C,
+        3 => RChannelLabel::LFE,
+        4 => RChannelLabel::Ls,  // Lss
+        5 => RChannelLabel::Rs,  // Rss
+        6 => RChannelLabel::Lb,  // Lrs
+        7 => RChannelLabel::Rb,  // Rrs
+        8 => RChannelLabel::Tfl, // Lfh (front height)
+        9 => RChannelLabel::Tfr, // Rfh
+        10 => RChannelLabel::Tsl, // Lts (top side)
+        11 => RChannelLabel::Tsr, // Rts
+        12 => RChannelLabel::Tbl, // Lrh (rear height)
+        13 => RChannelLabel::Tbr, // Rrh
+        14 => RChannelLabel::Lw,
+        15 => RChannelLabel::Rw,
+        16 => RChannelLabel::LFE2,
+        _ => RChannelLabel::Unknown,
     }
 }

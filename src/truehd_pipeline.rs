@@ -10,9 +10,9 @@ use truehd::process::{
 };
 
 use crate::bridge::{AtmosBridge, DrcMode};
-use crate::labels::channel_label_to_r;
+use crate::labels::{channel_label_to_r, oamd_speaker_to_label};
 use crate::logging::{bridge_diag_log, drc_diag_log_enabled, panic_message};
-use crate::metadata::{ObjectNameKey, build_metadata_frame_from_oamd};
+use crate::metadata::build_metadata_frame_from_oamd;
 use crate::perf::PerfStats;
 
 struct DrainContext<'a> {
@@ -28,7 +28,8 @@ struct DrainContext<'a> {
     recovering_until_major_sync: &'a mut bool,
     drc_mode: DrcMode,
     total_samples: &'a mut u64,
-    object_name_keys_by_id: &'a mut Vec<Option<ObjectNameKey>>,
+    declared_object_channels: &'a mut Option<RVec<bridge_api::RObjectChannel>>,
+    spatial_labels: &'a mut Option<RVec<RChannelLabel>>,
     perf: &'a mut PerfStats,
 }
 
@@ -55,7 +56,8 @@ impl DrainContext<'_> {
         *self.current_substream_info = None;
         *self.current_extended_substream_info = None;
         *self.current_dialogue_level = None;
-        self.object_name_keys_by_id.clear();
+        *self.declared_object_channels = None;
+        *self.spatial_labels = None;
         *self.recovering_until_major_sync = true;
     }
 }
@@ -328,33 +330,42 @@ fn build_thd_frame(
     #[cfg(feature = "bridge-perf")]
     ctx.perf.record_build_pcm(pcm_started.elapsed());
 
-    // Channel labels.
-    #[cfg(feature = "bridge-perf")]
-    let labels_started = Instant::now();
-    let channel_labels: RVec<RChannelLabel> = decoded
-        .channel_labels
-        .iter()
-        .map(channel_label_to_r)
-        .collect();
-    #[cfg(feature = "bridge-perf")]
-    ctx.perf.record_build_labels(labels_started.elapsed());
-
     // Metadata: one RMetadataFrame per parsed OAMD payload.
     #[cfg(feature = "bridge-perf")]
     let metadata_started = Instant::now();
     let mut metadata: RVec<RMetadataFrame> = RVec::new();
     if decoded.substream_info_changed {
-        ctx.object_name_keys_by_id.clear();
+        *ctx.declared_object_channels = None;
+        *ctx.spatial_labels = None;
     }
     #[cfg(feature = "bridge-perf")]
     let mut metadata_events = 0usize;
     for oamd in &decoded.oamd {
         let evo_base = base_sample_pos + oamd.evo_sample_offset;
+        // Fixed-channel labels of the spatial presentation: bed labels from
+        // the OAMD bed assignment, then `Object` for the object channels.
+        let bed_labels: RVec<RChannelLabel> = oamd
+            .program_assignment
+            .bed_assignment
+            .first()
+            .map(|bed| bed.to_index_vec())
+            .unwrap_or_default()
+            .iter()
+            .map(|&idx| oamd_speaker_to_label(idx))
+            .collect();
+        let mut labels = bed_labels;
+        while labels.len() < decoded.channel_count {
+            labels.push(RChannelLabel::Object);
+        }
+        if ctx.spatial_labels.as_ref() != Some(&labels) {
+            *ctx.spatial_labels = Some(labels);
+        }
         let meta = build_metadata_frame_from_oamd(
             oamd,
             evo_base,
             base_sample_pos,
-            ctx.object_name_keys_by_id,
+            ctx.declared_object_channels,
+            #[cfg(feature = "bridge-perf")]
             ctx.perf,
         );
         #[cfg(feature = "bridge-perf")]
@@ -368,6 +379,18 @@ fn build_thd_frame(
         ctx.perf.record_build_metadata(metadata_started.elapsed());
         ctx.perf.note_built_frame(metadata.len(), metadata_events);
     }
+
+    // Channel labels.
+    #[cfg(feature = "bridge-perf")]
+    let labels_started = Instant::now();
+    let channel_labels: RVec<RChannelLabel> = match ctx.spatial_labels.as_ref() {
+        // Spatial presentation: authoritative labels come from the OAMD bed
+        // assignment (cached across frames without a payload).
+        Some(labels) => labels.clone(),
+        None => decoded.channel_labels.iter().map(channel_label_to_r).collect(),
+    };
+    #[cfg(feature = "bridge-perf")]
+    ctx.perf.record_build_labels(labels_started.elapsed());
 
     RDecodedFrame {
         sampling_frequency: decoded.sampling_frequency,
@@ -412,7 +435,8 @@ pub(crate) fn process_extractor_input(
             recovering_until_major_sync: &mut bridge.recovering_until_major_sync,
             drc_mode: bridge.drc_mode,
             total_samples: &mut bridge.total_samples,
-            object_name_keys_by_id: &mut bridge.object_name_keys_by_id,
+            declared_object_channels: &mut bridge.declared_object_channels,
+            spatial_labels: &mut bridge.truehd_spatial_labels,
             perf: &mut bridge.perf,
         };
         #[cfg(feature = "bridge-perf")]
