@@ -1,0 +1,22 @@
+# Entries are applied in YAML order. Gains are dB amplitude values.
+sources:
+  - source: TFL
+    routes: [{target: L, gain_db: -3.0104780234}]
+  - source: TFR
+    routes: [{target: R, gain_db: -3.0104780234}]
+  - source: TBL
+    routes: [{target: Lb, gain_db: -3.0104780234}]
+  - source: TBR
+    routes: [{target: Rb, gain_db: -3.0104780234}]
+  - source: X0
+    routes: [{target: C, gain_db: -6.0206}, {target: L, gain_db: -3.0104780234}]
+  - source: X1
+    routes: [{target: L, gain_db: -3.0104780234}, {target: R, gain_db: -3.0104780234}]
+  - source: X2
+    routes: [{target: R, gain_db: -3.0104780234}, {target: Ls, gain_db: -3.0104780234}, {target: L, gain_db: -3.0104780234}]
+  - source: X3
+    routes: [{target: Lb, gain_db: -3.0104780234}, {target: Rs, gain_db: -3.0104780234}, {target: R, gain_db: -3.0104780234}]
+  - source: X4
+    routes: [{target: Rb, gain_db: -3.0104780234}, {target: Lb, gain_db: -3.0104780234}]
+  - source: X5
+    routes: [{target: Rb, gain_db: -3.0104780234}]

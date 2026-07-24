@@ -44,13 +44,13 @@ pub struct HdFrame {
     pub x_payload: Vec<u8>,
     /// Byte offset of `x_payload` within the XLL frame.
     pub x_payload_offset: usize,
-    /// Four decoded DTS:X extension waveforms. The XLL channel-set header does
-    /// not assign these channels to speakers, so they are deliberately not
-    /// mixed into `samples` or `output_mask` yet.
+    /// Decoded, speaker-unmapped extension waveforms. The standard profile has
+    /// four; alternate profiles can carry five or six across two channel sets.
+    /// They are deliberately not mixed into `samples` or `output_mask` here.
     pub x_samples: Vec<Vec<f32>>,
     pub x_pcm_bit_res: usize,
-    /// Bit position reached after decoding the four extension waveforms,
-    /// relative to `x_payload`.
+    /// Bit position reached after decoding the extension waveforms, relative
+    /// to `x_payload`.
     pub x_bits_consumed: usize,
     /// Diagnostic failure kind from the optional extension decode
     /// (allocation-free). A failure here never invalidates the lossless 7.1
@@ -287,36 +287,46 @@ mod tests {
 
     #[test]
     fn xll_7_1_matches_ffmpeg_lossless() {
-        // Ex Machina (2014): 24-bit DTS-HD MA 7.1.
-        check_xll_lossless(
-            "/mnt/local/SSD_A-CT4000/DTS:X-Dumps/Ex.Machina.2014.dtsx.eng.dts",
-            "/home/user/dev/spatial-renderer/dumps/dtsx_ref8.f32",
-            8,
-        );
+        let Ok(dump) = std::env::var("HARLETTY_DTSX_STANDARD_CORPUS") else {
+            eprintln!("skipping: HARLETTY_DTSX_STANDARD_CORPUS is not set");
+            return;
+        };
+        let Ok(reference) = std::env::var("HARLETTY_DTSX_STANDARD_REFERENCE") else {
+            eprintln!("skipping: HARLETTY_DTSX_STANDARD_REFERENCE is not set");
+            return;
+        };
+        check_xll_lossless(&dump, &reference, 8);
     }
 
     #[test]
     fn xll_5_1_16bit_matches_ffmpeg_lossless() {
-        // Dark Crystal (1982): 16-bit DTS-HD MA 5.1. Regression guard for the
-        // 16-bit-storage output-scale bug (the bed was ~48 dB / 256x too quiet).
-        check_xll_lossless(
-            "/home/user/dev/spatial-renderer/dumps/darkcrystal_dts51_16b.dts",
-            "/home/user/dev/spatial-renderer/dumps/darkcrystal_ref6.f32",
-            6,
-        );
+        // Regression guard for the 16-bit-storage output-scale bug (the bed
+        // was ~48 dB / 256x too quiet).
+        let Ok(dump) = std::env::var("HARLETTY_DTSHD_16BIT_CORPUS") else {
+            eprintln!("skipping: HARLETTY_DTSHD_16BIT_CORPUS is not set");
+            return;
+        };
+        let Ok(reference) = std::env::var("HARLETTY_DTSHD_16BIT_REFERENCE") else {
+            eprintln!("skipping: HARLETTY_DTSHD_16BIT_REFERENCE is not set");
+            return;
+        };
+        check_xll_lossless(&dump, &reference, 6);
     }
 
     #[test]
     fn xll_x_decodes_four_unmapped_waveforms() {
         use std::io::Read;
 
-        const DUMP: &str = "/mnt/local/SSD_A-CT4000/DTS:X-Dumps/Ex.Machina.2014.dtsx.eng.dts";
-        if !std::path::Path::new(DUMP).exists() {
-            eprintln!("skipping: spatial-layer corpus not present ({DUMP})");
+        let Ok(dump) = std::env::var("HARLETTY_DTSX_STANDARD_CORPUS") else {
+            eprintln!("skipping: HARLETTY_DTSX_STANDARD_CORPUS is not set");
+            return;
+        };
+        if !std::path::Path::new(&dump).is_file() {
+            eprintln!("skipping: configured spatial-layer corpus is not readable");
             return;
         }
         let mut bytes = Vec::new();
-        std::fs::File::open(DUMP)
+        std::fs::File::open(dump)
             .unwrap()
             .take(2 * 1024 * 1024)
             .read_to_end(&mut bytes)
