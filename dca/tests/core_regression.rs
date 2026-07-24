@@ -5,21 +5,19 @@
 // derived from copyrighted content), so the test SKIPS when the files are
 // absent. Regenerate locally with:
 //
-//   SRC=<ExMachina.mkv>
+//   SRC=<input.mkv>
 //   ffmpeg -v error -y -i "$SRC" -map 0:4 -t 8 -c:a copy -f dts \
 //       dumps/dts51_core.dts
 //   ffmpeg -v error -y -i "$SRC" -map 0:4 -t 8 -f f32le -ac 6 \
 //       dumps/dts51_ref.f32
+//   export HARLETTY_DTS_CORE_CORPUS="$PWD/dumps/dts51_core.dts"
+//   export HARLETTY_DTS_CORE_REFERENCE="$PWD/dumps/dts51_ref.f32"
 //
-// (track 0:4 is Ex Machina's plain DTS 5.1 track — ffmpeg decodes it core-only,
+// (select a plain DTS 5.1 track that ffmpeg decodes core-only,
 // so it validates the core decoder without the XLL extension.)
-
-use std::path::Path;
 
 use dca::{BedChannel, Extractor, PcmDecoder};
 
-const DTS: &str = "/home/user/dev/spatial-renderer/dumps/dts51_core.dts";
-const REF: &str = "/home/user/dev/spatial-renderer/dumps/dts51_ref.f32";
 const CHANNELS: usize = 6;
 const RMSE_GATE: f64 = 5.0e-3;
 
@@ -36,12 +34,20 @@ fn wav_index(b: BedChannel) -> usize {
 
 #[test]
 fn dts_core_5_1_matches_ffmpeg() {
-    if !Path::new(DTS).exists() || !Path::new(REF).exists() {
-        eprintln!("skipping: DTS corpus not present ({DTS})");
+    let Ok(dts) = std::env::var("HARLETTY_DTS_CORE_CORPUS") else {
+        eprintln!("skipping: HARLETTY_DTS_CORE_CORPUS is not set");
+        return;
+    };
+    let Ok(reference) = std::env::var("HARLETTY_DTS_CORE_REFERENCE") else {
+        eprintln!("skipping: HARLETTY_DTS_CORE_REFERENCE is not set");
+        return;
+    };
+    if !std::path::Path::new(&dts).is_file() || !std::path::Path::new(&reference).is_file() {
+        eprintln!("skipping: configured DTS core corpus is not readable");
         return;
     }
 
-    let bytes = std::fs::read(DTS).unwrap();
+    let bytes = std::fs::read(dts).unwrap();
     let mut ex = Extractor::default();
     ex.push_bytes(&bytes);
     let mut dec = PcmDecoder::new();
@@ -68,7 +74,7 @@ fn dts_core_5_1_matches_ffmpeg() {
         }
     }
 
-    let rbytes = std::fs::read(REF).unwrap();
+    let rbytes = std::fs::read(reference).unwrap();
     let reference: Vec<f32> = rbytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

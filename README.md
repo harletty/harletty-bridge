@@ -78,7 +78,7 @@ Play any TrueHD/Atmos file:
 - **mpv** —
 
   ```sh
-  mpv --ad=orender --ad-orender-osc film.mkv
+  mpv --ad=orender --ad-orender-osc input.mkv
   ```
 
   `--ad=orender` is what switches mpv over to object rendering for this

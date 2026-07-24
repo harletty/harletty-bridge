@@ -546,19 +546,22 @@ mod tests {
         assert_eq!(parse_xll_x_navigation(&[0; 8]), None);
     }
 
-    // Validate EXSS parsing on the real Ex Machina DTS-HD MA stream (7.1).
+    // Validate EXSS parsing on a real DTS-HD MA 7.1 stream.
     // Skips if the (uncommitted) dump is absent.
     #[test]
     fn parses_real_exss_locates_xll() {
-        const DUMP: &str = "/mnt/local/SSD_A-CT4000/DTS:X-Dumps/Ex.Machina.2014.dtsx.eng.dts";
-        if !std::path::Path::new(DUMP).exists() {
-            eprintln!("skipping: 7.1 dump not present");
+        let Ok(dump) = std::env::var("HARLETTY_DTSX_STANDARD_CORPUS") else {
+            eprintln!("skipping: HARLETTY_DTSX_STANDARD_CORPUS is not set");
+            return;
+        };
+        if !std::path::Path::new(&dump).is_file() {
+            eprintln!("skipping: configured 7.1 corpus is not readable");
             return;
         }
         // The stream is [core][exss][core][exss]…; the EXSS sits immediately
         // after the first core frame (don't naive-scan — 0x64582025 can occur
         // inside core audio data).
-        let bytes = std::fs::read(DUMP).unwrap();
+        let bytes = std::fs::read(dump).unwrap();
         let core = crate::parser::parse_header(&bytes).expect("core header");
         let pos = core.frame_size;
         let sync = 0x6458_2025u32.to_be_bytes();

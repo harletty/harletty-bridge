@@ -15,11 +15,6 @@ import re
 import sys
 from pathlib import Path
 
-DEFAULT_SRC = Path(
-    "/home/user/dev/spatial-renderer/reference-sources/ffmpeg_sources/libavcodec"
-)
-
-
 def strip_comments(text: str) -> str:
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
     text = re.sub(r"//[^\n]*", "", text)
@@ -93,7 +88,11 @@ HUFF_TABLES = [
 
 
 def main() -> None:
-    src_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_SRC
+    if len(sys.argv) < 2:
+        raise SystemExit(
+            "usage: gen_tables.py <ffmpeg-libavcodec-directory> [output-path]"
+        )
+    src_dir = Path(sys.argv[1])
     out_path = (
         Path(sys.argv[2])
         if len(sys.argv) > 2

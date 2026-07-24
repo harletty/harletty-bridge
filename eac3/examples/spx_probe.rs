@@ -4,12 +4,12 @@
 //! PcmDecoder and tallies the `spxinu` / `chinspx[ch]` flags after each
 //! frame. Useful when picking content for validating SPX-related
 //! decoder changes (e.g. the `fix/eac3-spx-coordinate-parse` branch),
-//! since not all DDP+ tracks exercise SPX — Dune Part Two's main bed
+//! since not all DDP+ tracks exercise SPX — use a witness known to activate it.
 //! never activates it.
 //!
 //! Usage:
 //!     # From an MKV via ffmpeg:
-//!     ffmpeg -i film.mkv -map 0:a:0 -c:a copy -f eac3 - 2>/dev/null \
+//!     ffmpeg -i input.mkv -map 0:a:0 -c:a copy -f eac3 - 2>/dev/null \
 //!         | cargo run --release --example spx_probe -p eac3 -- -
 //!
 //!     # From a pre-extracted .eac3 file:
