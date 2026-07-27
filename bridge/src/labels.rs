@@ -51,6 +51,26 @@ pub(crate) fn dca_bed_channel_to_r(ch: dca::BedChannel) -> RChannelLabel {
     }
 }
 
+/// Map a DTS:X spatial-extension channel to the renderer's channel label.
+///
+/// Which extension waveform sits at which position is codec knowledge and lives
+/// in `dca::spatial`; this is only the ABI projection of it, so the realtime
+/// path and the offline ADM exporter cannot drift apart on the mapping.
+pub(crate) fn dca_spatial_channel_to_r(ch: dca::SpatialChannel) -> RChannelLabel {
+    use dca::SpatialChannel;
+    match ch {
+        SpatialChannel::TopFrontLeft => RChannelLabel::Tfl,
+        SpatialChannel::TopFrontRight => RChannelLabel::Tfr,
+        SpatialChannel::TopFrontCenter => RChannelLabel::Tfc,
+        SpatialChannel::TopSideLeft => RChannelLabel::Tsl,
+        SpatialChannel::TopSideRight => RChannelLabel::Tsr,
+        SpatialChannel::TopBackLeft => RChannelLabel::Tbl,
+        SpatialChannel::TopBackRight => RChannelLabel::Tbr,
+        SpatialChannel::WideLeft => RChannelLabel::Lw,
+        SpatialChannel::WideRight => RChannelLabel::Rw,
+    }
+}
+
 pub(crate) fn bed_channel_to_r(ch: eac3::BedChannel) -> RChannelLabel {
     use eac3::BedChannel;
     match ch {

@@ -30,6 +30,7 @@ impl From<ParseError> for HdError {
 
 /// One decoded DTS-HD frame: lossless PCM indexed by DCA speaker, plus the
 /// active-speaker mask.
+#[derive(Default)]
 pub struct HdFrame {
     pub sample_rate: u32,
     pub output_mask: u32,
@@ -75,6 +76,20 @@ pub struct HdFrame {
     /// True when the decoder used the descriptor navigation rather than only
     /// locating the syncword after the decoded XLL band data.
     pub x_descriptor_navigation_used: bool,
+}
+
+impl HdFrame {
+    /// Samples per channel in the lossless bed, taken from the first active
+    /// speaker, or 0 when no speaker is active.
+    ///
+    /// Every bed and extension channel in a well-formed frame has this length;
+    /// consumers use it to validate a frame before indexing into it.
+    pub fn bed_sample_count(&self) -> usize {
+        self.samples
+            .iter()
+            .find_map(|channel| channel.as_ref().map(Vec::len))
+            .unwrap_or(0)
+    }
 }
 
 /// Size in bytes of the EXSS substream starting at `data` (which must begin at
