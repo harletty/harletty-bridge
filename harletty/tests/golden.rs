@@ -44,18 +44,17 @@ fn joc_master_set_matches_golden() {
     // it has to match the one the golden was generated with.
     let out_base = out_dir.join("out");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_truehdd"))
+    let status = Command::new(env!("CARGO_BIN_EXE_harletty"))
         .args(["--loglevel", "error", "decode"])
         .arg(fixture("joc_atmos_1s.eac3"))
         .arg("--output-path")
         .arg(&out_base)
         .status()
-        .expect("failed to run the truehdd binary");
-    assert!(status.success(), "truehdd decode failed: {status}");
+        .expect("failed to run the harletty binary");
+    assert!(status.success(), "harletty decode failed: {status}");
 
     // .atmos — the presentation. creationToolVersion tracks this package's
-    // version, so it is normalised out; creationTool itself is the contract
-    // Atmos Ranker reads and is asserted verbatim below.
+    // version, so it is normalised out.
     let produced = std::fs::read_to_string(out_dir.join("out.atmos")).unwrap();
     let normalised = produced
         .lines()
@@ -69,14 +68,19 @@ fn joc_master_set_matches_golden() {
     let golden = std::fs::read_to_string(fixture("joc_atmos_1s.atmos")).unwrap();
     assert_eq!(normalised, golden, ".atmos presentation drifted");
 
+    // creationTool is the tool's own identity, taken from CARGO_PKG_NAME. No
+    // consumer reads it — Atmos Ranker reads only sourceCodec and language —
+    // so it is pinned here simply to catch it changing unnoticed, not because
+    // anything downstream depends on the value.
     assert!(
-        produced.contains("    creationTool: truehdd\n"),
-        "creationTool must stay `truehdd`; Atmos Ranker and the masters under \
-         adm/ key off it. Produced:\n{produced}"
+        produced.contains("    creationTool: harletty\n"),
+        "creationTool should name this binary. Produced:\n{produced}"
     );
+    // sourceCodec, by contrast, *is* a contract: Atmos Ranker folds it into
+    // the codec column its Rank filter groups by.
     assert!(
         produced.contains("    sourceCodec: EAC3-JOC\n"),
-        "sourceCodec label drifted; scan.rs folds it into the codec column"
+        "sourceCodec label drifted; Atmos Ranker folds it into the codec column"
     );
 
     // .atmos.metadata — the per-event object metadata. Compared verbatim.

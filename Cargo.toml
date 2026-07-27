@@ -5,7 +5,7 @@
 # CLI must never pull in the Omniphony bridge ABI. See
 # docs/plan-truehdd-resurrection-in-harletty.md.
 [workspace]
-members = ["bridge", "truehdd", "truehd", "eac3", "dca", "damf", "truehdd-macros"]
+members = ["bridge", "harletty", "truehd", "eac3", "dca", "damf", "truehdd-macros"]
 resolver = "2"
 
 # Kept from the pre-workspace root package: the CLI ships under this profile.

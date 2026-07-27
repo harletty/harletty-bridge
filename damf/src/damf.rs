@@ -9,7 +9,7 @@ pub const DAMF_VERSION: &str = "0.5.1";
 /// `creationTool` / `creationToolVersion`.
 ///
 /// This used to be read straight off `CARGO_PKG_NAME`/`CARGO_PKG_VERSION`, back
-/// when the writer lived inside the `truehdd` binary crate. It cannot stay that
+/// when the writer lived inside the CLI's own binary crate. It cannot stay that
 /// way now that it is a library: the env vars would resolve to *this* crate and
 /// silently relabel every master set as produced by "damf 0.1.0". The caller
 /// declares itself instead.
@@ -728,13 +728,13 @@ fn format_yaml_string(mut yaml_str: String) -> String {
     yaml_str.replace("  ", "    ").replace("- ", "  - ")
 }
 
-/// Stands in for the `truehdd` binary's own identity. The CLI passes
+/// Stands in for the CLI binary's own identity. The CLI passes
 /// `CreationTool { name: env!("CARGO_PKG_NAME"), version: env!("CARGO_PKG_VERSION") }`,
 /// so pinning a fixture here checks that whatever the caller declares reaches
 /// `creationTool` verbatim.
 #[cfg(test)]
 const TEST_TOOL: CreationTool = CreationTool {
-    name: "truehdd",
+    name: "harletty",
     version: "9.9.9",
 };
 
