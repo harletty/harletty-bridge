@@ -722,10 +722,103 @@ where
     }
 }
 
-/// Helper function for common YAML string formatting
-fn format_yaml_string(mut yaml_str: String) -> String {
-    yaml_str.retain(|c| c != '\'');
-    yaml_str.replace("  ", "    ").replace("- ", "  - ")
+/// Reformat `serde_yaml_ng` output into the layout Dolby's tools emit for DAMF:
+/// four-space indent steps, sequence dashes one step under their key, and
+/// scalars written plain (DAMF quotes nothing, so `'24'` is written `24`).
+///
+/// Only structural text is rewritten. Scalar *content* is left alone apart from
+/// undoing YAML quoting, so a path containing `'`, `  ` or `- ` survives
+/// intact. This used to be a whole-document search and replace, which rewrote
+/// those sequences inside values too and produced `.atmos` files whose
+/// `metadata:`/`audio:` entries did not name the files actually written.
+fn format_yaml_string(yaml_str: String) -> String {
+    let mut out = String::with_capacity(yaml_str.len() * 2);
+
+    for raw_line in yaml_str.split_inclusive('\n') {
+        let (line, newline) = match raw_line.strip_suffix('\n') {
+            Some(line) => (line, "\n"),
+            None => (raw_line, ""),
+        };
+
+        // serde indents two spaces per level, DAMF four.
+        let content = line.trim_start_matches(' ');
+        for _ in 0..(line.len() - content.len()) * 2 {
+            out.push(' ');
+        }
+
+        // A sequence entry sits one further step in than its key in DAMF.
+        let mut content = content;
+        while let Some(rest) = content.strip_prefix("- ") {
+            out.push_str("  - ");
+            content = rest;
+        }
+
+        match split_key_value(content) {
+            Some((key, value)) => {
+                out.push_str(&unquote(key));
+                out.push(':');
+                if !value.is_empty() {
+                    out.push(' ');
+                    out.push_str(&unquote(value));
+                }
+            }
+            None => out.push_str(&unquote(content)),
+        }
+
+        out.push_str(newline);
+    }
+
+    out
+}
+
+/// Split `key: value` (or a bare `key:`) into its two halves, honouring a
+/// single-quoted key. Returns `None` when the line is a lone scalar.
+fn split_key_value(content: &str) -> Option<(&str, &str)> {
+    let key_end = if content.starts_with('\'') {
+        closing_quote(content)? + 1
+    } else {
+        content.find(':')?
+    };
+
+    let value = content.get(key_end..)?.strip_prefix(':')?;
+
+    match value.strip_prefix(' ') {
+        Some(value) => Some((&content[..key_end], value)),
+        None if value.is_empty() => Some((&content[..key_end], "")),
+        // A colon that is not followed by a space is part of the scalar.
+        None => None,
+    }
+}
+
+/// Byte offset of the `'` closing the single-quoted scalar starting at byte 0,
+/// skipping the `''` escape.
+fn closing_quote(content: &str) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut i = 1;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return Some(i);
+        }
+        i += 1;
+    }
+
+    None
+}
+
+/// Drop the single quotes `serde_yaml_ng` wraps a scalar in and undo the `''`
+/// escape. An apostrophe *inside* a scalar is content and is kept.
+fn unquote(scalar: &str) -> String {
+    match closing_quote(scalar) {
+        Some(end) if scalar.starts_with('\'') && end == scalar.len() - 1 => {
+            scalar[1..end].replace("''", "'")
+        }
+        _ => scalar.to_string(),
+    }
 }
 
 /// Stands in for the CLI binary's own identity. The CLI passes
@@ -883,4 +976,35 @@ presentations:
     let yaml_str = serde_yaml_ng::to_string(&data).unwrap();
 
     assert_eq!(test_str, format_yaml_string(yaml_str));
+}
+
+/// The `metadata:`/`audio:` entries must name the files actually written, even
+/// when the output path holds characters the YAML layout pass used to rewrite:
+/// a single quote, two spaces in a row, or a hyphen followed by a space.
+/// Anything else and the DAMF will not open in a DAW.
+#[test]
+fn base_name_survives_yaml_formatting() {
+    use truehd::structs::oamd::TEST_DATA_TRIM;
+
+    let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
+
+    for base_name in [
+        "audio  -  output",
+        "Ocean's Eleven",
+        "Movie - 2017",
+        "A Long Name That Comfortably Exceeds The Emitter's Default Line Width Of Eighty Columns",
+    ] {
+        let data =
+            Data::with_oamd_payload(&oamd, Path::new(base_name), SourceCodec::TrueHD, TEST_TOOL);
+        let yaml = data.serialize_damf();
+
+        assert!(
+            yaml.contains(&format!("metadata: {base_name}.atmos.metadata\n")),
+            "metadata entry mangled for {base_name:?}:\n{yaml}"
+        );
+        assert!(
+            yaml.contains(&format!("audio: {base_name}.atmos.audio\n")),
+            "audio entry mangled for {base_name:?}:\n{yaml}"
+        );
+    }
 }
