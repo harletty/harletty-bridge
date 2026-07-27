@@ -215,6 +215,11 @@ The same decoders also drive an offline tool that turns TrueHD and
 E-AC-3 JOC bitstreams into Dolby Atmos master files (`.atmos`,
 `.atmos.metadata`, plus CAF/WAV audio):
 
+It ships as its own asset on the
+[releases page](https://github.com/harletty/harletty-bridge/releases) —
+`truehdd-<version>-<system>.zip`, separate from the bridge, since the
+two have nothing to do with each other at install time. Or build it:
+
 ```sh
 cargo build --release -p truehdd
 ./target/release/truehdd decode --output-path out track.thd
@@ -222,7 +227,7 @@ cargo build --release -p truehdd
 ```
 
 It reads from a file or from `-` (stdin), so it pipes straight out of
-ffmpeg. It replaces the standalone `truehdd` fork this workspace used to
+ffmpeg. It also decodes DTS, exporting DTS:X as ADM. It replaces the standalone `truehdd` fork this workspace used to
 carry — see [docs/truehdd-fork-retirement.md](docs/truehdd-fork-retirement.md)
 for what was ported and what was superseded. It is a *separate artifact*: the bridge does not link it, does
 not pay for it, and cannot reach it. That isolation is by crate graph
