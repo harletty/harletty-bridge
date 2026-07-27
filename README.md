@@ -14,6 +14,13 @@ It is a **plugin**: you don't run it on its own. You install
 Omniphony or mpv-omniphony, drop this file next to it, and tell the
 config where it is. That's the whole job.
 
+> **Looking for the command-line converter instead?** The same decoders
+> also ship as **`harletty`**, a standalone tool that turns TrueHD,
+> E-AC-3 JOC and DTS bitstreams into Dolby Atmos master files on disk.
+> That one you *do* run yourself — see
+> **[docs/harletty-cli.md](docs/harletty-cli.md)** for the full command
+> reference.
+
 [![mpv-omniphony — mpv playing a TrueHD Atmos stream rendered by liborender, supervised by Omniphony Studio](https://github.com/mgth/mpv-omniphony/raw/main/mpv-omniphony-1200.png)](https://github.com/mgth/mpv-omniphony)
 
 *mpv-omniphony decoding a TrueHD Atmos track through this bridge, with
@@ -31,7 +38,7 @@ and follow the three steps for your OS below.
 
 > Each release has one bridge file per system. Download the one that
 > matches (the `harletty-cli-*` archives alongside them are the separate
-> offline tool, not needed for playback):
+> [offline tool](docs/harletty-cli.md) — not needed for playback):
 >
 > | Your system | File to download |
 > |---|---|
@@ -213,30 +220,29 @@ unix and `target\release\harletty_bridge.dll` on Windows. Point
 
 ## The offline `harletty` CLI
 
-The same decoders also drive an offline tool that turns TrueHD, E-AC-3
-JOC and DTS bitstreams into Dolby Atmos master files (`.atmos`,
+The same decoders also drive a standalone tool that turns TrueHD,
+E-AC-3 JOC and DTS bitstreams into Dolby Atmos master files (`.atmos`,
 `.atmos.metadata`, plus CAF/WAV audio) — including DTS:X, exported as
-ADM.
+ADM. It reads a file or stdin, so it pipes straight out of ffmpeg:
+
+```sh
+ffmpeg -i movie.mkv -map 0:a:0 -c copy -f truehd - \
+  | harletty --progress decode - --output-path "movie"
+```
+
+📖 **[docs/harletty-cli.md](docs/harletty-cli.md) — commands, every
+option, output files, recipes and limitations.**
 
 Grab `harletty-cli-<version>-<system>.zip` from the
 [releases page](https://github.com/harletty/harletty-bridge/releases),
-or build it:
-
-```sh
-cargo build --release -p harletty
-./target/release/harletty decode --output-path out track.thd
-./target/release/harletty info track.eac3
-```
-
-It reads from a file or from `-` (stdin), so it pipes straight out of
-ffmpeg.
+or build it with `cargo build --release -p harletty`.
 
 It replaces the standalone `truehdd` fork this workspace used to carry —
 see [docs/truehdd-fork-retirement.md](docs/truehdd-fork-retirement.md)
 for what was ported and what was superseded. It is deliberately *not*
 called `truehdd` any more: it covers three format families now, and
-sharing a binary name with its still-active upstream would mean whichever
-came first on `PATH` won.
+sharing a binary name with its upstream would mean whichever came first
+on `PATH` won.
 
 It is also a *separate artifact*: the bridge does not link it, does not
 pay for it, and cannot reach it. That isolation is by crate graph rather
