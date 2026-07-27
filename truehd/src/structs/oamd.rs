@@ -863,9 +863,15 @@ pub const DISTANCE_FACTORS: [f64; 16] = [
     1.1, 1.3, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0, 6.3, 7.9, 10.0, 12.6, 15.8, 20.0, 25.1, 50.1,
 ];
 
+/// Lookup table mapping a 4-bit trim index to a gain in dB.
+///
+/// Index 14 is -15.0, not the -16.0 this table used to carry: the reference
+/// decoder maps that index to the Q12 value 0x02d8 (728), i.e.
+/// `20 * log10(728 / 4096) = -15.005 dB`, and -15.0 is also where the -1.5 dB
+/// step running through entries 5..=13 lands next. (-16.0 dB would be Q12 649.)
 #[rustfmt::skip]
 pub const TRIM_LUT: [f64; 16] = [
-    6.0, 3.0, 1.5, 0.75, -0.75, -1.5, -3.0, -4.5, -6.0, -7.5, -9.0, -10.5, -12.0, -13.5, -16.0, -36.0,
+    6.0, 3.0, 1.5, 0.75, -0.75, -1.5, -3.0, -4.5, -6.0, -7.5, -9.0, -10.5, -12.0, -13.5, -15.0, -36.0,
 ];
 
 // TODO: TrimElement & ExtendObjectElement
@@ -1306,5 +1312,34 @@ mod tests {
         let _ = ObjectAudioMetadataPayload::read(TEST_DATA_BROKEN)?;
 
         Ok(())
+    }
+
+    /// Entries 3..=14 of the trim table step by a constant -0.75 dB and then
+    /// -1.5 dB; index 14 sitting at -16.0 rather than -15.0 broke that run and
+    /// disagreed with the reference decoder's Q12 code for it (0x02d8 = 728).
+    /// The DAMF `trimMode` block is written straight from this table, so an
+    /// off-by-one entry ships in every master set that carries trim metadata.
+    #[test]
+    fn trim_lut_follows_the_reference_quantiser() {
+        use crate::structs::oamd::TRIM_LUT;
+
+        for (idx, q12) in [(14usize, 728.0f64), (13, 865.0), (8, 2053.0)] {
+            let expected = 20.0 * (q12 / 4096.0).log10();
+            assert!(
+                (TRIM_LUT[idx] - expected).abs() < 0.01,
+                "TRIM_LUT[{idx}] = {} but Q12 {q12} gives {expected:.3} dB",
+                TRIM_LUT[idx]
+            );
+        }
+
+        // -1.5 dB per step from index 5 through 14, no discontinuity at the end.
+        for window in TRIM_LUT[5..=14].windows(2) {
+            assert!(
+                (window[0] - window[1] - 1.5).abs() < f64::EPSILON,
+                "step {} -> {} is not -1.5 dB",
+                window[0],
+                window[1]
+            );
+        }
     }
 }
