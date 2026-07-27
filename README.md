@@ -14,12 +14,14 @@ It is a **plugin**: you don't run it on its own. You install
 Omniphony or mpv-omniphony, drop this file next to it, and tell the
 config where it is. That's the whole job.
 
-> **Looking for the command-line converter instead?** The same decoders
-> also ship as **`harletty`**, a standalone tool that turns TrueHD,
-> E-AC-3 JOC and DTS bitstreams into Dolby Atmos master files on disk.
-> That one you *do* run yourself — see
-> **[docs/harletty-cli.md](docs/harletty-cli.md)** for the full command
-> reference.
+> **Looking for the command-line converter instead?** This repo also
+> ships **`harletty`** — a fork of
+> [`truehdd`](https://github.com/truehdd/truehdd) by
+> [Rainbaby](https://github.com/truehdd), extended with E-AC-3 JOC and
+> DTS input — which turns those bitstreams into Dolby Atmos master files
+> on disk. That one you *do* run yourself; see
+> **[docs/harletty-cli.md](docs/harletty-cli.md)** for the command
+> reference and the provenance in detail.
 
 [![mpv-omniphony — mpv playing a TrueHD Atmos stream rendered by liborender, supervised by Omniphony Studio](https://github.com/mgth/mpv-omniphony/raw/main/mpv-omniphony-1200.png)](https://github.com/mgth/mpv-omniphony)
 
@@ -220,10 +222,15 @@ unix and `target\release\harletty_bridge.dll` on Windows. Point
 
 ## The offline `harletty` CLI
 
-The same decoders also drive a standalone tool that turns TrueHD,
-E-AC-3 JOC and DTS bitstreams into Dolby Atmos master files (`.atmos`,
-`.atmos.metadata`, plus CAF/WAV audio) — including DTS:X, exported as
-ADM. It reads a file or stdin, so it pipes straight out of ffmpeg:
+**`harletty` is a fork of [`truehdd`](https://github.com/truehdd/truehdd)
+by [Rainbaby](https://github.com/truehdd)** — 85% of the shared-lineage
+code is byte-identical to upstream, including the whole DAMF master-set
+writer and the CAF/Wave64 writers. What was added here is E-AC-3 JOC and
+DTS/DTS:X input, the latter exported as ADM.
+
+It turns those bitstreams into Dolby Atmos master files (`.atmos`,
+`.atmos.metadata`, plus CAF/WAV audio), reading a file or stdin, so it
+pipes straight out of ffmpeg:
 
 ```sh
 ffmpeg -i movie.mkv -map 0:a:0 -c copy -f truehd - \
@@ -237,12 +244,12 @@ Grab `harletty-cli-<version>-<system>.zip` from the
 [releases page](https://github.com/harletty/harletty-bridge/releases),
 or build it with `cargo build --release -p harletty`.
 
-It replaces the standalone `truehdd` fork this workspace used to carry —
-see [docs/truehdd-fork-retirement.md](docs/truehdd-fork-retirement.md)
-for what was ported and what was superseded. It is deliberately *not*
-called `truehdd` any more: it covers three format families now, and
-sharing a binary name with its upstream would mean whichever came first
-on `PATH` won.
+The rename is not a claim of authorship — it exists because the binary
+accepts a superset of upstream's inputs and writes labels upstream does
+not, so two binaries called `truehdd` on one `PATH` would be a miserable
+thing to debug. See
+[docs/truehdd-fork-retirement.md](docs/truehdd-fork-retirement.md) for
+the audit of what was ported, superseded or imported.
 
 It is also a *separate artifact*: the bridge does not link it, does not
 pay for it, and cannot reach it. That isolation is by crate graph rather
@@ -272,17 +279,30 @@ OBJECT_SIZE_NOTES.md # notes on OAMD object_size handling
 ## Credits
 
 The hard part of this project — actually decoding a TrueHD bitstream —
-is **not** our work. The `truehd/` crate is vendored, essentially
-unchanged, from [**truehdd**](https://github.com/truehdd/truehdd) by
+is **not** our work, and neither is most of the offline CLI. Both come
+from [**truehdd**](https://github.com/truehdd/truehdd) by
 [**Rainbaby**](https://github.com/truehdd), a clean-room Rust parser and
-decoder for Dolby TrueHD. Without that decoder this bridge would have
-nothing to hand to the renderer.
+decoder for Dolby TrueHD.
 
-So: huge thanks to Rainbaby and the `truehdd` project. All the credit
-for the TrueHD decode path belongs there; we just wrap it in the
-`bridge_api` ABI and bolt on the OAMD plumbing the renderer needs. If
-this plugin is useful to you, go star [`truehdd`](https://github.com/truehdd/truehdd)
-too.
+Concretely, what is Rainbaby's:
+
+- **`truehd/`** — the TrueHD parser and decoder, vendored essentially
+  unchanged. Without it this bridge would have nothing to hand to the
+  renderer.
+- **The `harletty` CLI**, which is a fork of upstream's own binary rather
+  than something built alongside it. Of the 5470 lines with a shared
+  lineage, **4655 (85%) are byte-identical to upstream**: the command
+  structure, the DAMF master-set writer, the CAF and Wave64 writers, the
+  `info` report and `truehdd-macros/` are all upstream work.
+
+What is ours: the `bridge_api` ABI wrapper and the OAMD plumbing the
+renderer needs; the `eac3` and `dca` crates; the E-AC-3 JOC and DTS/DTS:X
+routing in the CLI; and decoder robustness fixes. Upstream is Apache-2.0,
+as is this repo.
+
+So: huge thanks to Rainbaby and the `truehdd` project. **If any of this
+is useful to you, go star [`truehdd`](https://github.com/truehdd/truehdd).**
+That is where the hard part was done.
 
 ## License
 

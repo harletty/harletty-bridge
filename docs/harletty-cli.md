@@ -5,16 +5,53 @@ Dolby Atmos master files — a `.atmos` presentation, its
 `.atmos.metadata` object automation, and the `.atmos.audio` bed/object
 interleave — or plain PCM when you ask for a downmix presentation.
 
-It is a **separate artifact from the bridge**. The bridge is the runtime
-plugin that plays audio; this is the batch tool that converts it. They
-share the decoder crates and nothing else — the bridge does not link the
-CLI, cannot reach it, and does not pay for its dependencies.
-`scripts/check-crate-isolation.sh` asserts that in CI.
+## Where this comes from
 
-> Formerly `truehdd`. It is deliberately not called that any more: it
-> covers three format families now, and sharing a binary name with its
-> still-active-at-the-time upstream meant whichever came first on `PATH`
-> won. See [truehdd-fork-retirement.md](truehdd-fork-retirement.md).
+**`harletty` is a fork of [`truehdd`](https://github.com/truehdd/truehdd)
+by [Rainbaby](https://github.com/truehdd).** Not a tool that borrows its
+decoder — a fork of the whole program. If you have used `truehdd`, you
+are looking at it: same commands, same options, same output files.
+
+Measured against upstream `23c9950`, the files with a shared lineage run
+**5470 lines, of which 4655 — 85% — are byte-identical to upstream**:
+
+| Part | Identical to upstream |
+|---|---|
+| `caf.rs`, `wav.rs`, `byteorder.rs`, `input.rs`, `truehdd-macros/` | 100% |
+| `cli/command.rs` | 94% |
+| `cli/decode/handler.rs` | 92% |
+| `cli/info.rs` | 90% |
+| `damf.rs` (the DAMF writer) | 79% |
+
+So: the command structure, the DAMF master-set writer, the CAF and Wave64
+writers, the `info` report and the proc macros behind it are Rainbaby's
+work, carried here essentially unchanged. Everything this page documents
+about `decode` and `info` describes their design.
+
+What was added on this side is the routing for the two formats upstream
+does not cover — E-AC-3 JOC and DTS/DTS:X, about 2250 lines
+(`eac3_to_oamd.rs`, `dts_to_oamd.rs`, `codec_probe.rs` and their handler
+and thread pairs) — plus decoder robustness work and the damaged-stream
+handling described [below](#damaged-streams).
+
+The rename is not a claim of authorship. It exists because the binary
+now accepts a superset of inputs and writes labels upstream does not, so
+two binaries called `truehdd` on one `PATH` would be a miserable thing to
+debug. Upstream is Apache-2.0 and so is this; see
+[truehdd-fork-retirement.md](truehdd-fork-retirement.md) for the full
+audit of what was ported, superseded or imported.
+
+**If this tool is useful to you, go star
+[`truehdd`](https://github.com/truehdd/truehdd).** That is where the hard
+part was done.
+
+## Relationship to the bridge
+
+It is a **separate artifact**. The bridge is the runtime plugin that
+plays audio; this is the batch tool that converts it. They share the
+decoder crates and nothing else — the bridge does not link the CLI,
+cannot reach it, and does not pay for its dependencies.
+`scripts/check-crate-isolation.sh` asserts that in CI.
 
 ## Install
 
