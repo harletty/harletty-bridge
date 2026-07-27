@@ -17,7 +17,7 @@
 //!
 //! This crate is deliberately consumer-agnostic and I/O-shaped only: it knows
 //! how to *write* the formats and nothing about how a bitstream is decoded. It
-//! is used by the offline `truehdd` CLI and must never be reachable from the
+//! is used by the offline `harletty` CLI and must never be reachable from the
 //! realtime `harletty-bridge` plugin — see the crate-graph invariant in
 //! docs/plan-truehdd-resurrection-in-harletty.md, which CI enforces.
 

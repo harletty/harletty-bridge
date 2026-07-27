@@ -56,6 +56,6 @@ check harletty-bridge "realtime plugin" damf clap indicatif indicatif-log-bridge
 
 # ...and the offline CLI must never pull in the bridge ABI: it stays a pure
 # offline tool, buildable without the sibling Omniphony checkout.
-check truehdd "offline CLI" bridge_api spdif abi_stable
+check harletty "offline CLI" bridge_api spdif abi_stable
 
 exit $status

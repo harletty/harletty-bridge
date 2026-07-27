@@ -7,7 +7,7 @@ presentations:
     offset: 0.0
     fps: 24
     scBedConfiguration: [3]
-    creationTool: truehdd
+    creationTool: harletty
     creationToolVersion: {VERSION}
     sourceCodec: EAC3-JOC
     bedInstances:

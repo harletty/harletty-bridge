@@ -26,8 +26,8 @@ mod input;
 pub(crate) mod timestamp;
 
 /// Identifies this binary in the `creationTool` field of every master set it
-/// writes. Must stay "truehdd": Atmos Ranker and the reference masters in
-/// `adm/` key off it.
+/// writes. Provenance only: no consumer reads it, so masters written before
+/// this tool was renamed still say "truehdd" and nothing cares.
 pub(crate) const CREATION_TOOL: damf::CreationTool = damf::CreationTool {
     name: env!("CARGO_PKG_NAME"),
     version: env!("CARGO_PKG_VERSION"),
