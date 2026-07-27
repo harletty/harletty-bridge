@@ -322,8 +322,16 @@ impl Block {
                     // D/16 > end_ptr_0 and an underflow (e.g. WALL-E HYPERION remux).
                     state.substream_state()?.substream_end_ptr
                 } else {
-                    state.substream_state()?.substream_end_ptr
-                        - state.substream_state[state.substream_index - 1].substream_end_ptr
+                    let end_ptr = state.substream_state()?.substream_end_ptr;
+                    let start_ptr =
+                        state.substream_state[state.substream_index - 1].substream_end_ptr;
+                    end_ptr.checked_sub(start_ptr).ok_or_else(|| {
+                        anyhow!(BlockError::SubstreamSizeUnderflow {
+                            substream: state.substream_index,
+                            end_ptr,
+                            start_ptr,
+                        })
+                    })?
                 };
 
                 state.substream_state_mut()?.substream_size_history[i] =
