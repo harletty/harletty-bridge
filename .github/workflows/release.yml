@@ -26,7 +26,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build (release)
-        run: cargo build --release -p harletty-bridge
+        run: cargo build --release -p harletty-bridge -p truehdd
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -35,12 +35,15 @@ jobs:
         run: |
           cd harletty-bridge/target/release
           zip "harletty-bridge-${GITHUB_REF_NAME}-linux-x86_64.zip" libharletty_bridge.so
+          zip "truehdd-${GITHUB_REF_NAME}-linux-x86_64.zip" truehdd
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: harletty-bridge-linux-x86_64
-          path: harletty-bridge/target/release/harletty-bridge-*-linux-x86_64.zip
+          path: |
+            harletty-bridge/target/release/harletty-bridge-*-linux-x86_64.zip
+            harletty-bridge/target/release/truehdd-*-linux-x86_64.zip
 
   build-windows:
     runs-on: windows-latest
@@ -62,7 +65,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build (release)
-        run: cargo build --release -p harletty-bridge
+        run: cargo build --release -p harletty-bridge -p truehdd
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -71,12 +74,15 @@ jobs:
         run: |
           cd harletty-bridge/target/release
           Compress-Archive -Path harletty_bridge.dll -DestinationPath "harletty-bridge-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
+          Compress-Archive -Path truehdd.exe -DestinationPath "truehdd-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: harletty-bridge-windows-x86_64
-          path: harletty-bridge/target/release/harletty-bridge-*-windows-x86_64.zip
+          path: |
+            harletty-bridge/target/release/harletty-bridge-*-windows-x86_64.zip
+            harletty-bridge/target/release/truehdd-*-windows-x86_64.zip
 
   build-macos:
     runs-on: macos-14
@@ -98,7 +104,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build (release)
-        run: cargo build --release -p harletty-bridge
+        run: cargo build --release -p harletty-bridge -p truehdd
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -107,12 +113,15 @@ jobs:
         run: |
           cd harletty-bridge/target/release
           zip "harletty-bridge-${GITHUB_REF_NAME}-macos-arm64.zip" libharletty_bridge.dylib
+          zip "truehdd-${GITHUB_REF_NAME}-macos-arm64.zip" truehdd
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: harletty-bridge-macos-arm64
-          path: harletty-bridge/target/release/harletty-bridge-*-macos-arm64.zip
+          path: |
+            harletty-bridge/target/release/harletty-bridge-*-macos-arm64.zip
+            harletty-bridge/target/release/truehdd-*-macos-arm64.zip
 
   release:
     needs: [build-linux, build-windows, build-macos]
@@ -145,3 +154,6 @@ jobs:
             harletty-bridge-*-linux-x86_64.zip
             harletty-bridge-*-windows-x86_64.zip
             harletty-bridge-*-macos-arm64.zip
+            truehdd-*-linux-x86_64.zip
+            truehdd-*-windows-x86_64.zip
+            truehdd-*-macos-arm64.zip
