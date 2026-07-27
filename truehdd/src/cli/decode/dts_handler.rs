@@ -54,6 +54,22 @@ pub struct DtsDecodeHandler {
     metadata_header_written: bool,
     /// Whether the dropped-channel warning has already been emitted.
     warned_dropped_channels: bool,
+    /// Label for the master set, chosen from the presentation of the first
+    /// spatial frame.
+    source_codec: SourceCodec,
+}
+
+/// Which DAMF codec label a spatial presentation is stored under.
+///
+/// The taxonomy is Atmos Ranker's, derived independently at scan time from the
+/// D0/D1/D3 syncwords; both sides must agree or the Rank codec filter splits.
+fn source_codec_for(presentation: XPresentation) -> SourceCodec {
+    match presentation {
+        XPresentation::Height => SourceCodec::DtsX714,
+        XPresentation::FixedD0 => SourceCodec::DtsX715,
+        XPresentation::FixedD1 => SourceCodec::DtsX914,
+        XPresentation::ObjectsD3 => SourceCodec::DtsX71Plus8,
+    }
 }
 
 impl Default for DtsDecodeHandler {
@@ -72,6 +88,7 @@ impl Default for DtsDecodeHandler {
             last_layout: None,
             metadata_header_written: false,
             warned_dropped_channels: false,
+            source_codec: SourceCodec::DtsX714,
         }
     }
 }
@@ -122,6 +139,11 @@ impl DtsDecodeHandler {
             self.warn_dropped_channels(active.len() - layout.bed.len());
         }
 
+        if let Some(presentation) = presentation {
+            if !self.has_spatial {
+                self.source_codec = source_codec_for(presentation);
+            }
+        }
         self.note_frame(
             frame.sample_rate,
             total_channels,
@@ -207,7 +229,7 @@ impl DtsDecodeHandler {
                     base_path,
                     &oamd,
                     self.warp_mode,
-                    SourceCodec::DtsX,
+                    self.source_codec,
                 ) {
                     log::error!("failed to write .atmos header: {e}");
                 }

@@ -83,11 +83,27 @@ pub enum SourceCodec {
     TrueHD,
     #[serde(rename = "EAC3-JOC")]
     Eac3Joc,
-    /// DTS:X. Written as its own label rather than folded into a generic "DTS"
-    /// so a consumer can tell an object-bearing master from a plain DTS bed —
-    /// Atmos Ranker's scan folds this into its codec column.
-    #[serde(rename = "DTS-X")]
-    DtsX,
+    // DTS:X, one label per spatial presentation.
+    //
+    // These strings are not free choices. Atmos Ranker classifies DTS:X tracks
+    // at scan time by looking for the D0/D1/D3 syncwords in the elementary
+    // stream, and stores the result under exactly these names; its
+    // `canonical_codec` maps them to themselves. Emitting anything else here —
+    // a generic "DTS-X", say — would leave the same physical codec stored under
+    // two different strings depending on whether it was scanned or decoded,
+    // which is precisely what that function exists to prevent.
+    /// Standard DTS:X: 7.1 bed plus four height feeds.
+    #[serde(rename = "DTS:X-7.1.4")]
+    DtsX714,
+    /// Experimental five-feed presentation (D0).
+    #[serde(rename = "DTS:X-7.1.5")]
+    DtsX715,
+    /// Experimental six-feed presentation (D1): four heights plus wides.
+    #[serde(rename = "DTS:X-9.1.4")]
+    DtsX914,
+    /// Experimental eight-feed object presentation (D3).
+    #[serde(rename = "DTS:X-7.1+8")]
+    DtsX71Plus8,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
