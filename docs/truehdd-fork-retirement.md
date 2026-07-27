@@ -5,9 +5,16 @@ upstream `truehdd/truehdd` carrying four unpushed local commits. It produced the
 `.atmos` / `.atmos.metadata` masters under `adm/` and was the binary Atmos
 Ranker invoked.
 
-It is now **archive/reference only**. This repo builds a `truehdd` CLI from the
+It is now **archive/reference only**. This repo builds the replacement from the
 same decoder lineage as the bridge, and Atmos Ranker's `DEFAULT_TRUEHDD_BIN`
 points at it.
+
+The replacement is called **`harletty`**, not `truehdd`. Two reasons: it decodes
+TrueHD, E-AC-3 JOC *and* DTS now, so the old name described one family out of
+three; and upstream `truehdd` is still active, so shipping a second binary by
+that name would mean whichever came first on `PATH` won — with ours accepting a
+superset of inputs and writing subtly different labels, that would be a
+miserable thing to debug.
 
 Why retire it rather than keep both: its decoder crates were frozen at
 `truehd` 0.4.0 and it has no DTS path at all, so adding DTS:X → ADM there would
@@ -71,7 +78,7 @@ it rather than from a revert of `b8cea40`.
   E-AC-3 JOC (`.atmos`, `.atmos.metadata` and `.atmos.audio` all identical),
   TrueHD (identical CAF and identical logs), `info` (identical modulo the
   version banner), and Atmos Ranker's exact invocation including its stdin pipe.
-- `truehdd/tests/golden.rs` pins that output to a committed fixture, so the
+- `harletty/tests/golden.rs` pins that output to a committed fixture, so the
   property survives the reference tree going away.
 - On top of parity: a DTS path the fork never had, exporting DTS:X as ADM.
 

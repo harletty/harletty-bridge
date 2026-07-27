@@ -29,7 +29,9 @@ file for your system from the
 [**releases page**](https://github.com/harletty/harletty-bridge/releases)
 and follow the three steps for your OS below.
 
-> Each release has one file per system. Download the one that matches:
+> Each release has one bridge file per system. Download the one that
+> matches (the `harletty-cli-*` archives alongside them are the separate
+> offline tool, not needed for playback):
 >
 > | Your system | File to download |
 > |---|---|
@@ -209,31 +211,38 @@ The build produces `target/release/libharletty_bridge.{so,dylib}` on
 unix and `target\release\harletty_bridge.dll` on Windows. Point
 `bridge_path` at that file exactly as in the install steps above.
 
-## The offline `truehdd` CLI
+## The offline `harletty` CLI
 
-The same decoders also drive an offline tool that turns TrueHD and
-E-AC-3 JOC bitstreams into Dolby Atmos master files (`.atmos`,
-`.atmos.metadata`, plus CAF/WAV audio):
+The same decoders also drive an offline tool that turns TrueHD, E-AC-3
+JOC and DTS bitstreams into Dolby Atmos master files (`.atmos`,
+`.atmos.metadata`, plus CAF/WAV audio) — including DTS:X, exported as
+ADM.
 
-It ships as its own asset on the
-[releases page](https://github.com/harletty/harletty-bridge/releases) —
-`truehdd-<version>-<system>.zip`, separate from the bridge, since the
-two have nothing to do with each other at install time. Or build it:
+Grab `harletty-cli-<version>-<system>.zip` from the
+[releases page](https://github.com/harletty/harletty-bridge/releases),
+or build it:
 
 ```sh
-cargo build --release -p truehdd
-./target/release/truehdd decode --output-path out track.thd
-./target/release/truehdd info track.eac3
+cargo build --release -p harletty
+./target/release/harletty decode --output-path out track.thd
+./target/release/harletty info track.eac3
 ```
 
 It reads from a file or from `-` (stdin), so it pipes straight out of
-ffmpeg. It also decodes DTS, exporting DTS:X as ADM. It replaces the standalone `truehdd` fork this workspace used to
-carry — see [docs/truehdd-fork-retirement.md](docs/truehdd-fork-retirement.md)
-for what was ported and what was superseded. It is a *separate artifact*: the bridge does not link it, does
-not pay for it, and cannot reach it. That isolation is by crate graph
-rather than feature flags, and `scripts/check-crate-isolation.sh`
-asserts it in CI — if you find yourself wanting `use damf::…` inside
-`bridge/`, the mapping you want belongs on the CLI side instead.
+ffmpeg.
+
+It replaces the standalone `truehdd` fork this workspace used to carry —
+see [docs/truehdd-fork-retirement.md](docs/truehdd-fork-retirement.md)
+for what was ported and what was superseded. It is deliberately *not*
+called `truehdd` any more: it covers three format families now, and
+sharing a binary name with its still-active upstream would mean whichever
+came first on `PATH` won.
+
+It is also a *separate artifact*: the bridge does not link it, does not
+pay for it, and cannot reach it. That isolation is by crate graph rather
+than feature flags, and `scripts/check-crate-isolation.sh` asserts it in
+CI — if you find yourself wanting `use damf::…` inside `bridge/`, the
+mapping you want belongs on the CLI side instead.
 
 ## Layout
 
@@ -242,7 +251,7 @@ builds two artifacts from one decoder lineage.
 
 ```
 bridge/              # bridge entry points + transport (raw / IEC61937) glue
-truehdd/             # offline CLI: decode/info, codec probing, codec->OAMD
+harletty/            # offline CLI: decode/info, codec probing, codec->OAMD
 damf/                # DAMF metadata + CAF/WAV writers (CLI-side only)
 truehdd-macros/      # proc macros used by the CAF writer and `info`
 truehd/              # TrueHD decoder crate (vendored, Apache-2.0)
