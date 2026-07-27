@@ -9,6 +9,10 @@ name: CI
 # `cargo fmt --check` is intentionally not gated yet: the tree predates
 # rustfmt and a whole-repo reformat would conflict with the in-flight
 # `research/spatial-object-layer` branch. Gate it after that branch lands.
+#
+# `cargo test` covers both artifacts since the root became a virtual
+# workspace, including the truehdd CLI's golden-file regression
+# (truehdd/tests/golden.rs).
 
 on:
   push:
@@ -47,3 +51,11 @@ jobs:
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
+
+      # The workspace builds two artifacts — the realtime plugin and the
+      # offline truehdd CLI — and their isolation is by crate graph, not
+      # feature flags. Nothing in a normal build or test run would notice the
+      # boundary being crossed, so it is asserted explicitly.
+      - name: Check crate-graph isolation
+        run: ./scripts/check-crate-isolation.sh
+        working-directory: harletty-bridge

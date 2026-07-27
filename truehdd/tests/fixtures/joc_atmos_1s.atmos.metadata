@@ -1,0 +1,281 @@
+sampleRate: 48000
+events:
+  - ID: 3
+    samplePos: 0
+    active: true
+    importance: 0.0
+    gain: 1
+    rampLength: 1536
+    trimBypass: false
+    headTrackMode: undefined
+    binauralRenderMode: off
+  - ID: 10
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 11
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 12
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 13
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 14
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 15
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 16
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 17
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 18
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 19
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 20
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 21
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 22
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 23
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined
+  - ID: 24
+    samplePos: 0
+    active: true
+    pos: [-1, 1, 0]
+    snap: false
+    elevation: true
+    zones: all
+    size: 0.0
+    importance: 0.0
+    gain: 0
+    rampLength: 1536
+    trimBypass: false
+    dialog: -1
+    music: -1
+    screenFactor: 0.0
+    depthFactor: 0.25
+    headTrackMode: undefined
+    binauralRenderMode: undefined

@@ -39,8 +39,10 @@ fn main() -> Result<()> {
     });
     println!("cargo:rustc-env=TRUEHD_VERSION={truehd_version}");
 
-    // Tell cargo to rerun this build script if the truehd Cargo.toml changes
-    println!("cargo:rerun-if-changed=truehd/Cargo.toml");
+    // Tell cargo to rerun this build script if the truehd Cargo.toml changes.
+    // Relative to this package, which is a workspace member now, so truehd/ is
+    // a sibling rather than a child.
+    println!("cargo:rerun-if-changed=../truehd/Cargo.toml");
 
     Ok(())
 }
@@ -95,7 +97,9 @@ fn get_truehd_version_from_metadata() -> Result<String> {
 
 /// Fallback: manually parse truehd/Cargo.toml (for edge cases)
 fn read_truehd_version_fallback() -> Result<String> {
-    let toml_content = fs::read_to_string("truehd/Cargo.toml")?;
+    // Build scripts run with the package root as CWD; truehd is a sibling
+    // member of the workspace, not a subdirectory of this package.
+    let toml_content = fs::read_to_string("../truehd/Cargo.toml")?;
 
     for line in toml_content.lines() {
         let line = line.trim();
