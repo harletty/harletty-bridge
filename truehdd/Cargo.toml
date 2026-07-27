@@ -1,0 +1,38 @@
+[package]
+name = "truehdd"
+version = "0.4.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Tools for inspecting and decoding Dolby TrueHD and E-AC-3 JOC bitstreams"
+repository = "https://github.com/harletty/harletty-bridge"
+build = "build.rs"
+authors = ["Rainbaby"]
+rust-version = "1.87.0"
+
+[[bin]]
+name = "truehdd"
+path = "src/main.rs"
+
+# Decoder crates + the offline writers. Nothing here may depend on the
+# Omniphony bridge ABI: this stays a pure offline tool. CI asserts the mirror
+# invariant (no damf/clap/indicatif reachable from harletty-bridge).
+[dependencies]
+truehdd-macros = { version = "0.1.0", path = "../truehdd-macros" }
+truehd = { version = "0.5.0", path = "../truehd" }
+eac3 = { version = "0.5.0", path = "../eac3" }
+damf = { version = "0.1.0", path = "../damf" }
+
+anyhow = "1.0.99"
+clap = { version = "4.5.45", features = ["derive"] }
+env_logger = "0.11.8"
+indicatif = "0.18.0"
+indicatif-log-bridge = "0.2.3"
+log = "0.4.27"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_yaml_ng = "0.10.0"
+
+[build-dependencies]
+anyhow = "1.0.99"
+vergen-gitcl = { version = "1.0.8", default-features = false, features = ["build"] }
+chrono = "0.4.41"
+serde_json = "1.0.142"
