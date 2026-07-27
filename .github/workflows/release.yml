@@ -26,7 +26,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release -p harletty-bridge
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -62,7 +62,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release -p harletty-bridge
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -98,7 +98,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release -p harletty-bridge
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
