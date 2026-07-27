@@ -5,5 +5,5 @@
 # CLI must never pull in the Omniphony bridge ABI. See
 # docs/plan-truehdd-resurrection-in-harletty.md.
 [workspace]
-members = ["bridge", "truehd", "eac3", "dca"]
+members = ["bridge", "truehd", "eac3", "dca", "damf", "truehdd-macros"]
 resolver = "2"
