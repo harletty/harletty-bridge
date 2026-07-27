@@ -1,4 +1,6 @@
 use super::decoder_thread::{DecoderThreadConfig, spawn_decoder_thread};
+use super::dts_handler::DtsDecodeHandler;
+use super::dts_thread::{DtsDecoderThreadConfig, spawn_dts_decoder_thread};
 use super::eac3_handler::Eac3DecodeHandler;
 use super::eac3_thread::{Eac3DecoderThreadConfig, spawn_eac3_decoder_thread};
 use super::handler::{DecodeHandler, FrameHandlerContext, WriterState};
@@ -27,6 +29,7 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
 
     match codec {
         Codec::Eac3 => return cmd_decode_eac3(args, cli, multi, prefix),
+        Codec::Dts => return cmd_decode_dts(args, cli, multi, prefix),
         Codec::Truehd | Codec::Auto => {}
     }
 
@@ -272,6 +275,85 @@ fn cmd_decode_eac3(
                 pb.finish_with_message("decode thread panicked");
             }
             return Err(anyhow::anyhow!("EAC3 decode thread panicked"));
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_decode_dts(
+    args: &DecodeArgs,
+    cli: &Cli,
+    multi: Option<&MultiProgress>,
+    prefix: Vec<u8>,
+) -> Result<()> {
+    log::info!(
+        "Decoding DTS stream: {} (strict mode: {})",
+        args.input.display(),
+        cli.strict
+    );
+
+    let base_path = args.output_path.clone();
+
+    // No frame estimation: DTS frame sizes vary with the EXSS extension, so a
+    // byte-count estimate would be misleading. Spinner only, as for E-AC-3.
+    let pb = if let Some(multi) = multi {
+        Some(create_progress_bar(multi, None)?)
+    } else {
+        None
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let decode_thread = spawn_dts_decoder_thread(DtsDecoderThreadConfig {
+        input_path: args.input.clone(),
+        strict_mode: cli.strict,
+        prefix,
+        tx,
+        pb_clone: pb.clone(),
+    });
+
+    let mut handler = DtsDecodeHandler::default();
+    handler.warp_mode = args.warp_mode;
+    let start_time = std::time::Instant::now();
+
+    while let Ok(result) = rx.recv() {
+        match result {
+            Ok(msg) => {
+                handler.handle_message(msg, &base_path, args.format, args.no_audio)?;
+            }
+            Err(e) => {
+                if let Some(pb) = pb {
+                    pb.finish_with_message("decode failed");
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    handler.finalize()?;
+
+    match decode_thread.join() {
+        Ok(Ok(())) => {
+            finalize_progress_bar(
+                &pb,
+                None,
+                handler.decoded_samples,
+                handler.final_sample_rate,
+                start_time,
+            );
+            log::info!("DTS decoding completed successfully");
+        }
+        Ok(Err(e)) => {
+            if let Some(pb) = pb {
+                pb.finish_with_message("decode failed");
+            }
+            return Err(e);
+        }
+        Err(_) => {
+            if let Some(pb) = pb {
+                pb.finish_with_message("decode thread panicked");
+            }
+            return Err(anyhow::anyhow!("DTS decode thread panicked"));
         }
     }
 

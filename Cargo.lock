@@ -1177,6 +1177,7 @@ dependencies = [
  "chrono",
  "clap",
  "damf",
+ "dca",
  "eac3",
  "env_logger",
  "indicatif",
