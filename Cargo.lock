@@ -540,6 +540,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "harletty"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "damf",
+ "dca",
+ "eac3",
+ "env_logger",
+ "indicatif",
+ "indicatif-log-bridge",
+ "log",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "truehd",
+ "truehdd-macros",
+ "vergen-gitcl",
+]
+
+[[package]]
 name = "harletty-bridge"
 version = "0.7.2"
 dependencies = [
@@ -1167,29 +1190,6 @@ dependencies = [
  "bitstream-io",
  "log",
  "thiserror",
-]
-
-[[package]]
-name = "truehdd"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "damf",
- "dca",
- "eac3",
- "env_logger",
- "indicatif",
- "indicatif-log-bridge",
- "log",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2",
- "truehd",
- "truehdd-macros",
- "vergen-gitcl",
 ]
 
 [[package]]
