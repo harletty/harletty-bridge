@@ -1,6 +1,8 @@
 pub mod atmos;
 mod decode_impl;
 pub mod decoder_thread;
+pub mod dts_handler;
+pub mod dts_thread;
 pub mod eac3_handler;
 pub mod eac3_thread;
 pub mod handler;

@@ -20,6 +20,7 @@ path = "src/main.rs"
 truehdd-macros = { version = "0.1.0", path = "../truehdd-macros" }
 truehd = { version = "0.5.0", path = "../truehd" }
 eac3 = { version = "0.5.0", path = "../eac3" }
+dca = { version = "0.1.0", path = "../dca" }
 damf = { version = "0.1.0", path = "../damf" }
 
 anyhow = "1.0.99"

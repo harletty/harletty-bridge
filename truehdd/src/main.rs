@@ -20,6 +20,7 @@ use log::info;
 // decode pipeline, and the codec->OAMD mapping that feeds the writers.
 mod cli;
 mod codec_probe;
+mod dts_to_oamd;
 mod eac3_to_oamd;
 mod input;
 pub(crate) mod timestamp;

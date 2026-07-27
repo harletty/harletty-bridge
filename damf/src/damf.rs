@@ -83,6 +83,11 @@ pub enum SourceCodec {
     TrueHD,
     #[serde(rename = "EAC3-JOC")]
     Eac3Joc,
+    /// DTS:X. Written as its own label rather than folded into a generic "DTS"
+    /// so a consumer can tell an object-bearing master from a plain DTS bed —
+    /// Atmos Ranker's scan folds this into its codec column.
+    #[serde(rename = "DTS-X")]
+    DtsX,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
