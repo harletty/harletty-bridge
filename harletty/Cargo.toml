@@ -1,6 +1,8 @@
 [package]
 name = "harletty"
-version = "0.4.0"
+# Shares the bridge's version line: the two artifacts come from one commit and
+# are tagged together, so a release number means the same thing for both.
+version = "0.7.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "Offline decoder for TrueHD, E-AC-3 JOC and DTS bitstreams, writing Dolby Atmos master files"
