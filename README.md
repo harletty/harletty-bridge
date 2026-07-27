@@ -211,10 +211,13 @@ unix and `target\release\harletty_bridge.dll` on Windows. Point
 
 ## Layout
 
+The repo is a virtual cargo workspace — no package at the root.
+
 ```
-src/                 # bridge entry points + transport (raw / IEC61937) glue
+bridge/              # bridge entry points + transport (raw / IEC61937) glue
 truehd/              # TrueHD decoder crate (vendored, Apache-2.0)
 eac3/                # E-AC-3 (JOC) decoder crate
+dca/                 # DTS (core / DTS-HD MA / XLL) decoder crate
 docs/                # protocol notes (IEC61937, OAMD shape, …)
 EAC3_PATCH_NOTES.md  # upstream patches to the E-AC-3 decoder
 OBJECT_SIZE_NOTES.md # notes on OAMD object_size handling
