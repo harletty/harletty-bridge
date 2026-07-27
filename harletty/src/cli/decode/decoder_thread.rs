@@ -1,4 +1,4 @@
-use super::processor::{ProcessFramesContext, process_frames};
+use super::processor::{AccessUnitShape, ProcessFramesContext, process_frames};
 use crate::input::InputReader;
 use anyhow::Result;
 use indicatif::ProgressBar;
@@ -38,6 +38,9 @@ pub fn spawn_decoder_thread(config: DecoderThreadConfig) -> thread::JoinHandle<R
         let mut current_substream_info: Option<u8> = None;
         let mut current_extended_substream_info: Option<u8> = None;
         let mut recovering_until_major_sync = false;
+        let mut last_shape: Option<AccessUnitShape> = None;
+        let mut gap_access_units = 0u64;
+        let mut gap_samples = 0u64;
 
         if !prefix.is_empty() {
             extractor.push_bytes(&prefix);
@@ -62,6 +65,9 @@ pub fn spawn_decoder_thread(config: DecoderThreadConfig) -> thread::JoinHandle<R
                 current_substream_info: &mut current_substream_info,
                 current_extended_substream_info: &mut current_extended_substream_info,
                 recovering_until_major_sync: &mut recovering_until_major_sync,
+                last_shape: &mut last_shape,
+                gap_access_units: &mut gap_access_units,
+                gap_samples: &mut gap_samples,
             };
 
             let should_exit = process_frames(&mut ctx)?;
@@ -70,6 +76,23 @@ pub fn spawn_decoder_thread(config: DecoderThreadConfig) -> thread::JoinHandle<R
         })?;
 
         log::info!("Processing complete: {frame_count} frames, {total_samples} samples");
+
+        if gap_access_units > 0 {
+            // Worth stating plainly: the output is not lossless any more, but
+            // it is still in sync, which is the trade the alternative gets
+            // wrong in the other direction.
+            let sample_rate = last_shape
+                .as_ref()
+                .map_or(48000, AccessUnitShape::sampling_frequency)
+                .max(1) as f64;
+            log::warn!(
+                "{gap_access_units} access units could not be decoded and were replaced with \
+                 silence ({gap_samples} samples, {:.0} ms). Output length is preserved; \
+                 audio stays aligned with the source timeline.",
+                gap_samples as f64 / sample_rate * 1000.0
+            );
+        }
+
         Ok(())
     })
 }
