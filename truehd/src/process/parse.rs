@@ -78,6 +78,12 @@ impl Parser {
     pub fn set_fail_level(&mut self, level: log::Level) {
         self.state.fail_level = level;
     }
+
+    /// Drops parser state after a fatal access-unit parse failure and waits for
+    /// the next major sync to rebuild stream configuration.
+    pub fn reset_for_next_major_sync(&mut self) {
+        self.state.reset_for_next_major_sync();
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -478,6 +484,19 @@ impl ParserState {
         for ss_state in &mut self.substream_state {
             ss_state.hires_output_timing_state.reset_for_branch()
         }
+    }
+
+    /// Resets every field that describes the *stream* while preserving the
+    /// caller's configuration, so a stream can be picked back up at the next
+    /// major sync instead of aborting the whole decode.
+    pub fn reset_for_next_major_sync(&mut self) {
+        *self = Self {
+            fail_level: self.fail_level,
+            allow_seamless_branch: self.allow_seamless_branch,
+            check_fifo: self.check_fifo,
+            required_presentations: self.required_presentations,
+            ..Default::default()
+        };
     }
 
     fn check_substream(&self, i: usize) -> Result<()> {

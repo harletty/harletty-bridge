@@ -51,6 +51,15 @@ impl Decoder {
     pub fn set_fail_level(&mut self, level: log::Level) {
         self.state.fail_level = level;
     }
+
+    /// Drops decoder state after a fatal parse failure and waits for a fresh
+    /// major sync/restart sequence before producing audio again.
+    pub fn reset_for_next_major_sync(&mut self) {
+        self.state = DecoderState {
+            fail_level: self.state.fail_level,
+            ..Default::default()
+        };
+    }
 }
 
 /// The result of decoding an access unit to PCM audio.

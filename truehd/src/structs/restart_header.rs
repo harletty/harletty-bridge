@@ -42,17 +42,19 @@ pub enum RestartSyncWord {
 impl RestartSyncWord {
     pub fn read(reader: &mut BsIoSliceReader) -> Result<Self> {
         let value = reader.get_n::<u16>(14)?;
-        Ok(RestartSyncWord::from(value))
+        RestartSyncWord::try_from(value).map_err(Into::into)
     }
 }
 
-impl From<u16> for RestartSyncWord {
-    fn from(value: u16) -> Self {
+impl TryFrom<u16> for RestartSyncWord {
+    type Error = RestartHeaderError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            0x31EA => RestartSyncWord::A,
-            0x31EB => RestartSyncWord::B,
-            0x31EC => RestartSyncWord::C,
-            _ => panic!("restart_sync_word must be 0x31EA, 0x31EB or 0x31EC. Read {value:#04X}"),
+            0x31EA => Ok(RestartSyncWord::A),
+            0x31EB => Ok(RestartSyncWord::B),
+            0x31EC => Ok(RestartSyncWord::C),
+            _ => Err(RestartHeaderError::InvalidRestartSyncWord(value)),
         }
     }
 }
@@ -211,6 +213,19 @@ impl RestartHeader {
                         .wrapping_sub(advance)
                         & 0xFFFF;
 
+                    if input_timing_interval == 0 {
+                        log_or_err!(
+                            state,
+                            Warn,
+                            anyhow!(RestartHeaderError::ZeroInputTimingInterval {
+                                samples_per_au,
+                                prev_advance,
+                                advance,
+                            })
+                        );
+                        break 'check_output_timing;
+                    }
+
                     let data_rate = (state.audio_sampling_frequency_1 as usize
                         * (prev_access_unit_length << 4))
                         .div_ceil(input_timing_interval);
@@ -224,11 +239,19 @@ impl RestartHeader {
                     let samples_per_75ms =
                         (state.audio_sampling_frequency_1 as usize * 3).div_ceil(40);
 
-                    let c1 = advance <= prev_advance + samples_per_au_3q4;
-                    let c2 = advance <= prev_advance + samples_per_au - prev_fifo_duration;
-                    let c3 = advance <= samples_per_75ms - samples_per_au;
-                    let c4 = prev_access_unit_length << 8
-                        <= state.prev_peak_data_rate * input_timing_interval;
+                    let c1_limit = prev_advance.saturating_add(samples_per_au_3q4);
+                    let c2_limit = prev_advance
+                        .checked_add(samples_per_au)
+                        .and_then(|v| v.checked_sub(prev_fifo_duration));
+                    let c3_limit = samples_per_75ms.checked_sub(samples_per_au);
+                    let c4_rhs = state
+                        .prev_peak_data_rate
+                        .saturating_mul(input_timing_interval);
+
+                    let c1 = advance <= c1_limit;
+                    let c2 = c2_limit.map(|limit| advance <= limit).unwrap_or(false);
+                    let c3 = c3_limit.map(|limit| advance <= limit).unwrap_or(false);
+                    let c4 = (prev_access_unit_length << 8) <= c4_rhs;
 
                     if c1 && c2 && c3 && c4 {
                         state.has_valid_branch = true;
