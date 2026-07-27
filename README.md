@@ -222,7 +222,9 @@ cargo build --release -p truehdd
 ```
 
 It reads from a file or from `-` (stdin), so it pipes straight out of
-ffmpeg. It is a *separate artifact*: the bridge does not link it, does
+ffmpeg. It replaces the standalone `truehdd` fork this workspace used to
+carry — see [docs/truehdd-fork-retirement.md](docs/truehdd-fork-retirement.md)
+for what was ported and what was superseded. It is a *separate artifact*: the bridge does not link it, does
 not pay for it, and cannot reach it. That isolation is by crate graph
 rather than feature flags, and `scripts/check-crate-isolation.sh`
 asserts it in CI — if you find yourself wanting `use damf::…` inside
