@@ -14,22 +14,18 @@ use bridge_api::RPushResult;
 use bridge_api::{
     RChannelLabel, RDecodedFrame, REvent, RMetadataFrame, RNameUpdate, RObjectChannel,
 };
-use dca::{CorePcmFrame, HdError, HdFrame, exss_has_xll, exss_substream_size, parse_header};
+use dca::{
+    CorePcmFrame, HdError, HdFrame, XPresentation, exss_has_xll, exss_substream_size, parse_header,
+};
 use serde::Deserialize;
 
 use crate::bridge::AtmosBridge;
 use crate::frame_builders::float_to_pcm_i32;
-use crate::labels::dca_bed_channel_to_r;
+use crate::labels::{dca_bed_channel_to_r, dca_spatial_channel_to_r};
 use crate::metadata::declare_object_channels;
 
 const CORE_SYNC: [u8; 4] = 0x7FFE_8001u32.to_be_bytes();
 const SUBSTREAM_SYNC: [u8; 4] = 0x6458_2025u32.to_be_bytes();
-const XLL_X_HEIGHT_LABELS: [RChannelLabel; 4] = [
-    RChannelLabel::Tfl,
-    RChannelLabel::Tfr,
-    RChannelLabel::Tbl,
-    RChannelLabel::Tbr,
-];
 // Exact Q15 -3 dB coefficient used by the DTS downmix table. The regular 7.1
 // presentation contains this contribution from each corresponding height feed.
 #[cfg(test)]
@@ -98,45 +94,10 @@ impl DtsFoldConfig {
             .map_or(0.0, |route| 10.0_f32.powf(route.gain_db / 20.0))
     }
 }
-// Working D0 presentation inferred from two complete programmes. X0 has a
-// stable front-centre signature; X1..X4 form the established top quartet.
-// Keep this isolated and experimental until a reference decode confirms it.
-const D0_FIXED_LABELS: [RChannelLabel; 5] = [
-    RChannelLabel::Tfc,
-    RChannelLabel::Tfl,
-    RChannelLabel::Tfr,
-    RChannelLabel::Tbl,
-    RChannelLabel::Tbr,
-];
-// Working D1 presentation inferred from one complete programme. The wide fold
-// is strongly measurable, while all six channel identities and every unfold
-// coefficient remain experimental pending an independent D1 source.
-const D1_FIXED_LABELS: [RChannelLabel; 6] = [
-    RChannelLabel::Tfl,
-    RChannelLabel::Tfr,
-    RChannelLabel::Lw,
-    RChannelLabel::Rw,
-    RChannelLabel::Tbl,
-    RChannelLabel::Tbr,
-];
+// The D0/D1 channel identities and the D3 inferred object positions moved to
+// `dca::spatial`, which documents their (research-only) provenance. Both this
+// pipeline and the offline ADM exporter read them from there.
 const D3_OBJECT_SOURCE_INDICES: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-
-// Research-only D3 default positions. The corpus supports stable left/right
-// pairing and a recurring rear association for X6/X7. X2/X3 also match the
-// front-elevation group in the paired fixed-layout control, while X4/X5
-// remain the broad side pair. X0/X1 are the least stable pair and are placed
-// at the front-wide positions by elimination. These are presentation defaults,
-// not decoded coordinates or a claimed normative speaker map.
-const D3_INFERRED_OBJECT_POSITIONS: [[f64; 3]; 8] = [
-    [-1.0, 0.5, 0.0],  // X0: Lw
-    [1.0, 0.5, 0.0],   // X1: Rw
-    [-1.0, 1.0, 1.0],  // X2: TFL
-    [1.0, 1.0, 1.0],   // X3: TFR
-    [-1.0, 0.0, 1.0],  // X4: TSL
-    [1.0, 0.0, 1.0],   // X5: TSR
-    [-1.0, -1.0, 1.0], // X6: TBL
-    [1.0, -1.0, 1.0],  // X7: TBR
-];
 
 enum FoldSources<'a> {
     None,
@@ -271,10 +232,28 @@ fn find(data: &[u8], needle: &[u8; 4]) -> Option<usize> {
 }
 
 fn hd_samples(hd: &HdFrame) -> usize {
-    hd.samples
+    hd.bed_sample_count()
+}
+
+/// ABI labels for a presentation's extension feeds, in feed order.
+///
+/// The feed->position tables themselves live in `dca::spatial` so the offline
+/// ADM exporter reads the same ones; this only projects them onto the ABI.
+fn spatial_labels(presentation: XPresentation) -> impl Iterator<Item = RChannelLabel> {
+    presentation
+        .channels()
         .iter()
-        .find_map(|o| o.as_ref().map(|v| v.len()))
-        .unwrap_or(0)
+        .copied()
+        .map(dca_spatial_channel_to_r)
+}
+
+/// Static position of D3 object feed `source`. Research-only defaults; see
+/// `dca::spatial` for their provenance.
+fn d3_object_position(source: usize) -> [f64; 3] {
+    XPresentation::ObjectsD3
+        .object_positions()
+        .and_then(|positions| positions.get(source).copied())
+        .unwrap_or([0.0; 3])
 }
 
 /// DCA speaker index -> renderer channel label, for the DTS-HD bed.
@@ -351,7 +330,7 @@ fn build_hd_frame_with_extensions(
 
     let emit_heights = height_samples.is_some() || *height_locked;
     let height_count = if emit_heights {
-        XLL_X_HEIGHT_LABELS.len()
+        XPresentation::Height.feed_count()
     } else {
         0
     };
@@ -387,8 +366,8 @@ fn build_hd_frame_with_extensions(
         Some(8) => &D3_OBJECT_SOURCE_INDICES,
         _ => &[],
     };
-    let d0_fixed_count = d0_fixed_samples.map_or(0, |_| D0_FIXED_LABELS.len());
-    let d1_fixed_count = d1_fixed_samples.map_or(0, |_| D1_FIXED_LABELS.len());
+    let d0_fixed_count = d0_fixed_samples.map_or(0, |_| XPresentation::FixedD0.feed_count());
+    let d1_fixed_count = d1_fixed_samples.map_or(0, |_| XPresentation::FixedD1.feed_count());
     let object_count = object_source_indices.len();
     let channel_count =
         active.len() + height_count + d0_fixed_count + d1_fixed_count + object_count;
@@ -495,9 +474,9 @@ fn build_hd_frame_with_extensions(
     for &spkr in &active {
         channel_labels.push(speaker_to_label(spkr));
     }
-    channel_labels.extend(XLL_X_HEIGHT_LABELS[..height_count].iter().copied());
-    channel_labels.extend(D0_FIXED_LABELS[..d0_fixed_count].iter().copied());
-    channel_labels.extend(D1_FIXED_LABELS[..d1_fixed_count].iter().copied());
+    channel_labels.extend(spatial_labels(XPresentation::Height).take(height_count));
+    channel_labels.extend(spatial_labels(XPresentation::FixedD0).take(d0_fixed_count));
+    channel_labels.extend(spatial_labels(XPresentation::FixedD1).take(d1_fixed_count));
     channel_labels.extend(std::iter::repeat_n(RChannelLabel::Object, object_count));
 
     if height_samples.is_some() {
@@ -586,7 +565,7 @@ fn build_d3_metadata(
             id: (10 + source) as u32,
             sample_pos,
             has_pos: true,
-            pos: D3_INFERRED_OBJECT_POSITIONS[source],
+            pos: d3_object_position(source),
             gain_db: 0,
             size: [0.0; 3],
             ramp_duration: 0,
@@ -909,7 +888,7 @@ mod tests {
             assert_eq!(metadata.events[source].id, (10 + source) as u32);
             assert_eq!(
                 metadata.events[source].pos,
-                D3_INFERRED_OBJECT_POSITIONS[source]
+                d3_object_position(source)
             );
         }
     }
