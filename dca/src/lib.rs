@@ -16,6 +16,7 @@ pub mod extract;
 pub mod hd;
 pub mod parser;
 mod pcm;
+pub mod spatial;
 mod types;
 
 pub use extract::{ExtractError, Extractor, Frame};
@@ -25,4 +26,5 @@ pub use parser::{
 };
 pub use hd::{exss_has_xll, exss_substream_size, HdDecoder, HdError, HdFrame};
 pub use pcm::{CorePcmFrame, DecodeError, PcmDecoder, PcmPushResult, bed_layout};
+pub use spatial::{SpatialChannel, XPresentation};
 pub use types::BedChannel;

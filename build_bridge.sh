@@ -4,7 +4,9 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$repo_dir"
 
-cargo build --release
+# -p: the workspace also holds the offline `truehdd` CLI; only build the plugin.
+# The artifact stays under the workspace-root `target/`, so paths are unchanged.
+cargo build --release -p harletty-bridge
 
 if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]]; then
   artifact="$repo_dir/target/release/harletty_bridge.dll"

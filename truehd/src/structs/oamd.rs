@@ -728,8 +728,10 @@ pub struct ObjectRenderInfo {
     pub b_differential_position_specified: bool,
     pub pos3d: [f64; 3],
     pub b_object_distance_specified: bool,
-    pub b_object_at_infinity: bool,
-    pub distance_factor_idx: u8,
+    /// Object distance in metres, `None` when the stream does not specify one
+    /// and `f64::INFINITY` for `b_object_at_infinity`. Resolved at parse time
+    /// from `DISTANCE_FACTORS` so consumers never see the raw 4-bit index.
+    pub distance_factor: Option<f64>,
     pub zone_constraints_idx: u8,
     pub b_enable_elevation: bool,
     pub object_size: [f64; 3],
@@ -745,8 +747,7 @@ impl Default for ObjectRenderInfo {
             b_differential_position_specified: false,
             pos3d: [0.5, 0.5, 0.0],
             b_object_distance_specified: false,
-            b_object_at_infinity: false,
-            distance_factor_idx: 0,
+            distance_factor: None,
             zone_constraints_idx: 0,
             b_enable_elevation: true,
             object_size: [0.0, 0.0, 0.0],
@@ -799,14 +800,17 @@ impl ObjectRenderInfo {
 
             render.b_object_distance_specified = reader.get()?;
 
-            // TODO: parse distance
-            if render.b_object_distance_specified {
-                render.b_object_at_infinity = reader.get()?;
-                // object_distance = inf
-                if !render.b_object_at_infinity {
-                    render.distance_factor_idx = reader.get_n(4)?;
+            render.distance_factor = if render.b_object_distance_specified {
+                if reader.get()? {
+                    // b_object_at_infinity: object is at infinite distance
+                    Some(f64::INFINITY)
+                } else {
+                    let idx = reader.get_n::<u8>(4)? as usize;
+                    Some(DISTANCE_FACTORS[idx])
                 }
-            }
+            } else {
+                None
+            };
         }
 
         if object_render_info_bits & 2 != 0 {
@@ -852,9 +856,22 @@ impl ObjectRenderInfo {
 
 pub const NUM_TRIM_CONFIGS: usize = 9;
 
+/// Lookup table mapping a 4-bit distance_factor_idx to distance in metres.
+/// Source: Dolby TrueHD Atmos OAMD spec (confirmed via Cavern open-source implementation).
+#[rustfmt::skip]
+pub const DISTANCE_FACTORS: [f64; 16] = [
+    1.1, 1.3, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0, 6.3, 7.9, 10.0, 12.6, 15.8, 20.0, 25.1, 50.1,
+];
+
+/// Lookup table mapping a 4-bit trim index to a gain in dB.
+///
+/// Index 14 is -15.0, not the -16.0 this table used to carry: the reference
+/// decoder maps that index to the Q12 value 0x02d8 (728), i.e.
+/// `20 * log10(728 / 4096) = -15.005 dB`, and -15.0 is also where the -1.5 dB
+/// step running through entries 5..=13 lands next. (-16.0 dB would be Q12 649.)
 #[rustfmt::skip]
 pub const TRIM_LUT: [f64; 16] = [
-    6.0, 3.0, 1.5, 0.75, -0.75, -1.5, -3.0, -4.5, -6.0, -7.5, -9.0, -10.5, -12.0, -13.5, -16.0, -36.0,
+    6.0, 3.0, 1.5, 0.75, -0.75, -1.5, -3.0, -4.5, -6.0, -7.5, -9.0, -10.5, -12.0, -13.5, -15.0, -36.0,
 ];
 
 // TODO: TrimElement & ExtendObjectElement
@@ -1187,7 +1204,7 @@ impl ExtendedPrecisionPositionBlock {
 }
 
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum SpeakerLabels {
     L,
@@ -1295,5 +1312,34 @@ mod tests {
         let _ = ObjectAudioMetadataPayload::read(TEST_DATA_BROKEN)?;
 
         Ok(())
+    }
+
+    /// Entries 3..=14 of the trim table step by a constant -0.75 dB and then
+    /// -1.5 dB; index 14 sitting at -16.0 rather than -15.0 broke that run and
+    /// disagreed with the reference decoder's Q12 code for it (0x02d8 = 728).
+    /// The DAMF `trimMode` block is written straight from this table, so an
+    /// off-by-one entry ships in every master set that carries trim metadata.
+    #[test]
+    fn trim_lut_follows_the_reference_quantiser() {
+        use crate::structs::oamd::TRIM_LUT;
+
+        for (idx, q12) in [(14usize, 728.0f64), (13, 865.0), (8, 2053.0)] {
+            let expected = 20.0 * (q12 / 4096.0).log10();
+            assert!(
+                (TRIM_LUT[idx] - expected).abs() < 0.01,
+                "TRIM_LUT[{idx}] = {} but Q12 {q12} gives {expected:.3} dB",
+                TRIM_LUT[idx]
+            );
+        }
+
+        // -1.5 dB per step from index 5 through 14, no discontinuity at the end.
+        for window in TRIM_LUT[5..=14].windows(2) {
+            assert!(
+                (window[0] - window[1] - 1.5).abs() < f64::EPSILON,
+                "step {} -> {} is not -1.5 dB",
+                window[0],
+                window[1]
+            );
+        }
     }
 }
