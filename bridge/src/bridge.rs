@@ -93,23 +93,38 @@ fn sniff_raw_codec(data: &[u8]) -> Option<RawCodec> {
     None
 }
 
+/// Decoder state for every supported format, owned by one bridge instance.
+///
+/// Every decoder field is boxed on purpose. Their inline state is large (the
+/// TrueHD `Decoder` alone is ~126 KiB, the whole set ~210 KiB), and a host may
+/// well create the bridge on a thread with a small stack: mpv's macOS playback
+/// thread is a plain `pthread_create` with no attributes, so 512 KiB. Held by
+/// value, the struct is copied two to three times on the way to the heap
+/// (`new()`'s locals → the return temporary → `RBox::new` inside
+/// `FormatBridge_TO::from_value`) and overflows that stack before the first
+/// packet is ever pushed.
+///
+/// Boxing keeps `AtmosBridge` itself pointer-sized per field, so the largest
+/// transient is a single `Decoder` in a leaf frame. The cost is one pointer
+/// hop per pipeline entry — never per sample — so hot loops are unaffected.
+/// `tests::atmos_bridge_stack_footprint_stays_small` guards the invariant.
 pub(crate) struct AtmosBridge {
     // ── TrueHD pipeline ──────────────────────────────────────────────
     pub(crate) mat_stream: MatStream,
     pub(crate) extractor: Extractor,
-    pub(crate) parser: Parser,
-    pub(crate) decoder: Decoder,
+    pub(crate) parser: Box<Parser>,
+    pub(crate) decoder: Box<Decoder>,
     // ── E-AC3 pipeline ───────────────────────────────────────────────
     pub(crate) eac3_spdif: Eac3SpdifStream,
     /// Raw E-AC3 syncframe extractor (used by the `Raw` transport, e.g. mpv).
     pub(crate) eac3_raw_extractor: Eac3RawExtractor,
-    pub(crate) eac3_pcm_decoder: PcmDecoder,
+    pub(crate) eac3_pcm_decoder: Box<PcmDecoder>,
     /// Separate PCM decoder for the dependent substream of a non-JOC 7.1
     /// channel-extension pair (kept apart from the core decoder so their
     /// per-stream state never interferes).
-    pub(crate) eac3_dependent_pcm_decoder: PcmDecoder,
-    pub(crate) eac3_object_decoder: ObjectPcmDecoder,
-    pub(crate) ac3_decoder: NativeAc3Decoder,
+    pub(crate) eac3_dependent_pcm_decoder: Box<PcmDecoder>,
+    pub(crate) eac3_object_decoder: Box<ObjectPcmDecoder>,
+    pub(crate) ac3_decoder: Box<NativeAc3Decoder>,
     /// Decoded AC-3 cores awaiting either a following E-AC3 dependent (→ paired
     /// 7.1 bed / object frame) or, if none arrives, a standalone-core flush
     /// (→ plain 5.1 bed). The `Vec<u8>` keeps the original AC-3 access unit so
@@ -131,9 +146,9 @@ pub(crate) struct AtmosBridge {
     /// Raw byte buffer for demuxing `[core][exss]` DTS-HD frames.
     pub(crate) dts_buf: Vec<u8>,
     /// Plain DTS core (5.1) decoder.
-    pub(crate) dts_decoder: dca::PcmDecoder,
+    pub(crate) dts_decoder: Box<dca::PcmDecoder>,
     /// DTS-HD Master Audio lossless (5.1/7.1) decoder.
-    pub(crate) dts_hd_decoder: dca::HdDecoder,
+    pub(crate) dts_hd_decoder: Box<dca::HdDecoder>,
     pub(crate) dts_frame_count: u64,
     /// Latches once a valid XLL-X height quartet has been emitted: fallback
     /// frames then keep the 12-channel shape (composite bed + silent heights)
@@ -171,8 +186,9 @@ impl AtmosBridge {
         // Default to presentation 3 (full Atmos/JOC); overridable via configure().
         let presentation = 3u8;
 
-        let mut parser = Parser::default();
-        let mut decoder = Decoder::default();
+        // Boxed as they are built, never held by value: see `AtmosBridge`.
+        let mut parser = Box::new(Parser::default());
+        let mut decoder = Box::new(Decoder::default());
 
         let fail_level = if strict {
             log::Level::Warn
@@ -194,11 +210,11 @@ impl AtmosBridge {
         } else {
             log::Level::Error
         };
-        let mut eac3_pcm = PcmDecoder::new();
+        let mut eac3_pcm = Box::new(PcmDecoder::new());
         eac3_pcm.set_debug_log_level(eac3_log_level);
-        let mut eac3_dependent_pcm = PcmDecoder::new();
+        let mut eac3_dependent_pcm = Box::new(PcmDecoder::new());
         eac3_dependent_pcm.set_debug_log_level(eac3_log_level);
-        let mut eac3_obj = ObjectPcmDecoder::new();
+        let mut eac3_obj = Box::new(ObjectPcmDecoder::new());
         eac3_obj.set_debug_log_level(eac3_log_level);
         #[allow(unused_mut)]
         let mut bridge = Self {
@@ -211,7 +227,7 @@ impl AtmosBridge {
             eac3_pcm_decoder: eac3_pcm,
             eac3_dependent_pcm_decoder: eac3_dependent_pcm,
             eac3_object_decoder: eac3_obj,
-            ac3_decoder: NativeAc3Decoder::default(),
+            ac3_decoder: Box::new(NativeAc3Decoder::default()),
             pending_ac3_cores: VecDeque::new(),
             pending_dependent_frames: VecDeque::new(),
             eac3_frame_count: 0,
@@ -221,8 +237,8 @@ impl AtmosBridge {
             raw_codec: None,
             eac3_diag_stats: Eac3DiagStats::default(),
             dts_buf: Vec::new(),
-            dts_decoder: dca::PcmDecoder::new(),
-            dts_hd_decoder: dca::HdDecoder::new(),
+            dts_decoder: Box::new(dca::PcmDecoder::new()),
+            dts_hd_decoder: Box::new(dca::HdDecoder::new()),
             dts_frame_count: 0,
             dts_height_locked: false,
             dts_active: false,
@@ -262,8 +278,10 @@ impl AtmosBridge {
         // TrueHD reset.
         self.mat_stream.reset();
         self.extractor = Extractor::default();
-        self.parser = Parser::default();
-        self.decoder = Decoder::default();
+        // Assign through the boxes: the fresh state lands in the existing
+        // allocations instead of being copied around the stack.
+        *self.parser = Parser::default();
+        *self.decoder = Decoder::default();
 
         // E-AC3 reset.
         self.eac3_spdif.reset();
@@ -1091,5 +1109,44 @@ mod raw_transport_tests {
                 format!("X{source}")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stack_footprint_tests {
+    use super::*;
+
+    /// Hosts may create the bridge on a small-stack thread — mpv's macOS
+    /// playback thread is a bare `pthread_create`, so 512 KiB. Keeping the
+    /// struct pointer-sized per decoder is what stops `new()` from copying
+    /// hundreds of KiB across the three frames between the constructor and the
+    /// heap. Box any decoder state added here; do not inline it.
+    #[test]
+    fn atmos_bridge_stack_footprint_stays_small() {
+        const BUDGET: usize = 4 * 1024;
+        let actual = std::mem::size_of::<AtmosBridge>();
+        assert!(
+            actual <= BUDGET,
+            "AtmosBridge grew to {actual} bytes (budget {BUDGET}); \
+             box the newly inlined decoder state instead"
+        );
+    }
+
+    /// End-to-end guard for the same invariant: build a bridge on a thread
+    /// sized like mpv's macOS playback thread. A by-value decoder field would
+    /// overflow the guard page here exactly as it did in the field report
+    /// (`SIGBUS` in `AtmosBridge::new`, Omniphony issue #205).
+    #[test]
+    fn new_fits_on_a_macos_sized_playback_thread() {
+        const MACOS_PLAYBACK_STACK: usize = 512 * 1024;
+        std::thread::Builder::new()
+            .stack_size(MACOS_PLAYBACK_STACK)
+            .spawn(|| {
+                let bridge = AtmosBridge::new(false);
+                assert_eq!(bridge.presentation, 3);
+            })
+            .expect("spawn small-stack thread")
+            .join()
+            .expect("bridge construction overflowed a 512 KiB stack");
     }
 }
