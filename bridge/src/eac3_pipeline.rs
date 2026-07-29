@@ -112,73 +112,21 @@ pub(crate) fn process_eac3_frame(
     }
 }
 
-/// Speaker positions a dependent-substream `chanmap` carries, in coded-channel
-/// order (MSB→LSB; pair bits emit left then right). Only the bits that map to a
-/// concrete bed position are emitted — enough for the common 5.1/7.1 channel
-/// extensions (e.g. 0x1A00 = Ls, Rs, Lrs/Rrs).
-fn dependent_chanmap_positions(chanmap: u16) -> Vec<BedChannel> {
-    use BedChannel::*;
-    const TABLE: &[(u16, &[BedChannel])] = &[
-        (1 << 15, &[FrontLeft]),
-        (1 << 14, &[Center]),
-        (1 << 13, &[FrontRight]),
-        (1 << 12, &[SurroundLeft]),
-        (1 << 11, &[SurroundRight]),
-        (1 << 9, &[RearLeft, RearRight]), // Lrs/Rrs (back surrounds)
-        (1 << 8, &[RearCenter]),          // Cs
-        (1 << 5, &[WideLeft, WideRight]), // Lw/Rw
-    ];
-    let mut out = Vec::new();
-    for &(bit, chans) in TABLE {
-        if chanmap & bit != 0 {
-            out.extend_from_slice(chans);
-        }
-    }
-    out
-}
-
 /// Merge a decoded core (5.1) with its dependent E-AC3 substream — the discrete
-/// surround/back channels of a 7.1 extension — into one bed, placing the
-/// dependent's channels by its `chanmap`. Returns `None` (caller falls back to
-/// the core alone) when the dependent can't be decoded or doesn't line up.
+/// surround/back channels of a 7.1 extension — into one bed, via the shared
+/// [`eac3::merge_core_with_dependent`] helper (also used by the harletty CLI).
+/// Returns `None` (caller falls back to the core alone) when the dependent
+/// can't be decoded or doesn't line up.
 fn merge_eac3_core_with_dependent(
     bridge: &mut AtmosBridge,
     core: &CorePcmFrame,
     dependent_frame: &[u8],
 ) -> Option<CorePcmFrame> {
-    let dep = bridge
-        .eac3_dependent_pcm_decoder
-        .push_access_unit(dependent_frame)
-        .ok()?;
-    let positions = dependent_chanmap_positions(dep.info.dependent_channel_map?);
-    let dep_pcm = dep.pcm;
-    if positions.len() != dep_pcm.fullband_channels.len()
-        || dep_pcm.samples_per_channel() != core.samples_per_channel()
-    {
-        return None;
-    }
-
-    // Start from the core's fullband channels, then overlay the dependent's:
-    // replace a position the core also carried (discrete side surrounds) or
-    // append a new one (the back pair).
-    let mut order: Vec<BedChannel> = core.fullband_channel_order.clone();
-    let mut chans: Vec<Vec<f32>> = core.fullband_channels.clone();
-    for (i, &pos) in positions.iter().enumerate() {
-        match order.iter().position(|&b| b == pos) {
-            Some(idx) => chans[idx] = dep_pcm.fullband_channels[i].clone(),
-            None => {
-                order.push(pos);
-                chans.push(dep_pcm.fullband_channels[i].clone());
-            }
-        }
-    }
-
-    Some(CorePcmFrame {
-        sample_rate: core.sample_rate,
-        fullband_channel_order: order,
-        fullband_channels: chans,
-        lfe_channel: core.lfe_channel.clone(),
-    })
+    eac3::merge_core_with_dependent(
+        &mut bridge.eac3_dependent_pcm_decoder,
+        core,
+        dependent_frame,
+    )
 }
 
 pub(crate) fn process_eac3_dependent_frame_with_core(
@@ -865,16 +813,19 @@ mod tests {
     /// Local-only end-to-end check: decode a real non-JOC E-AC3 7.1 stream
     /// (AC-3 core + dependent) through the full bridge and confirm it now emits a
     /// non-silent multichannel bed (it used to drop the pair → silence). Skips
-    /// gracefully when the local capture is absent. Writes the decoded PCM to
-    /// `/tmp/aladdin/harletty_bridge.f32` for `compare_pcm` against ffmpeg.
+    /// gracefully when the local capture is absent. Writes the decoded PCM next
+    /// to the fixture as `<fixture>.harletty_bridge.f32` for `compare_pcm`
+    /// against ffmpeg. The fixture path can be overridden with
+    /// `HARLETTY_EAC3_PAIR_FIXTURE` — keep such captures on disk, not tmpfs.
     #[test]
     fn aladdin_eac3_pair_emits_nonsilent_bed() {
         use crate::bridge::AtmosBridge;
         use abi_stable::std_types::RSlice;
         use bridge_api::{FormatBridge, RInputTransport};
 
-        let path = "/tmp/aladdin/fr.eac3";
-        let Ok(bytes) = std::fs::read(path) else {
+        let path = std::env::var("HARLETTY_EAC3_PAIR_FIXTURE")
+            .unwrap_or_else(|_| "/tmp/aladdin/fr.eac3".to_string());
+        let Ok(bytes) = std::fs::read(&path) else {
             eprintln!("skip: {path} not present");
             return;
         };
@@ -895,24 +846,26 @@ mod tests {
                 }
                 // Bridge PCM is i32 scaled to 24-bit (see `float_to_pcm_i32`).
                 for &s in f.pcm.iter() {
-                    pcm_f32.push(s as f32 / 8_388_607.0);
+                    pcm_f32.push(s as f32 / 8_388_608.0);
                 }
             }
         }
         eprintln!("labels: {labels}");
 
-        assert!(frames > 0, "no frames decoded from the E-AC3 pair stream");
-        assert!(channels >= 6, "expected >= 5.1, got {channels} channels");
         let peak = pcm_f32.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        assert!(peak > 1e-4, "decoded bed is silent (peak={peak})");
         eprintln!("decoded {frames} frames, {channels} ch, peak={peak:.4}");
+        // Dump before asserting so an ad-hoc fixture (other layouts fed via
+        // HARLETTY_EAC3_PAIR_FIXTURE) still leaves PCM to compare against ffmpeg.
         let _ = std::fs::write(
-            "/tmp/aladdin/harletty_bridge.f32",
+            format!("{path}.harletty_bridge.f32"),
             pcm_f32
                 .iter()
                 .flat_map(|s| s.to_le_bytes())
                 .collect::<Vec<u8>>(),
         );
+        assert!(frames > 0, "no frames decoded from the E-AC3 pair stream");
+        assert!(channels >= 6, "expected >= 5.1, got {channels} channels");
+        assert!(peak > 1e-4, "decoded bed is silent (peak={peak})");
     }
 
     /// Local-only end-to-end check: decode a real DTS (DTS-HD MA / DTS:X) stream
@@ -945,7 +898,7 @@ mod tests {
                     labels = format!("{:?}", f.channel_labels);
                 }
                 for &s in f.pcm.iter() {
-                    pcm_f32.push(s as f32 / 8_388_607.0);
+                    pcm_f32.push(s as f32 / 8_388_608.0);
                 }
             }
         }
@@ -962,20 +915,6 @@ mod tests {
                 .iter()
                 .flat_map(|s| s.to_le_bytes())
                 .collect::<Vec<u8>>(),
-        );
-    }
-
-    #[test]
-    fn chanmap_0x1a00_maps_to_side_and_back_surrounds() {
-        // The common 7.1 channel-extension chanmap (Ls, Rs, Lrs/Rrs).
-        assert_eq!(
-            dependent_chanmap_positions(0x1A00),
-            vec![
-                BedChannel::SurroundLeft,
-                BedChannel::SurroundRight,
-                BedChannel::RearLeft,
-                BedChannel::RearRight,
-            ]
         );
     }
 
@@ -1022,6 +961,9 @@ mod tests {
             audio_frame: AudioFrameInfo {
                 exponent_strategies_embedded: true,
                 adaptive_hybrid_transform_enabled: false,
+                coupling_uses_aht: false,
+                channel_uses_aht: Vec::new(),
+                lfe_uses_aht: false,
                 snr_offset_strategy: 0,
                 transient_processing_enabled: false,
                 block_switching_enabled: false,

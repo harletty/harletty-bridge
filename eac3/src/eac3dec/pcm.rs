@@ -34,6 +34,72 @@ impl CorePcmFrame {
     }
 }
 
+/// Speaker positions a dependent-substream `chanmap` carries, in coded-channel
+/// order (MSB→LSB; pair bits emit left then right). Only the bits that map to a
+/// concrete bed position are emitted — enough for the common 5.1/7.1 channel
+/// extensions (e.g. 0x1A00 = Ls, Rs, Lrs/Rrs).
+pub fn dependent_chanmap_positions(chanmap: u16) -> Vec<BedChannel> {
+    use BedChannel::*;
+    const TABLE: &[(u16, &[BedChannel])] = &[
+        (1 << 15, &[FrontLeft]),
+        (1 << 14, &[Center]),
+        (1 << 13, &[FrontRight]),
+        (1 << 12, &[SurroundLeft]),
+        (1 << 11, &[SurroundRight]),
+        (1 << 9, &[RearLeft, RearRight]), // Lrs/Rrs (back surrounds)
+        (1 << 8, &[RearCenter]),          // Cs
+        (1 << 5, &[WideLeft, WideRight]), // Lw/Rw
+    ];
+    let mut out = Vec::new();
+    for &(bit, chans) in TABLE {
+        if chanmap & bit != 0 {
+            out.extend_from_slice(chans);
+        }
+    }
+    out
+}
+
+/// Merge a decoded core (5.1) with its dependent E-AC-3 substream — the discrete
+/// surround/back channels of a 7.1 extension — into one bed, placing the
+/// dependent's channels by its `chanmap`. Returns `None` (caller falls back to
+/// the core alone) when the dependent can't be decoded or doesn't line up.
+pub fn merge_core_with_dependent(
+    dependent_decoder: &mut PcmDecoder,
+    core: &CorePcmFrame,
+    dependent_frame: &[u8],
+) -> Option<CorePcmFrame> {
+    let dep = dependent_decoder.push_access_unit(dependent_frame).ok()?;
+    let positions = dependent_chanmap_positions(dep.info.dependent_channel_map?);
+    let dep_pcm = dep.pcm;
+    if positions.len() != dep_pcm.fullband_channels.len()
+        || dep_pcm.samples_per_channel() != core.samples_per_channel()
+    {
+        return None;
+    }
+
+    // Start from the core's fullband channels, then overlay the dependent's:
+    // replace a position the core also carried (discrete side surrounds) or
+    // append a new one (the back pair).
+    let mut order: Vec<BedChannel> = core.fullband_channel_order.clone();
+    let mut chans: Vec<Vec<f32>> = core.fullband_channels.clone();
+    for (i, &pos) in positions.iter().enumerate() {
+        match order.iter().position(|&b| b == pos) {
+            Some(idx) => chans[idx] = dep_pcm.fullband_channels[i].clone(),
+            None => {
+                order.push(pos);
+                chans.push(dep_pcm.fullband_channels[i].clone());
+            }
+        }
+    }
+
+    Some(CorePcmFrame {
+        sample_rate: core.sample_rate,
+        fullband_channel_order: order,
+        fullband_channels: chans,
+        lfe_channel: core.lfe_channel.clone(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 /// Object-audio PCM plus the metadata that was active for the same access unit.
 ///
@@ -108,6 +174,14 @@ impl PcmDecoder {
     /// Reset all cross-frame decode state.
     pub fn reset(&mut self) {
         self.frames_seen = 0;
+        self.reset_decode_state();
+    }
+
+    /// Reset the cross-frame bitstream state (IMDCT overlap-add delay, block
+    /// syntax, metadata sequencing) without touching `frames_seen`. A failed
+    /// decode can leave this state partially mutated, so it must never be
+    /// carried into the next frame.
+    fn reset_decode_state(&mut self) {
         self.aux_state.reset();
         self.core_state.reset();
         self.metadata_state.reset();
@@ -142,7 +216,17 @@ impl PcmDecoder {
     }
 
     /// Decode one complete access unit into core PCM.
+    ///
+    /// On `Err`, the decoder's cross-frame state is reset: a failed decode may
+    /// have left it partially mutated, and reusing it would corrupt every
+    /// following frame (stale IMDCT overlap-add delay, stale coupling state).
     pub fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<PcmPushResult, ParseError> {
+        self.push_access_unit_inner(access_unit).inspect_err(|_| {
+            self.reset_decode_state();
+        })
+    }
+
+    fn push_access_unit_inner(&mut self, access_unit: &[u8]) -> Result<PcmPushResult, ParseError> {
         self.apply_debug_log_level();
         let info = inspect_access_unit_with_metadata_state(
             access_unit,
@@ -173,7 +257,20 @@ impl PcmDecoder {
     }
 
     /// Decode one complete legacy AC-3 syncframe into core PCM.
+    ///
+    /// On `Err`, the decoder's cross-frame state is reset (see
+    /// [`PcmDecoder::push_access_unit`]).
     pub fn push_legacy_ac3_access_unit(
+        &mut self,
+        access_unit: &[u8],
+    ) -> Result<PcmPushResult, ParseError> {
+        self.push_legacy_ac3_access_unit_inner(access_unit)
+            .inspect_err(|_| {
+                self.reset_decode_state();
+            })
+    }
+
+    fn push_legacy_ac3_access_unit_inner(
         &mut self,
         access_unit: &[u8],
     ) -> Result<PcmPushResult, ParseError> {
@@ -239,6 +336,12 @@ impl ObjectPcmDecoder {
     /// Reset all cross-frame decode state.
     pub fn reset(&mut self) {
         self.frames_seen = 0;
+        self.reset_decode_state();
+    }
+
+    /// Reset the cross-frame bitstream state without touching `frames_seen`
+    /// (see [`PcmDecoder`]'s private counterpart).
+    fn reset_decode_state(&mut self) {
         self.aux_state.reset();
         self.core_state.reset();
         self.joc_state.reset();
@@ -271,7 +374,19 @@ impl ObjectPcmDecoder {
     ///
     /// Returns `Ok(None)` when the frame is valid E-AC-3 but does not contain the object payloads
     /// needed for this stage.
+    ///
+    /// On `Err`, the decoder's cross-frame state is reset (see
+    /// [`PcmDecoder::push_access_unit`]).
     pub fn push_access_unit(
+        &mut self,
+        access_unit: &[u8],
+    ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
+        self.push_access_unit_inner(access_unit).inspect_err(|_| {
+            self.reset_decode_state();
+        })
+    }
+
+    fn push_access_unit_inner(
         &mut self,
         access_unit: &[u8],
     ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
@@ -331,7 +446,21 @@ impl ObjectPcmDecoder {
     }
 
     /// Decode dynamic object PCM from a dependent access unit using externally decoded core PCM.
+    ///
+    /// On `Err`, the decoder's cross-frame state is reset (see
+    /// [`PcmDecoder::push_access_unit`]).
     pub fn push_access_unit_with_core(
+        &mut self,
+        access_unit: &[u8],
+        core: CorePcmFrame,
+    ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
+        self.push_access_unit_with_core_inner(access_unit, core)
+            .inspect_err(|_| {
+                self.reset_decode_state();
+            })
+    }
+
+    fn push_access_unit_with_core_inner(
         &mut self,
         access_unit: &[u8],
         core: CorePcmFrame,
@@ -388,5 +517,24 @@ impl ObjectPcmDecoder {
                 oamd_payloads,
             },
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chanmap_0x1a00_maps_to_side_and_back_surrounds() {
+        // The common 7.1 channel-extension chanmap (Ls, Rs, Lrs/Rrs).
+        assert_eq!(
+            dependent_chanmap_positions(0x1A00),
+            vec![
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::RearLeft,
+                BedChannel::RearRight,
+            ]
+        );
     }
 }

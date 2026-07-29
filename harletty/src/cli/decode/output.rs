@@ -158,6 +158,36 @@ impl AudioWriter {
     }
 }
 
+/// Largest positive 24-bit sample. Note this is *not* the scale factor: see
+/// [`float_to_i24`].
+const I24_MAX: i32 = 8_388_607;
+/// Most negative 24-bit sample. The range is asymmetric, and the decoders do
+/// emit this value (`dca`'s `clip23` clamps to it), so it must survive.
+const I24_MIN: i32 = -8_388_608;
+/// 2^23 — the divisor the decoders use to produce their f32 output, so the
+/// multiplier that inverts it.
+const I24_SCALE: f32 = 8_388_608.0;
+
+/// Convert a decoder's float sample back to the 24-bit integer it came from.
+///
+/// Used by the DTS and E-AC-3 handlers; the TrueHD path stays integer
+/// end-to-end and never goes through here.
+///
+/// `dca` emits `int24 as f32 / 2^23`, so this must scale by 2^23 and round.
+/// Scaling by 2^23 - 1 and truncating (as this used to) shaved one count off
+/// *every* nonzero sample, which is inaudible but cost bit-exactness: DTS-HD MA
+/// is lossless, so its output has to match a reference decoder sample for
+/// sample. +1.0 lands one past the positive maximum, hence the clamp.
+#[inline]
+pub fn float_to_i24(sample: f32) -> i32 {
+    // NaN must map to silence, not rely on `as`-cast saturation semantics:
+    // a decoder bug upstream must never turn into full-scale output.
+    if !sample.is_finite() {
+        return 0;
+    }
+    ((sample.clamp(-1.0, 1.0) * I24_SCALE).round_ties_even() as i32).clamp(I24_MIN, I24_MAX)
+}
+
 pub fn create_caf_writer_from_existing_file(file: File) -> Result<CAFWriter<BufWriter<File>>> {
     let mut temp_file = file.try_clone()?;
     let file_info = damf::caf::parse_caf_file(&mut temp_file)?;
@@ -166,4 +196,65 @@ pub fn create_caf_writer_from_existing_file(file: File) -> Result<CAFWriter<BufW
         BufWriter::new(file),
         file_info,
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{I24_MAX, I24_MIN, float_to_i24};
+
+    /// The decoders divide by 2^23; this must be the exact inverse, or lossless
+    /// output stops matching a reference decoder sample for sample.
+    #[test]
+    fn float_to_i24_round_trips_every_24_bit_value() {
+        for n in [
+            I24_MIN,
+            I24_MIN + 1,
+            -8_000_000,
+            -4_194_304,
+            -1_000_001,
+            -3,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            3,
+            1_000_001,
+            4_194_304,
+            8_000_000,
+            I24_MAX - 1,
+            I24_MAX,
+        ] {
+            assert_eq!(float_to_i24(n as f32 / 8_388_608.0), n, "round trip of {n}");
+        }
+    }
+
+    /// Exhaustive over the low end and a strided sweep of the full range: the
+    /// old `* (2^23 - 1) as i32` lost exactly one count here on every nonzero
+    /// sample, in both directions.
+    #[test]
+    fn float_to_i24_round_trips_exhaustively() {
+        for n in (I24_MIN..=I24_MAX).step_by(97) {
+            assert_eq!(float_to_i24(n as f32 / 8_388_608.0), n, "round trip of {n}");
+        }
+        for n in -4096..=4096 {
+            assert_eq!(float_to_i24(n as f32 / 8_388_608.0), n, "round trip of {n}");
+        }
+    }
+
+    /// The output boundary is the last guard between a decoder bug and the
+    /// user's speakers: non-finite maps to silence, everything else saturates.
+    #[test]
+    fn float_to_i24_guards_non_finite_and_out_of_range_samples() {
+        assert_eq!(float_to_i24(f32::NAN), 0);
+        assert_eq!(float_to_i24(f32::INFINITY), 0);
+        assert_eq!(float_to_i24(f32::NEG_INFINITY), 0);
+        assert_eq!(float_to_i24(1.0e9), I24_MAX);
+        assert_eq!(float_to_i24(-1.0e9), I24_MIN);
+        // +1.0 scales to 2^23, one past full scale; -1.0 is exactly I24_MIN.
+        assert_eq!(float_to_i24(1.0), I24_MAX);
+        assert_eq!(float_to_i24(-1.0), I24_MIN);
+        assert_eq!(float_to_i24(0.0), 0);
+        assert_eq!(float_to_i24(-0.0), 0);
+    }
 }

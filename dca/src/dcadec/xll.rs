@@ -559,12 +559,12 @@ impl XllDecoder {
 
     /// Parse + decode one XLL frame (`data` = full asset bytes; the XLL bytes are
     /// at `asset.xll_offset`), combining residual channels with `core`.
-    pub(crate) fn decode(
-        &mut self,
-        data: &[u8],
-        asset: &ExssAsset,
-        core: Option<&CoreOutput>,
-    ) -> R<()> {
+    /// Parse the XLL headers and band data. Split from [`Self::filter`] because
+    /// the caller must know the primary channel set's sample rate (see
+    /// [`Self::primary_freq`]) before it can synthesize the core at the matching
+    /// rate — mirroring ffmpeg, which parses XLL first and only then filters the
+    /// core.
+    pub(crate) fn parse(&mut self, data: &[u8], asset: &ExssAsset) -> R<()> {
         if self.hd_stream_id != asset.hd_stream_id {
             self.clear_pbr();
             self.hd_stream_id = asset.hd_stream_id;
@@ -574,10 +574,18 @@ impl XllDecoder {
         self.x_descriptor_size = asset.xll_x_size;
         let xll = &data[asset.xll_offset..asset.xll_offset + asset.xll_size];
         if self.pbr_delay > 0 || !self.pbr_buffer.is_empty() {
-            self.parse_frame_pbr(xll)?;
+            self.parse_frame_pbr(xll)
         } else {
-            self.parse_frame_no_pbr(xll, asset)?;
+            self.parse_frame_no_pbr(xll, asset)
         }
+    }
+
+    /// Sample rate of the primary (first) channel set, once parsed.
+    pub(crate) fn primary_freq(&self) -> Option<u32> {
+        self.chset.first().map(|c| c.freq)
+    }
+
+    pub(crate) fn filter(&mut self, core: Option<&CoreOutput>) -> R<()> {
         self.filter_frame(core)
     }
 

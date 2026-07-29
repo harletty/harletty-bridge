@@ -55,17 +55,26 @@ impl PcmStats {
 
 /// Convert a floating-point PCM sample to the bridge's i32 PCM convention
 /// (24-bit signed, stored in i32, matching the TrueHD decoder's range).
+///
+/// The decoders emit `int24 as f32 / 2^23`, so this scales by 2^23 and rounds:
+/// scaling by 2^23 - 1 and truncating (as this used to) shaves one count off
+/// every nonzero sample and breaks bit-exactness for lossless sources. +1.0
+/// lands one past the positive maximum, hence the clamp; -1.0 is exactly
+/// `I24_MIN`, which the decoders do emit, so it must survive.
+#[inline]
 pub(crate) fn float_to_pcm_i32(sample: f32) -> i32 {
     if !sample.is_finite() {
         return 0;
     }
-    const SCALE: f32 = 8_388_607.0; // 2^23 - 1
-    (sample.clamp(-1.0, 1.0) * SCALE) as i32
+    const SCALE: f32 = 8_388_608.0; // 2^23
+    const I24_MAX: i32 = 8_388_607;
+    const I24_MIN: i32 = -8_388_608;
+    ((sample.clamp(-1.0, 1.0) * SCALE).round_ties_even() as i32).clamp(I24_MIN, I24_MAX)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PcmStats;
+    use super::{PcmStats, float_to_pcm_i32};
     use abi_stable::std_types::RVec;
     use bridge_api::{RChannelLabel, RDecodedFrame};
 
@@ -107,5 +116,41 @@ mod tests {
         let frame = decoded_frame(16, 2, vec![i32::MAX; 32]);
         let err = PcmStats::from_frame(&frame).expect_err("frame should be rejected");
         assert!(err.starts_with("too_many_near_clip_samples"));
+    }
+
+    /// The output boundary must map non-finite decoder output to silence and
+    /// clamp everything else to 24-bit full scale — this is the last guard
+    /// between a decoder bug and the user's speakers.
+    #[test]
+    fn float_to_pcm_i32_guards_non_finite_and_out_of_range_samples() {
+        assert_eq!(float_to_pcm_i32(f32::NAN), 0);
+        assert_eq!(float_to_pcm_i32(f32::INFINITY), 0);
+        assert_eq!(float_to_pcm_i32(f32::NEG_INFINITY), 0);
+        assert_eq!(float_to_pcm_i32(1.0e9), 8_388_607);
+        assert_eq!(float_to_pcm_i32(-1.0e9), -8_388_608);
+        assert_eq!(float_to_pcm_i32(1.0), 8_388_607);
+        assert_eq!(float_to_pcm_i32(-1.0), -8_388_608);
+        assert_eq!(float_to_pcm_i32(0.0), 0);
+        assert_eq!(float_to_pcm_i32(0.5), 4_194_304);
+    }
+
+    /// The decoders divide by 2^23; this must be the exact inverse, or the
+    /// realtime path stops being bit-exact on lossless sources.
+    #[test]
+    fn float_to_pcm_i32_round_trips_24_bit_values() {
+        for n in (-8_388_608..=8_388_607).step_by(97) {
+            assert_eq!(
+                float_to_pcm_i32(n as f32 / 8_388_608.0),
+                n,
+                "round trip of {n}"
+            );
+        }
+        for n in -4096..=4096 {
+            assert_eq!(
+                float_to_pcm_i32(n as f32 / 8_388_608.0),
+                n,
+                "round trip of {n}"
+            );
+        }
     }
 }

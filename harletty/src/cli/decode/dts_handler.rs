@@ -6,7 +6,7 @@
 //! reports a presentation per frame and `dts_to_oamd` projects it.
 
 use super::atmos::create_damf_header_file;
-use super::output::{AudioWriter, create_output_paths};
+use super::output::{AudioWriter, create_output_paths, float_to_i24};
 use crate::cli::command::{AudioFormat, WarpMode};
 use crate::dts_to_oamd::{BedSource, DtsLayout, convert_dts};
 use anyhow::Result;
@@ -15,8 +15,6 @@ use dca::{CorePcmFrame, HdFrame, PcmPushResult, XPresentation};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-
-const I24_MAX: f32 = 8_388_607.0;
 
 pub enum DtsFrameMessage {
     /// A lossless DTS-HD frame, with whatever spatial presentation it carries.
@@ -440,9 +438,4 @@ impl DtsDecodeHandler {
         }
         Ok(())
     }
-}
-
-#[inline]
-fn float_to_i24(sample: f32) -> i32 {
-    (sample.clamp(-1.0, 1.0) * I24_MAX) as i32
 }

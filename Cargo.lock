@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "damf"
-version = "0.1.0"
+version = "0.7.3"
 dependencies = [
  "serde",
  "serde_yaml_ng",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "dca"
-version = "0.1.0"
+version = "0.7.3"
 dependencies = [
  "log",
  "rustfft",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "eac3"
-version = "0.5.1"
+version = "0.7.3"
 dependencies = [
  "log",
  "rustfft",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "harletty"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "harletty-bridge"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "abi_stable",
  "anyhow",
@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "truehd"
-version = "0.5.0"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "bitstream-io",
@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "truehdd-macros"
-version = "0.1.0"
+version = "0.7.3"
 dependencies = [
  "darling",
  "quote",

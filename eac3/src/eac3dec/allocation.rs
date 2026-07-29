@@ -81,6 +81,13 @@ const BAPTAB: [u8; 64] = [
     10, 10, 10, 10, 11, 11, 11, 11, 12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 14, 14,
     15, 15, 15, 15, 15, 15, 15, 15, 15,
 ];
+/// High-efficiency bap table used for AHT channels (A/52 Annex E; FFmpeg
+/// `ff_eac3_hebap_tab`). Values are `hebap` codes 0..=19.
+const HEBAPTAB: [u8; 64] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 9, 9, 9, 10, 10, 10, 10, 11, 11, 11, 11, 12, 12, 12, 12,
+    13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15, 16, 16, 16, 16, 17, 17, 17, 17, 18, 18, 18, 18,
+    18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19,
+];
 const INT24_MAX: f32 = ((1 << 23) - 1) as f32;
 const FROM_INT24: f32 = 1.0 / INT24_MAX;
 const FROM_INT32: f32 = 1.0 / i32::MAX as f32;
@@ -293,6 +300,7 @@ impl AllocationState {
         delta: &DeltaBitAllocationState,
         mut fast_leak: i32,
         mut slow_leak: i32,
+        aht: bool,
     ) -> Result<(), ParseError> {
         if end == 0 || end > MAX_ALLOCATION_SIZE || start >= end {
             self.clear_bap();
@@ -371,14 +379,22 @@ impl AllocationState {
             DeltaBitAllocationMode::Reuse | DeltaBitAllocationMode::NewInfoFollows
         ) {
             let mut band = bnd_start;
-            for index in 0..delta.offsets.len() {
-                band += delta.offsets[index];
-                let delta_mask = if delta.bit_allocation[index] >= 4 {
-                    ((delta.bit_allocation[index] as i32) - 3) << 7
+            // Iterate the zipped segments so a partially-read state (e.g. a
+            // ShortPacket mid read_segments that a later Reuse block picks up)
+            // can never index out of bounds — audio paths must not panic.
+            for ((&offset, &length), &bits) in delta
+                .offsets
+                .iter()
+                .zip(&delta.lengths)
+                .zip(&delta.bit_allocation)
+            {
+                band += offset;
+                let delta_mask = if bits >= 4 {
+                    ((bits as i32) - 3) << 7
                 } else {
-                    ((delta.bit_allocation[index] as i32) - 4) << 7
+                    ((bits as i32) - 4) << 7
                 };
-                for _ in 0..delta.lengths[index] {
+                for _ in 0..length {
                     let Some(mask) = self.mask.get_mut(band) else {
                         break;
                     };
@@ -392,6 +408,7 @@ impl AllocationState {
             return Ok(());
         }
 
+        let bap_tab: &[u8; 64] = if aht { &HEBAPTAB } else { &BAPTAB };
         let mut bin = start;
         let mut band = bnd_start;
         loop {
@@ -403,7 +420,7 @@ impl AllocationState {
             masked = (masked & 0x1fe0) + floor;
             while bin < last_bin {
                 let address = ((self.psd[bin] - masked) >> 5).clamp(0, 63) as usize;
-                self.bap[bin] = BAPTAB[address];
+                self.bap[bin] = bap_tab[address];
                 bin += 1;
             }
             band += 1;
@@ -541,6 +558,45 @@ impl AllocationState {
         }
 
         Ok(())
+    }
+
+    /// Decode this channel's AHT payload from block 0 of the frame: GAQ gain
+    /// codes plus VQ / GAQ pre-mantissas for `start..end`, followed by the
+    /// per-bin 6-point IDCT. `allocate()` must have run with `aht = true` so
+    /// `bap` holds hebap values. Consumes the exact bit count of the payload,
+    /// so it is also used by the syntax walker to stay bit-aligned.
+    pub(crate) fn decode_aht_mantissas(
+        &self,
+        reader: &mut super::bitstream::BitReader<'_>,
+        start: usize,
+        end: usize,
+        pre_mantissas: &mut Vec<[i32; 6]>,
+    ) -> Result<(), ParseError> {
+        if end > MAX_ALLOCATION_SIZE || start > end {
+            return Err(ParseError::InvalidHeader("aht-range"));
+        }
+        pre_mantissas.clear();
+        pre_mantissas.resize(end, [0; 6]);
+        super::aht::decode_pre_mantissas(reader, &self.bap, start, end, pre_mantissas)
+    }
+
+    /// Produce one block's transform coefficients from decoded AHT
+    /// pre-mantissas, applying the per-bin exponent shift (the AHT equivalent
+    /// of `decode_transform_coeffs`).
+    pub(crate) fn extract_aht_coeffs(
+        &self,
+        pre_mantissas: &[[i32; 6]],
+        block: usize,
+        target: &mut [f32; MAX_ALLOCATION_SIZE],
+        start: usize,
+        end: usize,
+    ) {
+        target.fill(0.0);
+        let end = end.min(pre_mantissas.len()).min(MAX_ALLOCATION_SIZE);
+        for bin in start..end {
+            let pre = pre_mantissas[bin].get(block).copied().unwrap_or(0);
+            target[bin] = scale_int24(pre, self.exponents[bin]);
+        }
     }
 
     fn decode_grouped_exponents(
