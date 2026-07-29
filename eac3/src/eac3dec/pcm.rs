@@ -34,6 +34,72 @@ impl CorePcmFrame {
     }
 }
 
+/// Speaker positions a dependent-substream `chanmap` carries, in coded-channel
+/// order (MSB→LSB; pair bits emit left then right). Only the bits that map to a
+/// concrete bed position are emitted — enough for the common 5.1/7.1 channel
+/// extensions (e.g. 0x1A00 = Ls, Rs, Lrs/Rrs).
+pub fn dependent_chanmap_positions(chanmap: u16) -> Vec<BedChannel> {
+    use BedChannel::*;
+    const TABLE: &[(u16, &[BedChannel])] = &[
+        (1 << 15, &[FrontLeft]),
+        (1 << 14, &[Center]),
+        (1 << 13, &[FrontRight]),
+        (1 << 12, &[SurroundLeft]),
+        (1 << 11, &[SurroundRight]),
+        (1 << 9, &[RearLeft, RearRight]), // Lrs/Rrs (back surrounds)
+        (1 << 8, &[RearCenter]),          // Cs
+        (1 << 5, &[WideLeft, WideRight]), // Lw/Rw
+    ];
+    let mut out = Vec::new();
+    for &(bit, chans) in TABLE {
+        if chanmap & bit != 0 {
+            out.extend_from_slice(chans);
+        }
+    }
+    out
+}
+
+/// Merge a decoded core (5.1) with its dependent E-AC-3 substream — the discrete
+/// surround/back channels of a 7.1 extension — into one bed, placing the
+/// dependent's channels by its `chanmap`. Returns `None` (caller falls back to
+/// the core alone) when the dependent can't be decoded or doesn't line up.
+pub fn merge_core_with_dependent(
+    dependent_decoder: &mut PcmDecoder,
+    core: &CorePcmFrame,
+    dependent_frame: &[u8],
+) -> Option<CorePcmFrame> {
+    let dep = dependent_decoder.push_access_unit(dependent_frame).ok()?;
+    let positions = dependent_chanmap_positions(dep.info.dependent_channel_map?);
+    let dep_pcm = dep.pcm;
+    if positions.len() != dep_pcm.fullband_channels.len()
+        || dep_pcm.samples_per_channel() != core.samples_per_channel()
+    {
+        return None;
+    }
+
+    // Start from the core's fullband channels, then overlay the dependent's:
+    // replace a position the core also carried (discrete side surrounds) or
+    // append a new one (the back pair).
+    let mut order: Vec<BedChannel> = core.fullband_channel_order.clone();
+    let mut chans: Vec<Vec<f32>> = core.fullband_channels.clone();
+    for (i, &pos) in positions.iter().enumerate() {
+        match order.iter().position(|&b| b == pos) {
+            Some(idx) => chans[idx] = dep_pcm.fullband_channels[i].clone(),
+            None => {
+                order.push(pos);
+                chans.push(dep_pcm.fullband_channels[i].clone());
+            }
+        }
+    }
+
+    Some(CorePcmFrame {
+        sample_rate: core.sample_rate,
+        fullband_channel_order: order,
+        fullband_channels: chans,
+        lfe_channel: core.lfe_channel.clone(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 /// Object-audio PCM plus the metadata that was active for the same access unit.
 ///
@@ -388,5 +454,24 @@ impl ObjectPcmDecoder {
                 oamd_payloads,
             },
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chanmap_0x1a00_maps_to_side_and_back_surrounds() {
+        // The common 7.1 channel-extension chanmap (Ls, Rs, Lrs/Rrs).
+        assert_eq!(
+            dependent_chanmap_positions(0x1A00),
+            vec![
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::RearLeft,
+                BedChannel::RearRight,
+            ]
+        );
     }
 }
