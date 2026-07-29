@@ -371,14 +371,22 @@ impl AllocationState {
             DeltaBitAllocationMode::Reuse | DeltaBitAllocationMode::NewInfoFollows
         ) {
             let mut band = bnd_start;
-            for index in 0..delta.offsets.len() {
-                band += delta.offsets[index];
-                let delta_mask = if delta.bit_allocation[index] >= 4 {
-                    ((delta.bit_allocation[index] as i32) - 3) << 7
+            // Iterate the zipped segments so a partially-read state (e.g. a
+            // ShortPacket mid read_segments that a later Reuse block picks up)
+            // can never index out of bounds — audio paths must not panic.
+            for ((&offset, &length), &bits) in delta
+                .offsets
+                .iter()
+                .zip(&delta.lengths)
+                .zip(&delta.bit_allocation)
+            {
+                band += offset;
+                let delta_mask = if bits >= 4 {
+                    ((bits as i32) - 3) << 7
                 } else {
-                    ((delta.bit_allocation[index] as i32) - 4) << 7
+                    ((bits as i32) - 4) << 7
                 };
-                for _ in 0..delta.lengths[index] {
+                for _ in 0..length {
                     let Some(mask) = self.mask.get_mut(band) else {
                         break;
                     };

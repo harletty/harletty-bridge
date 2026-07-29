@@ -865,16 +865,19 @@ mod tests {
     /// Local-only end-to-end check: decode a real non-JOC E-AC3 7.1 stream
     /// (AC-3 core + dependent) through the full bridge and confirm it now emits a
     /// non-silent multichannel bed (it used to drop the pair → silence). Skips
-    /// gracefully when the local capture is absent. Writes the decoded PCM to
-    /// `/tmp/aladdin/harletty_bridge.f32` for `compare_pcm` against ffmpeg.
+    /// gracefully when the local capture is absent. Writes the decoded PCM next
+    /// to the fixture as `<fixture>.harletty_bridge.f32` for `compare_pcm`
+    /// against ffmpeg. The fixture path can be overridden with
+    /// `HARLETTY_EAC3_PAIR_FIXTURE` — keep such captures on disk, not tmpfs.
     #[test]
     fn aladdin_eac3_pair_emits_nonsilent_bed() {
         use crate::bridge::AtmosBridge;
         use abi_stable::std_types::RSlice;
         use bridge_api::{FormatBridge, RInputTransport};
 
-        let path = "/tmp/aladdin/fr.eac3";
-        let Ok(bytes) = std::fs::read(path) else {
+        let path = std::env::var("HARLETTY_EAC3_PAIR_FIXTURE")
+            .unwrap_or_else(|_| "/tmp/aladdin/fr.eac3".to_string());
+        let Ok(bytes) = std::fs::read(&path) else {
             eprintln!("skip: {path} not present");
             return;
         };
@@ -901,18 +904,20 @@ mod tests {
         }
         eprintln!("labels: {labels}");
 
-        assert!(frames > 0, "no frames decoded from the E-AC3 pair stream");
-        assert!(channels >= 6, "expected >= 5.1, got {channels} channels");
         let peak = pcm_f32.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        assert!(peak > 1e-4, "decoded bed is silent (peak={peak})");
         eprintln!("decoded {frames} frames, {channels} ch, peak={peak:.4}");
+        // Dump before asserting so an ad-hoc fixture (other layouts fed via
+        // HARLETTY_EAC3_PAIR_FIXTURE) still leaves PCM to compare against ffmpeg.
         let _ = std::fs::write(
-            "/tmp/aladdin/harletty_bridge.f32",
+            format!("{path}.harletty_bridge.f32"),
             pcm_f32
                 .iter()
                 .flat_map(|s| s.to_le_bytes())
                 .collect::<Vec<u8>>(),
         );
+        assert!(frames > 0, "no frames decoded from the E-AC3 pair stream");
+        assert!(channels >= 6, "expected >= 5.1, got {channels} channels");
+        assert!(peak > 1e-4, "decoded bed is silent (peak={peak})");
     }
 
     /// Local-only end-to-end check: decode a real DTS (DTS-HD MA / DTS:X) stream
