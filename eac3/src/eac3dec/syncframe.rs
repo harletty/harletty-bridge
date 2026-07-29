@@ -2054,13 +2054,6 @@ fn read_legacy_ac3_coupling_strategy(
     audio_frame: &mut AudioFrameInfo,
     state: &mut BlockSyntaxState,
 ) -> Result<(), ParseError> {
-    if channel_mode <= 1 {
-        audio_frame.coupling_strategy_updates[block] = false;
-        audio_frame.coupling_in_use[block] = false;
-        state.clear_coupling();
-        return Ok(());
-    }
-
     let update = reader.read_bit().ok_or(ParseError::ShortPacket)?;
     if block == 0 && !update {
         return Err(ParseError::InvalidHeader("cplstrat"));
@@ -2068,6 +2061,13 @@ fn read_legacy_ac3_coupling_strategy(
     audio_frame.coupling_strategy_updates[block] = update;
     if update {
         let in_use = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+        // Legacy AC-3 transmits cplstre/cplinu in every audblk regardless of
+        // acmod — mono and dual-mono included (skipping them desyncs the whole
+        // block). Coupling itself needs two full-bandwidth channels, so
+        // cplinu=1 there is invalid data (FFmpeg errors identically).
+        if in_use && channel_mode <= 1 {
+            return Err(ParseError::InvalidHeader("cpl-mono"));
+        }
         audio_frame.coupling_in_use[block] = in_use;
         state.ecplinu = false;
         if in_use {
@@ -4346,6 +4346,44 @@ mod tests {
         assert_eq!(state.ncplsubnd, 2);
         assert_eq!(state.ncplbnd, 1); // band 1 folded into band 0
         assert_eq!(reader.position(), 16); // every strategy bit consumed
+    }
+
+    /// Legacy AC-3 transmits cplstre/cplinu in every audblk regardless of
+    /// acmod — mono included. Skipping the bits desyncs the whole block
+    /// (real-world mono BD tracks then fail every frame).
+    #[test]
+    fn legacy_coupling_reads_strategy_bits_in_mono() {
+        let mut bits = Vec::new();
+        push_bits(&mut bits, 1, 1); // cplstre
+        push_bits(&mut bits, 0, 1); // cplinu = 0 (mandatory in mono)
+        let bytes = bits_to_bytes(&bits, 1);
+
+        let mut reader = super::BitReader::new(&bytes);
+        let mut audio_frame = super::legacy_ac3_audio_frame_info(0, 1, false);
+        let mut state = BlockSyntaxState::new(1, false, 0);
+        super::read_legacy_ac3_coupling_strategy(&mut reader, 0, 1, 1, &mut audio_frame, &mut state)
+            .expect("mono coupling strategy bits must parse");
+        assert!(!audio_frame.coupling_in_use[0]);
+        assert_eq!(reader.position(), 2); // cplstre + cplinu consumed
+
+        // cplinu=1 with fewer than two full-bandwidth channels is invalid data.
+        let mut bits = Vec::new();
+        push_bits(&mut bits, 1, 1); // cplstre
+        push_bits(&mut bits, 1, 1); // cplinu = 1
+        let bytes = bits_to_bytes(&bits, 1);
+        let mut reader = super::BitReader::new(&bytes);
+        let mut audio_frame = super::legacy_ac3_audio_frame_info(0, 1, false);
+        let mut state = BlockSyntaxState::new(1, false, 0);
+        let err = super::read_legacy_ac3_coupling_strategy(
+            &mut reader,
+            0,
+            1,
+            1,
+            &mut audio_frame,
+            &mut state,
+        )
+        .expect_err("coupling in mono must be rejected");
+        assert!(matches!(err, ParseError::InvalidHeader("cpl-mono")));
     }
 
     /// An empty coupling range is a hard parse error: silently clearing
