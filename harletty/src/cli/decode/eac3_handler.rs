@@ -1,5 +1,5 @@
 use super::atmos::create_damf_header_file;
-use super::output::{AudioWriter, create_output_paths};
+use super::output::{AudioWriter, create_output_paths, float_to_i24};
 use crate::cli::command::{AudioFormat, WarpMode};
 use damf::{Configuration, Event, SourceCodec};
 use crate::eac3_to_oamd::convert_oamd;
@@ -8,8 +8,6 @@ use eac3::{CorePcmFrame, ObjectPcmPushResult, PcmPushResult};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-
-const I24_MAX: f32 = 8_388_607.0;
 
 pub enum Eac3FrameMessage {
     Object(ObjectPcmPushResult),
@@ -297,14 +295,4 @@ impl Eac3DecodeHandler {
         }
         Ok(())
     }
-}
-
-#[inline]
-fn float_to_i24(sample: f32) -> i32 {
-    // NaN must map to silence, not rely on `as`-cast saturation semantics:
-    // a decoder bug upstream must never turn into full-scale output.
-    if !sample.is_finite() {
-        return 0;
-    }
-    (sample.clamp(-1.0, 1.0) * I24_MAX) as i32
 }

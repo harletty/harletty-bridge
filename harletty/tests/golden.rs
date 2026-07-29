@@ -88,7 +88,10 @@ fn joc_master_set_matches_golden() {
     let golden_meta = std::fs::read_to_string(fixture("joc_atmos_1s.atmos.metadata")).unwrap();
     assert_eq!(produced_meta, golden_meta, ".atmos.metadata drifted");
 
-    // .atmos.audio — too big to commit, pinned by hash.
+    // .atmos.audio — too big to commit, pinned by hash. The hash was rebased
+    // once, when `float_to_i24` stopped scaling by 2^23 - 1 and truncating:
+    // that shifted 1.6% of samples by exactly one count away from zero (no
+    // sign flips, max delta 1) and made lossless sources bit-exact again.
     let produced_audio = sha256_of(&out_dir.join("out.atmos.audio"));
     let golden_audio = std::fs::read_to_string(fixture("joc_atmos_1s.atmos.audio.sha256")).unwrap();
     assert_eq!(

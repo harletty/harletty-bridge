@@ -846,7 +846,7 @@ mod tests {
                 }
                 // Bridge PCM is i32 scaled to 24-bit (see `float_to_pcm_i32`).
                 for &s in f.pcm.iter() {
-                    pcm_f32.push(s as f32 / 8_388_607.0);
+                    pcm_f32.push(s as f32 / 8_388_608.0);
                 }
             }
         }
@@ -898,7 +898,7 @@ mod tests {
                     labels = format!("{:?}", f.channel_labels);
                 }
                 for &s in f.pcm.iter() {
-                    pcm_f32.push(s as f32 / 8_388_607.0);
+                    pcm_f32.push(s as f32 / 8_388_608.0);
                 }
             }
         }
