@@ -1,6 +1,6 @@
 [package]
 name = "damf"
-version = "0.1.0"
+version = "0.7.3"
 edition = "2024"
 license = "Apache-2.0"
 description = "Dolby Atmos Master File (DAMF) metadata writer plus CAF/WAV container writers"
@@ -15,7 +15,7 @@ crate-type = ["lib"]
 # `truehd` only for the OAMD payload types the DAMF metadata is projected from.
 # Nothing here may depend on the bridge ABI or on any CLI crate.
 [dependencies]
-truehdd-macros = { version = "0.1.0", path = "../truehdd-macros" }
-truehd = { version = "0.5.0", path = "../truehd" }
+truehdd-macros = { version = "0.7.3", path = "../truehdd-macros" }
+truehd = { version = "0.7.3", path = "../truehd" }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml_ng = "0.10"
