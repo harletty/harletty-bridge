@@ -444,5 +444,10 @@ impl DtsDecodeHandler {
 
 #[inline]
 fn float_to_i24(sample: f32) -> i32 {
+    // NaN must map to silence, not rely on `as`-cast saturation semantics:
+    // a decoder bug upstream must never turn into full-scale output.
+    if !sample.is_finite() {
+        return 0;
+    }
     (sample.clamp(-1.0, 1.0) * I24_MAX) as i32
 }

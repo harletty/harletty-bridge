@@ -65,7 +65,7 @@ pub(crate) fn float_to_pcm_i32(sample: f32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::PcmStats;
+    use super::{PcmStats, float_to_pcm_i32};
     use abi_stable::std_types::RVec;
     use bridge_api::{RChannelLabel, RDecodedFrame};
 
@@ -107,5 +107,19 @@ mod tests {
         let frame = decoded_frame(16, 2, vec![i32::MAX; 32]);
         let err = PcmStats::from_frame(&frame).expect_err("frame should be rejected");
         assert!(err.starts_with("too_many_near_clip_samples"));
+    }
+
+    /// The output boundary must map non-finite decoder output to silence and
+    /// clamp everything else to 24-bit full scale — this is the last guard
+    /// between a decoder bug and the user's speakers.
+    #[test]
+    fn float_to_pcm_i32_guards_non_finite_and_out_of_range_samples() {
+        assert_eq!(float_to_pcm_i32(f32::NAN), 0);
+        assert_eq!(float_to_pcm_i32(f32::INFINITY), 0);
+        assert_eq!(float_to_pcm_i32(f32::NEG_INFINITY), 0);
+        assert_eq!(float_to_pcm_i32(1.0e9), 8_388_607);
+        assert_eq!(float_to_pcm_i32(-1.0e9), -8_388_607);
+        assert_eq!(float_to_pcm_i32(0.0), 0);
+        assert_eq!(float_to_pcm_i32(0.5), 4_194_303);
     }
 }

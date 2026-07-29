@@ -146,14 +146,7 @@ fn handle_frame(
                 return Ok(());
             }
             Err(err) => {
-                return surface_decode_err(
-                    err,
-                    strict_mode,
-                    tx,
-                    pb,
-                    &mut state.frame_count,
-                    &frame.info(),
-                );
+                return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());
             }
         }
     }
@@ -194,14 +187,7 @@ fn handle_frame(
                     return Ok(());
                 }
                 Err(err) => {
-                    return surface_decode_err(
-                        err,
-                        strict_mode,
-                        tx,
-                        pb,
-                        &mut state.frame_count,
-                        &frame.info(),
-                    );
+                    return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());
                 }
             }
         }
@@ -220,14 +206,7 @@ fn handle_frame(
             // No JOC — fall through to core PCM decode.
         }
         Err(err) => {
-            return surface_decode_err(
-                err,
-                strict_mode,
-                tx,
-                pb,
-                &mut state.frame_count,
-                &frame.info(),
-            );
+            return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());
         }
     }
 
@@ -239,14 +218,7 @@ fn handle_frame(
             let _ = tx.send(Ok(Eac3FrameMessage::Core(result)));
         }
         Err(err) => {
-            return surface_decode_err(
-                err,
-                strict_mode,
-                tx,
-                pb,
-                &mut state.frame_count,
-                &frame.info(),
-            );
+            return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());
         }
     }
     Ok(())
@@ -269,14 +241,7 @@ fn handle_ac3_core_pair(
     let dep_info = match inspect_access_unit(bytes) {
         Ok(info) => info,
         Err(err) => {
-            return surface_decode_err(
-                err,
-                strict_mode,
-                tx,
-                pb,
-                &mut state.frame_count,
-                &frame.info(),
-            );
+            return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());
         }
     };
 
@@ -295,14 +260,7 @@ fn handle_ac3_core_pair(
                 // No object payload after all — fall through to the channel bed.
             }
             Err(err) => {
-                return surface_decode_err(
-                    err,
-                    strict_mode,
-                    tx,
-                    pb,
-                    &mut state.frame_count,
-                    &frame.info(),
-                );
+                return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());
             }
         }
     }
@@ -338,15 +296,27 @@ fn surface_decode_err(
     strict_mode: bool,
     tx: &mpsc::Sender<Result<Eac3FrameMessage>>,
     pb: &Option<ProgressBar>,
-    frame_count: &mut u64,
+    state: &mut DecoderState,
     info: &eac3::FrameInfo,
 ) -> Result<()> {
+    // The frame that failed is dropped from every decoder's point of view, so
+    // this is a stream discontinuity: cross-frame state (IMDCT overlap-add
+    // delay, coupling/SPX reuse flags, JOC differential state) must not be
+    // carried into the frames that follow, and buffered partial pairs are
+    // stale.
+    state.object_decoder.reset();
+    state.pcm_decoder.reset();
+    state.ac3_core_decoder.reset();
+    state.dependent_pcm_decoder.reset();
+    state.pending_independent_core = None;
+    state.pending_ac3_core = None;
+
     let msg = format!("{err:?}");
     if strict_mode {
         return Err(anyhow::anyhow!("EAC3 decode error: {msg}"));
     }
     log::warn!("EAC3 decode error (substituting silence): {msg}");
-    *frame_count += 1;
+    state.frame_count += 1;
     tick_progress(pb);
     let _ = tx.send(Ok(Eac3FrameMessage::Silence {
         sample_count: info.samples as usize,
