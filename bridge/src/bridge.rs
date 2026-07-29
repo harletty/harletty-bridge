@@ -44,9 +44,18 @@ pub(crate) struct Eac3DiagStats {
     /// Standalone AC-3 cores (plain AC-3, no dependent) emitted as 5.1 beds.
     pub(crate) standalone_ac3_core_beds: u64,
     pub(crate) short_packet_silence_frames: u64,
+    /// Dependent frames evicted because the pending queue hit its bound
+    /// (their AC-3 cores kept failing to decode).
+    pub(crate) dependent_frames_dropped: u64,
     pub(crate) last_ac3_core_decode_error: Option<String>,
     pub(crate) last_dependent_pair_error: Option<String>,
 }
+
+/// Upper bound on buffered dependent access units awaiting an AC-3 core
+/// partner. In a healthy stream the queue never holds more than one entry;
+/// it only grows while cores fail to decode, so keep a small window and drop
+/// the oldest beyond it.
+const MAX_PENDING_DEPENDENT_FRAMES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum DrcMode {
@@ -442,6 +451,18 @@ impl AtmosBridge {
         }
 
         let decode_result = if is_dependent_eac3_frame(frame) {
+            // A dependent is normally paired with its core immediately, so the
+            // queue holds at most one entry. It only grows when cores keep
+            // failing to decode; bound it so a corrupt stream cannot grow it
+            // without limit for the whole playback session.
+            while self.pending_dependent_frames.len() >= MAX_PENDING_DEPENDENT_FRAMES {
+                self.pending_dependent_frames.pop_front();
+                self.eac3_diag_stats.dependent_frames_dropped += 1;
+                bridge_diag_log(
+                    log::Level::Warn,
+                    "eac3_dependent_queue_overflow dropping oldest pending dependent frame",
+                );
+            }
             self.pending_dependent_frames.push_back(frame.to_vec());
             match self.try_decode_pending_eac3_pair() {
                 Some(decoded_frame) => Ok(decoded_frame),

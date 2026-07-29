@@ -174,6 +174,14 @@ impl PcmDecoder {
     /// Reset all cross-frame decode state.
     pub fn reset(&mut self) {
         self.frames_seen = 0;
+        self.reset_decode_state();
+    }
+
+    /// Reset the cross-frame bitstream state (IMDCT overlap-add delay, block
+    /// syntax, metadata sequencing) without touching `frames_seen`. A failed
+    /// decode can leave this state partially mutated, so it must never be
+    /// carried into the next frame.
+    fn reset_decode_state(&mut self) {
         self.aux_state.reset();
         self.core_state.reset();
         self.metadata_state.reset();
@@ -208,7 +216,17 @@ impl PcmDecoder {
     }
 
     /// Decode one complete access unit into core PCM.
+    ///
+    /// On `Err`, the decoder's cross-frame state is reset: a failed decode may
+    /// have left it partially mutated, and reusing it would corrupt every
+    /// following frame (stale IMDCT overlap-add delay, stale coupling state).
     pub fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<PcmPushResult, ParseError> {
+        self.push_access_unit_inner(access_unit).inspect_err(|_| {
+            self.reset_decode_state();
+        })
+    }
+
+    fn push_access_unit_inner(&mut self, access_unit: &[u8]) -> Result<PcmPushResult, ParseError> {
         self.apply_debug_log_level();
         let info = inspect_access_unit_with_metadata_state(
             access_unit,
@@ -239,7 +257,20 @@ impl PcmDecoder {
     }
 
     /// Decode one complete legacy AC-3 syncframe into core PCM.
+    ///
+    /// On `Err`, the decoder's cross-frame state is reset (see
+    /// [`PcmDecoder::push_access_unit`]).
     pub fn push_legacy_ac3_access_unit(
+        &mut self,
+        access_unit: &[u8],
+    ) -> Result<PcmPushResult, ParseError> {
+        self.push_legacy_ac3_access_unit_inner(access_unit)
+            .inspect_err(|_| {
+                self.reset_decode_state();
+            })
+    }
+
+    fn push_legacy_ac3_access_unit_inner(
         &mut self,
         access_unit: &[u8],
     ) -> Result<PcmPushResult, ParseError> {
@@ -305,6 +336,12 @@ impl ObjectPcmDecoder {
     /// Reset all cross-frame decode state.
     pub fn reset(&mut self) {
         self.frames_seen = 0;
+        self.reset_decode_state();
+    }
+
+    /// Reset the cross-frame bitstream state without touching `frames_seen`
+    /// (see [`PcmDecoder`]'s private counterpart).
+    fn reset_decode_state(&mut self) {
         self.aux_state.reset();
         self.core_state.reset();
         self.joc_state.reset();
@@ -337,7 +374,19 @@ impl ObjectPcmDecoder {
     ///
     /// Returns `Ok(None)` when the frame is valid E-AC-3 but does not contain the object payloads
     /// needed for this stage.
+    ///
+    /// On `Err`, the decoder's cross-frame state is reset (see
+    /// [`PcmDecoder::push_access_unit`]).
     pub fn push_access_unit(
+        &mut self,
+        access_unit: &[u8],
+    ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
+        self.push_access_unit_inner(access_unit).inspect_err(|_| {
+            self.reset_decode_state();
+        })
+    }
+
+    fn push_access_unit_inner(
         &mut self,
         access_unit: &[u8],
     ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
@@ -397,7 +446,21 @@ impl ObjectPcmDecoder {
     }
 
     /// Decode dynamic object PCM from a dependent access unit using externally decoded core PCM.
+    ///
+    /// On `Err`, the decoder's cross-frame state is reset (see
+    /// [`PcmDecoder::push_access_unit`]).
     pub fn push_access_unit_with_core(
+        &mut self,
+        access_unit: &[u8],
+        core: CorePcmFrame,
+    ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
+        self.push_access_unit_with_core_inner(access_unit, core)
+            .inspect_err(|_| {
+                self.reset_decode_state();
+            })
+    }
+
+    fn push_access_unit_with_core_inner(
         &mut self,
         access_unit: &[u8],
         core: CorePcmFrame,
