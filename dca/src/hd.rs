@@ -132,18 +132,34 @@ impl HdDecoder {
 
     /// Decode one DTS-HD frame from its core access unit + EXSS substream bytes.
     pub fn decode(&mut self, core_au: &[u8], exss: &[u8]) -> Result<HdFrame, HdError> {
-        // 1) Core (residual base), fixed-point, indexed by speaker.
+        // 1) Core bitstream decode (the residual base).
         let info = parse_header(core_au)?;
         self.core
             .decode_frame(&info, core_au)
             .map_err(|_| HdError::Core)?;
-        let core_out = self.synth.synthesize_fixed_by_speaker(&mut self.core);
 
         // 2) EXSS → locate XLL asset.
         let mut exssp = ExssParser::parse(exss).map_err(|_| HdError::Exss)?;
 
-        // 3) XLL lossless decode, combined with the core residual.
-        match self.xll.decode(exss, &exssp.asset, Some(&core_out)) {
+        // 3) Parse XLL before synthesizing the core: the core must be rendered at
+        // the XLL's rate for the residual to line up.
+        match self.xll.parse(exss, &exssp.asset) {
+            Ok(()) => {}
+            Err(XllError::Eagain) => return Err(HdError::Pending),
+            Err(e) => return Err(HdError::Xll(format!("{e:?}"))),
+        }
+
+        // 4) A 96 kHz channel set over a 48 kHz core is rendered through the
+        // 64-band bank so both sides carry the same rate and sample count. There
+        // is no X96 payload involved — this is pure oversampling of the core.
+        let x96_synth =
+            self.xll.primary_freq() == Some(96_000) && self.core.sample_rate() == 48_000;
+        let core_out = self
+            .synth
+            .synthesize_fixed_by_speaker(&mut self.core, x96_synth);
+
+        // 5) Combine the lossless XLL bands with the core residual.
+        match self.xll.filter(Some(&core_out)) {
             Ok(()) => {}
             Err(XllError::Eagain) => return Err(HdError::Pending),
             Err(e) => return Err(HdError::Xll(format!("{e:?}"))),
