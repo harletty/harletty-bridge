@@ -17,6 +17,7 @@ pub use metadata::{
 };
 pub use pcm::{
     CorePcmFrame, ObjectPcmDecoder, ObjectPcmFrame, ObjectPcmPushResult, PcmDecoder, PcmPushResult,
+    dependent_chanmap_positions, merge_core_with_dependent,
 };
 pub use syncframe::{
     AccessUnitInfo, AudioFrameInfo, AuxParseStatus, BlockDrcInfo, EmdfBlockInfo, EmdfPayloadInfo,
