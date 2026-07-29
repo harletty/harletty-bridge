@@ -961,6 +961,9 @@ mod tests {
             audio_frame: AudioFrameInfo {
                 exponent_strategies_embedded: true,
                 adaptive_hybrid_transform_enabled: false,
+                coupling_uses_aht: false,
+                channel_uses_aht: Vec::new(),
+                lfe_uses_aht: false,
                 snr_offset_strategy: 0,
                 transient_processing_enabled: false,
                 block_switching_enabled: false,
