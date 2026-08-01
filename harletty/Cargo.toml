@@ -20,8 +20,8 @@ path = "src/main.rs"
 # Omniphony bridge ABI: this stays a pure offline tool. CI asserts the mirror
 # invariant (no damf/clap/indicatif reachable from harletty-bridge).
 [dependencies]
-truehdd-macros = { version = "0.7.3", path = "../truehdd-macros" }
-truehd = { version = "0.7.3", path = "../truehd" }
+truehdd-macros = "0.1.1"
+truehd = { version = "0.6.1", features = ["perf"] }
 eac3 = { version = "0.7.3", path = "../eac3" }
 dca = { version = "0.7.3", path = "../dca" }
 damf = { version = "0.7.3", path = "../damf" }
