@@ -16,6 +16,6 @@ crate-type = ["lib"]
 # Nothing here may depend on the bridge ABI or on any CLI crate.
 [dependencies]
 truehdd-macros = "0.1.1"
-truehd = { version = "0.6.1", features = ["perf"] }
+truehd = { version = "0.6.3", features = ["perf"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml_ng = "0.10"
