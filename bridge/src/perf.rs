@@ -83,8 +83,6 @@ pub(crate) struct PerfStats {
     build_labels: StageStat,
     build_metadata: StageStat,
     build_metadata_events: StageStat,
-    build_metadata_bed_indices: StageStat,
-    build_metadata_name_updates: StageStat,
     packets_raw: u64,
     packets_iec61937: u64,
     mat_payload_bytes: u64,
@@ -211,18 +209,6 @@ impl PerfStats {
         }
     }
 
-    pub(crate) fn record_build_metadata_bed_indices(&mut self, elapsed: Duration) {
-        if self.enabled {
-            self.build_metadata_bed_indices.record(elapsed);
-        }
-    }
-
-    pub(crate) fn record_build_metadata_name_updates(&mut self, elapsed: Duration) {
-        if self.enabled {
-            self.build_metadata_name_updates.record(elapsed);
-        }
-    }
-
     pub(crate) fn note_raw_packet(&mut self, bytes: usize) {
         if self.enabled {
             self.packets_raw += 1;
@@ -287,7 +273,7 @@ impl PerfStats {
             self.metadata_events as f64 / self.metadata_frames as f64
         };
         eprintln!(
-            "harletty-bridge perf @ frame {}: packets raw={} iec61937={} | bytes mat_payload={} mat_chunks={} avg_chunk={:.1} extractor_in={} | mat total {:.2}/{:.2}/{:.2}us chunk {:.2}/{:.2}/{:.2}us | extractor push {:.2}/{:.2}/{:.2}us drain {:.2}/{:.2}/{:.2}us next {:.2}/{:.2}/{:.2}us | parse {:.2}/{:.2}/{:.2}us au {:.2}/{:.2}/{:.2}us dirs {:.2}/{:.2}/{:.2}us segs {:.2}/{:.2}/{:.2}us blocks {:.2}/{:.2}/{:.2}us bh {:.2}/{:.2}/{:.2}us blsb {:.2}/{:.2}/{:.2}us huff {:.2}/{:.2}/{:.2}us checks {:.2}/{:.2}/{:.2}us tail {:.2}/{:.2}/{:.2}us extra {:.2}/{:.2}/{:.2}us decode {:.2}/{:.2}/{:.2}us | build total {:.2}/{:.2}/{:.2}us pcm {:.2}/{:.2}/{:.2}us labels {:.2}/{:.2}/{:.2}us metadata {:.2}/{:.2}/{:.2}us events {:.2}/{:.2}/{:.2}us beds {:.2}/{:.2}/{:.2}us names {:.2}/{:.2}/{:.2}us | frames built={} dup={} metadata_frames={} avg_events={:.2}",
+            "harletty-bridge perf @ frame {}: packets raw={} iec61937={} | bytes mat_payload={} mat_chunks={} avg_chunk={:.1} extractor_in={} | mat total {:.2}/{:.2}/{:.2}us chunk {:.2}/{:.2}/{:.2}us | extractor push {:.2}/{:.2}/{:.2}us drain {:.2}/{:.2}/{:.2}us next {:.2}/{:.2}/{:.2}us | parse {:.2}/{:.2}/{:.2}us au {:.2}/{:.2}/{:.2}us dirs {:.2}/{:.2}/{:.2}us segs {:.2}/{:.2}/{:.2}us blocks {:.2}/{:.2}/{:.2}us bh {:.2}/{:.2}/{:.2}us blsb {:.2}/{:.2}/{:.2}us huff {:.2}/{:.2}/{:.2}us checks {:.2}/{:.2}/{:.2}us tail {:.2}/{:.2}/{:.2}us extra {:.2}/{:.2}/{:.2}us decode {:.2}/{:.2}/{:.2}us | build total {:.2}/{:.2}/{:.2}us pcm {:.2}/{:.2}/{:.2}us labels {:.2}/{:.2}/{:.2}us metadata {:.2}/{:.2}/{:.2}us events {:.2}/{:.2}/{:.2}us | frames built={} dup={} metadata_frames={} avg_events={:.2}",
             frame_count,
             self.packets_raw,
             self.packets_iec61937,
@@ -361,12 +347,6 @@ impl PerfStats {
             self.build_metadata_events.avg_us(),
             self.build_metadata_events.p95_us(),
             self.build_metadata_events.max_us(),
-            self.build_metadata_bed_indices.avg_us(),
-            self.build_metadata_bed_indices.p95_us(),
-            self.build_metadata_bed_indices.max_us(),
-            self.build_metadata_name_updates.avg_us(),
-            self.build_metadata_name_updates.p95_us(),
-            self.build_metadata_name_updates.max_us(),
             self.frames_built,
             self.duplicate_frames,
             self.metadata_frames,
@@ -416,10 +396,6 @@ impl PerfStats {
     pub(crate) fn record_build_metadata(&mut self, _elapsed: ()) {}
 
     pub(crate) fn record_build_metadata_events(&mut self, _elapsed: ()) {}
-
-    pub(crate) fn record_build_metadata_bed_indices(&mut self, _elapsed: ()) {}
-
-    pub(crate) fn record_build_metadata_name_updates(&mut self, _elapsed: ()) {}
 
     pub(crate) fn note_raw_packet(&mut self, _bytes: usize) {}
 
