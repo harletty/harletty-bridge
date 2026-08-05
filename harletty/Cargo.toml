@@ -21,7 +21,7 @@ path = "src/main.rs"
 # invariant (no damf/clap/indicatif reachable from harletty-bridge).
 [dependencies]
 truehdd-macros = "0.1.1"
-truehd = { version = "0.6.3", features = ["perf"] }
+truehd = { version = "0.6.3" }
 eac3 = { version = "0.7.3", path = "../eac3" }
 dca = { version = "0.7.3", path = "../dca" }
 damf = { version = "0.7.3", path = "../damf" }
