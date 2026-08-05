@@ -313,7 +313,7 @@ pub(crate) fn build_metadata_frame_from_oamd(
     evo_base: u64,
     frame_sample_pos: u64,
     declared_object_channels: &mut Option<RVec<bridge_api::RObjectChannel>>,
-    #[cfg(feature = "bridge-perf")] perf: &mut crate::perf::BridgePerf,
+    #[cfg(feature = "bridge-perf")] perf: &mut crate::perf::PerfStats,
 ) -> RMetadataFrame {
     #[cfg(feature = "bridge-perf")]
     let events_started = Instant::now();
