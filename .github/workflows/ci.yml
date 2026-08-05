@@ -52,6 +52,14 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
 
+      # The bridge-perf timing path is compiled by nothing else — it rotted
+      # unnoticed once already (#31) — so keep it building.
+      - name: Check bridge-perf feature
+        run: cargo check -p harletty-bridge --features bridge-perf --all-targets
+        working-directory: harletty-bridge
+        env:
+          RUSTFLAGS: -D warnings
+
       # The workspace builds two artifacts — the realtime plugin and the
       # offline truehdd CLI — and their isolation is by crate graph, not
       # feature flags. Nothing in a normal build or test run would notice the
