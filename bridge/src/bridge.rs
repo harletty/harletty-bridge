@@ -821,12 +821,20 @@ impl FormatBridge for AtmosBridge {
     }
 
     fn vbap_cartesian_defaults(&self) -> RVbapCartesianDefaults {
-        // Balanced default grid size for runtime cartesian VBAP table generation.
+        // Balanced default grid size for runtime cartesian VBAP table
+        // generation. The axis sizes mirror the OAMD position quantisation
+        // (x, y on 6 bits / 62, z magnitude on 4 bits / 15).
         RVbapCartesianDefaults {
             x_size: 62,
             y_size: 62,
             z_size: 15,
-            allow_negative_z: false,
+            // The OAMD position decode carries z in [-1, 1] — the bitstream
+            // has an explicit sign bit for below-floor objects — so the
+            // renderer must not clamp z at the panner. Grids without
+            // negative-z cells (the default) clamp such requests onto the
+            // z = 0 plane, which is the pre-existing behaviour; realtime and
+            // polar evaluation render them at their true position.
+            allow_negative_z: true,
         }
     }
 
