@@ -2,6 +2,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use crate::byteorder::{WriteBytesBe, WriteBytesLe};
 use crate::impl_u32_enum;
+use truehd::structs::channel::ChannelLabel as DecodedChannelLabel;
 use truehdd_macros::{ToBytes, caf_chunk_type};
 
 pub fn write_caf_file_header<W: Write>(writer: &mut W) -> io::Result<()> {
@@ -89,6 +90,31 @@ impl ChannelLayout {
             Some(tag) => Self::with_tag(tag),
             None => Self::with_descriptions(labels),
         }
+    }
+
+    /// The layout a decode of `channel_count` channels is in, where the decoder's own
+    /// labels describe every one of them.
+    ///
+    /// They do not always. A spatial presentation reports the labels of its bed alone:
+    /// an LFE-only bed is one label for twelve channels, the other eleven being objects,
+    /// which are not speakers and have no place in a channel layout. A label the
+    /// decoder reports and CoreAudio does not name has the same effect. In either case
+    /// the file is better left saying nothing about its layout than saying something
+    /// untrue, so this returns `None` and the caller decides what to fall back to.
+    pub fn for_decoded_channels(
+        labels: &[DecodedChannelLabel],
+        channel_count: usize,
+    ) -> Option<Self> {
+        if labels.is_empty() || labels.len() != channel_count {
+            return None;
+        }
+
+        let named = labels
+            .iter()
+            .map(|&label| ChannelLabel::for_decoded_label(label))
+            .collect::<Option<Vec<_>>>()?;
+
+        Some(Self::for_channel_labels(&named))
     }
 }
 
@@ -403,6 +429,45 @@ const STANDARD_LAYOUTS: &[(ChannelLayoutTag, &[ChannelLabel])] = {
         ),
     ]
 };
+
+impl ChannelLabel {
+    /// The label naming the same speaker as one the decoder reports.
+    ///
+    /// `Tsl`/`Tsr`, the top side pair, have no CoreAudio label. Reporting the nearest
+    /// one would move a speaker, so they have none here either, and a presentation
+    /// carrying them is left without a stated layout rather than with a wrong one.
+    pub fn for_decoded_label(label: DecodedChannelLabel) -> Option<Self> {
+        use DecodedChannelLabel as D;
+
+        Some(match label {
+            D::L => Self::Left,
+            D::R => Self::Right,
+            D::C => Self::Center,
+            D::LFE => Self::LFEScreen,
+            D::LFE2 => Self::LFE2,
+            // The 5.1 surround pair. CoreAudio names this pair for what a 5.1 layout
+            // puts there, and the back pair separately.
+            D::Ls => Self::LeftSurround,
+            D::Rs => Self::RightSurround,
+            D::Lb => Self::RearSurroundLeft,
+            D::Rb => Self::RearSurroundRight,
+            D::Cb => Self::CenterSurround,
+            D::Lsd => Self::LeftSurroundDirect,
+            D::Rsd => Self::RightSurroundDirect,
+            D::Lsc => Self::LeftCenter,
+            D::Rsc => Self::RightCenter,
+            D::Lw => Self::LeftWide,
+            D::Rw => Self::RightWide,
+            D::Tfl => Self::VerticalHeightLeft,
+            D::Tfc => Self::VerticalHeightCenter,
+            D::Tfr => Self::VerticalHeightRight,
+            D::Tbl => Self::TopBackLeft,
+            D::Tbr => Self::TopBackRight,
+            D::Tc => Self::TopCenterSurround,
+            D::Tsl | D::Tsr => return None,
+        })
+    }
+}
 
 impl ChannelLayoutTag {
     /// The tag whose channel order is exactly `labels`, if one names it.
@@ -940,18 +1005,25 @@ pub struct CAFWriterStats {
 
 /// Helper methods for working with TrueHD streams
 impl<W: Write + Seek> CAFWriter<W> {
-    /// Configure the writer from TrueHD stream parameters
+    /// Configure the writer from decoded stream parameters.
+    ///
+    /// `labels` are the decoder's own, and are what the layout is named from wherever
+    /// they describe every channel of the file. Pass an empty slice for a decoder that
+    /// reports none: the layout then falls back to the order this many channels are
+    /// assumed to decode in, which is a guess and is documented as one.
     pub fn configure_audio_format(
         &mut self,
         sample_rate: u32,
         channels: u32,
         bits_per_channel: u32,
+        labels: &[DecodedChannelLabel],
     ) -> io::Result<()> {
-        // Set audio format
         self.set_audio_format(sample_rate as f64, channels, bits_per_channel)?;
 
-        // Set basic channel layout based on channel count
-        self.set_basic_channel_layout(channels)?;
+        match ChannelLayout::for_decoded_channels(labels, channels as usize) {
+            Some(layout) => self.set_channel_layout(layout),
+            None => self.set_basic_channel_layout(channels)?,
+        }
 
         Ok(())
     }
@@ -1028,7 +1100,7 @@ mod tests {
         let cursor = Cursor::new(buffer);
         let mut writer = CAFWriter::new(cursor);
 
-        writer.configure_audio_format(48000, 2, 24)?;
+        writer.configure_audio_format(48000, 2, 24, &[])?;
         writer.write_header()?;
 
         // Test PCM conversion
@@ -1209,7 +1281,7 @@ mod tests {
         let cursor = Cursor::new(buffer);
         let mut writer = CAFWriter::new(cursor);
 
-        writer.configure_audio_format(48000, 2, 24)?;
+        writer.configure_audio_format(48000, 2, 24, &[])?;
         writer.write_header()?;
 
         // Write some data
@@ -1310,6 +1382,67 @@ mod tests {
         assert_eq!(
             unnamed.channel_descriptions.len(),
             unnamed.number_channel_descriptions as usize
+        );
+    }
+
+    /// The orders this decoder actually reports, measured on real streams: presentation
+    /// 0 is `L R`, 1 is `L R C LFE Ls Rs`, 2 is `L R C LFE Ls Rs Lb Rb`. The last is the
+    /// one a channel count gets wrong — its back pair is a *rear* pair, not the front
+    /// centre pair `MPEG_7_1_A` names.
+    #[test]
+    fn decoded_labels_name_the_layout_the_decoder_reports() {
+        use DecodedChannelLabel as D;
+
+        let tag_for = |labels: &[D], channels: usize| {
+            ChannelLayout::for_decoded_channels(labels, channels).map(|l| l.channel_layout_tag)
+        };
+
+        assert_eq!(tag_for(&[D::L, D::R], 2), Some(ChannelLayoutTag::Stereo));
+        assert_eq!(
+            tag_for(&[D::L, D::R, D::C, D::LFE, D::Ls, D::Rs], 6),
+            Some(ChannelLayoutTag::MPEG_5_1_A)
+        );
+        assert_eq!(
+            tag_for(&[D::L, D::R, D::C, D::LFE, D::Ls, D::Rs, D::Lb, D::Rb], 8),
+            Some(ChannelLayoutTag::MPEG_7_1_C)
+        );
+
+        // Where the labels earn their keep: six channels whose surround pair is a
+        // height pair are not the 5.1 that a channel count would call them. No tag
+        // names that order, so it is spelled out instead.
+        let heights =
+            ChannelLayout::for_decoded_channels(&[D::L, D::R, D::C, D::LFE, D::Tfl, D::Tfr], 6)
+                .unwrap();
+        assert_eq!(
+            heights.channel_layout_tag,
+            ChannelLayoutTag::UseChannelDescriptions
+        );
+        assert_eq!(heights.number_channel_descriptions, 6);
+        assert_eq!(
+            heights.channel_descriptions[4].channel_label,
+            ChannelLabel::VerticalHeightLeft
+        );
+    }
+
+    /// A spatial presentation reports its bed's labels alone. Measured on real streams:
+    /// an LFE-only bed is one label for twelve channels, the other eleven being objects.
+    /// Naming a layout from that would describe eleven objects as speakers.
+    #[test]
+    fn a_layout_is_not_named_from_labels_that_describe_part_of_the_file() {
+        use DecodedChannelLabel as D;
+
+        assert!(
+            ChannelLayout::for_decoded_channels(&[D::LFE], 12).is_none(),
+            "an LFE-only bed with eleven objects states no layout"
+        );
+        assert!(ChannelLayout::for_decoded_channels(&[], 6).is_none());
+        assert!(
+            ChannelLayout::for_decoded_channels(&[D::L, D::R], 6).is_none(),
+            "fewer labels than channels states no layout"
+        );
+        assert!(
+            ChannelLayout::for_decoded_channels(&[D::L, D::R, D::Tsl, D::Tsr], 4).is_none(),
+            "a label CoreAudio cannot name leaves the whole layout unstated"
         );
     }
 }

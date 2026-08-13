@@ -202,7 +202,7 @@ impl Eac3DecodeHandler {
         log::info!("Creating audio file: {}", audio_path.display());
         let writer = match (format, self.has_atmos) {
             (AudioFormat::Caf, _) | (_, true) => {
-                AudioWriter::create_caf(audio_path, sample_rate, channel_count as u32)?
+                AudioWriter::create_caf(audio_path, sample_rate, channel_count as u32, &[])?
             }
             (AudioFormat::W64, false) => {
                 AudioWriter::create_w64(audio_path, sample_rate, channel_count as u32)?

@@ -1,6 +1,7 @@
 use damf::caf::CAFWriter;
 use damf::wav::WAVWriter;
 use anyhow::Result;
+use truehd::structs::channel::ChannelLabel;
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -74,9 +75,17 @@ impl AudioWriter {
         Ok(AudioWriter::Pcm(pcm_writer))
     }
 
-    pub fn create_caf(path: PathBuf, sample_rate: u32, channel_count: u32) -> Result<Self> {
+    /// `labels` are the decoder's own channel labels, from which the file's channel
+    /// layout is named. Pass an empty slice where the decoder reports none, or where
+    /// they do not describe the channels being written.
+    pub fn create_caf(
+        path: PathBuf,
+        sample_rate: u32,
+        channel_count: u32,
+        labels: &[ChannelLabel],
+    ) -> Result<Self> {
         let mut caf_writer = CAFWriter::new(BufWriter::new(File::create(path)?));
-        caf_writer.configure_audio_format(sample_rate, channel_count, 24)?;
+        caf_writer.configure_audio_format(sample_rate, channel_count, 24, labels)?;
         caf_writer.write_header()?;
         Ok(AudioWriter::Caf(caf_writer))
     }
