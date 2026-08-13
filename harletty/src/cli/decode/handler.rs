@@ -675,7 +675,7 @@ impl DecodeHandler {
         };
 
         let mut conf =
-            Configuration::with_oamd_payload(oamd, sample_rate, segment_relative_sample_pos);
+            Configuration::with_oamd_payload(oamd, sample_rate, segment_relative_sample_pos)?;
 
         let (events_diff, remove_header) = if !self.prev_events.is_empty() {
             (

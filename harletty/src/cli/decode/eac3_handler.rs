@@ -263,7 +263,7 @@ impl Eac3DecodeHandler {
         sample_rate: u32,
         base_path: &PathBuf,
     ) -> Result<()> {
-        let mut conf = Configuration::with_oamd_payload(oamd, sample_rate, self.decoded_samples);
+        let mut conf = Configuration::with_oamd_payload(oamd, sample_rate, self.decoded_samples)?;
         let (events_diff, remove_header) = if !self.prev_events.is_empty() {
             (Event::compare_event_vectors(&self.prev_events, &conf.events), true)
         } else {

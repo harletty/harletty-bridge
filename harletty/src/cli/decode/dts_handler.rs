@@ -399,7 +399,7 @@ impl DtsDecodeHandler {
         sample_rate: u32,
         base_path: &PathBuf,
     ) -> Result<()> {
-        let mut conf = Configuration::with_oamd_payload(oamd, sample_rate, self.decoded_samples);
+        let mut conf = Configuration::with_oamd_payload(oamd, sample_rate, self.decoded_samples)?;
         let events_diff = if self.prev_events.is_empty() {
             conf.events.clone()
         } else {
