@@ -114,6 +114,20 @@ impl Default for QuadratureMirrorFilterBank {
     }
 }
 
+/// Number of independent accumulators used by the scalar fallbacks.
+///
+/// A single accumulator makes the dot product latency-bound: every multiply-add
+/// waits on the previous one. Eight partial sums break that chain so the loop
+/// becomes throughput-bound instead. This matters most where no vector unit is
+/// reachable, which is exactly the fallback's job (see [`dot_product`]).
+const SCALAR_ACCUMULATORS: usize = 8;
+
+/// The NEON paths below are gated on `target_arch`, not `target_feature`: only
+/// aarch64 takes them. Every other target — x86_64 included, not just 32-bit ARM
+/// — runs the scalar fallbacks. `-C target-feature=+neon` does not reach this
+/// gate and will not switch a 32-bit ARM build onto the intrinsics; ARMv7
+/// Advanced SIMD is not IEEE-754 conformant for `f32`, so the autovectoriser
+/// declines there as well and the fallbacks are all that runs.
 fn dot_product(lhs: &[f32; QMF_DOUBLE_LENGTH], rhs: &[f32; QMF_DOUBLE_LENGTH]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     {
@@ -127,6 +141,26 @@ fn dot_product(lhs: &[f32; QMF_DOUBLE_LENGTH], rhs: &[f32; QMF_DOUBLE_LENGTH]) -
 
 #[cfg(any(test, not(target_arch = "aarch64")))]
 fn dot_product_scalar(lhs: &[f32], rhs: &[f32]) -> f32 {
+    let len = lhs.len().min(rhs.len());
+    let mut acc = [0.0f32; SCALAR_ACCUMULATORS];
+    let mut index = 0usize;
+    while index + SCALAR_ACCUMULATORS <= len {
+        for (lane, sum) in acc.iter_mut().enumerate() {
+            *sum += lhs[index + lane] * rhs[index + lane];
+        }
+        index += SCALAR_ACCUMULATORS;
+    }
+    let mut sum = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    while index < len {
+        sum += lhs[index] * rhs[index];
+        index += 1;
+    }
+    sum
+}
+
+/// Single-accumulator reference, kept as the yardstick the tests compare against.
+#[cfg(test)]
+fn dot_product_naive(lhs: &[f32], rhs: &[f32]) -> f32 {
     let mut sum = 0.0f32;
     for index in 0..lhs.len() {
         sum += lhs[index] * rhs[index];
@@ -154,13 +188,39 @@ fn dot_product_signed(
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let mut sum = 0.0f32;
-        for index in 0..QMF_SUBBANDS {
-            sum += positive_lhs[index] * positive_rhs[index];
-            sum -= negative_lhs[index] * negative_rhs[index];
-        }
-        sum
+        dot_product_signed_scalar(positive_lhs, positive_rhs, negative_lhs, negative_rhs)
     }
+}
+
+/// Accumulating the positive and negative halves into one running sum chains
+/// every multiply-add against the previous two. Two banks of partial sums keep
+/// the halves independent; they are only combined once, at the end.
+#[cfg(any(test, not(target_arch = "aarch64")))]
+fn dot_product_signed_scalar(
+    positive_lhs: &[f32; QMF_SUBBANDS],
+    positive_rhs: &[f32; QMF_SUBBANDS],
+    negative_lhs: &[f32; QMF_SUBBANDS],
+    negative_rhs: &[f32; QMF_SUBBANDS],
+) -> f32 {
+    const LANES: usize = SCALAR_ACCUMULATORS / 2;
+    let mut positive = [0.0f32; LANES];
+    let mut negative = [0.0f32; LANES];
+    let mut index = 0usize;
+    while index + LANES <= QMF_SUBBANDS {
+        for lane in 0..LANES {
+            positive[lane] += positive_lhs[index + lane] * positive_rhs[index + lane];
+            negative[lane] += negative_lhs[index + lane] * negative_rhs[index + lane];
+        }
+        index += LANES;
+    }
+    let mut sum = ((positive[0] + positive[1]) + (positive[2] + positive[3]))
+        - ((negative[0] + negative[1]) + (negative[2] + negative[3]));
+    while index < QMF_SUBBANDS {
+        sum += positive_lhs[index] * positive_rhs[index];
+        sum -= negative_lhs[index] * negative_rhs[index];
+        index += 1;
+    }
+    sum
 }
 
 fn compute_forward_grouping(window: &[f32], grouping: &mut [f32; QMF_DOUBLE_LENGTH]) {
@@ -493,9 +553,9 @@ mod tests {
             let cache = qmf_cache();
             let mut result = QmfSubbands::zero();
             for subband in 0..QMF_SUBBANDS {
-                result.real[subband] = dot_product_scalar(&cache.forward_real[subband], &grouping);
+                result.real[subband] = dot_product_naive(&cache.forward_real[subband], &grouping);
                 result.imaginary[subband] =
-                    dot_product_scalar(&cache.forward_imaginary[subband], &grouping);
+                    dot_product_naive(&cache.forward_imaginary[subband], &grouping);
             }
             result
         }
@@ -534,6 +594,49 @@ mod tests {
                             * QMF_COEFFS[coeff_pair + sample];
                 }
             }
+        }
+    }
+
+    #[test]
+    fn scalar_dot_products_match_the_single_accumulator_reference() {
+        const TOLERANCE: f32 = 1e-5;
+        let mut seed = 0x0bad_f00d;
+        for _ in 0..64 {
+            let mut lhs = [0.0f32; QMF_DOUBLE_LENGTH];
+            let mut rhs = [0.0f32; QMF_DOUBLE_LENGTH];
+            for index in 0..QMF_DOUBLE_LENGTH {
+                lhs[index] = next_sample(&mut seed);
+                rhs[index] = next_sample(&mut seed);
+            }
+            let actual = dot_product_scalar(&lhs, &rhs);
+            let expected = dot_product_naive(&lhs, &rhs);
+            assert!(
+                (actual - expected).abs() <= TOLERANCE,
+                "dot_product_scalar mismatch: {actual} vs {expected}",
+            );
+
+            let mut positive_lhs = [0.0f32; QMF_SUBBANDS];
+            let mut positive_rhs = [0.0f32; QMF_SUBBANDS];
+            let mut negative_lhs = [0.0f32; QMF_SUBBANDS];
+            let mut negative_rhs = [0.0f32; QMF_SUBBANDS];
+            for index in 0..QMF_SUBBANDS {
+                positive_lhs[index] = next_sample(&mut seed);
+                positive_rhs[index] = next_sample(&mut seed);
+                negative_lhs[index] = next_sample(&mut seed);
+                negative_rhs[index] = next_sample(&mut seed);
+            }
+            let actual = dot_product_signed_scalar(
+                &positive_lhs,
+                &positive_rhs,
+                &negative_lhs,
+                &negative_rhs,
+            );
+            let expected = dot_product_naive(&positive_lhs, &positive_rhs)
+                - dot_product_naive(&negative_lhs, &negative_rhs);
+            assert!(
+                (actual - expected).abs() <= TOLERANCE,
+                "dot_product_signed_scalar mismatch: {actual} vs {expected}",
+            );
         }
     }
 
