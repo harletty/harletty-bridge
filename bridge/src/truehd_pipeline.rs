@@ -150,27 +150,27 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
                     *ctx.current_substream_info = Some(major_sync.substream_info);
                     *ctx.current_extended_substream_info = Some(major_sync.extended_substream_info);
 
-                    // Extract dialogue level.
-                    let cm = &major_sync.channel_meaning;
-                    let dialogue_level: i8 = match ctx.presentation {
-                        0 => -(cm.twoch_dialogue_norm as i8),
-                        1 => -(cm.sixch_dialogue_norm as i8),
-                        2 => -(cm.eightch_dialogue_norm as i8),
-                        3 => {
-                            if let Some(ref extra) = cm.extra_channel_meaning {
-                                -(extra.sixteench_dialogue_norm as i8)
-                            } else {
-                                -(cm.eightch_dialogue_norm as i8)
-                            }
-                        }
-                        _ => -(cm.eightch_dialogue_norm as i8),
-                    };
-                    *ctx.current_dialogue_level = Some(dialogue_level);
-                    log::debug!(
-                        "Dialogue level: {} dBFS (presentation {})",
-                        dialogue_level,
-                        ctx.presentation
-                    );
+                    // Extract dialogue level. The other syntax puts an entirely
+                    // different structure in those bits, so a stream carrying one
+                    // states no dialogue level rather than one read from fields that
+                    // mean nothing of the sort.
+                    if let Some(cm) = major_sync.channel_meaning.fba() {
+                        let dialogue_level: i8 = match ctx.presentation {
+                            0 => -(cm.twoch_dialogue_norm as i8),
+                            1 => -(cm.sixch_dialogue_norm as i8),
+                            3 => match major_sync.channel_meaning.extra_channel_meaning() {
+                                Some(extra) => -(extra.sixteench_dialogue_norm as i8),
+                                None => -(cm.eightch_dialogue_norm as i8),
+                            },
+                            _ => -(cm.eightch_dialogue_norm as i8),
+                        };
+                        *ctx.current_dialogue_level = Some(dialogue_level);
+                        log::debug!(
+                            "Dialogue level: {} dBFS (presentation {})",
+                            dialogue_level,
+                            ctx.presentation
+                        );
+                    }
                 }
 
                 #[cfg(feature = "bridge-perf")]

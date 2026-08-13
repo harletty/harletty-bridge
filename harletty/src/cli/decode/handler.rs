@@ -10,7 +10,27 @@ use log::Level;
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
-use truehd::log_or_err;
+/// Log a failure, or return it where the caller asked for that severity to be fatal.
+///
+/// This was `truehd::log_or_err!` until that macro became parser-internal in all but
+/// name: it now expands to `DiagnosticSink` calls and needs a `&mut` to the sink, which
+/// is machinery a file writer has no business carrying. The behaviour below is the one
+/// the writer has always relied on.
+macro_rules! log_or_err {
+    ($state:expr, $level:expr, $err:expr $(,)?) => {{
+        if $level <= $state.fail_level {
+            return Err($err);
+        }
+
+        match $level {
+            Level::Error => log::error!("{}", $err),
+            Level::Warn => log::warn!("{}", $err),
+            Level::Info => log::info!("{}", $err),
+            Level::Debug => log::debug!("{}", $err),
+            Level::Trace => log::trace!("{}", $err),
+        }
+    }};
+}
 
 struct AudioFormatHandler;
 
