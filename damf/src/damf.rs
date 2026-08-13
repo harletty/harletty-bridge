@@ -227,7 +227,7 @@ impl TrimMode {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TrimOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,13 +248,23 @@ impl TrimOptions {
             return None;
         };
 
-        Some(Self {
+        let options = Self {
             center_trim: trim.trim_centre,
             surround_trim: trim.trim_surround,
             height_trim: trim.trim_height,
             front_back_balance_overhead_floor: trim.bal3d_y_tb,
             front_back_balance_listener: trim.bal3d_y_lis,
-        })
+        };
+
+        // A trim the renderer derives itself carries no value for any of these. The
+        // payload distinguishes it from an absent trim, but the master set has no way
+        // to say "derived", and an empty trim entry states nothing at all — so it is
+        // written as the absence it was written as before that distinction existed.
+        if options == Self::default() {
+            return None;
+        }
+
+        Some(options)
     }
 }
 

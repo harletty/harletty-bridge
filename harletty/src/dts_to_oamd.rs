@@ -257,7 +257,9 @@ pub fn convert_dts(layout: &DtsLayout) -> ObjectAudioMetadataPayload {
         object_element,
         trim_element: None,
         extended_object_element: None,
-        oa_element_md: Vec::new(),
+        // The elements a synthesized payload states nothing about: headphone
+        // rendering intent and per-object dialogue indication.
+        ..Default::default()
     }
 }
 
