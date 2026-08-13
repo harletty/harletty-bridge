@@ -13,3 +13,4 @@ resolver = "2"
 inherits = "release"
 lto = "thin"
 strip = "symbols"
+

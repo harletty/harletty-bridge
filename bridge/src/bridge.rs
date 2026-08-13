@@ -22,7 +22,7 @@ use crate::frame_builders::PcmStats;
 use crate::logging::bridge_diag_log;
 use crate::mat::MatStream;
 use crate::perf::PerfStats;
-use crate::truehd_pipeline::process_extractor_input;
+use crate::truehd_pipeline::{configure_parser, process_extractor_input};
 
 #[derive(Debug, Default)]
 pub(crate) struct Eac3DiagStats {
@@ -204,15 +204,8 @@ impl AtmosBridge {
         } else {
             log::Level::Error
         };
-        parser.set_fail_level(fail_level);
         decoder.set_fail_level(fail_level);
-
-        // Require all presentations up to and including the requested one.
-        let mut required_presentations = [false; MAX_PRESENTATIONS];
-        required_presentations[..=presentation as usize]
-            .iter_mut()
-            .for_each(|p| *p = true);
-        parser.set_required_presentations(&required_presentations);
+        configure_parser(&mut parser, fail_level, presentation);
 
         let eac3_log_level = if strict {
             log::Level::Warn
@@ -321,16 +314,10 @@ impl AtmosBridge {
         } else {
             log::Level::Error
         };
-        self.parser.set_fail_level(fail_level);
         self.decoder.set_fail_level(fail_level);
         self.eac3_pcm_decoder.set_debug_log_level(fail_level);
         self.eac3_object_decoder.set_debug_log_level(fail_level);
-        let mut required_presentations = [false; MAX_PRESENTATIONS];
-        required_presentations[..=self.presentation as usize]
-            .iter_mut()
-            .for_each(|p| *p = true);
-        self.parser
-            .set_required_presentations(&required_presentations);
+        configure_parser(&mut self.parser, fail_level, self.presentation);
         self.declared_object_channels = None;
         self.truehd_spatial_labels = None;
         self.recovering_until_major_sync = false;
