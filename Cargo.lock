@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "damf"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "serde",
  "serde_yaml_ng",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "dca"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "log",
  "rustfft",
@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "eac3"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "log",
  "rustfft",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "harletty"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "harletty-bridge"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "abi_stable",
  "anyhow",
