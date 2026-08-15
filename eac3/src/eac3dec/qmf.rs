@@ -120,6 +120,7 @@ impl Default for QuadratureMirrorFilterBank {
 /// waits on the previous one. Eight partial sums break that chain so the loop
 /// becomes throughput-bound instead. This matters most where no vector unit is
 /// reachable, which is exactly the fallback's job (see [`dot_product`]).
+#[cfg(any(test, not(target_arch = "aarch64")))]
 const SCALAR_ACCUMULATORS: usize = 8;
 
 /// The NEON paths below are gated on `target_arch`, not `target_feature`: only
