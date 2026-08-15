@@ -15,6 +15,37 @@ use crate::logging::{bridge_diag_log, drc_diag_log_enabled, panic_message};
 use crate::metadata::build_metadata_frame_from_oamd;
 use crate::perf::PerfStats;
 
+/// Applies everything a fresh [`Parser`] needs to match this bridge's contract.
+///
+/// The bridge replaces its parser wholesale in three places — construction, pipeline
+/// reset, and parse recovery — and each one used to re-apply the settings itself. A
+/// setting applied in two of the three is a setting that silently reverts at the third,
+/// so they all come from here.
+pub(crate) fn configure_parser(parser: &mut Parser, fail_level: log::Level, presentation: u8) {
+    parser.set_fail_level(fail_level);
+
+    // The byte-domain FIFO depth model answers whether a stream is legal to author on a
+    // disc. A playback decode never asks that: the samples are the same either way, and
+    // the model otherwise accounts every access unit for an answer nothing reads.
+    parser.set_check_fifo(false);
+
+    // Require all presentations up to and including the requested one.
+    let mut required_presentations = [false; MAX_PRESENTATIONS];
+    required_presentations[..=presentation as usize]
+        .iter_mut()
+        .for_each(|p| *p = true);
+    parser.set_required_presentations(&required_presentations);
+}
+
+/// How many branch points the parser may hold before the list is dropped.
+///
+/// The parser records every point the stream's timing restarts at and never forgets
+/// one. A pass over a file reads the list at the end, where its size is bounded by the
+/// file; playback has no end to read it at, and a stream that restarts its timing on
+/// every access unit — a damaged one does — would grow it for as long as it plays.
+/// Nothing here reads the list, so it is emptied once it is past any plausible use.
+const MAX_RETAINED_BRANCHES: usize = 64;
+
 struct DrainContext<'a> {
     extractor: &'a mut Extractor,
     parser: &'a mut Parser,
@@ -43,15 +74,8 @@ impl DrainContext<'_> {
 
         *self.parser = Parser::default();
         *self.decoder = Decoder::default();
-        self.parser.set_fail_level(fail_level);
         self.decoder.set_fail_level(fail_level);
-
-        let mut required_presentations = [false; MAX_PRESENTATIONS];
-        required_presentations[..=self.presentation as usize]
-            .iter_mut()
-            .for_each(|p| *p = true);
-        self.parser
-            .set_required_presentations(&required_presentations);
+        configure_parser(self.parser, fail_level, self.presentation);
 
         *self.current_substream_info = None;
         *self.current_extended_substream_info = None;
@@ -115,6 +139,17 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
                         .record_parse_substats(ctx.parser.last_parse_stats());
                 }
 
+                // Reading the length is a slice length; the list is only ever taken
+                // once it has actually grown, which a stream with no splice in it
+                // never does.
+                if ctx.parser.branches().len() > MAX_RETAINED_BRANCHES {
+                    let dropped = ctx.parser.take_branches().len();
+                    log::debug!(
+                        "dropped {dropped} recorded branch points at frame {}",
+                        ctx.frame_count
+                    );
+                }
+
                 // Track substream info changes and extract dialogue level.
                 let mut substream_info_changed = false;
                 if let Some(major_sync) = &access_unit.major_sync_info {
@@ -150,27 +185,27 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
                     *ctx.current_substream_info = Some(major_sync.substream_info);
                     *ctx.current_extended_substream_info = Some(major_sync.extended_substream_info);
 
-                    // Extract dialogue level.
-                    let cm = &major_sync.channel_meaning;
-                    let dialogue_level: i8 = match ctx.presentation {
-                        0 => -(cm.twoch_dialogue_norm as i8),
-                        1 => -(cm.sixch_dialogue_norm as i8),
-                        2 => -(cm.eightch_dialogue_norm as i8),
-                        3 => {
-                            if let Some(ref extra) = cm.extra_channel_meaning {
-                                -(extra.sixteench_dialogue_norm as i8)
-                            } else {
-                                -(cm.eightch_dialogue_norm as i8)
-                            }
-                        }
-                        _ => -(cm.eightch_dialogue_norm as i8),
-                    };
-                    *ctx.current_dialogue_level = Some(dialogue_level);
-                    log::debug!(
-                        "Dialogue level: {} dBFS (presentation {})",
-                        dialogue_level,
-                        ctx.presentation
-                    );
+                    // Extract dialogue level. The other syntax puts an entirely
+                    // different structure in those bits, so a stream carrying one
+                    // states no dialogue level rather than one read from fields that
+                    // mean nothing of the sort.
+                    if let Some(cm) = major_sync.channel_meaning.fba() {
+                        let dialogue_level: i8 = match ctx.presentation {
+                            0 => -(cm.twoch_dialogue_norm as i8),
+                            1 => -(cm.sixch_dialogue_norm as i8),
+                            3 => match major_sync.channel_meaning.extra_channel_meaning() {
+                                Some(extra) => -(extra.sixteench_dialogue_norm as i8),
+                                None => -(cm.eightch_dialogue_norm as i8),
+                            },
+                            _ => -(cm.eightch_dialogue_norm as i8),
+                        };
+                        *ctx.current_dialogue_level = Some(dialogue_level);
+                        log::debug!(
+                            "Dialogue level: {} dBFS (presentation {})",
+                            dialogue_level,
+                            ctx.presentation
+                        );
+                    }
                 }
 
                 #[cfg(feature = "bridge-perf")]

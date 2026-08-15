@@ -5,6 +5,36 @@ use truehd::structs::oamd::{ObjectAudioMetadataPayload, SpeakerLabels, Trim};
 
 pub const DAMF_VERSION: &str = "0.5.1";
 
+/// An OAMD payload shape the DAMF projection does not implement yet.
+///
+/// These are real streams, not corrupt ones — the projection simply has no reading for
+/// them, and guessing would write a master set that misplaces objects. They used to
+/// abort the process from inside the writer; reporting them lets the caller finalize
+/// whatever it has already written and say what it could not project.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsupportedPayload {
+    /// More than one object info block per payload.
+    MultipleUpdateBlocks(usize),
+    /// More than one bed instance in the program assignment.
+    MultipleBedInstances(usize),
+    /// Intermediate spatial format objects, which carry no per-object position.
+    IsfObjects(usize),
+}
+
+impl Display for UnsupportedPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match *self {
+            Self::MultipleUpdateBlocks(n) => format!("{n} object info blocks"),
+            Self::MultipleBedInstances(n) => format!("{n} bed instances"),
+            Self::IsfObjects(n) => format!("{n} ISF objects"),
+        };
+
+        write!(f, "{what} are not supported yet, please submit a sample")
+    }
+}
+
+impl std::error::Error for UnsupportedPayload {}
+
 /// Identifies the program that produced a master set, written verbatim into
 /// `creationTool` / `creationToolVersion`.
 ///
@@ -197,7 +227,7 @@ impl TrimMode {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TrimOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,13 +248,23 @@ impl TrimOptions {
             return None;
         };
 
-        Some(Self {
+        let options = Self {
             center_trim: trim.trim_centre,
             surround_trim: trim.trim_surround,
             height_trim: trim.trim_height,
             front_back_balance_overhead_floor: trim.bal3d_y_tb,
             front_back_balance_listener: trim.bal3d_y_lis,
-        })
+        };
+
+        // A trim the renderer derives itself carries no value for any of these. The
+        // payload distinguishes it from an absent trim, but the master set has no way
+        // to say "derived", and an empty trim entry states nothing at all — so it is
+        // written as the absence it was written as before that distinction existed.
+        if options == Self::default() {
+            return None;
+        }
+
+        Some(options)
     }
 }
 
@@ -395,6 +435,9 @@ pub struct Configuration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_rate: Option<u32>,
     pub events: Vec<Event>,
+    /// The payload carried no update timing, so it restates what is already in force.
+    #[serde(skip)]
+    pub restates_current_state: bool,
 }
 
 impl Configuration {
@@ -421,13 +464,14 @@ impl Configuration {
         oamd: &ObjectAudioMetadataPayload,
         sample_rate: u32,
         sample_pos: u64,
-    ) -> Self {
+    ) -> Result<Self, UnsupportedPayload> {
         let object_count = oamd.object_count;
         let Some(object_element) = &oamd.object_element else {
-            return Self {
+            return Ok(Self {
                 sample_rate: Some(sample_rate),
                 events: vec![],
-            };
+                restates_current_state: false,
+            });
         };
 
         let pos_vec = oamd.get_damf_pos();
@@ -445,23 +489,31 @@ impl Configuration {
         };
 
         // TODO: implement
-        assert_eq!(
-            object_element.md_update_info.num_obj_info_blocks, 1,
-            "Found multiple update blocks, please submit a sample"
-        );
+        let num_obj_info_blocks = object_element.md_update_info.num_obj_info_blocks;
+        if num_obj_info_blocks != 1 {
+            return Err(UnsupportedPayload::MultipleUpdateBlocks(
+                num_obj_info_blocks,
+            ));
+        }
 
-        assert_eq!(
-            oamd.program_assignment.bed_assignment.len(),
-            1,
-            "Found multiple bed instances, please submit a sample"
-        );
+        let bed_instances = oamd.program_assignment.bed_assignment.len();
+        if bed_instances != 1 {
+            return Err(UnsupportedPayload::MultipleBedInstances(bed_instances));
+        }
 
-        assert_eq!(
-            oamd.program_assignment.num_isf_objects, 0,
-            "Found ISF objects, please submit a sample"
-        );
+        let num_isf_objects = oamd.program_assignment.num_isf_objects;
+        if num_isf_objects != 0 {
+            return Err(UnsupportedPayload::IsfObjects(num_isf_objects));
+        }
 
         let sample_offset = object_element.md_update_info.sample_offset as u64;
+        let restates_current_state = sample_offset == 0
+            && object_element
+                .md_update_info
+                .block_update_info
+                .iter()
+                .all(|block| block.block_offset_factor_bits == 0 && block.ramp_duration == 0);
+
         let ramp_duration =
             object_element.md_update_info.block_update_info[0].ramp_duration as usize;
 
@@ -533,10 +585,11 @@ impl Configuration {
             events.push(event);
         }
 
-        Self {
+        Ok(Self {
             sample_rate: Some(sample_rate),
             events,
-        }
+            restates_current_state,
+        })
     }
 }
 
@@ -678,6 +731,21 @@ impl Event {
             .zip(events2)
             .map(|(event1, event2)| event1.diff(event2))
             .collect()
+    }
+
+    /// A payload that restates values already in force zeroes its timing, which leaves the ramp as
+    /// the only field that moved. A ramp to values that did not change is not an event.
+    pub fn drop_re_asserted_ramps(events: &mut [Event]) {
+        for event in events.iter_mut() {
+            let mut rest = event.clone();
+            rest.id = None;
+            rest.sample_pos = None;
+            rest.ramp_length = None;
+
+            if event.ramp_length == Some(0) && rest == Event::default() {
+                *event = Event::default();
+            }
+        }
     }
 }
 
@@ -1007,4 +1075,98 @@ fn base_name_survives_yaml_formatting() {
             "audio entry mangled for {base_name:?}:\n{yaml}"
         );
     }
+}
+
+/// A payload shape the projection has no reading for must be reported, not asserted.
+/// These are legal streams — an assert took the whole process down and left the caller
+/// with no way to finalize what it had already written. This affected every version.
+#[test]
+fn unsupported_payload_shapes_are_reported_rather_than_asserted() {
+    use truehd::structs::oamd::{BedAssignment, TEST_DATA_TRIM};
+
+    let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
+    assert!(
+        Configuration::with_oamd_payload(&oamd, 48000, 0).is_ok(),
+        "the shape the projection does read must still read"
+    );
+
+    let mut isf = oamd.clone();
+    isf.program_assignment.num_isf_objects = 4;
+    assert!(matches!(
+        Configuration::with_oamd_payload(&isf, 48000, 0),
+        Err(UnsupportedPayload::IsfObjects(4))
+    ));
+
+    let mut beds = oamd.clone();
+    beds.program_assignment
+        .bed_assignment
+        .push(BedAssignment::with_lfe_only());
+    assert!(matches!(
+        Configuration::with_oamd_payload(&beds, 48000, 0),
+        Err(UnsupportedPayload::MultipleBedInstances(2))
+    ));
+}
+
+/// An encoder that has no fresh metadata for a while re-asserts the last payload it sent, with
+/// the timing zeroed. The values are unchanged, so it says nothing new, and it must not turn
+/// into an event: the source never had one there.
+#[test]
+fn a_re_asserted_payload_writes_no_event() {
+    use truehd::structs::oamd::TEST_DATA_TRIM;
+
+    let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
+    let first = Configuration::with_oamd_payload(&oamd, 48000, 0).unwrap();
+
+    let mut repeat = oamd.clone();
+    let update = &mut repeat.object_element.as_mut().unwrap().md_update_info;
+    update.sample_offset = 0;
+    for block in update.block_update_info.iter_mut() {
+        block.block_offset_factor_bits = 0;
+        block.ramp_duration = 0;
+    }
+
+    let mut later = Configuration::with_oamd_payload(&repeat, 48000, 5120).unwrap();
+    assert!(later.restates_current_state);
+
+    let mut events = Event::compare_event_vectors(&first.events, &later.events);
+    Event::drop_re_asserted_ramps(&mut events);
+    later.events = events;
+
+    assert_eq!(
+        later.serialize_events(true),
+        "",
+        "a re-assert of the same values is not an event"
+    );
+}
+
+/// The re-assert rule keys on the values being unchanged, so a payload that zeroes its timing
+/// and moves an object is still an event.
+#[test]
+fn a_re_asserted_payload_still_reports_a_move() {
+    use truehd::structs::oamd::TEST_DATA_TRIM;
+
+    let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
+    let first = Configuration::with_oamd_payload(&oamd, 48000, 0).unwrap();
+
+    let mut repeat = oamd.clone();
+    let object_element = repeat.object_element.as_mut().unwrap();
+
+    let update = &mut object_element.md_update_info;
+    update.sample_offset = 0;
+    for block in update.block_update_info.iter_mut() {
+        block.block_offset_factor_bits = 0;
+        block.ramp_duration = 0;
+    }
+
+    let render = &mut object_element.object_data[1][0].object_render_info;
+    render.pos3d = [0.25, 0.75, 0.5];
+
+    let mut later = Configuration::with_oamd_payload(&repeat, 48000, 5120).unwrap();
+    let mut events = Event::compare_event_vectors(&first.events, &later.events);
+    Event::drop_re_asserted_ramps(&mut events);
+    later.events = events;
+
+    let written = later.serialize_events(true);
+    assert!(written.contains("pos: [-0.5, -0.5, 0.5]"), "{written}");
+    assert!(written.contains("samplePos: 5120"), "{written}");
 }

@@ -2,6 +2,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use crate::byteorder::{WriteBytesBe, WriteBytesLe};
 use crate::impl_u32_enum;
+use truehd::structs::channel::ChannelLabel as DecodedChannelLabel;
 use truehdd_macros::{ToBytes, caf_chunk_type};
 
 pub fn write_caf_file_header<W: Write>(writer: &mut W) -> io::Result<()> {
@@ -44,7 +45,77 @@ pub struct AudioFormat {
 pub struct ChannelLayout {
     pub channel_layout_tag: ChannelLayoutTag,
     pub channel_bitmap: ChannelBitmap,
-    pub chennel_description: Vec<ChennelDescription>,
+    /// How many descriptions follow. The field is part of the chunk whatever the
+    /// layout tag, and a reader that does not find it treats the whole chunk as
+    /// malformed and reports no channel layout at all.
+    pub number_channel_descriptions: u32,
+    pub channel_descriptions: Vec<ChannelDescription>,
+}
+
+impl ChannelLayout {
+    /// A layout named by one of the standard tags.
+    pub fn with_tag(channel_layout_tag: ChannelLayoutTag) -> Self {
+        Self {
+            channel_layout_tag,
+            channel_bitmap: ChannelBitmap::Unused,
+            number_channel_descriptions: 0,
+            channel_descriptions: Vec::new(),
+        }
+    }
+
+    /// A layout spelled out channel by channel, for orders no standard tag names.
+    pub fn with_descriptions(labels: &[ChannelLabel]) -> Self {
+        Self {
+            channel_layout_tag: ChannelLayoutTag::UseChannelDescriptions,
+            channel_bitmap: ChannelBitmap::Unused,
+            number_channel_descriptions: labels.len() as u32,
+            channel_descriptions: labels
+                .iter()
+                .map(|&channel_label| ChannelDescription {
+                    channel_label,
+                    channel_flags: 0,
+                    coordinates: [0.0; 3],
+                })
+                .collect(),
+        }
+    }
+
+    /// The layout that describes `labels`: the standard tag whose channel order they
+    /// match exactly, or a description of each channel when no tag does.
+    ///
+    /// Samples are never reordered to fit a tag, so an order no tag names is described
+    /// rather than relabelled.
+    pub fn for_channel_labels(labels: &[ChannelLabel]) -> Self {
+        match ChannelLayoutTag::for_channel_labels(labels) {
+            Some(tag) => Self::with_tag(tag),
+            None => Self::with_descriptions(labels),
+        }
+    }
+
+    /// The layout a decode of `channel_count` channels is in, where the decoder's own
+    /// labels describe every one of them.
+    ///
+    /// They do not always. A spatial presentation reports the labels of its bed alone:
+    /// an LFE-only bed is one label for twelve channels, the other eleven being objects,
+    /// which are not speakers and have no place in a channel layout. A label the
+    /// decoder reports and CoreAudio does not name has the same effect. In either case
+    /// the file is better left saying nothing about its layout than saying something
+    /// untrue, so this returns `None` and the caller decides what to fall back to.
+    pub fn for_decoded_channels(
+        labels: &[DecodedChannelLabel],
+        channel_count: usize,
+    ) -> Option<Self> {
+        if labels.is_empty() || labels.len() != channel_count {
+            return None;
+        }
+
+        let named = labels
+            .iter()
+            .map(|&label| ChannelLabel::for_decoded_label(label))
+            .collect::<Option<Vec<_>>>()?;
+
+        Some(Self::for_channel_labels(&named))
+    }
 }
 
 #[allow(non_camel_case_types)]
@@ -104,7 +175,7 @@ pub enum ChannelLayoutTag {
     MPEG_6_1_A = (125 << 16) | 7,        // L R C LFE Ls Rs Cs
     MPEG_7_1_A = (126 << 16) | 8,        // L R C LFE Ls Rs Lc Rc
     MPEG_7_1_B = (127 << 16) | 8,        // C Lc Rc L R Ls Rs LFE
-    MPEG_7_1_C = (128 << 16) | 8,        // L R C LFE Ls R Rls Rrs
+    MPEG_7_1_C = (128 << 16) | 8,        // L R C LFE Ls Rs Rls Rrs
     EmagicDefault_7_1 = (129 << 16) | 8, // L R Ls Rs C LFE Lc Rc
     SMPTE_DTV = (130 << 16) | 8,         // L R C LFE Ls Rs Lt Rt
 
@@ -139,6 +210,9 @@ pub enum ChannelLayoutTag {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelBitmap {
+    /// No bitmap. What the field must hold whenever the layout is named by a tag or
+    /// spelled out by descriptions, which is every layout this crate writes.
+    Unused = 0,
     Left = 1 << 0,
     Right = 1 << 1,
     Center = 1 << 2,
@@ -168,7 +242,7 @@ pub enum ChannelBitmap {
 }
 
 #[derive(Debug, Clone, ToBytes)]
-pub struct ChennelDescription {
+pub struct ChannelDescription {
     pub channel_label: ChannelLabel,
     pub channel_flags: u32,
     pub coordinates: [f32; 3],
@@ -251,6 +325,167 @@ pub enum ChannelLabel {
 impl_u32_enum!(ChannelLayoutTag);
 impl_u32_enum!(ChannelBitmap);
 impl_u32_enum!(ChannelLabel);
+
+/// The channel order each standard tag names. A tag says both which speakers are
+/// present and in what order they are interleaved, so it may only be written for an
+/// order that matches one of these entries exactly.
+const STANDARD_LAYOUTS: &[(ChannelLayoutTag, &[ChannelLabel])] = {
+    use ChannelLabel::*;
+    use ChannelLayoutTag as Tag;
+
+    &[
+        (Tag::Mono, &[Center]),
+        (Tag::Stereo, &[Left, Right]),
+        (
+            Tag::Quadraphonic,
+            &[Left, Right, LeftSurround, RightSurround],
+        ),
+        (Tag::MPEG_3_0_A, &[Left, Right, Center]),
+        (Tag::MPEG_3_0_B, &[Center, Left, Right]),
+        (Tag::MPEG_4_0_A, &[Left, Right, Center, CenterSurround]),
+        (Tag::MPEG_4_0_B, &[Center, Left, Right, CenterSurround]),
+        (
+            Tag::MPEG_5_0_A,
+            &[Left, Right, Center, LeftSurround, RightSurround],
+        ),
+        (
+            Tag::MPEG_5_0_B,
+            &[Left, Right, LeftSurround, RightSurround, Center],
+        ),
+        (
+            Tag::MPEG_5_0_C,
+            &[Left, Center, Right, LeftSurround, RightSurround],
+        ),
+        (
+            Tag::MPEG_5_0_D,
+            &[Center, Left, Right, LeftSurround, RightSurround],
+        ),
+        (
+            Tag::MPEG_5_1_A,
+            &[Left, Right, Center, LFEScreen, LeftSurround, RightSurround],
+        ),
+        (
+            Tag::MPEG_5_1_B,
+            &[Left, Right, LeftSurround, RightSurround, Center, LFEScreen],
+        ),
+        (
+            Tag::MPEG_5_1_C,
+            &[Left, Center, Right, LeftSurround, RightSurround, LFEScreen],
+        ),
+        (
+            Tag::MPEG_5_1_D,
+            &[Center, Left, Right, LeftSurround, RightSurround, LFEScreen],
+        ),
+        (
+            Tag::MPEG_6_1_A,
+            &[
+                Left,
+                Right,
+                Center,
+                LFEScreen,
+                LeftSurround,
+                RightSurround,
+                CenterSurround,
+            ],
+        ),
+        (
+            Tag::MPEG_7_1_A,
+            &[
+                Left,
+                Right,
+                Center,
+                LFEScreen,
+                LeftSurround,
+                RightSurround,
+                LeftCenter,
+                RightCenter,
+            ],
+        ),
+        (
+            Tag::MPEG_7_1_B,
+            &[
+                Center,
+                LeftCenter,
+                RightCenter,
+                Left,
+                Right,
+                LeftSurround,
+                RightSurround,
+                LFEScreen,
+            ],
+        ),
+        (
+            Tag::MPEG_7_1_C,
+            &[
+                Left,
+                Right,
+                Center,
+                LFEScreen,
+                LeftSurround,
+                RightSurround,
+                RearSurroundLeft,
+                RearSurroundRight,
+            ],
+        ),
+    ]
+};
+
+impl ChannelLabel {
+    /// The label naming the same speaker as one the decoder reports.
+    ///
+    /// `Tsl`/`Tsr`, the top side pair, have no CoreAudio label. Reporting the nearest
+    /// one would move a speaker, so they have none here either, and a presentation
+    /// carrying them is left without a stated layout rather than with a wrong one.
+    pub fn for_decoded_label(label: DecodedChannelLabel) -> Option<Self> {
+        use DecodedChannelLabel as D;
+
+        Some(match label {
+            D::L => Self::Left,
+            D::R => Self::Right,
+            D::C => Self::Center,
+            D::LFE => Self::LFEScreen,
+            D::LFE2 => Self::LFE2,
+            // The 5.1 surround pair. CoreAudio names this pair for what a 5.1 layout
+            // puts there, and the back pair separately.
+            D::Ls => Self::LeftSurround,
+            D::Rs => Self::RightSurround,
+            D::Lb => Self::RearSurroundLeft,
+            D::Rb => Self::RearSurroundRight,
+            D::Cb => Self::CenterSurround,
+            D::Lsd => Self::LeftSurroundDirect,
+            D::Rsd => Self::RightSurroundDirect,
+            D::Lsc => Self::LeftCenter,
+            D::Rsc => Self::RightCenter,
+            D::Lw => Self::LeftWide,
+            D::Rw => Self::RightWide,
+            D::Tfl => Self::VerticalHeightLeft,
+            D::Tfc => Self::VerticalHeightCenter,
+            D::Tfr => Self::VerticalHeightRight,
+            D::Tbl => Self::TopBackLeft,
+            D::Tbr => Self::TopBackRight,
+            D::Tc => Self::TopCenterSurround,
+            D::Tsl | D::Tsr => return None,
+        })
+    }
+}
+
+impl ChannelLayoutTag {
+    /// The tag whose channel order is exactly `labels`, if one names it.
+    ///
+    /// An order no tag names has no tag: the caller writes descriptions instead. A tag
+    /// that merely has the right channel count would rename the channels the samples
+    /// are actually in, which is how a rear pair ends up in front of the listener.
+    pub fn for_channel_labels(labels: &[ChannelLabel]) -> Option<Self> {
+        if labels.is_empty() {
+            return None;
+        }
+
+        STANDARD_LAYOUTS
+            .iter()
+            .find(|(_, order)| *order == labels)
+            .map(|&(tag, _)| tag)
+    }
+}
 
 /// PCM data type (integer vs floating point)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -630,24 +865,37 @@ impl<W: Write + Seek> CAFWriter<W> {
         self.channel_layout = Some(layout);
     }
 
-    /// Create a basic channel layout for common configurations
+    /// Create a channel layout from the channel count alone, assuming the order a
+    /// TrueHD presentation decodes in.
+    ///
+    /// A count cannot tell one order from another — `L R C LFE Ls Rs` and
+    /// `L R Ls Rs C LFE` are both six channels — so this states the order it assumes
+    /// and derives the tag from it. Prefer [`Self::set_channel_layout`] with
+    /// [`ChannelLayout::for_channel_labels`] wherever the decoded labels are at hand.
     pub fn set_basic_channel_layout(&mut self, channels: u32) -> io::Result<()> {
-        let layout_tag = match channels {
-            1 => ChannelLayoutTag::Mono,
-            2 => ChannelLayoutTag::Stereo,
-            3 => ChannelLayoutTag::MPEG_3_0_A, // L R C
-            4 => ChannelLayoutTag::Quadraphonic,
-            5 => ChannelLayoutTag::MPEG_5_0_A, // L R C Ls Rs
-            6 => ChannelLayoutTag::MPEG_5_1_A, // L R C LFE Ls Rs
-            8 => ChannelLayoutTag::MPEG_7_1_A, // L R C LFE Ls Rs Lc Rc
-            _ => return Ok(()),                // No standard layout for this channel count
+        use ChannelLabel::*;
+
+        let assumed_order: &[ChannelLabel] = match channels {
+            1 => &[Center],
+            2 => &[Left, Right],
+            3 => &[Left, Right, Center],
+            4 => &[Left, Right, LeftSurround, RightSurround],
+            5 => &[Left, Right, Center, LeftSurround, RightSurround],
+            6 => &[Left, Right, Center, LFEScreen, LeftSurround, RightSurround],
+            8 => &[
+                Left,
+                Right,
+                Center,
+                LFEScreen,
+                LeftSurround,
+                RightSurround,
+                RearSurroundLeft,
+                RearSurroundRight,
+            ],
+            _ => return Ok(()), // No standard layout for this channel count
         };
 
-        self.channel_layout = Some(ChannelLayout {
-            channel_layout_tag: layout_tag,
-            channel_bitmap: ChannelBitmap::Left, // Not used when layout_tag is set
-            chennel_description: Vec::new(),
-        });
+        self.channel_layout = Some(ChannelLayout::for_channel_labels(assumed_order));
         Ok(())
     }
 
@@ -757,18 +1005,25 @@ pub struct CAFWriterStats {
 
 /// Helper methods for working with TrueHD streams
 impl<W: Write + Seek> CAFWriter<W> {
-    /// Configure the writer from TrueHD stream parameters
+    /// Configure the writer from decoded stream parameters.
+    ///
+    /// `labels` are the decoder's own, and are what the layout is named from wherever
+    /// they describe every channel of the file. Pass an empty slice for a decoder that
+    /// reports none: the layout then falls back to the order this many channels are
+    /// assumed to decode in, which is a guess and is documented as one.
     pub fn configure_audio_format(
         &mut self,
         sample_rate: u32,
         channels: u32,
         bits_per_channel: u32,
+        labels: &[DecodedChannelLabel],
     ) -> io::Result<()> {
-        // Set audio format
         self.set_audio_format(sample_rate as f64, channels, bits_per_channel)?;
 
-        // Set basic channel layout based on channel count
-        self.set_basic_channel_layout(channels)?;
+        match ChannelLayout::for_decoded_channels(labels, channels as usize) {
+            Some(layout) => self.set_channel_layout(layout),
+            None => self.set_basic_channel_layout(channels)?,
+        }
 
         Ok(())
     }
@@ -845,7 +1100,7 @@ mod tests {
         let cursor = Cursor::new(buffer);
         let mut writer = CAFWriter::new(cursor);
 
-        writer.configure_audio_format(48000, 2, 24)?;
+        writer.configure_audio_format(48000, 2, 24, &[])?;
         writer.write_header()?;
 
         // Test PCM conversion
@@ -1026,7 +1281,7 @@ mod tests {
         let cursor = Cursor::new(buffer);
         let mut writer = CAFWriter::new(cursor);
 
-        writer.configure_audio_format(48000, 2, 24)?;
+        writer.configure_audio_format(48000, 2, 24, &[])?;
         writer.write_header()?;
 
         // Write some data
@@ -1052,5 +1307,142 @@ mod tests {
         assert_eq!(actual_data_size, expected_data_size as u64);
 
         Ok(())
+    }
+
+    /// The `chan` chunk is a layout tag, a bitmap, a description count and then that
+    /// many descriptions. Written without the count, the chunk is malformed and a
+    /// reader reports no channel layout at all rather than the one we meant.
+    #[test]
+    fn chan_chunk_carries_its_description_count() {
+        let tagged = ChannelLayout::with_tag(ChannelLayoutTag::Stereo);
+        let bytes = tagged.chunk_data();
+
+        assert_eq!(bytes.len(), 12, "tag + bitmap + count");
+        assert_eq!(
+            &bytes[0..4],
+            &(ChannelLayoutTag::Stereo as u32).to_be_bytes()
+        );
+        assert_eq!(&bytes[4..8], &0u32.to_be_bytes(), "no stray bitmap bit");
+        assert_eq!(&bytes[8..12], &0u32.to_be_bytes(), "no descriptions");
+
+        let described =
+            ChannelLayout::with_descriptions(&[ChannelLabel::Left, ChannelLabel::Right]);
+        let bytes = described.chunk_data();
+
+        assert_eq!(
+            &bytes[0..4],
+            &(ChannelLayoutTag::UseChannelDescriptions as u32).to_be_bytes()
+        );
+        assert_eq!(&bytes[8..12], &2u32.to_be_bytes());
+        // Each description is a label, its flags and three coordinates.
+        assert_eq!(bytes.len(), 12 + 2 * (4 + 4 + 12));
+    }
+
+    /// A tag names an order, not just a channel count. Eight channels decoded as
+    /// `L R C LFE Ls Rs Rls Rrs` are `MPEG_7_1_C`; `MPEG_7_1_A` ends in a front centre
+    /// pair, which puts the rear surrounds in front of the listener.
+    #[test]
+    fn channel_count_layouts_name_the_order_they_assume() {
+        let layout_for = |channels: u32| {
+            let mut writer = CAFWriter::new(Cursor::new(Vec::new()));
+            writer.set_basic_channel_layout(channels).unwrap();
+            writer.channel_layout.as_ref().map(|l| l.channel_layout_tag)
+        };
+
+        assert_eq!(layout_for(8), Some(ChannelLayoutTag::MPEG_7_1_C));
+        assert_eq!(layout_for(6), Some(ChannelLayoutTag::MPEG_5_1_A));
+        assert_eq!(layout_for(2), Some(ChannelLayoutTag::Stereo));
+        assert_eq!(layout_for(7), None, "no standard layout for seven channels");
+    }
+
+    /// Samples are never reordered to fit a tag, so an order no tag names is spelled
+    /// out channel by channel instead of being given the tag that merely has the right
+    /// channel count.
+    #[test]
+    fn an_order_no_tag_names_is_described_rather_than_relabelled() {
+        use ChannelLabel::*;
+
+        let named = ChannelLayout::for_channel_labels(&[
+            Left,
+            Right,
+            LeftSurround,
+            RightSurround,
+            Center,
+            LFEScreen,
+        ]);
+        assert_eq!(named.channel_layout_tag, ChannelLayoutTag::MPEG_5_1_B);
+        assert_eq!(named.number_channel_descriptions, 0);
+
+        let unnamed = ChannelLayout::for_channel_labels(&[Left, Right, LFEScreen]);
+        assert_eq!(
+            unnamed.channel_layout_tag,
+            ChannelLayoutTag::UseChannelDescriptions
+        );
+        assert_eq!(unnamed.number_channel_descriptions, 3);
+        assert_eq!(
+            unnamed.channel_descriptions.len(),
+            unnamed.number_channel_descriptions as usize
+        );
+    }
+
+    /// The orders this decoder actually reports, measured on real streams: presentation
+    /// 0 is `L R`, 1 is `L R C LFE Ls Rs`, 2 is `L R C LFE Ls Rs Lb Rb`. The last is the
+    /// one a channel count gets wrong — its back pair is a *rear* pair, not the front
+    /// centre pair `MPEG_7_1_A` names.
+    #[test]
+    fn decoded_labels_name_the_layout_the_decoder_reports() {
+        use DecodedChannelLabel as D;
+
+        let tag_for = |labels: &[D], channels: usize| {
+            ChannelLayout::for_decoded_channels(labels, channels).map(|l| l.channel_layout_tag)
+        };
+
+        assert_eq!(tag_for(&[D::L, D::R], 2), Some(ChannelLayoutTag::Stereo));
+        assert_eq!(
+            tag_for(&[D::L, D::R, D::C, D::LFE, D::Ls, D::Rs], 6),
+            Some(ChannelLayoutTag::MPEG_5_1_A)
+        );
+        assert_eq!(
+            tag_for(&[D::L, D::R, D::C, D::LFE, D::Ls, D::Rs, D::Lb, D::Rb], 8),
+            Some(ChannelLayoutTag::MPEG_7_1_C)
+        );
+
+        // Where the labels earn their keep: six channels whose surround pair is a
+        // height pair are not the 5.1 that a channel count would call them. No tag
+        // names that order, so it is spelled out instead.
+        let heights =
+            ChannelLayout::for_decoded_channels(&[D::L, D::R, D::C, D::LFE, D::Tfl, D::Tfr], 6)
+                .unwrap();
+        assert_eq!(
+            heights.channel_layout_tag,
+            ChannelLayoutTag::UseChannelDescriptions
+        );
+        assert_eq!(heights.number_channel_descriptions, 6);
+        assert_eq!(
+            heights.channel_descriptions[4].channel_label,
+            ChannelLabel::VerticalHeightLeft
+        );
+    }
+
+    /// A spatial presentation reports its bed's labels alone. Measured on real streams:
+    /// an LFE-only bed is one label for twelve channels, the other eleven being objects.
+    /// Naming a layout from that would describe eleven objects as speakers.
+    #[test]
+    fn a_layout_is_not_named_from_labels_that_describe_part_of_the_file() {
+        use DecodedChannelLabel as D;
+
+        assert!(
+            ChannelLayout::for_decoded_channels(&[D::LFE], 12).is_none(),
+            "an LFE-only bed with eleven objects states no layout"
+        );
+        assert!(ChannelLayout::for_decoded_channels(&[], 6).is_none());
+        assert!(
+            ChannelLayout::for_decoded_channels(&[D::L, D::R], 6).is_none(),
+            "fewer labels than channels states no layout"
+        );
+        assert!(
+            ChannelLayout::for_decoded_channels(&[D::L, D::R, D::Tsl, D::Tsr], 4).is_none(),
+            "a label CoreAudio cannot name leaves the whole layout unstated"
+        );
     }
 }

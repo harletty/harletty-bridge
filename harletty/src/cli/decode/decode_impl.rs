@@ -143,6 +143,7 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
                         decoded.sampling_frequency,
                         decoded.channel_count,
                         args.bed_conform,
+                        &decoded.channel_labels,
                     )?;
                     handler.is_segmented = true; // Mark that we're now in segmented mode
                 }

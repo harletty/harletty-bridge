@@ -462,7 +462,10 @@ impl<'a> PresentationBuilder<'a> {
         major_sync: &'a truehd::structs::sync::MajorSyncInfo,
         access_unit: &'a AccessUnit,
     ) -> Self {
-        let presentation_map = PresentationMap::with_substream_info(
+        // `with_substream_info` is the derivation of one syntax alone, and applying it
+        // to the other invents presentations the stream does not declare.
+        let presentation_map = PresentationMap::for_format_sync(
+            major_sync.format_sync,
             major_sync.substream_info,
             major_sync.extended_substream_info,
         );
@@ -517,10 +520,14 @@ impl<'a> PresentationBuilder<'a> {
 
     fn configure_twoch_presentation(&self, presentation: &mut PresentationInfo) {
         let format_info = &self.major_sync.format_info;
-        let channel_meaning = &self.major_sync.channel_meaning;
 
         presentation.twoch_format =
             Some(ChannelGroup::from_modifier(format_info.twoch_decoder_channel_modifier).unwrap());
+
+        let Some(channel_meaning) = self.major_sync.channel_meaning.fba() else {
+            return;
+        };
+
         presentation.control = Some(channel_meaning.twoch_control_enabled);
         presentation.dialogue_level = -(channel_meaning.twoch_dialogue_norm as i8);
         presentation.mix_level = channel_meaning.twoch_mix_level + 70;
@@ -528,7 +535,6 @@ impl<'a> PresentationBuilder<'a> {
 
     fn configure_sixch_presentation(&self, presentation: &mut PresentationInfo) {
         let format_info = &self.major_sync.format_info;
-        let channel_meaning = &self.major_sync.channel_meaning;
 
         let assignment = format_info.sixch_decoder_channel_assignment;
         if assignment == 1 {
@@ -551,6 +557,11 @@ impl<'a> PresentationBuilder<'a> {
 
         presentation.assignments =
             ChannelLabel::from_sixch_channel(format_info.sixch_decoder_channel_assignment).unwrap();
+
+        let Some(channel_meaning) = self.major_sync.channel_meaning.fba() else {
+            return;
+        };
+
         presentation.control = Some(channel_meaning.sixch_control_enabled);
         presentation.dialogue_level = -(channel_meaning.sixch_dialogue_norm as i8);
         presentation.mix_level = channel_meaning.sixch_mix_level + 70;
@@ -558,22 +569,24 @@ impl<'a> PresentationBuilder<'a> {
 
     fn configure_eightch_presentation(&self, presentation: &mut PresentationInfo) {
         let format_info = &self.major_sync.format_info;
-        let channel_meaning = &self.major_sync.channel_meaning;
 
         presentation.assignments = ChannelLabel::from_eightch_channel(
             format_info.eightch_decoder_channel_assignment,
             self.major_sync.flags,
         )
         .unwrap();
+
+        let Some(channel_meaning) = self.major_sync.channel_meaning.fba() else {
+            return;
+        };
+
         presentation.control = Some(channel_meaning.eightch_control_enabled);
         presentation.dialogue_level = -(channel_meaning.eightch_dialogue_norm as i8);
         presentation.mix_level = channel_meaning.eightch_mix_level + 70;
     }
 
     fn configure_sixteench_presentation(&self, presentation: &mut PresentationInfo) {
-        let channel_meaning = &self.major_sync.channel_meaning;
-
-        let Some(extra) = &channel_meaning.extra_channel_meaning else {
+        let Some(extra) = self.major_sync.channel_meaning.extra_channel_meaning() else {
             return;
         };
 

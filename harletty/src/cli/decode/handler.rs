@@ -10,7 +10,29 @@ use log::Level;
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
-use truehd::log_or_err;
+use truehd::structs::channel::ChannelLabel;
+
+/// Log a failure, or return it where the caller asked for that severity to be fatal.
+///
+/// This was `truehd::log_or_err!` until that macro became parser-internal in all but
+/// name: it now expands to `DiagnosticSink` calls and needs a `&mut` to the sink, which
+/// is machinery a file writer has no business carrying. The behaviour below is the one
+/// the writer has always relied on.
+macro_rules! log_or_err {
+    ($state:expr, $level:expr, $err:expr $(,)?) => {{
+        if $level <= $state.fail_level {
+            return Err($err);
+        }
+
+        match $level {
+            Level::Error => log::error!("{}", $err),
+            Level::Warn => log::warn!("{}", $err),
+            Level::Info => log::info!("{}", $err),
+            Level::Debug => log::debug!("{}", $err),
+            Level::Trace => log::trace!("{}", $err),
+        }
+    }};
+}
 
 struct AudioFormatHandler;
 
@@ -359,12 +381,21 @@ impl DecodeHandler {
             channel_count
         };
 
+        // Bed conformance rewrites the channels into a layout of its own, so the
+        // decoder's labels no longer describe the file being written.
+        let channel_labels: &[ChannelLabel] = if effective_channel_count == channel_count {
+            &decoded.channel_labels
+        } else {
+            &[]
+        };
+
         self.create_audio_writer_if_needed(
             ctx.base_path,
             ctx.format,
             ctx.no_audio,
             sample_rate,
             effective_channel_count,
+            channel_labels,
         )?;
 
         if !ctx.no_audio {
@@ -626,10 +657,13 @@ impl DecodeHandler {
             conformed_channel_count,
         );
 
+        // The samples have just been re-laid-out into the conformed bed, so the
+        // decoder's labels describe an order this file is no longer in.
         let mut caf_writer = AudioWriter::create_caf(
             new_path.to_path_buf(),
             sample_rate as u32,
             conformed_channel_count as u32,
+            &[],
         )?;
         caf_writer.write_pcm_samples(&conformed_samples, conformed_channel_count)?;
         caf_writer.finish()?;
@@ -675,9 +709,9 @@ impl DecodeHandler {
         };
 
         let mut conf =
-            Configuration::with_oamd_payload(oamd, sample_rate, segment_relative_sample_pos);
+            Configuration::with_oamd_payload(oamd, sample_rate, segment_relative_sample_pos)?;
 
-        let (events_diff, remove_header) = if !self.prev_events.is_empty() {
+        let (mut events_diff, remove_header) = if !self.prev_events.is_empty() {
             (
                 Event::compare_event_vectors(&self.prev_events, &conf.events),
                 true,
@@ -685,6 +719,10 @@ impl DecodeHandler {
         } else {
             (conf.events.clone(), false)
         };
+
+        if conf.restates_current_state && remove_header {
+            Event::drop_re_asserted_ramps(&mut events_diff);
+        }
 
         self.prev_events = conf.events.clone();
         conf.events = events_diff;
@@ -714,6 +752,7 @@ impl DecodeHandler {
         no_audio: bool,
         sample_rate: u32,
         channel_count: usize,
+        channel_labels: &[ChannelLabel],
     ) -> Result<()> {
         if no_audio {
             return Ok(());
@@ -744,6 +783,7 @@ impl DecodeHandler {
                             audio_path,
                             sample_rate,
                             channel_count as u32,
+                            channel_labels,
                         )?);
                     }
                     AudioFormat::Pcm => {
@@ -845,6 +885,7 @@ impl DecodeHandler {
         sample_rate: u32,
         channel_count: usize,
         bed_conform: bool,
+        channel_labels: &[ChannelLabel],
     ) -> Result<()> {
         if let Some(base_path) = base_path {
             log::info!(
@@ -897,6 +938,14 @@ impl DecodeHandler {
                 channel_count
             };
 
+            // Bed conformance rewrites the channels into a layout of its own, so the
+            // decoder's labels no longer describe the file being written.
+            let channel_labels: &[ChannelLabel] = if effective_channel_count == channel_count {
+                channel_labels
+            } else {
+                &[]
+            };
+
             if !no_audio {
                 // Create new audio writer based on format
                 let audio_writer = match format {
@@ -905,6 +954,7 @@ impl DecodeHandler {
                         new_audio_path.clone(),
                         sample_rate,
                         effective_channel_count as u32,
+                        channel_labels,
                     )?,
                     AudioFormat::W64 => AudioWriter::create_w64(
                         new_audio_path.clone(),
