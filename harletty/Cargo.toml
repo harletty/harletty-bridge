@@ -3,7 +3,7 @@ name = "harletty"
 # Every crate in the workspace shares one version line: they all come from a
 # single commit and are tagged together, so a release number means the same
 # thing everywhere. Bump them together or not at all.
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 license = "Apache-2.0"
 description = "Offline decoder for TrueHD, E-AC-3 JOC and DTS bitstreams, writing Dolby Atmos master files"
@@ -22,9 +22,9 @@ path = "src/main.rs"
 [dependencies]
 truehdd-macros = "0.1.1"
 truehd = { version = "0.7.1" }
-eac3 = { version = "0.7.3", path = "../eac3" }
-dca = { version = "0.7.3", path = "../dca" }
-damf = { version = "0.7.3", path = "../damf" }
+eac3 = { version = "0.7.4", path = "../eac3" }
+dca = { version = "0.7.4", path = "../dca" }
+damf = { version = "0.7.4", path = "../damf" }
 
 anyhow = "1.0.99"
 clap = { version = "4.5.45", features = ["derive"] }
