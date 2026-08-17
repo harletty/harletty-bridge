@@ -2,7 +2,13 @@
 name = "harletty-bridge"
 version = "0.7.4"
 edition = "2024"
-license = "Apache-2.0"
+# The sources in this crate are Apache-2.0 like the rest of the workspace, but
+# the built library links bridge_api, spdif and sys from Omniphony, which are
+# GPL-3.0-or-later. The result is a combined work that can only be distributed
+# under the GPL, so that is what this field states — it describes what you may
+# do with the artifact, not who wrote which line. The CLI (../harletty) has no
+# such dependency and stays Apache-2.0.
+license = "GPL-3.0-or-later"
 
 # cdylib: loadable .so/.dll   rlib: linkable by tests / static fallback
 [lib]

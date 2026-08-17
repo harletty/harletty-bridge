@@ -306,5 +306,22 @@ That is where the hard part was done.
 
 ## License
 
-Apache-2.0. The vendored TrueHD decoder under `truehd/` ships its own
-upstream `LICENSE` and remains © its original author.
+The sources in this repository are **Apache-2.0**. The two things it builds
+are not distributable under the same terms, so they are worth separating:
+
+- **`harletty`, the CLI** — Apache-2.0. It depends only on this workspace and
+  on crates.io (`truehd` and `truehdd-macros` are Apache-2.0 too), so the
+  binary carries no copyleft.
+- **`libharletty_bridge.so` / `.dll`, the decoder bridge** —
+  **GPL-3.0-or-later**. It links `bridge_api`, `spdif` and `sys` from
+  [Omniphony](https://github.com/mgth/Omniphony), which are GPL-3.0-or-later,
+  and the resulting library is a combined work. Apache-2.0 code may be
+  combined into a GPLv3 work, so there is no licence conflict — but what you
+  receive is governed by the GPL, and linking it into a proprietary program is
+  not permitted. Source for both halves is public.
+
+Note that this is one-way: Apache-2.0 is incompatible with GPLv2 because of
+its patent clause, so anything built on `truehd` can be GPLv3 but never GPLv2.
+
+The TrueHD decoder itself is the `truehd` crate from crates.io (Apache-2.0),
+© its original author; it used to be vendored here and no longer is.
