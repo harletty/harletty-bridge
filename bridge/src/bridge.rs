@@ -660,7 +660,16 @@ impl FormatBridge for AtmosBridge {
                     self.eac3_active = false;
                     self.dts_active = true;
                     let payload = crate::dts_spdif::normalise_payload(data.as_slice());
-                    self.dts_buf.extend_from_slice(&payload);
+                    // Types I/II/III carry the frame directly; type IV wraps it
+                    // in a start code plus a length, and pads the burst past it.
+                    // Fed whole, the pipeline finds no sync word and decodes
+                    // nothing at all.
+                    let payload = if data_type == crate::dts_spdif::DTSHD_DATA_TYPE {
+                        crate::dts_spdif::unwrap_hd_payload(&payload).unwrap_or(&payload)
+                    } else {
+                        &payload
+                    };
+                    self.dts_buf.extend_from_slice(payload);
                     crate::dts_pipeline::drain_dts(self, &mut result);
                     return result;
                 }
