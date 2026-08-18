@@ -79,12 +79,7 @@ pub(crate) enum RawCodec {
 /// specific pattern first: the TrueHD major-sync word `0xF8726FBA` at offset 4,
 /// then the E-AC3/AC-3 sync word `0x0B77` at offset 0 (incl. byte-swapped).
 fn sniff_raw_codec(data: &[u8]) -> Option<RawCodec> {
-    if data.len() >= 8
-        && data[4] == 0xF8
-        && data[5] == 0x72
-        && data[6] == 0x6F
-        && data[7] == 0xBA
-    {
+    if data.len() >= 8 && data[4] == 0xF8 && data[5] == 0x72 && data[6] == 0x6F && data[7] == 0xBA {
         return Some(RawCodec::TrueHd);
     }
     // DTS core (0x7FFE8001) or extension substream (0x64582025) at offset 0.
@@ -183,10 +178,12 @@ pub(crate) struct AtmosBridge {
     pub(crate) frame_count: u64,
     /// Last object↔channel declaration emitted (sparse re-emission on change
     /// and after reset). Shared by the TrueHD and E-AC3 metadata paths.
-    pub(crate) declared_object_channels: Option<abi_stable::std_types::RVec<bridge_api::RObjectChannel>>,
+    pub(crate) declared_object_channels:
+        Option<abi_stable::std_types::RVec<bridge_api::RObjectChannel>>,
     /// Fixed-channel labels of the active TrueHD spatial presentation
     /// (bed labels from the OAMD bed assignment, then `Object` fillers).
-    pub(crate) truehd_spatial_labels: Option<abi_stable::std_types::RVec<bridge_api::RChannelLabel>>,
+    pub(crate) truehd_spatial_labels:
+        Option<abi_stable::std_types::RVec<bridge_api::RChannelLabel>>,
     pub(crate) perf: PerfStats,
 }
 
@@ -762,7 +759,10 @@ impl FormatBridge for AtmosBridge {
                 };
                 // Force re-resolution against the new codec on the next packet.
                 self.raw_codec = None;
-                log::debug!("atmos-bridge: input_codec set to {:?}", self.forced_raw_codec);
+                log::debug!(
+                    "atmos-bridge: input_codec set to {:?}",
+                    self.forced_raw_codec
+                );
                 true
             }
             #[cfg(feature = "bridge-perf")]
@@ -910,7 +910,10 @@ mod raw_transport_tests {
         let mut bridge = AtmosBridge::new(false);
         bridge.forced_raw_codec = Some(RawCodec::Eac3);
         // Unrecognisable bytes, but the host-declared codec wins.
-        assert_eq!(bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]), RawCodec::Eac3);
+        assert_eq!(
+            bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]),
+            RawCodec::Eac3
+        );
         assert_eq!(bridge.raw_codec, Some(RawCodec::Eac3));
     }
 
@@ -931,7 +934,10 @@ mod raw_transport_tests {
         let mut bridge = AtmosBridge::new(false);
         // No recognisable sync → treat as TrueHD for this packet but do NOT
         // lock, so a later syncful packet can still pin the codec.
-        assert_eq!(bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]), RawCodec::TrueHd);
+        assert_eq!(
+            bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]),
+            RawCodec::TrueHd
+        );
         assert_eq!(bridge.raw_codec, None);
     }
 
@@ -1013,11 +1019,17 @@ mod raw_transport_tests {
             .find(|f| f.channel_count == 12)
             .expect("expected a 12-channel 7.1.4 frame");
         assert_eq!(f.sampling_frequency, 48_000);
-        assert!(f.metadata.is_empty(), "fixed presentation must carry no metadata");
+        assert!(
+            f.metadata.is_empty(),
+            "fixed presentation must carry no metadata"
+        );
         use bridge_api::RChannelLabel::*;
         let labels: Vec<_> = f.channel_labels.iter().copied().collect();
         // Active speakers ascending (C,L,R,Ls,Rs,LFE,Lsr,Rsr) + the height quartet.
-        assert_eq!(labels, vec![C, L, R, Ls, Rs, LFE, Lb, Rb, Tfl, Tfr, Tbl, Tbr]);
+        assert_eq!(
+            labels,
+            vec![C, L, R, Ls, Rs, LFE, Lb, Rb, Tfl, Tfr, Tbl, Tbr]
+        );
     }
 
     #[test]
@@ -1092,10 +1104,7 @@ mod raw_transport_tests {
         assert!(bridge.configure("input_codec".into(), "dts".into()));
         let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
         assert!(result.error_message.is_empty(), "{}", result.error_message);
-        assert!(
-            bridge.has_objects(),
-            "D3 must expose object channels"
-        );
+        assert!(bridge.has_objects(), "D3 must expose object channels");
 
         let frame = result
             .frames

@@ -156,7 +156,11 @@ pub(crate) fn process_eac3_dependent_frame_with_core(
         bridge.eac3_total_samples += sample_count as u64;
         bridge.eac3_diag_stats.dependent_pair_channel_beds += 1;
         bridge.perf.maybe_report(bridge.eac3_frame_count);
-        return Ok(Some(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge)));
+        return Ok(Some(build_eac3_channel_bed_frame(
+            &bed,
+            Some(&dep_info),
+            bridge,
+        )));
     }
 
     match bridge

@@ -886,10 +886,7 @@ mod tests {
                 format!("X{source}")
             );
             assert_eq!(metadata.events[source].id, (10 + source) as u32);
-            assert_eq!(
-                metadata.events[source].pos,
-                d3_object_position(source)
-            );
+            assert_eq!(metadata.events[source].pos, d3_object_position(source));
         }
     }
 
