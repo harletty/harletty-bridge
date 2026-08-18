@@ -249,16 +249,15 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
                         }
                         DrcMode::Heavy if ss_state.heavy_drc_active || ss_state.drc_active => {
                             if ss_state.heavy_drc_active {
-                                drc_gain =
-                                    (ss_state.heavy_drc_gain_update as f32 * 0.03125).exp2();
+                                drc_gain = (ss_state.heavy_drc_gain_update as f32 * 0.03125).exp2();
                                 drc_ramp_duration = ((1 << ss_state.heavy_drc_time_update)
                                     * decoded.sample_length)
                                     as u32;
                             } else {
                                 drc_gain = (ss_state.drc_gain_update as f32 * 0.015625).exp2();
-                                drc_ramp_duration =
-                                    ((1 << ss_state.drc_time_update) * decoded.sample_length)
-                                        as u32;
+                                drc_ramp_duration = ((1 << ss_state.drc_time_update)
+                                    * decoded.sample_length)
+                                    as u32;
                             }
                             drc_source_ss = Some(i);
                             break;
@@ -422,7 +421,11 @@ fn build_thd_frame(
         // Spatial presentation: authoritative labels come from the OAMD bed
         // assignment (cached across frames without a payload).
         Some(labels) => labels.clone(),
-        None => decoded.channel_labels.iter().map(channel_label_to_r).collect(),
+        None => decoded
+            .channel_labels
+            .iter()
+            .map(channel_label_to_r)
+            .collect(),
     };
     #[cfg(feature = "bridge-perf")]
     ctx.perf.record_build_labels(labels_started.elapsed());

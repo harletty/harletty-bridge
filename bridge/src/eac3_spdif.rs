@@ -17,6 +17,14 @@ use crate::logging::bridge_external_log;
 /// IEC 61937 data type for E-AC-3.
 const IEC61937_EAC3_DATA_TYPE: u8 = 0x15;
 
+/// IEC 61937 data type for AC-3 (IEC 61937-3).
+///
+/// Legacy AC-3 rides its own burst type and its own 48 kHz carrier, but the
+/// bitstream inside shares the 0x0B77 syncword with E-AC-3 and is already
+/// handled here: `ac3_frame_size_from_header` is tried before the E-AC-3 sizing
+/// on every frame boundary, and the decoder accepts `bsid <= 10`.
+const IEC61937_AC3_DATA_TYPE: u8 = 0x01;
+
 /// E-AC-3 syncword (16-bit big-endian: 0x0B77).
 const EAC3_SYNCWORD: u16 = 0x0B77;
 
@@ -154,7 +162,7 @@ impl Eac3SpdifStream {
 
     /// Returns `true` if this parser handles the given IEC 61937 data type.
     pub fn accepts_data_type(data_type: u8) -> bool {
-        data_type == IEC61937_EAC3_DATA_TYPE
+        matches!(data_type, IEC61937_EAC3_DATA_TYPE | IEC61937_AC3_DATA_TYPE)
     }
 
     /// Replace the current payload with a new one.
@@ -562,8 +570,13 @@ mod tests {
     #[test]
     fn accepts_expected_data_type() {
         assert!(Eac3SpdifStream::accepts_data_type(0x15));
+        // AC-3 rides burst type 0x01, and its frames are sized and decoded by
+        // this same parser.
+        assert!(Eac3SpdifStream::accepts_data_type(0x01));
+        // TrueHD/MAT stays with the MAT stream.
         assert!(!Eac3SpdifStream::accepts_data_type(0x16));
-        assert!(!Eac3SpdifStream::accepts_data_type(0x01));
+        // DTS types belong to the DTS path.
+        assert!(!Eac3SpdifStream::accepts_data_type(0x0B));
     }
 
     #[test]

@@ -95,9 +95,6 @@ pub(crate) fn bed_channel_to_r(ch: eac3::BedChannel) -> RChannelLabel {
     }
 }
 
-
-
-
 /// Channel label for an OAMD bed-assignment speaker index
 /// (`truehd::structs::oamd::SpeakerLabels` order).
 pub(crate) fn oamd_speaker_to_label(speaker_index: usize) -> RChannelLabel {
@@ -106,12 +103,12 @@ pub(crate) fn oamd_speaker_to_label(speaker_index: usize) -> RChannelLabel {
         1 => RChannelLabel::R,
         2 => RChannelLabel::C,
         3 => RChannelLabel::LFE,
-        4 => RChannelLabel::Ls,  // Lss
-        5 => RChannelLabel::Rs,  // Rss
-        6 => RChannelLabel::Lb,  // Lrs
-        7 => RChannelLabel::Rb,  // Rrs
-        8 => RChannelLabel::Tfl, // Lfh (front height)
-        9 => RChannelLabel::Tfr, // Rfh
+        4 => RChannelLabel::Ls,   // Lss
+        5 => RChannelLabel::Rs,   // Rss
+        6 => RChannelLabel::Lb,   // Lrs
+        7 => RChannelLabel::Rb,   // Rrs
+        8 => RChannelLabel::Tfl,  // Lfh (front height)
+        9 => RChannelLabel::Tfr,  // Rfh
         10 => RChannelLabel::Tsl, // Lts (top side)
         11 => RChannelLabel::Tsr, // Rts
         12 => RChannelLabel::Tbl, // Lrh (rear height)
