@@ -105,17 +105,21 @@ fn joc_master_set_matches_golden() {
     // hash pins one target rather than the algorithm. Decoding this same
     // fixture with the same source:
     //
-    //     x86_64-unknown-linux-gnu     769f8b6a…   (the committed hash)
-    //     aarch64-unknown-linux-musl   b3d1a6b9…   (NEON QMF path)
+    //     x86_64-unknown-linux-gnu     a6d9eb60…   (the committed hash)
+    //     aarch64-unknown-linux-musl   —           (NEON QMF path, differs)
     //
     // Both are correct decodes. Asserting the hash off x86_64 would report a
     // failure that is not a regression, so it is scoped rather than dropped —
     // on x86_64 it stays a byte-exact tripwire, which is what it is good at.
+    // The aarch64 value moved with the last rebase below and was not
+    // recomputed; nothing asserts it, so it is left unstated rather than stale.
     //
-    // Rebased twice: once when `float_to_i24` stopped scaling by 2^23 - 1 and
-    // truncating (1.6% of samples moved one count away from zero, no sign
-    // flips, max delta 1), and once when the QMF scalar fallbacks stopped
-    // accumulating into a single sum.
+    // Rebased three times: once when `float_to_i24` stopped scaling by
+    // 2^23 - 1 and truncating (1.6% of samples moved one count away from zero,
+    // no sign flips, max delta 1), once when the QMF scalar fallbacks stopped
+    // accumulating into a single sum, and once when the JOC parameter bands
+    // started being expanded onto the subbands they cover on every path. That
+    // last one changes the audio on purpose; that is what it is for.
     #[cfg(target_arch = "x86_64")]
     {
         let produced_audio = sha256_of(&audio_path);
