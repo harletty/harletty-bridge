@@ -284,10 +284,6 @@ fn build_object_timeslots(
         return Ok(());
     }
 
-    let bands_index = object
-        .bands_index
-        .ok_or(ParseError::InvalidHeader("joc_num_bands_idx"))? as usize;
-    let mapping = expanded_parameter_band_mapping(bands_index)?;
     if object.data_points == 1 {
         if object.steep_slope {
             // Two regions, and only two: the previous matrix up to the
@@ -298,13 +294,13 @@ fn build_object_timeslots(
                 if timeslot < split {
                     copy_matrix(matrix, prev_matrix.as_slice());
                 } else {
-                    copy_matrix_mapped(matrix, mix_matrix[0].as_slice(), mapping);
+                    copy_matrix(matrix, mix_matrix[0].as_slice());
                 }
             }
         } else {
             for (timeslot, matrix) in output.iter_mut().enumerate() {
                 let lerp = (timeslot + 1) as f32 / timeslots as f32;
-                lerp_matrix_to_mapped(matrix, prev_matrix, &mix_matrix[0], mapping, lerp);
+                lerp_matrix(matrix, prev_matrix, &mix_matrix[0], lerp);
             }
         }
     } else if object.steep_slope {
@@ -313,9 +309,9 @@ fn build_object_timeslots(
             if timeslot < timeslot_offsets[0] as usize {
                 copy_matrix(matrix, prev_matrix.as_slice());
             } else if timeslot < timeslot_offsets[1] as usize {
-                copy_matrix_mapped(matrix, mix_matrix[0].as_slice(), mapping);
+                copy_matrix(matrix, mix_matrix[0].as_slice());
             } else {
-                copy_matrix_mapped(matrix, mix_matrix[1].as_slice(), mapping);
+                copy_matrix(matrix, mix_matrix[1].as_slice());
             }
         }
     } else {
@@ -323,16 +319,16 @@ fn build_object_timeslots(
         for (timeslot, matrix) in output.iter_mut().enumerate() {
             if timeslot < first_half {
                 let lerp = (timeslot + 1) as f32 / first_half as f32;
-                lerp_matrix_to_mapped(matrix, prev_matrix, &mix_matrix[0], mapping, lerp);
+                lerp_matrix(matrix, prev_matrix, &mix_matrix[0], lerp);
             } else {
                 let second_len = (timeslots - first_half).max(1);
                 let lerp = (timeslot + 1 - first_half) as f32 / second_len as f32;
-                lerp_matrix_mapped(matrix, &mix_matrix[0], &mix_matrix[1], mapping, lerp);
+                lerp_matrix(matrix, &mix_matrix[0], &mix_matrix[1], lerp);
             }
         }
     }
 
-    update_prev_matrix(prev_matrix, &mix_matrix[object.data_points - 1], mapping);
+    copy_matrix(prev_matrix, mix_matrix[object.data_points - 1].as_slice());
     Ok(())
 }
 
@@ -453,6 +449,25 @@ fn decode_parameter_points(
             }
         }
     }
+
+    // The matrices above hold one value per parameter band; the reconstruction
+    // needs one per QMF subband (ETSI TS 103 420 table 54). Expand them once
+    // here, so the per-timeslot loops downstream stay straight copies and lerps
+    // instead of re-gathering through the mapping on every slot. Walking the
+    // subbands top-down makes the expansion safe in place: a band never starts
+    // above its own index, so `mapping[subband] <= subband` and the source slot
+    // is always still unexpanded when it is read.
+    let bands_index = object
+        .bands_index
+        .ok_or(ParseError::InvalidHeader("joc_num_bands_idx"))? as usize;
+    let mapping = expanded_parameter_band_mapping(bands_index)?;
+    for matrix in mix_matrix.iter_mut().take(data_points) {
+        for channel in matrix.iter_mut() {
+            for subband in (0..QMF_SUBBANDS).rev() {
+                channel[subband] = channel[mapping[subband] as usize];
+            }
+        }
+    }
     Ok(())
 }
 
@@ -478,72 +493,24 @@ fn expanded_parameter_band_mapping(
         .ok_or(ParseError::InvalidHeader("joc_num_bands_idx"))
 }
 
-/// Copy a matrix that is already indexed by subband - only `prev_matrix` is.
-///
-/// Everything that comes out of [`decode_parameter_points`] is indexed by
-/// parameter band and has to go through [`copy_matrix_mapped`] instead. The two
-/// look alike and are both `[f32; QMF_SUBBANDS]` per channel, so the distinction
-/// lives in these two names and nowhere else.
+/// Both operands are indexed by subband: [`decode_parameter_points`] expands
+/// every matrix it decodes before returning it, and `prev_matrix` only ever
+/// holds copies of those.
 fn copy_matrix(target: &mut SubbandMatrix, source: &[[f32; QMF_SUBBANDS]]) {
     for (dst, src) in target.iter_mut().zip(source.iter()) {
         *dst = *src;
     }
 }
 
-/// Copy a parameter-band matrix out to the subbands each band covers.
-fn copy_matrix_mapped(
-    target: &mut SubbandMatrix,
-    source: &[[f32; QMF_SUBBANDS]],
-    mapping: &[u8; QMF_SUBBANDS],
-) {
-    for (dst, src) in target.iter_mut().zip(source.iter()) {
-        for subband in 0..QMF_SUBBANDS {
-            dst[subband] = src[mapping[subband] as usize];
-        }
-    }
-}
-
-fn lerp_matrix_to_mapped(
+fn lerp_matrix(
     target: &mut SubbandMatrix,
     from: &[[f32; QMF_SUBBANDS]],
     to: &[[f32; QMF_SUBBANDS]],
-    mapping: &[u8; QMF_SUBBANDS],
     lerp: f32,
 ) {
     for ((dst, src_from), src_to) in target.iter_mut().zip(from.iter()).zip(to.iter()) {
         for subband in 0..QMF_SUBBANDS {
-            let parameter_band = mapping[subband] as usize;
-            let target_value = src_to[parameter_band];
-            dst[subband] = src_from[subband] + (target_value - src_from[subband]) * lerp;
-        }
-    }
-}
-
-fn lerp_matrix_mapped(
-    target: &mut SubbandMatrix,
-    from: &[[f32; QMF_SUBBANDS]],
-    to: &[[f32; QMF_SUBBANDS]],
-    mapping: &[u8; QMF_SUBBANDS],
-    lerp: f32,
-) {
-    for ((dst, src_from), src_to) in target.iter_mut().zip(from.iter()).zip(to.iter()) {
-        for subband in 0..QMF_SUBBANDS {
-            let parameter_band = mapping[subband] as usize;
-            let from_value = src_from[parameter_band];
-            let to_value = src_to[parameter_band];
-            dst[subband] = from_value + (to_value - from_value) * lerp;
-        }
-    }
-}
-
-fn update_prev_matrix(
-    prev_matrix: &mut SubbandMatrix,
-    source: &[[f32; QMF_SUBBANDS]],
-    mapping: &[u8; QMF_SUBBANDS],
-) {
-    for (dst, src) in prev_matrix.iter_mut().zip(source.iter()) {
-        for subband in 0..QMF_SUBBANDS {
-            dst[subband] = src[mapping[subband] as usize];
+            dst[subband] = src_from[subband] + (src_to[subband] - src_from[subband]) * lerp;
         }
     }
 }
@@ -624,25 +591,17 @@ mod tests {
         decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5)
             .expect("points");
 
+        // The zeroed parameter bands are expanded across every subband on the
+        // way out, so whatever the matrices held before is gone entirely.
         assert!(
             mix_matrix[0]
                 .iter()
-                .all(|channel| channel[..3].iter().all(|value| *value == 0.0))
-        );
-        assert!(
-            mix_matrix[0]
-                .iter()
-                .all(|channel| channel[3..].iter().all(|value| *value == 1.0))
+                .all(|channel| channel.iter().all(|value| *value == 0.0))
         );
         assert!(
             mix_matrix[1]
                 .iter()
-                .all(|channel| channel[..3].iter().all(|value| *value == 0.0))
-        );
-        assert!(
-            mix_matrix[1]
-                .iter()
-                .all(|channel| channel[3..].iter().all(|value| *value == 2.0))
+                .all(|channel| channel.iter().all(|value| *value == 0.0))
         );
     }
 
