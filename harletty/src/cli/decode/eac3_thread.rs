@@ -30,53 +30,34 @@ struct DecoderState {
     pcm_decoder: PcmDecoder,
     ac3_core_decoder: PcmDecoder,
     dependent_pcm_decoder: PcmDecoder,
-    /// Core of the last decoded (and already emitted) independent E-AC-3
-    /// frame, kept in case the next frame is a JOC dependent.
-    pending_independent_core: Option<PendingIndependentCore>,
+    /// The last independent E-AC-3 frame, buffered until the next access unit
+    /// shows whether a dependent substream pairs with it.
+    pending_independent: Option<PendingIndependent>,
     /// Decoded legacy AC-3 core (bsid <= 10) buffered — not yet emitted —
     /// until we see whether the next access unit is its dependent partner.
     pending_ac3_core: Option<PcmPushResult>,
     frame_count: u64,
 }
 
-/// The independent frame's core, buffered for a dependent substream that may
-/// follow it.
-///
-/// A dependent JOC frame needs the downmix the reconstruction actually ran on;
-/// the no-JOC fallback emits a plain core frame and wants the core exactly as
-/// the independent frame shipped it. Those are the same audio unless the
-/// independent frame carried objects, where the shipped core is held back by
-/// [`eac3::JOC_LATENCY_SAMPLES`] to sit with the objects it is written beside —
-/// so only that case has two forms to keep.
-enum PendingIndependentCore {
-    /// No objects on the frame, so nothing was delayed and one core answers
-    /// both questions. This is the path every plain E-AC-3 stream takes on
-    /// every frame, which is why it holds a single copy.
-    Undelayed(eac3::CorePcmFrame),
-    /// An object frame, where the two forms are [`eac3::JOC_LATENCY_SAMPLES`]
-    /// apart and neither can stand in for the other.
-    Delayed {
-        joc_input: eac3::CorePcmFrame,
-        aligned: eac3::CorePcmFrame,
-    },
-}
-
-impl PendingIndependentCore {
-    /// Split into the core to reconstruct a following dependent frame's objects
-    /// from, and the core to emit if that frame turns out to carry no JOC.
-    ///
-    /// `push_access_unit_with_core` takes its input by value and drops it when
-    /// there is no JOC to spend it on, so the fallback form has to be held back
-    /// separately — before either branch is known. When the two forms are the
-    /// same core that costs one copy, but only here, on a frame that actually
-    /// has a dependent substream to pair with, rather than on every frame that
-    /// might turn out to have one.
-    fn split(self) -> (eac3::CorePcmFrame, eac3::CorePcmFrame) {
-        match self {
-            Self::Undelayed(core) => (core.clone(), core),
-            Self::Delayed { joc_input, aligned } => (joc_input, aligned),
-        }
-    }
+/// An E-AC-3 program larger than 5.1 is carried as an independent frame (the
+/// 5.1 core) immediately followed by a dependent frame (the channel extension
+/// and/or the JOC objects), and the pair describes ONE span of audio — so a
+/// plain independent frame must not be emitted until the next access unit
+/// shows it stands alone, exactly as `pending_ac3_core` already holds a legacy
+/// AC-3 core back. The exception is an independent frame that itself carried
+/// JOC: it is a complete object presentation and is emitted at once; only its
+/// undelayed core is kept, as reconstruction input in case a JOC dependent
+/// follows.
+enum PendingIndependent {
+    /// A plain independent frame, not yet emitted. Standalone → sent as-is; a
+    /// JOC dependent consumes its core as reconstruction input; a non-JOC
+    /// dependent merges its extension channels onto that core.
+    UnsentCore(PcmPushResult),
+    /// An independent frame with JOC, already emitted. Only the undelayed core
+    /// its own reconstruction ran on is kept — a following JOC dependent needs
+    /// exactly that form, not the [`eac3::JOC_LATENCY_SAMPLES`]-delayed one
+    /// that shipped inside the emitted frame.
+    EmittedObject { joc_input: eac3::CorePcmFrame },
 }
 
 pub fn spawn_eac3_decoder_thread(
@@ -113,8 +94,9 @@ pub fn spawn_eac3_decoder_thread(
         // Final drain after EOF.
         drain_frames(&mut extractor, &mut state, &pb_clone, strict_mode, &tx)?;
 
-        // A trailing AC-3 core whose dependent partner never arrived (stream
-        // truncated mid-pair): emit it as a standalone 5.1 bed.
+        // A trailing buffered frame whose dependent partner never arrived
+        // (stream truncated mid-pair): emit it as a standalone bed.
+        flush_pending_independent(&mut state, &pb_clone, &tx);
         if let Some(core) = state.pending_ac3_core.take() {
             emit_standalone_ac3_core(core, &mut state.frame_count, &pb_clone, &tx);
         }
@@ -165,12 +147,14 @@ fn handle_frame(
     };
     let is_dependent = matches!(frame_type, Some(FrameType::Dependent));
 
-    // A buffered AC-3 core is only ever paired with an *immediately* following
-    // dependent access unit. Any other frame type means the buffered core had
-    // no partner (plain AC-3 never carries dependents) — emit it as a
-    // standalone 5.1 bed before handling this unit, otherwise the core sits
-    // buffered forever and the output is short.
+    // A buffered frame is only ever paired with an *immediately* following
+    // dependent access unit. Any other frame type means the buffered frame had
+    // no partner — emit it as a standalone bed before handling this unit,
+    // otherwise it sits buffered forever and the output is short. (At most one
+    // of the two buffers is occupied: both are flushed here before either is
+    // refilled below.)
     if !is_dependent {
+        flush_pending_independent(state, pb, tx);
         if let Some(core) = state.pending_ac3_core.take() {
             emit_standalone_ac3_core(core, &mut state.frame_count, pb, tx);
         }
@@ -194,44 +178,27 @@ fn handle_frame(
     if is_dependent {
         // Pair a buffered legacy AC-3 core with this dependent substream.
         if let Some(core_result) = state.pending_ac3_core.take() {
-            return handle_ac3_core_pair(core_result, frame, state, pb, strict_mode, tx);
+            return handle_core_pair(core_result, frame, state, pb, strict_mode, tx);
         }
 
-        // Dependent following an independent E-AC-3 frame: decode against the
-        // previously decoded (and already emitted) independent core.
-        if let Some(pending) = state.pending_independent_core.take() {
-            let (joc_input, aligned) = pending.split();
-            match state
-                .object_decoder
-                .push_access_unit_with_core(bytes, joc_input)
-            {
-                Ok(Some(obj)) => {
-                    state.frame_count += 1;
-                    tick_progress(pb);
-                    let _ = tx.send(Ok(Eac3FrameMessage::Object(obj)));
-                    return Ok(());
+        // Pair the buffered independent E-AC-3 frame with this dependent
+        // substream. The pair emits exactly one message.
+        if let Some(pending) = state.pending_independent.take() {
+            return match pending {
+                PendingIndependent::UnsentCore(core_msg) => {
+                    handle_core_pair(core_msg, frame, state, pb, strict_mode, tx)
                 }
-                Ok(None) => {
-                    // No JOC on dependent frame — emit the core we already have.
-                    state.frame_count += 1;
-                    tick_progress(pb);
-                    let info = match inspect_access_unit(bytes) {
-                        Ok(i) => i,
-                        Err(_) => return Ok(()),
-                    };
-                    let push = PcmPushResult {
-                        frames_seen: state.frame_count,
-                        info,
-                        pcm: aligned,
-                    };
-                    let _ = tx.send(Ok(Eac3FrameMessage::Core(push)));
-                    return Ok(());
+                PendingIndependent::EmittedObject { joc_input } => {
+                    handle_emitted_object_pair(joc_input, frame, state, pb, strict_mode, tx)
                 }
-                Err(err) => {
-                    return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());
-                }
-            }
+            };
         }
+
+        // A dependent with nothing to pair with (orphaned by a decode error or
+        // a stream cut): its extension channels cannot stand alone — skip it
+        // rather than emit a bed with only the extension's channel layout.
+        log::warn!("skipping E-AC-3 dependent substream with no frame to pair with");
+        return Ok(());
     }
 
     // Try object decode first (independent frame with JOC).
@@ -239,19 +206,14 @@ fn handle_frame(
         Ok(Some(obj)) => {
             state.frame_count += 1;
             tick_progress(pb);
-            // The core on the frame is held back to sit with the objects it
-            // ships beside; a following dependent JOC substream needs the one
-            // the reconstruction actually ran on, or it decodes from a core
-            // that is already late and then gets delayed a second time. The
-            // no-JOC fallback still wants the aligned one, so keep both. Only
-            // the aligned form is copied — the decoder hands the other over.
-            state.pending_independent_core =
-                state.object_decoder.take_joc_input_core().map(|joc_input| {
-                    PendingIndependentCore::Delayed {
-                        joc_input,
-                        aligned: obj.pcm.core.clone(),
-                    }
-                });
+            // A following dependent JOC substream needs the core the
+            // reconstruction actually ran on, or it decodes from a core that
+            // is already late and then gets delayed a second time. The decoder
+            // hands it over by value — no copy.
+            state.pending_independent = state
+                .object_decoder
+                .take_joc_input_core()
+                .map(|joc_input| PendingIndependent::EmittedObject { joc_input });
             let _ = tx.send(Ok(Eac3FrameMessage::Object(obj)));
             return Ok(());
         }
@@ -265,14 +227,11 @@ fn handle_frame(
 
     match state.pcm_decoder.push_access_unit(bytes) {
         Ok(result) => {
-            state.frame_count += 1;
-            tick_progress(pb);
-            // No objects on this frame, so no alignment delay was applied and
-            // the two forms are the same core: one copy, because the result
-            // itself is about to be sent away.
-            state.pending_independent_core =
-                Some(PendingIndependentCore::Undelayed(result.pcm.clone()));
-            let _ = tx.send(Ok(Eac3FrameMessage::Core(result)));
+            // Not sent yet: the next access unit decides whether this frame
+            // stands alone (sent as-is) or is one half of a pair — in which
+            // case the pair's single message is built from it. No copy is made
+            // either way.
+            state.pending_independent = Some(PendingIndependent::UnsentCore(result));
         }
         Err(err) => {
             return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());
@@ -281,12 +240,13 @@ fn handle_frame(
     Ok(())
 }
 
-/// Decode a dependent substream against the buffered legacy AC-3 core it
-/// belongs to. JOC dependents (DD+ Atmos with a backward-compatible AC-3 core)
+/// Decode a dependent substream against the buffered, not-yet-emitted core it
+/// belongs to — a legacy AC-3 core (BD-style pairs) or an independent E-AC-3
+/// frame's core. JOC dependents (DD+ Atmos with a backward-compatible core)
 /// go through the object decoder; non-JOC pairs are a plain channel-extension
 /// bed, merged into a full 7.1 frame (falling back to the 5.1 core alone if
-/// the merge fails — never silent).
-fn handle_ac3_core_pair(
+/// the merge fails — never silent). Exactly one message is emitted per pair.
+fn handle_core_pair(
     core_result: PcmPushResult,
     frame: &Frame,
     state: &mut DecoderState,
@@ -335,6 +295,55 @@ fn handle_ac3_core_pair(
     Ok(())
 }
 
+/// Decode a dependent substream that follows an independent frame which
+/// carried JOC and was therefore already emitted. Only a JOC dependent
+/// produces output here: reconstruction runs on the undelayed core the
+/// independent's own JOC consumed. A dependent without JOC has only
+/// channel-extension audio to offer, and the frame's bed is already sent —
+/// merging would write the bed twice, so the extension is dropped instead.
+fn handle_emitted_object_pair(
+    joc_input: eac3::CorePcmFrame,
+    frame: &Frame,
+    state: &mut DecoderState,
+    pb: &Option<ProgressBar>,
+    strict_mode: bool,
+    tx: &mpsc::Sender<Result<Eac3FrameMessage>>,
+) -> Result<()> {
+    match state
+        .object_decoder
+        .push_access_unit_with_core(frame.as_bytes(), joc_input)
+    {
+        Ok(Some(obj)) => {
+            state.frame_count += 1;
+            tick_progress(pb);
+            let _ = tx.send(Ok(Eac3FrameMessage::Object(obj)));
+            Ok(())
+        }
+        Ok(None) => {
+            log::warn!(
+                "dropping E-AC-3 dependent substream without JOC after an already-emitted object frame"
+            );
+            Ok(())
+        }
+        Err(err) => surface_decode_err(err, strict_mode, tx, pb, state, &frame.info()),
+    }
+}
+
+/// Send a buffered independent E-AC-3 frame that turned out to have no
+/// dependent partner. An `EmittedObject` (or empty) buffer holds nothing left
+/// to send — clearing it is all that happens.
+fn flush_pending_independent(
+    state: &mut DecoderState,
+    pb: &Option<ProgressBar>,
+    tx: &mpsc::Sender<Result<Eac3FrameMessage>>,
+) {
+    if let Some(PendingIndependent::UnsentCore(msg)) = state.pending_independent.take() {
+        state.frame_count += 1;
+        tick_progress(pb);
+        let _ = tx.send(Ok(Eac3FrameMessage::Core(msg)));
+    }
+}
+
 /// Emit a buffered legacy AC-3 core that had no dependent partner as a plain
 /// 5.1 bed.
 fn emit_standalone_ac3_core(
@@ -365,7 +374,7 @@ fn surface_decode_err(
     state.pcm_decoder.reset();
     state.ac3_core_decoder.reset();
     state.dependent_pcm_decoder.reset();
-    state.pending_independent_core = None;
+    state.pending_independent = None;
     state.pending_ac3_core = None;
 
     let msg = format!("{err:?}");
