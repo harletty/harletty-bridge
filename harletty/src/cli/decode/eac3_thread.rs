@@ -32,11 +32,51 @@ struct DecoderState {
     dependent_pcm_decoder: PcmDecoder,
     /// Core of the last decoded (and already emitted) independent E-AC-3
     /// frame, kept in case the next frame is a JOC dependent.
-    pending_independent_core: Option<eac3::CorePcmFrame>,
+    pending_independent_core: Option<PendingIndependentCore>,
     /// Decoded legacy AC-3 core (bsid <= 10) buffered — not yet emitted —
     /// until we see whether the next access unit is its dependent partner.
     pending_ac3_core: Option<PcmPushResult>,
     frame_count: u64,
+}
+
+/// The independent frame's core, buffered for a dependent substream that may
+/// follow it.
+///
+/// A dependent JOC frame needs the downmix the reconstruction actually ran on;
+/// the no-JOC fallback emits a plain core frame and wants the core exactly as
+/// the independent frame shipped it. Those are the same audio unless the
+/// independent frame carried objects, where the shipped core is held back by
+/// [`eac3::JOC_LATENCY_SAMPLES`] to sit with the objects it is written beside —
+/// so only that case has two forms to keep.
+enum PendingIndependentCore {
+    /// No objects on the frame, so nothing was delayed and one core answers
+    /// both questions. This is the path every plain E-AC-3 stream takes on
+    /// every frame, which is why it holds a single copy.
+    Undelayed(eac3::CorePcmFrame),
+    /// An object frame, where the two forms are [`eac3::JOC_LATENCY_SAMPLES`]
+    /// apart and neither can stand in for the other.
+    Delayed {
+        joc_input: eac3::CorePcmFrame,
+        aligned: eac3::CorePcmFrame,
+    },
+}
+
+impl PendingIndependentCore {
+    /// Split into the core to reconstruct a following dependent frame's objects
+    /// from, and the core to emit if that frame turns out to carry no JOC.
+    ///
+    /// `push_access_unit_with_core` takes its input by value and drops it when
+    /// there is no JOC to spend it on, so the fallback form has to be held back
+    /// separately — before either branch is known. When the two forms are the
+    /// same core that costs one copy, but only here, on a frame that actually
+    /// has a dependent substream to pair with, rather than on every frame that
+    /// might turn out to have one.
+    fn split(self) -> (eac3::CorePcmFrame, eac3::CorePcmFrame) {
+        match self {
+            Self::Undelayed(core) => (core.clone(), core),
+            Self::Delayed { joc_input, aligned } => (joc_input, aligned),
+        }
+    }
 }
 
 pub fn spawn_eac3_decoder_thread(
@@ -159,10 +199,11 @@ fn handle_frame(
 
         // Dependent following an independent E-AC-3 frame: decode against the
         // previously decoded (and already emitted) independent core.
-        if let Some(core) = state.pending_independent_core.take() {
+        if let Some(pending) = state.pending_independent_core.take() {
+            let (joc_input, aligned) = pending.split();
             match state
                 .object_decoder
-                .push_access_unit_with_core(bytes, core.clone())
+                .push_access_unit_with_core(bytes, joc_input)
             {
                 Ok(Some(obj)) => {
                     state.frame_count += 1;
@@ -181,7 +222,7 @@ fn handle_frame(
                     let push = PcmPushResult {
                         frames_seen: state.frame_count,
                         info,
-                        pcm: core,
+                        pcm: aligned,
                     };
                     let _ = tx.send(Ok(Eac3FrameMessage::Core(push)));
                     return Ok(());
@@ -198,7 +239,19 @@ fn handle_frame(
         Ok(Some(obj)) => {
             state.frame_count += 1;
             tick_progress(pb);
-            state.pending_independent_core = Some(obj.pcm.core.clone());
+            // The core on the frame is held back to sit with the objects it
+            // ships beside; a following dependent JOC substream needs the one
+            // the reconstruction actually ran on, or it decodes from a core
+            // that is already late and then gets delayed a second time. The
+            // no-JOC fallback still wants the aligned one, so keep both. Only
+            // the aligned form is copied — the decoder hands the other over.
+            state.pending_independent_core =
+                state.object_decoder.take_joc_input_core().map(|joc_input| {
+                    PendingIndependentCore::Delayed {
+                        joc_input,
+                        aligned: obj.pcm.core.clone(),
+                    }
+                });
             let _ = tx.send(Ok(Eac3FrameMessage::Object(obj)));
             return Ok(());
         }
@@ -214,7 +267,11 @@ fn handle_frame(
         Ok(result) => {
             state.frame_count += 1;
             tick_progress(pb);
-            state.pending_independent_core = Some(result.pcm.clone());
+            // No objects on this frame, so no alignment delay was applied and
+            // the two forms are the same core: one copy, because the result
+            // itself is about to be sent away.
+            state.pending_independent_core =
+                Some(PendingIndependentCore::Undelayed(result.pcm.clone()));
             let _ = tx.send(Ok(Eac3FrameMessage::Core(result)));
         }
         Err(err) => {

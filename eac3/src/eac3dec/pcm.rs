@@ -2,12 +2,31 @@
 
 use super::joc::{JocObjectDecoderState, JocObjectMatrices};
 use super::metadata::{JocPayload, MetadataParseState, OamdPayload, ParsedEmdfPayloadData};
+use super::qmf::QMF_RECONSTRUCTION_DELAY;
 use super::syncframe::{
     AccessUnitInfo, AuxDataDecodeState, CoreDecodeState, ParseError,
     decode_core_pcm_frame_with_state, inspect_access_unit_with_metadata_state,
     inspect_legacy_ac3_access_unit,
 };
 use crate::BedChannel;
+
+/// How much later than the core an object channel arrives, in samples.
+///
+/// The objects are reconstructed in the hybrid QMF domain; the core PCM never
+/// enters that filter bank, so the objects trail it by exactly the bank's own
+/// analysis-to-synthesis delay — 577 samples, 12 ms at 48 kHz. That figure
+/// belongs to the filter bank and is measured there rather than restated here,
+/// by the impulse round-trip test that pins `QMF_RECONSTRUCTION_DELAY`.
+///
+/// This matters because an object frame is not purely objects: the whole core
+/// bed is carried across beside them, untouched by the reconstruction. The LFE
+/// is where that always shows, since JOC never reconstructs it and it is the one
+/// bed channel still there to be mixed with the objects however the frame is
+/// presented — but the offset is on every carried channel, not only that one.
+/// Untouched, the bed arrives 12 ms ahead of every object it belongs with,
+/// splitting each transient into two arrivals. `CoreAlignmentDelay`, below, is
+/// what closes that gap.
+pub const JOC_LATENCY_SAMPLES: usize = QMF_RECONSTRUCTION_DELAY;
 
 #[derive(Debug, Clone, PartialEq)]
 /// Decoded core channel PCM for one access unit.
@@ -305,13 +324,141 @@ impl PcmDecoder {
 ///
 /// This is the highest-level decoder before rendering. It returns `Ok(None)` for frames that do
 /// not carry the required dynamic-object payloads.
+///
+/// Every frame it does return sits on one clock: the core bed is held back by
+/// [`JOC_LATENCY_SAMPLES`] so that it lines up with the objects, which leave the
+/// reconstruction that much later than the core entered it. That delay only runs
+/// while objects are being reconstructed, so crossing into or out of object
+/// decoding — a stream that stops carrying JOC, or a caller alternating between
+/// this decoder and a plain [`PcmDecoder`] — steps the bed by 577 samples at the
+/// boundary, once per crossing. That is deliberate and is not smoothed here; the
+/// reasoning is on `CoreAlignmentDelay`.
 pub struct ObjectPcmDecoder {
     frames_seen: u64,
     aux_state: AuxDataDecodeState,
     core_state: CoreDecodeState,
     joc_state: JocObjectDecoderState,
     metadata_state: MetadataParseState,
+    core_delay: CoreAlignmentDelay,
+    joc_input_core: Option<CorePcmFrame>,
     debug_log_level: log::Level,
+}
+
+/// Holds the core PCM back by [`JOC_LATENCY_SAMPLES`] so that everything in an
+/// [`ObjectPcmFrame`] sits on one clock.
+///
+/// Each channel keeps the tail of the previous frame, which becomes the head of
+/// the next one. After a reset the tails start as silence, matching the QMF's
+/// own history: the objects begin with the same 577 samples of filter warm-up.
+///
+/// The tails are addressed by position, so they only mean anything while the
+/// core keeps the same shape. The remembered layout is what says whether they
+/// still do — without it, a core dropping from `[FL, C, FR]` to `[FL, FR]` would
+/// hand the old centre tail to the new right front, and an LFE that went away
+/// and came back would open on 12 ms of whatever was playing when it left.
+///
+/// # Crossing into and out of object decoding
+///
+/// The delay only runs on frames that carry objects. A stream that stops
+/// reconstructing objects — JOC disappearing mid-stream, or a caller switching
+/// between [`ObjectPcmDecoder`] and a plain [`PcmDecoder`] — emits its next core
+/// undelayed, so the bed jumps 577 samples (12 ms at 48 kHz) earlier at that
+/// boundary, and 577 samples later on the way back in. Both are audible splices:
+/// a discontinuity in every bed channel at the frame where the path changes.
+///
+/// Nothing here smooths that, deliberately. Holding the delay open across the
+/// boundary would carry object-era tails into a frame the objects are gone from,
+/// and the tails only mean anything against the reconstruction that filled them;
+/// cross-fading across it would need a frame of lookahead this decode path does
+/// not have. The boundary is also rare — a JOC stream carries JOC throughout —
+/// and it costs one splice per crossing rather than a standing per-frame error,
+/// where the misalignment this delay exists to remove was on every object frame.
+/// That trade is the reason it is left alone; this note is here so the next
+/// person to want it smoothed finds the reasoning rather than the symptom.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct CoreAlignmentDelay {
+    sample_rate: Option<u32>,
+    fullband_channel_order: Vec<BedChannel>,
+    lfe_present: bool,
+    fullband_tails: Vec<Vec<f32>>,
+    lfe_tail: Vec<f32>,
+}
+
+impl CoreAlignmentDelay {
+    fn reset(&mut self) {
+        self.sample_rate = None;
+        self.fullband_channel_order.clear();
+        self.lfe_present = false;
+        self.fullband_tails.clear();
+        self.lfe_tail.clear();
+    }
+
+    /// Whether the tails on hand belong to the layout `core` is in.
+    ///
+    /// This is the same test [`CoreDecodeState::reconfigure`] applies to its own
+    /// cross-frame state, one step finer: it compares the speaker order rather
+    /// than only the channel count, so a reordering that keeps the count also
+    /// counts as a new layout.
+    fn belongs_to(&self, core: &CorePcmFrame) -> bool {
+        self.sample_rate == Some(core.sample_rate)
+            && self.fullband_channel_order == core.fullband_channel_order
+            && self.lfe_present == core.lfe_channel.is_some()
+    }
+
+    /// Return `core` shifted later by the JOC reconstruction latency.
+    ///
+    /// The result is a new frame rather than an edit in place: the caller still
+    /// needs the undelayed one, which is what the objects were reconstructed
+    /// from. See [`ObjectPcmDecoder::take_joc_input_core`].
+    fn delayed(&mut self, core: &CorePcmFrame) -> CorePcmFrame {
+        if !self.belongs_to(core) {
+            self.reset();
+            self.sample_rate = Some(core.sample_rate);
+            self.fullband_channel_order
+                .clone_from(&core.fullband_channel_order);
+            self.lfe_present = core.lfe_channel.is_some();
+        }
+
+        self.fullband_tails
+            .resize(core.fullband_channels.len(), Vec::new());
+        let fullband_channels = core
+            .fullband_channels
+            .iter()
+            .zip(self.fullband_tails.iter_mut())
+            .map(|(channel, tail)| delay_channel(channel, tail))
+            .collect();
+        let lfe_channel = core
+            .lfe_channel
+            .as_ref()
+            .map(|lfe| delay_channel(lfe, &mut self.lfe_tail));
+
+        CorePcmFrame {
+            sample_rate: core.sample_rate,
+            fullband_channel_order: core.fullband_channel_order.clone(),
+            fullband_channels,
+            lfe_channel,
+        }
+    }
+}
+
+/// Delay one channel by [`JOC_LATENCY_SAMPLES`], carrying the samples that fall
+/// off the end into `tail` for the next frame. Correct for frames shorter than
+/// the delay, which is why the split is expressed against the joined length.
+fn delay_channel(channel: &[f32], tail: &mut Vec<f32>) -> Vec<f32> {
+    if tail.len() != JOC_LATENCY_SAMPLES {
+        tail.clear();
+        tail.resize(JOC_LATENCY_SAMPLES, 0.0);
+    }
+
+    let mut joined = Vec::with_capacity(tail.len() + channel.len());
+    joined.extend_from_slice(tail);
+    joined.extend_from_slice(channel);
+
+    let carried = joined.len() - JOC_LATENCY_SAMPLES;
+    tail.clear();
+    tail.extend_from_slice(&joined[carried..]);
+    joined.truncate(channel.len());
+    joined
 }
 
 impl Default for ObjectPcmDecoder {
@@ -322,6 +469,8 @@ impl Default for ObjectPcmDecoder {
             core_state: CoreDecodeState::default(),
             joc_state: JocObjectDecoderState::default(),
             metadata_state: MetadataParseState::default(),
+            core_delay: CoreAlignmentDelay::default(),
+            joc_input_core: None,
             debug_log_level: log::Level::Debug,
         }
     }
@@ -346,11 +495,48 @@ impl ObjectPcmDecoder {
         self.core_state.reset();
         self.joc_state.reset();
         self.metadata_state.reset();
+        self.core_delay.reset();
+        self.joc_input_core = None;
     }
 
     /// Number of access units accepted since the last reset.
     pub fn frames_seen(&self) -> u64 {
         self.frames_seen
+    }
+
+    /// Take the core PCM the most recent frame's objects were reconstructed
+    /// from, before the alignment delay was applied.
+    ///
+    /// [`ObjectPcmFrame::core`] is held back by [`JOC_LATENCY_SAMPLES`] so that
+    /// it lines up with the objects it ships beside, which makes it the wrong
+    /// thing to feed back in as the JOC downmix for a following dependent
+    /// substream: those objects would be reconstructed from a core that is
+    /// already late, and then delayed a second time on the way out. Callers that
+    /// pair an independent frame's core with a later dependent frame want this
+    /// instead. `None` before the first object frame, after a reset, and on a
+    /// second call before the next one.
+    ///
+    /// It is handed over rather than lent because nothing inside the decoder
+    /// reads it: it is held for exactly one caller, which wants it by value, and
+    /// a borrow would only make that caller copy a whole core to get it.
+    pub fn take_joc_input_core(&mut self) -> Option<CorePcmFrame> {
+        self.joc_input_core.take()
+    }
+
+    /// Cold-start the object reconstruction when the core changes shape.
+    ///
+    /// A layout, LFE-presence or sample-rate change invalidates every piece of
+    /// cross-frame audio history at once — the QMF banks and interpolation
+    /// matrices inside the reconstruction as much as [`CoreAlignmentDelay`]'s
+    /// own tails. The delay notices on its own, but only once it is handed the
+    /// frame, which is after the objects for that frame have already been
+    /// reconstructed through banks holding the old configuration. Asking first
+    /// is what keeps both sides starting cold on the same frame, and the frame
+    /// itself on one clock.
+    fn reset_history_if_reconfigured(&mut self, core: &CorePcmFrame) {
+        if !self.core_delay.belongs_to(core) {
+            self.joc_state.reset();
+        }
     }
 
     /// Per-object subband matrices reconstructed for the most recent decoded frame.
@@ -418,8 +604,15 @@ impl ObjectPcmDecoder {
             return Ok(None);
         };
 
-        let core = decode_core_pcm_frame_with_state(access_unit, &info, &mut self.core_state)?;
-        let object_channels = self.joc_state.decode_frame(&core, &joc)?;
+        let joc_input_core =
+            decode_core_pcm_frame_with_state(access_unit, &info, &mut self.core_state)?;
+        self.reset_history_if_reconfigured(&joc_input_core);
+        let object_channels = self.joc_state.decode_frame(&joc_input_core, &joc)?;
+        // Only now that the core has been through JOC as input can it be held
+        // back to meet the objects coming out the other side. The undelayed one
+        // is kept as it was: see `joc_input_core`.
+        let core = self.core_delay.delayed(&joc_input_core);
+        self.joc_input_core = Some(joc_input_core);
         let object_active = joc.objects.iter().map(|object| object.active).collect();
         let oamd_payloads = info
             .payloads()
@@ -463,7 +656,7 @@ impl ObjectPcmDecoder {
     fn push_access_unit_with_core_inner(
         &mut self,
         access_unit: &[u8],
-        core: CorePcmFrame,
+        joc_input_core: CorePcmFrame,
     ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
         self.apply_debug_log_level();
         let info = inspect_access_unit_with_metadata_state(
@@ -493,7 +686,12 @@ impl ObjectPcmDecoder {
             return Ok(None);
         };
 
-        let object_channels = self.joc_state.decode_frame(&core, &joc)?;
+        self.reset_history_if_reconfigured(&joc_input_core);
+        let object_channels = self.joc_state.decode_frame(&joc_input_core, &joc)?;
+        // As in `push_access_unit_inner`: hold the core back to meet the
+        // objects, once it has served as the reconstruction's input.
+        let core = self.core_delay.delayed(&joc_input_core);
+        self.joc_input_core = Some(joc_input_core);
         let object_active = joc.objects.iter().map(|object| object.active).collect();
         let oamd_payloads = info
             .payloads()
@@ -523,6 +721,210 @@ impl ObjectPcmDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ramp is the easiest signal to read a delay off: sample `n` carries the
+    /// value `n`, so wherever the ramp starts is the delay.
+    #[test]
+    fn the_core_is_held_back_by_exactly_the_joc_latency() {
+        let mut delay = CoreAlignmentDelay::default();
+        let frame_len = 1536;
+        let mut seen: Vec<f32> = Vec::new();
+
+        for frame in 0..3 {
+            let base = frame * frame_len;
+            let core = CorePcmFrame {
+                sample_rate: 48_000,
+                fullband_channel_order: vec![BedChannel::FrontLeft],
+                fullband_channels: vec![(0..frame_len).map(|n| (base + n) as f32).collect()],
+                lfe_channel: Some((0..frame_len).map(|n| (base + n) as f32).collect()),
+            };
+            let core = delay.delayed(&core);
+            // The LFE is the channel that actually reaches the mix; it must be
+            // shifted the same way as everything else in the frame.
+            assert_eq!(
+                core.lfe_channel.as_deref(),
+                Some(&core.fullband_channels[0][..])
+            );
+            seen.extend_from_slice(&core.fullband_channels[0]);
+        }
+
+        assert!(seen[..JOC_LATENCY_SAMPLES].iter().all(|&s| s == 0.0));
+        for (n, &sample) in seen[JOC_LATENCY_SAMPLES..].iter().enumerate() {
+            assert_eq!(sample, n as f32, "sample {n} landed in the wrong slot");
+        }
+    }
+
+    /// After a seek the objects restart with a cold filter bank, so the core
+    /// has to restart with a cold delay - otherwise the first frames of the new
+    /// position would be prefixed with audio from the old one.
+    #[test]
+    fn a_reset_clears_the_carried_tail() {
+        let mut delay = CoreAlignmentDelay::default();
+        let first = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![],
+            fullband_channels: vec![],
+            lfe_channel: Some(vec![1.0; 1536]),
+        };
+        delay.delayed(&first);
+        delay.reset();
+
+        let second = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![],
+            fullband_channels: vec![],
+            lfe_channel: Some(vec![2.0; 1536]),
+        };
+        let lfe = delay.delayed(&second).lfe_channel.unwrap();
+        assert!(lfe[..JOC_LATENCY_SAMPLES].iter().all(|&s| s == 0.0));
+        assert!(lfe[JOC_LATENCY_SAMPLES..].iter().all(|&s| s == 2.0));
+    }
+
+    /// The tails are addressed by position, so a layout change silently
+    /// repoints them: dropping the centre channel would slide the old centre
+    /// tail onto the new right front. A cold start is the only answer that
+    /// cannot play one channel's audio out of another.
+    #[test]
+    fn a_narrower_core_starts_its_tails_from_silence() {
+        let mut delay = CoreAlignmentDelay::default();
+        let wide = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![
+                BedChannel::FrontLeft,
+                BedChannel::Center,
+                BedChannel::FrontRight,
+            ],
+            fullband_channels: vec![vec![1.0; 1536], vec![2.0; 1536], vec![3.0; 1536]],
+            lfe_channel: None,
+        };
+        delay.delayed(&wide);
+
+        let narrow = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![BedChannel::FrontLeft, BedChannel::FrontRight],
+            fullband_channels: vec![vec![0.0; 1536], vec![0.0; 1536]],
+            lfe_channel: None,
+        };
+        let narrow = delay.delayed(&narrow);
+        for (index, channel) in narrow.fullband_channels.iter().enumerate() {
+            assert!(
+                channel.iter().all(|&sample| sample == 0.0),
+                "channel {index} opened on the previous layout's audio",
+            );
+        }
+    }
+
+    /// Same hazard on the channel that actually reaches the mix: a frame
+    /// without LFE leaves `lfe_tail` holding the last frame that had one, and
+    /// nothing clears it before the LFE comes back.
+    #[test]
+    fn an_lfe_that_comes_back_starts_from_silence() {
+        let mut delay = CoreAlignmentDelay::default();
+        let with_lfe = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![BedChannel::FrontLeft],
+            fullband_channels: vec![vec![1.0; 1536]],
+            lfe_channel: Some(vec![1.0; 1536]),
+        };
+        delay.delayed(&with_lfe);
+
+        let without_lfe = CorePcmFrame {
+            lfe_channel: None,
+            ..with_lfe.clone()
+        };
+        delay.delayed(&without_lfe);
+
+        let returned = CorePcmFrame {
+            lfe_channel: Some(vec![0.0; 1536]),
+            ..with_lfe
+        };
+        let lfe = delay.delayed(&returned).lfe_channel.unwrap();
+        assert!(
+            lfe.iter().all(|&sample| sample == 0.0),
+            "the LFE came back carrying the audio it left with",
+        );
+    }
+
+    /// A sample-rate change is the third way the tails stop meaning what they
+    /// meant, and the one `CoreDecodeState::reconfigure` already resets on.
+    #[test]
+    fn a_sample_rate_change_starts_the_tails_from_silence() {
+        let mut delay = CoreAlignmentDelay::default();
+        let at_48k = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![BedChannel::FrontLeft],
+            fullband_channels: vec![vec![1.0; 1536]],
+            lfe_channel: None,
+        };
+        delay.delayed(&at_48k);
+
+        let at_44k = CorePcmFrame {
+            sample_rate: 44_100,
+            fullband_channels: vec![vec![0.0; 1536]],
+            ..at_48k
+        };
+        let at_44k = delay.delayed(&at_44k);
+        assert!(at_44k.fullband_channels[0].iter().all(|&s| s == 0.0));
+    }
+
+    /// The delay's tails and the reconstruction's filter banks are two halves
+    /// of the same history, and the objects are reconstructed before the delay
+    /// ever sees the frame. If only the tails cold-start, the frame that
+    /// crosses the change carries a core with 577 fresh silent samples against
+    /// objects still coloured by the previous configuration - which is exactly
+    /// the one-clock invariant the delay exists to hold.
+    #[test]
+    fn a_core_reconfiguration_cold_starts_the_object_reconstruction() {
+        use super::super::metadata::{JocObject, JocObjectData};
+
+        let at_48k = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![BedChannel::FrontLeft, BedChannel::FrontRight],
+            fullband_channels: vec![vec![0.5; 64], vec![-0.5; 64]],
+            lfe_channel: Some(vec![0.25; 64]),
+        };
+        let joc = JocPayload {
+            downmix_config: 0,
+            channel_count: 2,
+            object_count: 1,
+            gain: 1.0,
+            sequence_counter: 0,
+            objects: vec![JocObject {
+                active: true,
+                bands_index: Some(0),
+                bands: 1,
+                sparse_coded: false,
+                quantization_table: Some(0),
+                steep_slope: false,
+                data_points: 1,
+                timeslot_offsets: Vec::new(),
+                data: Some(JocObjectData::Dense {
+                    matrices: vec![vec![vec![1], vec![1]]],
+                }),
+            }],
+        };
+
+        let mut decoder = ObjectPcmDecoder::new();
+        decoder
+            .joc_state
+            .decode_frame(&at_48k, &joc)
+            .expect("a frame to warm the banks");
+        decoder.core_delay.delayed(&at_48k);
+        assert!(
+            !decoder.joc_state.is_cold(),
+            "the reconstruction should be holding history after a frame",
+        );
+
+        let at_44k = CorePcmFrame {
+            sample_rate: 44_100,
+            ..at_48k
+        };
+        decoder.reset_history_if_reconfigured(&at_44k);
+        assert!(
+            decoder.joc_state.is_cold(),
+            "a sample-rate change left the filter banks warm",
+        );
+    }
 
     #[test]
     fn chanmap_0x1a00_maps_to_side_and_back_surrounds() {

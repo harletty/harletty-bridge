@@ -53,6 +53,20 @@ pub(crate) struct JocObjectDecoderState {
 }
 
 impl JocObjectDecoderState {
+    /// Whether the reconstruction is holding no cross-frame history.
+    ///
+    /// The filter banks and the previous frame's matrices only mean anything
+    /// while the core keeps the shape they were filled from. Nothing in the
+    /// decode path asks - a reconfiguration resets unconditionally - so this
+    /// exists for the tests that check the reset actually happened.
+    #[cfg(test)]
+    pub fn is_cold(&self) -> bool {
+        self.prev_matrix.is_empty()
+            && self.forward_qmf.is_empty()
+            && self.inverse_qmf.is_empty()
+            && self.inverse_history.is_empty()
+    }
+
     pub fn reset(&mut self) {
         self.prev_matrix.clear();
         self.mix_matrix.clear();
