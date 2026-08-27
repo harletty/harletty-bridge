@@ -290,16 +290,16 @@ fn build_object_timeslots(
     let mapping = expanded_parameter_band_mapping(bands_index)?;
     if object.data_points == 1 {
         if object.steep_slope {
-            let split = timeslot_offsets[0].min(timeslots as u8) as usize;
+            // Two regions, and only two: the previous matrix up to the
+            // transmitted timeslot offset, this frame's from there on. With a
+            // single data point there is no second matrix to switch to.
+            let split = (timeslot_offsets[0] as usize).min(timeslots);
             for (timeslot, matrix) in output.iter_mut().enumerate() {
-                let source = if timeslot < split {
-                    prev_matrix.as_slice()
-                } else if timeslot < timeslot_offsets[1] as usize {
-                    mix_matrix[1].as_slice()
+                if timeslot < split {
+                    copy_matrix(matrix, prev_matrix.as_slice());
                 } else {
-                    mix_matrix[0].as_slice()
-                };
-                copy_matrix(matrix, source);
+                    copy_matrix_mapped(matrix, mix_matrix[0].as_slice(), mapping);
+                }
             }
         } else {
             for (timeslot, matrix) in output.iter_mut().enumerate() {
@@ -308,24 +308,25 @@ fn build_object_timeslots(
             }
         }
     } else if object.steep_slope {
+        // Three regions, one boundary per transmitted offset.
         for (timeslot, matrix) in output.iter_mut().enumerate() {
-            let source = if timeslot + 1 < timeslot_offsets[0] as usize {
-                prev_matrix.as_slice()
+            if timeslot < timeslot_offsets[0] as usize {
+                copy_matrix(matrix, prev_matrix.as_slice());
+            } else if timeslot < timeslot_offsets[1] as usize {
+                copy_matrix_mapped(matrix, mix_matrix[0].as_slice(), mapping);
             } else {
-                mix_matrix[0].as_slice()
-            };
-            copy_matrix(matrix, source);
+                copy_matrix_mapped(matrix, mix_matrix[1].as_slice(), mapping);
+            }
         }
     } else {
         let first_half = (timeslots >> 1).max(1);
         for (timeslot, matrix) in output.iter_mut().enumerate() {
-            let timeslot_index = timeslot + 1;
-            if timeslot_index <= first_half {
-                let lerp = timeslot_index as f32 / first_half as f32;
-                lerp_matrix(matrix, prev_matrix, &mix_matrix[0], lerp);
+            if timeslot < first_half {
+                let lerp = (timeslot + 1) as f32 / first_half as f32;
+                lerp_matrix_to_mapped(matrix, prev_matrix, &mix_matrix[0], mapping, lerp);
             } else {
                 let second_len = (timeslots - first_half).max(1);
-                let lerp = (timeslot_index - first_half) as f32 / second_len as f32;
+                let lerp = (timeslot + 1 - first_half) as f32 / second_len as f32;
                 lerp_matrix_mapped(matrix, &mix_matrix[0], &mix_matrix[1], mapping, lerp);
             }
         }
@@ -477,21 +478,27 @@ fn expanded_parameter_band_mapping(
         .ok_or(ParseError::InvalidHeader("joc_num_bands_idx"))
 }
 
+/// Copy a matrix that is already indexed by subband - only `prev_matrix` is.
+///
+/// Everything that comes out of [`decode_parameter_points`] is indexed by
+/// parameter band and has to go through [`copy_matrix_mapped`] instead. The two
+/// look alike and are both `[f32; QMF_SUBBANDS]` per channel, so the distinction
+/// lives in these two names and nowhere else.
 fn copy_matrix(target: &mut SubbandMatrix, source: &[[f32; QMF_SUBBANDS]]) {
     for (dst, src) in target.iter_mut().zip(source.iter()) {
         *dst = *src;
     }
 }
 
-fn lerp_matrix(
+/// Copy a parameter-band matrix out to the subbands each band covers.
+fn copy_matrix_mapped(
     target: &mut SubbandMatrix,
-    from: &[[f32; QMF_SUBBANDS]],
-    to: &[[f32; QMF_SUBBANDS]],
-    lerp: f32,
+    source: &[[f32; QMF_SUBBANDS]],
+    mapping: &[u8; QMF_SUBBANDS],
 ) {
-    for ((dst, src_from), src_to) in target.iter_mut().zip(from.iter()).zip(to.iter()) {
+    for (dst, src) in target.iter_mut().zip(source.iter()) {
         for subband in 0..QMF_SUBBANDS {
-            dst[subband] = src_from[subband] + (src_to[subband] - src_from[subband]) * lerp;
+            dst[subband] = src[mapping[subband] as usize];
         }
     }
 }
@@ -639,8 +646,134 @@ mod tests {
         );
     }
 
+    /// The smooth branches are the ones nearly every block takes, and both
+    /// halves of a two-point frame have to expand parameter bands as they
+    /// interpolate: the first half from the previous frame's subband matrix
+    /// towards point 0, the second between the two points. Interpolating
+    /// band-indexed values as though they were subband-indexed is what emptied
+    /// everything above the last band and put the wrong bands underneath it.
     #[test]
-    fn steep_multi_point_uses_reference_timeslot_comparison() {
+    fn smooth_two_point_frames_expand_parameter_bands_in_both_halves() {
+        let object = JocObject {
+            active: true,
+            bands_index: Some(1), // three parameter bands
+            bands: 3,
+            sparse_coded: false,
+            quantization_table: Some(0),
+            steep_slope: false,
+            data_points: 2,
+            timeslot_offsets: Vec::new(),
+            data: Some(JocObjectData::Dense {
+                // Differential within each point, and point 1 is differential
+                // against point 0: point 0 decodes to 0.0, 0.2, 0.4 and point 1
+                // to 0.4, 0.6, 0.8.
+                matrices: vec![vec![vec![0, 1, 1]], vec![vec![2, 1, 1]]],
+            }),
+        };
+
+        let mut mix_matrix = [vec![[0.0; 64]], vec![[0.0; 64]]];
+        let mut timeslot_offsets = [0; 2];
+        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 1)
+            .expect("points");
+        let mut prev_matrix = vec![[0.0; 64]];
+        let mut output = vec![vec![[0.0; 64]]; 4];
+        build_object_timeslots(
+            &mut prev_matrix,
+            &mix_matrix,
+            timeslot_offsets,
+            &object,
+            4,
+            &mut output,
+        )
+        .expect("timeslots");
+
+        // Table 54, three-band column: subband 0 is band 0, subbands 3 to 13 are
+        // band 1, and everything from 14 up is band 2.
+        const BAND_1: usize = 3;
+        const BAND_2: usize = 14;
+
+        // First half, four slots so two: from an all-zero previous matrix
+        // towards point 0, reaching it on the last slot of the half.
+        let half = &output[1][0];
+        assert!((half[0] - 0.0).abs() < 1e-6);
+        assert!((half[BAND_1] - 0.2).abs() < 1e-6);
+        assert!((half[13] - 0.2).abs() < 1e-6);
+        assert!((half[BAND_2] - 0.4).abs() < 1e-6);
+        assert!((half[63] - 0.4).abs() < 1e-6);
+
+        // Midway through the second half: half of the way from point 0 to
+        // point 1, band by band.
+        let between = &output[2][0];
+        assert!((between[0] - 0.2).abs() < 1e-6);
+        assert!((between[BAND_1] - 0.4).abs() < 1e-6);
+        assert!((between[BAND_2] - 0.6).abs() < 1e-6);
+
+        // And the frame ends on point 1 itself, expanded the same way.
+        let end = &output[3][0];
+        assert!((end[0] - 0.4).abs() < 1e-6);
+        assert!((end[BAND_1] - 0.6).abs() < 1e-6);
+        assert!((end[13] - 0.6).abs() < 1e-6);
+        assert!((end[BAND_2] - 0.8).abs() < 1e-6);
+        assert!((end[63] - 0.8).abs() < 1e-6);
+
+        // The matrix carried into the next frame is the last point, expanded -
+        // not the raw parameter array, which would zero the top end again on
+        // the very next frame's first half.
+        assert!((prev_matrix[0][BAND_2] - 0.8).abs() < 1e-6);
+        assert!((prev_matrix[0][63] - 0.8).abs() < 1e-6);
+    }
+
+    /// The parameters arrive one per parameter band; the reconstruction needs
+    /// one per QMF subband. A steep frame switches matrices rather than
+    /// interpolating, and it still has to expand them on the way.
+    #[test]
+    fn steep_frames_expand_parameter_bands_across_the_subbands() {
+        let object = JocObject {
+            active: true,
+            bands_index: Some(1), // three parameter bands
+            bands: 3,
+            sparse_coded: false,
+            quantization_table: Some(0),
+            steep_slope: true,
+            data_points: 1,
+            timeslot_offsets: vec![1],
+            data: Some(JocObjectData::Dense {
+                // Differential: band 0 stays at the centre, bands 1 and 2 each
+                // step once, so the three bands decode to 0.0, 0.2 and 0.4.
+                matrices: vec![vec![vec![0, 1, 1]]],
+            }),
+        };
+
+        let mut mix_matrix = [vec![[0.0; 64]], vec![[0.0; 64]]];
+        let mut timeslot_offsets = [0; 2];
+        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 1)
+            .expect("points");
+        let mut prev_matrix = vec![[0.0; 64]];
+        let mut output = vec![vec![[0.0; 64]]; 4];
+        build_object_timeslots(
+            &mut prev_matrix,
+            &mix_matrix,
+            timeslot_offsets,
+            &object,
+            4,
+            &mut output,
+        )
+        .expect("timeslots");
+
+        // Table 54, three-band column: subband 0 is band 0, subbands 3 to 13
+        // are band 1, and everything from 14 up is band 2. Before this was
+        // expanded, every subband past the third read whatever was left in the
+        // parameter array - zero - and the object lost its whole top end.
+        let switched = &output[3][0];
+        assert!((switched[0] - 0.0).abs() < 1e-6);
+        assert!((switched[3] - 0.2).abs() < 1e-6);
+        assert!((switched[13] - 0.2).abs() < 1e-6);
+        assert!((switched[14] - 0.4).abs() < 1e-6);
+        assert!((switched[63] - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn steep_multi_point_switches_at_both_transmitted_offsets() {
         let object = JocObject {
             active: true,
             bands_index: Some(0),
@@ -649,14 +782,16 @@ mod tests {
             quantization_table: Some(0),
             steep_slope: true,
             data_points: 2,
-            timeslot_offsets: vec![2, 1],
+            // joc_offset_ts values, already carrying the +1 the parser applies.
+            timeslot_offsets: vec![1, 3],
             data: Some(JocObjectData::Dense {
+                // Point 0 decodes to 0.0, point 1 to one quantization step.
                 matrices: vec![vec![vec![0]], vec![vec![1]]],
             }),
         };
 
         let mut prev_matrix = vec![[1.0; 64]];
-        let mut mix_matrix = [vec![[0.0; 64]], vec![[0.2; 64]]];
+        let mut mix_matrix = [vec![[0.0; 64]], vec![[0.0; 64]]];
         let mut timeslot_offsets = [0; 2];
         decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 1)
             .expect("points");
@@ -671,10 +806,12 @@ mod tests {
         )
         .expect("timeslots");
 
+        // Clause 6.6.5 Pseudocode 6: previous matrix below the first offset,
+        // point 0 between the offsets, point 1 from the second offset on.
         assert!(output[0][0].iter().all(|value| *value == 1.0));
-        assert!(output[2][0].iter().all(|value| *value == 0.0));
-        assert!(output[3][0].iter().all(|value| *value == 0.0));
         assert!(output[1][0].iter().all(|value| *value == 0.0));
+        assert!(output[2][0].iter().all(|value| *value == 0.0));
+        assert!(output[3][0].iter().all(|value| (*value - 0.2).abs() < 1e-6));
         assert!(
             prev_matrix[0]
                 .iter()
@@ -683,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn steep_single_point_can_reuse_stale_second_slot() {
+    fn steep_single_point_never_reaches_for_a_second_slot() {
         let previous = JocObject {
             active: true,
             bands_index: Some(0),
@@ -730,11 +867,12 @@ mod tests {
         )
         .expect("timeslots");
 
+        // The previous frame left a second data point behind in the shared
+        // slot. Clause 6.6.5 gives a single-point steep frame two regions, so
+        // that leftover must not appear anywhere in this frame's output.
         assert!(output[0][0].iter().all(|value| *value == 1.0));
-        assert!((output[1][0][0] - 0.2).abs() < 1e-6);
-        assert!(output[1][0][1..].iter().all(|value| *value == 0.0));
-        assert!((output[2][0][0] - 0.2).abs() < 1e-6);
-        assert!(output[2][0][1..].iter().all(|value| *value == 0.0));
+        assert!(output[1][0].iter().all(|value| *value == 0.0));
+        assert!(output[2][0].iter().all(|value| *value == 0.0));
         assert!(output[3][0].iter().all(|value| *value == 0.0));
         assert!(prev_matrix[0].iter().all(|value| *value == 0.0));
     }
