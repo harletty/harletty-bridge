@@ -113,14 +113,24 @@ impl ImdctState {
         self.delay.copy_from_slice(&self.output[256..512]);
     }
 
+    /// Pre-rotation for the two 128-coefficient short transforms.
+    ///
+    /// Each transform sees only its own half of the spectrum: the first takes
+    /// the even coefficients `even[j] = coeffs[2 * j]`, the second the odd
+    /// `odd[j] = coeffs[2 * j + 1]`. The rotation pairs `input[2 * index]`
+    /// with `input[127 - 2 * index]`, exactly as `apply_512` pairs
+    /// `coeffs[2 * index]` with `coeffs[255 - 2 * index]` over all 256. Both
+    /// halves of every pair therefore stride by 4 in the flat array - the
+    /// long-block stride of 2 would feed each transform three quarters of the
+    /// wrong spectrum.
     fn prepare_256_intermediates(&mut self, coeffs: &[f32; 256]) {
         let x = x256();
         for (index, slot) in self.intermediate_256_a.iter_mut().enumerate() {
-            *slot = Complex32::new(coeffs[254 - 4 * index], coeffs[2 * index]) * x[index];
+            *slot = Complex32::new(coeffs[254 - 4 * index], coeffs[4 * index]) * x[index];
         }
         // https://github.com/FFmpeg/FFmpeg/blob/415b466d41ac81856abc76d7a9341132b0f668b0/libavcodec/ac3dec.c#L587
         for (index, slot) in self.intermediate_256_b.iter_mut().enumerate() {
-            *slot = Complex32::new(coeffs[255 - 4 * index], coeffs[2 * index + 1]) * x[index];
+            *slot = Complex32::new(coeffs[255 - 4 * index], coeffs[4 * index + 1]) * x[index];
         }
     }
 }
@@ -223,5 +233,175 @@ mod tests {
         let expected = Complex32::new(5.0, 3.0) * x256()[0];
         assert!((sample.re - expected.re).abs() < 1e-6);
         assert!((sample.im - expected.im).abs() < 1e-6);
+    }
+
+    /// `index == 0` cannot tell the two strides apart, since `2 * 0 == 4 * 0`.
+    /// Every other index can, so pin one.
+    #[test]
+    fn short_block_pre_ifft_strides_by_four() {
+        let mut state = ImdctState::new();
+        let coeffs: [f32; 256] = std::array::from_fn(|i| i as f32);
+
+        state.prepare_256_intermediates(&coeffs);
+
+        let even = state.intermediate_256_a[1];
+        let expected_even = Complex32::new(250.0, 4.0) * x256()[1];
+        assert!((even.re - expected_even.re).abs() < 1e-3);
+        assert!((even.im - expected_even.im).abs() < 1e-3);
+
+        let odd = state.intermediate_256_b[1];
+        let expected_odd = Complex32::new(251.0, 5.0) * x256()[1];
+        assert!((odd.re - expected_odd.re).abs() < 1e-3);
+        assert!((odd.im - expected_odd.im).abs() < 1e-3);
+    }
+}
+
+/// Parity against the reference decoder, for both transform lengths.
+///
+/// The reference is FFmpeg's own direct O(N^2) inverse MDCT
+/// (`ff_tx_mdct_naive_inv`, libavutil/tx_template.c), driven the way
+/// libavcodec/ac3dec.c `do_imdct` drives it and folded by
+/// `vector_fmul_window` (libavutil/float_dsp.c). Nothing here shares code
+/// with [`ImdctState`], so a shared misreading of the transform cannot make
+/// both sides agree, and no corpus is needed to run it.
+#[cfg(test)]
+mod reference_parity {
+    use super::{ImdctState, WINDOW};
+
+    /// `ff_tx_mdct_naive_inv` with `s->len = len` and `scale = 1.0`: `len`
+    /// coefficients in, `len` samples out (the half-length transform).
+    fn naive_imdct(coeffs: &[f64], len: usize) -> Vec<f64> {
+        let half = len / 2;
+        let phase = std::f64::consts::PI / (4.0 * len as f64);
+        let mut out = vec![0.0f64; len];
+        for i in 0..half {
+            let down = phase * (4.0 * half as f64 - 2.0 * i as f64 - 1.0);
+            let up = phase * (3.0 * len as f64 + 2.0 * i as f64 + 1.0);
+            let mut sum_down = 0.0f64;
+            let mut sum_up = 0.0f64;
+            for (j, coeff) in coeffs.iter().enumerate().take(len) {
+                let odd = (2 * j + 1) as f64;
+                sum_down += (odd * down).cos() * coeff;
+                sum_up += (odd * up).cos() * coeff;
+            }
+            out[i] = sum_down;
+            out[i + half] = -sum_up;
+        }
+        out
+    }
+
+    /// `do_imdct` for one channel: the long block runs one 256-coefficient
+    /// transform and splits it, the short block runs two 128-coefficient
+    /// transforms over the even and the odd coefficients. Either way the first
+    /// half folds against the delay and the second half becomes the new delay.
+    struct Reference {
+        delay: [f64; 128],
+    }
+
+    impl Reference {
+        fn new() -> Self {
+            Self { delay: [0.0; 128] }
+        }
+
+        fn apply(&mut self, coeffs: &[f64; 256], block_switch: bool) -> [f64; 256] {
+            let (head, tail) = if block_switch {
+                let even: Vec<f64> = (0..128).map(|i| coeffs[2 * i]).collect();
+                let odd: Vec<f64> = (0..128).map(|i| coeffs[2 * i + 1]).collect();
+                (naive_imdct(&even, 128), naive_imdct(&odd, 128))
+            } else {
+                let full = naive_imdct(coeffs, 256);
+                (full[..128].to_vec(), full[128..].to_vec())
+            };
+
+            // vector_fmul_window(out, delay, head, WINDOW, 128).
+            let mut out = [0.0f64; 256];
+            for k in 0..128 {
+                let delayed = self.delay[k];
+                let fresh = head[127 - k];
+                let rising = WINDOW[k] as f64;
+                let falling = WINDOW[255 - k] as f64;
+                out[k] = delayed * falling - fresh * rising;
+                out[255 - k] = delayed * rising + fresh * falling;
+            }
+            self.delay.copy_from_slice(&tail);
+            out
+        }
+    }
+
+    /// Spectrally shaped pseudo-random coefficients, so the blocks look more
+    /// like audio than like noise. xorshift64, seeded per test.
+    struct Rng(u64);
+
+    impl Rng {
+        fn coefficients(&mut self) -> [f32; 256] {
+            std::array::from_fn(|i| {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                let uniform = ((x >> 40) as f32 / 8_388_608.0) - 1.0;
+                uniform / (1.0 + i as f32 / 24.0)
+            })
+        }
+    }
+
+    /// `ImdctState` doubles the overlap-add sum where the reference does not.
+    const SCALE: f64 = 2.0;
+
+    fn assert_matches_reference(pattern: &[bool], seed: u64) {
+        let mut rng = Rng(seed);
+        let mut state = ImdctState::new();
+        let mut reference = Reference::new();
+
+        for (block, &block_switch) in pattern.iter().enumerate() {
+            let coeffs = rng.coefficients();
+            let mut got = [0.0f32; 256];
+            state.apply(&coeffs, block_switch, &mut got);
+
+            let wide: [f64; 256] = std::array::from_fn(|i| coeffs[i] as f64);
+            let want = reference.apply(&wide, block_switch);
+
+            let peak = want.iter().fold(0.0f64, |a, w| a.max((SCALE * w).abs()));
+            let error = got
+                .iter()
+                .zip(want)
+                .fold(0.0f64, |a, (g, w)| a.max((*g as f64 - SCALE * w).abs()));
+            assert!(
+                error <= peak * 1e-5,
+                "block {block} (block_switch={block_switch}): peak error {error:e} \
+                 against a reference peak of {peak:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_blocks_match_reference() {
+        assert_matches_reference(&[false; 8], 0x1234_5678_9abc_def0);
+    }
+
+    #[test]
+    fn short_blocks_match_reference() {
+        assert_matches_reference(&[true; 8], 0x1234_5678_9abc_def0);
+    }
+
+    /// A transient the way a real stream carries one: a short block among long
+    /// ones. The block after a short block matters as much as the short block
+    /// itself, because it reads back the delay the short block left behind.
+    #[test]
+    fn transitions_between_block_lengths_match_reference() {
+        let pattern = [false, false, true, false, true, true, false, true, false];
+        assert_matches_reference(&pattern, 0xdead_beef_cafe_1234);
+    }
+
+    /// Every position a short block can take inside a six-block AC-3 frame,
+    /// including the last, whose delay crosses into the next frame.
+    #[test]
+    fn every_short_block_position_matches_reference() {
+        for position in 0..6 {
+            let mut pattern = [false; 12];
+            pattern[position] = true;
+            assert_matches_reference(&pattern, 0xa5a5_0000_0000_0001 + position as u64);
+        }
     }
 }
