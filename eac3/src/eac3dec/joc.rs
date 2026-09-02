@@ -384,6 +384,22 @@ fn resolve_joc_input_channel_index(core: &CorePcmFrame, channel: BedChannel) -> 
         })
 }
 
+/// The dequantization step of clause 6.6.4 Pseudocode 5, which scales a
+/// quantized coefficient by `820 / (4096 * (1 + joc_num_quant_idx))`.
+///
+/// That is 0,2001953125 on the coarse quantizer and 0,10009765625 on the fine
+/// one - close enough to 0,2 and 0,1 to read like them, but 0,098 % short if
+/// they are used instead, which leaves every non-zero coefficient in both the
+/// dense and the sparse path slightly wrong. Both values are dyadic, so the
+/// division is exact in binary floating point rather than merely close.
+///
+/// The successor codec keeps the same step: A-JOC's wet quantizer in ETSI
+/// TS 103 190-2 tables 46 and 47 is 2,001953125/10 and 2,00195313/20, the same
+/// two numbers.
+fn dequantization_step(quantization_table: usize) -> f32 {
+    820.0 / (4096.0 * (1 + quantization_table) as f32)
+}
+
 fn decode_parameter_points(
     mix_matrix: &mut [SubbandMatrix; 2],
     timeslot_offsets: &mut [u8; 2],
@@ -416,7 +432,7 @@ fn decode_parameter_points(
             if matrices.len() != data_points {
                 return Err(ParseError::InvalidHeader("joc_dense_points"));
             }
-            let gain_step = 0.2f32 - quantization_table as f32 * 0.1f32;
+            let gain_step = dequantization_step(quantization_table);
             let center = (quantization_table as f32 * 48.0 + 48.0) * gain_step;
             let max = center * 2.0;
             for (data_point, source) in matrices.iter().enumerate() {
@@ -505,7 +521,7 @@ fn decode_parameter_points(
             // than to the channel: carrying it across those moves agrees better
             // (0,667 against 0,557) and lands fewer bands on the quantizer's
             // rails.
-            let gain_step = 0.2f32 - quantization_table as f32 * 0.1f32;
+            let gain_step = dequantization_step(quantization_table);
             // joc_num_quant, and the quantized value that clause 6.6.4
             // dequantizes to a gain of zero.
             let quantization_steps = (quantization_table as i32 + 1) * 96;
@@ -619,6 +635,12 @@ fn lerp_matrix(
 }
 
 #[cfg(test)]
+// The expected coefficients below are written out to their last dyadic digit -
+// 1.201171875 is exactly six steps of 820/4096, and 1.2011719 is only the
+// shortest thing that round-trips. Writing what the step actually is keeps the
+// expectations derivable by hand and independent of the constant the decoder
+// uses, which is the whole point of asserting them.
+#[allow(clippy::excessive_precision)]
 mod tests {
     use super::{
         build_object_timeslots, decode_parameter_points, expanded_parameter_band_mapping,
@@ -711,17 +733,20 @@ mod tests {
         const BAND_1: usize = 3;
         const BAND_2: usize = 14;
 
+        // Dequantized at clause 6.6.4's exact 820/4096 per step, so 6, 11 and
+        // 17 steps above the quantizer's zero on point 0, and 9, 17 and 26 on
+        // point 1.
         let expected_point_0 = [
-            [1.2, 0.0, 0.0],
-            [0.0, 2.2, 3.4],
+            [1.201171875, 0.0, 0.0],
+            [0.0, 2.2021484375, 3.4033203125],
             [0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0],
         ];
         let expected_point_1 = [
             [0.0, 0.0, 0.0],
-            [1.8, 3.4, 0.0],
-            [0.0, 0.0, 5.2],
+            [1.8017578125, 3.4033203125, 0.0],
+            [0.0, 0.0, 5.205078125],
             [0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0],
         ];
@@ -763,6 +788,76 @@ mod tests {
         }
     }
 
+    /// The dense chain wraps in floating point, against a `max` that is itself
+    /// a multiple of the step, so the step has to be exact or the wrap lands on
+    /// the wrong side.
+    ///
+    /// 820/4096 is 205/1024, a dyadic rational, so `48 * step` and every
+    /// `value * step` are exact in f32 and the modulo agrees with the integer
+    /// arithmetic clause 6.6.2 actually specifies. 0,2 is not representable in
+    /// binary, and the accumulated rounding pushes chains across the boundary:
+    /// a band that should sit near the top of the quantizer comes back near the
+    /// bottom, a gain error of the whole 19,2 range rather than the 0,098 % the
+    /// wrong constant suggests.
+    ///
+    /// This drives [`decode_parameter_points`] itself rather than repeating the
+    /// arithmetic beside it, so it holds the decoder to the integer-space
+    /// result and not merely to whatever expression the dense branch currently
+    /// happens to contain. Every start value on both quantizers is swept, and
+    /// the two deltas after it carry the chain past the top of the range, so
+    /// the first band exercises the `offset + value` branch and the two after
+    /// it the running one. It is also the only place the fine quantizer's dense
+    /// path is decoded end to end.
+    #[test]
+    fn dense_decode_wraps_exactly_like_the_integer_quantizer() {
+        // Table 54's three-band column: band 0 covers subband 0, band 1 starts
+        // at 3 and band 2 at 14, so each band's decoded value is read off the
+        // subband its row begins at.
+        const BAND_SUBBAND: [usize; 3] = [0, 3, 14];
+
+        for quantization_table in 0..2u8 {
+            let steps = (quantization_table as i32 + 1) * 96;
+            let center = steps / 2;
+            let step = super::dequantization_step(quantization_table as usize);
+
+            for first in 0..steps {
+                // Two deltas that walk the chain over the top of the quantizer
+                // from wherever `first` left it.
+                let deltas = [first as u16, (steps - 7) as u16, 11];
+                let object = JocObject {
+                    active: true,
+                    bands_index: Some(1),
+                    bands: 3,
+                    sparse_coded: false,
+                    quantization_table: Some(quantization_table),
+                    steep_slope: false,
+                    data_points: 1,
+                    timeslot_offsets: Vec::new(),
+                    data: Some(JocObjectData::Dense {
+                        matrices: vec![vec![deltas.to_vec()]],
+                    }),
+                };
+
+                let mut mix_matrix = [vec![[0.0; 64]; 1], vec![[0.0; 64]; 1]];
+                let mut timeslot_offsets = [0; 2];
+                decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 1)
+                    .expect("points");
+
+                let mut quantized = center;
+                for (band, delta) in deltas.iter().enumerate() {
+                    quantized = (quantized + *delta as i32) % steps;
+                    let expected = (quantized - center) as f32 * step;
+                    let decoded = mix_matrix[0][0][BAND_SUBBAND[band]];
+                    assert_eq!(
+                        decoded, expected,
+                        "quant {quantization_table}, first {first}, band {band}: \
+                         {decoded} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A step that walks past the last channel wraps, and a coefficient step
     /// that walks past the quantizer's top wraps too - clause 6.6.2 takes both
     /// modulo, so a chain near the top of the range reappears at the bottom
@@ -800,15 +895,15 @@ mod tests {
         const BAND_1: usize = 3;
         const BAND_2: usize = 14;
 
-        // Band 0 on channel 4: (50 + 90) % 96 = 44, so (44 - 48) * 0.2.
-        assert!((mix_matrix[0][4][0] - -0.8).abs() < 1e-6);
-        assert!((mix_matrix[0][4][2] - -0.8).abs() < 1e-6);
+        // Band 0 on channel 4: (50 + 90) % 96 = 44, so (44 - 48) * 820/4096.
+        assert!((mix_matrix[0][4][0] - -0.80078125).abs() < 1e-6);
+        assert!((mix_matrix[0][4][2] - -0.80078125).abs() < 1e-6);
         // Band 1 moves to channel 2 and the chain carries: (44 + 90) % 96 = 38.
-        assert!((mix_matrix[0][2][BAND_1] - -2.0).abs() < 1e-6);
-        assert!((mix_matrix[0][2][13] - -2.0).abs() < 1e-6);
+        assert!((mix_matrix[0][2][BAND_1] - -2.001953125).abs() < 1e-6);
+        assert!((mix_matrix[0][2][13] - -2.001953125).abs() < 1e-6);
         // Band 2 stays on channel 2: (38 + 90) % 96 = 32.
-        assert!((mix_matrix[0][2][BAND_2] - -3.2).abs() < 1e-6);
-        assert!((mix_matrix[0][2][63] - -3.2).abs() < 1e-6);
+        assert!((mix_matrix[0][2][BAND_2] - -3.203125).abs() < 1e-6);
+        assert!((mix_matrix[0][2][63] - -3.203125).abs() < 1e-6);
         // Everything the bands did not name is silent, not offset - channel 0
         // across the whole row, and channel 4 outside band 0's row.
         assert_eq!(mix_matrix[0][0][0], 0.0);
@@ -819,7 +914,8 @@ mod tests {
 
     /// The fine quantizer doubles every constant in the sparse path: 192 steps
     /// instead of 96, a zero at 96 instead of 48, a chain starting at 100
-    /// instead of 50, and half the gain per step. Only the coarse quantizer
+    /// instead of 50, and half the gain per step - 820/8192 rather than
+    /// 820/4096. Only the coarse quantizer
     /// appears in the streams to hand, so this pins the scaling that the coarse
     /// tests cannot reach.
     #[test]
@@ -844,8 +940,8 @@ mod tests {
         decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5)
             .expect("points");
 
-        // (100 + 5) % 192 = 105, dequantized about 96 at 0.1 per step.
-        assert!((mix_matrix[0][2][0] - 0.9).abs() < 1e-6);
+        // (100 + 5) % 192 = 105, dequantized about 96 at 820/8192 per step.
+        assert!((mix_matrix[0][2][0] - 0.90087890625).abs() < 1e-6);
         // And the channels band 0 did not name are silent here too.
         assert_eq!(mix_matrix[0][0][0], 0.0);
         assert_eq!(mix_matrix[0][4][0], 0.0);
@@ -870,8 +966,9 @@ mod tests {
             timeslot_offsets: Vec::new(),
             data: Some(JocObjectData::Dense {
                 // Differential within each point, and point 1 is differential
-                // against point 0: point 0 decodes to 0.0, 0.2, 0.4 and point 1
-                // to 0.4, 0.6, 0.8.
+                // against point 0: point 0 decodes to 0, 1 and 2 steps above
+                // the quantizer's zero, point 1 to 2, 3 and 4 - a step being
+                // clause 6.6.4's 820/4096, or 0,2001953125.
                 matrices: vec![vec![vec![0, 1, 1]], vec![vec![2, 1, 1]]],
             }),
         };
@@ -901,31 +998,31 @@ mod tests {
         // towards point 0, reaching it on the last slot of the half.
         let half = &output[1][0];
         assert!((half[0] - 0.0).abs() < 1e-6);
-        assert!((half[BAND_1] - 0.2).abs() < 1e-6);
-        assert!((half[13] - 0.2).abs() < 1e-6);
-        assert!((half[BAND_2] - 0.4).abs() < 1e-6);
-        assert!((half[63] - 0.4).abs() < 1e-6);
+        assert!((half[BAND_1] - 0.2001953125).abs() < 1e-6);
+        assert!((half[13] - 0.2001953125).abs() < 1e-6);
+        assert!((half[BAND_2] - 0.400390625).abs() < 1e-6);
+        assert!((half[63] - 0.400390625).abs() < 1e-6);
 
         // Midway through the second half: half of the way from point 0 to
         // point 1, band by band.
         let between = &output[2][0];
-        assert!((between[0] - 0.2).abs() < 1e-6);
-        assert!((between[BAND_1] - 0.4).abs() < 1e-6);
-        assert!((between[BAND_2] - 0.6).abs() < 1e-6);
+        assert!((between[0] - 0.2001953125).abs() < 1e-6);
+        assert!((between[BAND_1] - 0.400390625).abs() < 1e-6);
+        assert!((between[BAND_2] - 0.6005859375).abs() < 1e-6);
 
         // And the frame ends on point 1 itself, expanded the same way.
         let end = &output[3][0];
-        assert!((end[0] - 0.4).abs() < 1e-6);
-        assert!((end[BAND_1] - 0.6).abs() < 1e-6);
-        assert!((end[13] - 0.6).abs() < 1e-6);
-        assert!((end[BAND_2] - 0.8).abs() < 1e-6);
-        assert!((end[63] - 0.8).abs() < 1e-6);
+        assert!((end[0] - 0.400390625).abs() < 1e-6);
+        assert!((end[BAND_1] - 0.6005859375).abs() < 1e-6);
+        assert!((end[13] - 0.6005859375).abs() < 1e-6);
+        assert!((end[BAND_2] - 0.80078125).abs() < 1e-6);
+        assert!((end[63] - 0.80078125).abs() < 1e-6);
 
         // The matrix carried into the next frame is the last point, expanded -
         // not the raw parameter array, which would zero the top end again on
         // the very next frame's first half.
-        assert!((prev_matrix[0][BAND_2] - 0.8).abs() < 1e-6);
-        assert!((prev_matrix[0][63] - 0.8).abs() < 1e-6);
+        assert!((prev_matrix[0][BAND_2] - 0.80078125).abs() < 1e-6);
+        assert!((prev_matrix[0][63] - 0.80078125).abs() < 1e-6);
     }
 
     /// The parameters arrive one per parameter band; the reconstruction needs
@@ -944,7 +1041,8 @@ mod tests {
             timeslot_offsets: vec![1],
             data: Some(JocObjectData::Dense {
                 // Differential: band 0 stays at the centre, bands 1 and 2 each
-                // step once, so the three bands decode to 0.0, 0.2 and 0.4.
+                // step once, so the three bands decode to 0, 1 and 2 steps of
+                // clause 6.6.4's 820/4096.
                 matrices: vec![vec![vec![0, 1, 1]]],
             }),
         };
@@ -971,10 +1069,10 @@ mod tests {
         // parameter array - zero - and the object lost its whole top end.
         let switched = &output[3][0];
         assert!((switched[0] - 0.0).abs() < 1e-6);
-        assert!((switched[3] - 0.2).abs() < 1e-6);
-        assert!((switched[13] - 0.2).abs() < 1e-6);
-        assert!((switched[14] - 0.4).abs() < 1e-6);
-        assert!((switched[63] - 0.4).abs() < 1e-6);
+        assert!((switched[3] - 0.2001953125).abs() < 1e-6);
+        assert!((switched[13] - 0.2001953125).abs() < 1e-6);
+        assert!((switched[14] - 0.400390625).abs() < 1e-6);
+        assert!((switched[63] - 0.400390625).abs() < 1e-6);
     }
 
     #[test]
@@ -1016,11 +1114,15 @@ mod tests {
         assert!(output[0][0].iter().all(|value| *value == 1.0));
         assert!(output[1][0].iter().all(|value| *value == 0.0));
         assert!(output[2][0].iter().all(|value| *value == 0.0));
-        assert!(output[3][0].iter().all(|value| (*value - 0.2).abs() < 1e-6));
+        assert!(
+            output[3][0]
+                .iter()
+                .all(|value| (*value - 0.2001953125).abs() < 1e-6)
+        );
         assert!(
             prev_matrix[0]
                 .iter()
-                .all(|value| (*value - 0.2).abs() < 1e-6)
+                .all(|value| (*value - 0.2001953125).abs() < 1e-6)
         );
     }
 
