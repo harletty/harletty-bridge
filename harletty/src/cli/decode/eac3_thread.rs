@@ -98,6 +98,9 @@ pub fn spawn_eac3_decoder_thread(
         // (stream truncated mid-pair): emit it as a standalone bed.
         flush_pending_independent(&mut state, &pb_clone, &tx);
         if let Some(core) = state.pending_ac3_core.take() {
+            // AC-3 never carries JOC, so a core emitted on its own is one
+            // more presentation the object decoder did not see.
+            state.object_decoder.note_non_joc_presentation();
             emit_standalone_ac3_core(core, &mut state.frame_count, &pb_clone, &tx);
         }
 
@@ -156,6 +159,9 @@ fn handle_frame(
     if !is_dependent {
         flush_pending_independent(state, pb, tx);
         if let Some(core) = state.pending_ac3_core.take() {
+            // As above: a standalone AC-3 core is a resolved no-JOC
+            // presentation.
+            state.object_decoder.note_non_joc_presentation();
             emit_standalone_ac3_core(core, &mut state.frame_count, pb, tx);
         }
     }
@@ -282,6 +288,9 @@ fn handle_core_pair(
         }
     }
 
+    // Resolved the other way: the pair is complete and neither half produced
+    // objects, so this presentation carried no JOC either.
+    state.object_decoder.note_non_joc_presentation();
     let bed = merge_core_with_dependent(&mut state.dependent_pcm_decoder, &core_result.pcm, bytes)
         .unwrap_or(core_result.pcm);
     state.frame_count += 1;
@@ -338,6 +347,11 @@ fn flush_pending_independent(
     tx: &mpsc::Sender<Result<Eac3FrameMessage>>,
 ) {
     if let Some(PendingIndependent::UnsentCore(msg)) = state.pending_independent.take() {
+        // Resolved: this independent had no dependent partner and carried no
+        // JOC, so a whole presentation has gone by without the object decoder
+        // running. Its filter banks would otherwise carry the programme from
+        // before the gap into whatever JOC frame comes next.
+        state.object_decoder.note_non_joc_presentation();
         state.frame_count += 1;
         tick_progress(pb);
         let _ = tx.send(Ok(Eac3FrameMessage::Core(msg)));
