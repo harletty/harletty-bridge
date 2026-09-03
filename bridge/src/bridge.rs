@@ -4,7 +4,6 @@ use bridge_api::{
     RVbapTableMode,
 };
 use eac3::{CorePcmFrame, Extractor as Eac3RawExtractor, ObjectPcmDecoder, PcmDecoder};
-use std::collections::VecDeque;
 #[cfg(feature = "bridge-perf")]
 use std::env;
 #[cfg(feature = "bridge-perf")]
@@ -15,8 +14,9 @@ use crate::ac3_native::NativeAc3Decoder;
 use crate::auro_pipeline::DtsAuroState;
 use crate::dts_pipeline::{DtsFoldConfig, DtsXState};
 use crate::eac3_pipeline::{
-    diagnose_eac3_frame, is_dependent_eac3_frame, is_legacy_ac3_frame,
-    is_temporary_eac3_silence_frame, process_eac3_dependent_frame_with_core, process_eac3_frame,
+    diagnose_eac3_frame, eac3_frame_can_carry_dependents, eac3_frame_carries_joc,
+    is_dependent_eac3_frame, is_legacy_ac3_frame, is_temporary_eac3_silence_frame,
+    process_eac3_frame,
 };
 use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::PcmStats;
@@ -42,6 +42,8 @@ pub(crate) struct Eac3DiagStats {
     pub(crate) paired_object_frames: u64,
     /// Non-JOC AC-3-core + dependent pairs emitted as plain channel beds.
     pub(crate) dependent_pair_channel_beds: u64,
+    /// Dependents whose channels could not be overlaid onto the core.
+    pub(crate) dependent_merge_failures: u64,
     /// Standalone AC-3 cores (plain AC-3, no dependent) emitted as 5.1 beds.
     pub(crate) standalone_ac3_core_beds: u64,
     pub(crate) short_packet_silence_frames: u64,
@@ -56,7 +58,6 @@ pub(crate) struct Eac3DiagStats {
 /// partner. In a healthy stream the queue never holds more than one entry;
 /// it only grows while cores fail to decode, so keep a small window and drop
 /// the oldest beyond it.
-const MAX_PENDING_DEPENDENT_FRAMES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum DrcMode {
@@ -113,6 +114,39 @@ fn sniff_raw_codec(data: &[u8]) -> Option<RawCodec> {
 /// transient is a single `Decoder` in a leaf frame. The cost is one pointer
 /// hop per pipeline entry — never per sample — so hot loops are unaffected.
 /// `tests::atmos_bridge_stack_footprint_stays_small` guards the invariant.
+/// A presentation being assembled: the core, and the dependents that have
+/// attached themselves to it so far.
+///
+/// An independent may be followed by up to eight dependents, and the JOC
+/// payload rides in the last of them, so the group is collected rather than
+/// resolved on the first arrival - taking the core away from the second
+/// dependent would orphan it and lose exactly the payload that matters.
+pub(crate) struct PendingEac3Presentation {
+    pub(crate) core: PendingEac3Core,
+    pub(crate) dependents: Vec<Vec<u8>>,
+}
+
+/// ETSI TS 102 366 E.1.3.1.2 allows at most eight dependent substreams behind
+/// one independent. More than that is a malformed group, not a longer one.
+const MAX_EAC3_DEPENDENTS: usize = 8;
+
+/// A presentation's core, held until its dependent arrives or the next
+/// non-dependent access unit ends the presentation without one.
+pub(crate) enum PendingEac3Core {
+    /// A legacy AC-3 core. AC-3 carries no JOC, so this is only ever the
+    /// channel half of a pair. The access unit is kept so a standalone flush
+    /// can recover its DRC and dialnorm.
+    LegacyAc3 {
+        core: CorePcmFrame,
+        access_unit: Vec<u8>,
+    },
+    /// An independent E-AC-3 frame that carried no JOC payload of its own.
+    ///
+    /// Boxed to keep `AtmosBridge` pointer-sized per field, which
+    /// `tests::atmos_bridge_stack_footprint_stays_small` holds it to.
+    Independent(Box<eac3::PcmPushResult>),
+}
+
 pub(crate) struct AtmosBridge {
     // ── TrueHD pipeline ──────────────────────────────────────────────
     pub(crate) mat_stream: MatStream,
@@ -130,12 +164,15 @@ pub(crate) struct AtmosBridge {
     pub(crate) eac3_dependent_pcm_decoder: Box<PcmDecoder>,
     pub(crate) eac3_object_decoder: Box<ObjectPcmDecoder>,
     pub(crate) ac3_decoder: Box<NativeAc3Decoder>,
-    /// Decoded AC-3 cores awaiting either a following E-AC3 dependent (→ paired
-    /// 7.1 bed / object frame) or, if none arrives, a standalone-core flush
-    /// (→ plain 5.1 bed). The `Vec<u8>` keeps the original AC-3 access unit so
-    /// the standalone flush can recover its DRC/dialnorm.
-    pub(crate) pending_ac3_cores: VecDeque<(CorePcmFrame, Vec<u8>)>,
-    pub(crate) pending_dependent_frames: VecDeque<Vec<u8>>,
+    /// The core of a presentation whose dependent has not arrived yet.
+    ///
+    /// A dependent substream belongs to the independent it immediately follows,
+    /// so at most one core is ever outstanding: the next non-dependent access
+    /// unit ends the presentation whether a dependent came or not. Holding it
+    /// as an `Option` rather than a queue is what makes a dependent that
+    /// arrives with nothing in front of it an orphan to drop, instead of one to
+    /// park until some later, unrelated core turns up.
+    pub(crate) pending_eac3_core: Option<PendingEac3Presentation>,
     pub(crate) eac3_frame_count: u64,
     pub(crate) eac3_total_samples: u64,
     /// True when the most recent `push_packet` used the E-AC3 path.
@@ -232,8 +269,7 @@ impl AtmosBridge {
             eac3_dependent_pcm_decoder: eac3_dependent_pcm,
             eac3_object_decoder: eac3_obj,
             ac3_decoder: Box::new(NativeAc3Decoder::default()),
-            pending_ac3_cores: VecDeque::new(),
-            pending_dependent_frames: VecDeque::new(),
+            pending_eac3_core: None,
             eac3_frame_count: 0,
             eac3_total_samples: 0,
             eac3_active: false,
@@ -295,8 +331,7 @@ impl AtmosBridge {
         self.eac3_dependent_pcm_decoder.reset();
         self.eac3_object_decoder.reset();
         self.ac3_decoder.reset();
-        self.pending_ac3_cores.clear();
-        self.pending_dependent_frames.clear();
+        self.pending_eac3_core = None;
         self.eac3_frame_count = 0;
         self.eac3_active = false;
 
@@ -327,51 +362,85 @@ impl AtmosBridge {
         self.recovering_until_major_sync = false;
     }
 
-    /// Emit any AC-3 cores buffered without a following E-AC3 dependent as plain
-    /// 5.1 channel beds. Called before processing a non-dependent access unit
-    /// (the buffered core had no partner) so plain AC-3 streams are not silent.
-    fn flush_pending_standalone_ac3_cores(&mut self, result: &mut RPushResult) {
-        while let Some((core, au)) = self.pending_ac3_cores.pop_front() {
-            result
-                .frames
-                .push(crate::eac3_pipeline::build_standalone_ac3_core_frame(
-                    self, &core, &au,
-                ));
+    /// Resolve the pending presentation, applying the pipeline's failure
+    /// policy: strict mode surfaces the error and resets, as every other decode
+    /// failure here does.
+    fn finish_presentation(&mut self, result: &mut RPushResult) -> Result<(), ()> {
+        match self.resolve_pending_presentation(result) {
+            Ok(()) => Ok(()),
+            Err(msg) => {
+                log::warn!("{msg}");
+                self.reset_pipeline();
+                result.did_reset = true;
+                result.error_message = msg.as_str().into();
+                Err(())
+            }
         }
     }
 
-    fn try_decode_pending_eac3_pair(&mut self) -> Option<bridge_api::RDecodedFrame> {
-        // Both queues must have a frame before we commit to popping either —
-        // otherwise an AC-3 core popped here without a partner is silently
-        // dropped when `?` short-circuits the function. On streams that
-        // deliver `[AC-3 core, E-AC-3 dep]` per packet (DD+ JOC with a
-        // backward-compat AC-3 core), the first try_pair after the core was
-        // queued ALWAYS hits the empty dep queue, losing the core. The next
-        // try_pair after the dep is queued then finds no core to pair with.
-        // Net effect: pair_attempts stays at 0 forever and is_spatial never
-        // flips to true.
-        if self.pending_ac3_cores.is_empty() || self.pending_dependent_frames.is_empty() {
-            return None;
+    /// Resolve the presentation in hand into exactly one emitted frame.
+    ///
+    /// Any non-dependent access unit ends the group, because a dependent
+    /// belongs to the unit it immediately follows. The dependents are merged
+    /// onto the core in bitstream order, and the last of them decides what
+    /// comes out: a JOC payload there means objects reconstructed from the
+    /// merged bed, and its absence means the bed itself.
+    ///
+    /// Returns the decode error rather than swallowing it, so strict mode can
+    /// reset the pipeline; the caller decides whether to fall back.
+    fn resolve_pending_presentation(&mut self, result: &mut RPushResult) -> Result<(), String> {
+        let Some(pending) = self.pending_eac3_core.take() else {
+            return Ok(());
+        };
+        let PendingEac3Presentation { core, dependents } = pending;
+
+        // A presentation with no JOC anywhere in it is a gap in object
+        // carriage, and the object decoder cannot see one from the inside: its
+        // sequence counter only advances on frames that carry a payload, so the
+        // next JOC frame would otherwise interpolate away from a matrix
+        // belonging to whatever played before the gap.
+        let joc_dependent = dependents
+            .last()
+            .filter(|dependent| eac3_frame_carries_joc(dependent));
+        if joc_dependent.is_none() {
+            self.eac3_object_decoder.note_non_joc_presentation();
         }
-        let (core, _core_au) = self.pending_ac3_cores.pop_front().unwrap();
-        let dependent = self.pending_dependent_frames.pop_front().unwrap();
+
+        // Nothing attached: the core stands on its own.
+        if dependents.is_empty() {
+            match core {
+                PendingEac3Core::LegacyAc3 { core, access_unit } => {
+                    result
+                        .frames
+                        .push(crate::eac3_pipeline::build_standalone_ac3_core_frame(
+                            self,
+                            &core,
+                            &access_unit,
+                        ));
+                }
+                PendingEac3Core::Independent(push) => {
+                    result
+                        .frames
+                        .push(crate::eac3_pipeline::build_buffered_core_frame(self, &push));
+                }
+            }
+            return Ok(());
+        }
+
         self.eac3_diag_stats.dependent_pair_attempts += 1;
-        match process_eac3_dependent_frame_with_core(self, &dependent, core) {
-            Ok(Some(decoded_frame)) => Some(decoded_frame),
-            Ok(None) => {
-                self.eac3_diag_stats.dependent_pair_no_object += 1;
-                self.eac3_diag_stats.last_dependent_pair_error =
-                    Some("no_object_payload".to_string());
-                None
+        let core_pcm = match core {
+            PendingEac3Core::LegacyAc3 { core, .. } => core,
+            PendingEac3Core::Independent(push) => push.pcm,
+        };
+        match crate::eac3_pipeline::resolve_eac3_presentation(self, core_pcm, &dependents) {
+            Ok(frame) => {
+                result.frames.push(frame);
+                Ok(())
             }
             Err(err) => {
                 self.eac3_diag_stats.dependent_pair_failures += 1;
                 self.eac3_diag_stats.last_dependent_pair_error = Some(err.clone());
-                bridge_diag_log(
-                    log::Level::Warn,
-                    &format!("eac3_dependent_pair_failed error={err}"),
-                );
-                None
+                Err(err)
             }
         }
     }
@@ -407,24 +476,56 @@ impl AtmosBridge {
         temporary_silence_pushed: &mut bool,
     ) -> Result<(), ()> {
         self.eac3_frame_count += 1;
-        // A buffered AC-3 core is only ever paired with an *immediately*
-        // following E-AC3 dependent access unit. If the next access unit is not a
-        // dependent, the buffered core had no partner (plain AC-3, which never
-        // carries dependents) — flush it as a standalone 5.1 bed before handling
-        // this unit, otherwise the core sits queued forever and the track is
-        // silent.
-        if !is_dependent_eac3_frame(frame) {
-            self.flush_pending_standalone_ac3_cores(result);
+        // A dependent substream belongs to the access unit it immediately
+        // follows, so any other kind of unit ends the group in hand.
+        if is_dependent_eac3_frame(frame) {
+            let Some(pending) = self.pending_eac3_core.as_mut() else {
+                // Nothing in front of it: this dependent belongs to nothing. It
+                // used to be parked for some later, unrelated core to claim,
+                // which put one programme's extension channels on another's bed.
+                self.eac3_diag_stats.dependent_frames_dropped += 1;
+                bridge_diag_log(
+                    log::Level::Warn,
+                    "eac3_orphan_dependent no core precedes this dependent access unit",
+                );
+                return Ok(());
+            };
+            if pending.dependents.len() >= MAX_EAC3_DEPENDENTS {
+                // More than the eight ETSI allows behind one independent: the
+                // group is malformed rather than longer, so resolve what is
+                // valid and drop the excess instead of growing without bound.
+                self.eac3_diag_stats.dependent_frames_dropped += 1;
+                bridge_diag_log(
+                    log::Level::Warn,
+                    "eac3_dependent_group_overflow more than eight dependents behind one independent",
+                );
+                return self.finish_presentation(result);
+            }
+            pending.dependents.push(frame.to_vec());
+            // The JOC payload rides in the last dependent, so one that carries
+            // it ends the group with no need to wait for the next access unit.
+            if eac3_frame_carries_joc(frame) {
+                return self.finish_presentation(result);
+            }
+            return Ok(());
         }
+
+        if let Err(()) = self.finish_presentation(result) {
+            return Err(());
+        }
+
         if is_legacy_ac3_frame(frame) {
             match self.ac3_decoder.decode_frame(frame) {
                 Ok(core) => {
                     diagnose_eac3_frame(self, frame);
                     self.eac3_diag_stats.ac3_core_decoded += 1;
-                    self.pending_ac3_cores.push_back((core, frame.to_vec()));
-                    if let Some(decoded_frame) = self.try_decode_pending_eac3_pair() {
-                        result.frames.push(decoded_frame);
-                    }
+                    self.pending_eac3_core = Some(PendingEac3Presentation {
+                        core: PendingEac3Core::LegacyAc3 {
+                            core,
+                            access_unit: frame.to_vec(),
+                        },
+                        dependents: Vec::new(),
+                    });
                     return Ok(());
                 }
                 Err(err) => {
@@ -441,27 +542,33 @@ impl AtmosBridge {
             }
         }
 
-        let decode_result = if is_dependent_eac3_frame(frame) {
-            // A dependent is normally paired with its core immediately, so the
-            // queue holds at most one entry. It only grows when cores keep
-            // failing to decode; bound it so a corrupt stream cannot grow it
-            // without limit for the whole playback session.
-            while self.pending_dependent_frames.len() >= MAX_PENDING_DEPENDENT_FRAMES {
-                self.pending_dependent_frames.pop_front();
-                self.eac3_diag_stats.dependent_frames_dropped += 1;
-                bridge_diag_log(
-                    log::Level::Warn,
-                    "eac3_dependent_queue_overflow dropping oldest pending dependent frame",
-                );
-            }
-            self.pending_dependent_frames.push_back(frame.to_vec());
-            match self.try_decode_pending_eac3_pair() {
-                Some(decoded_frame) => Ok(decoded_frame),
-                None => return Ok(()),
-            }
-        } else {
-            process_eac3_frame(self, frame)
-        };
+        let decode_result =
+            if eac3_frame_can_carry_dependents(frame) && !eac3_frame_carries_joc(frame) {
+                // A plain independent core might be the first half of a group, and
+                // nothing in it says whether a dependent follows. Hold it until the
+                // next access unit answers that. A converted-AC-3 frame is excluded:
+                // ETSI allows it no dependents, so buffering it would add latency
+                // for a partner that cannot arrive.
+                match self.eac3_pcm_decoder.push_access_unit(frame) {
+                    Ok(push) => {
+                        diagnose_eac3_frame(self, frame);
+                        crate::eac3_pipeline::note_eac3_dialogue_level(self, &push.info);
+                        self.pending_eac3_core = Some(PendingEac3Presentation {
+                            core: PendingEac3Core::Independent(Box::new(push)),
+                            dependents: Vec::new(),
+                        });
+                        return Ok(());
+                    }
+                    Err(err) => Err(format!("E-AC3 core decode error: {err}")),
+                }
+            } else {
+                // JOC in the independent frame itself is a complete presentation -
+                // the reconstruction takes the core it arrived with and wants no
+                // dependent - so it is emitted straight away rather than buffered.
+                // That keeps the common 5.1-core Atmos stream free of the access
+                // unit of latency buffering would add.
+                process_eac3_frame(self, frame)
+            };
 
         match decode_result {
             Ok(decoded_frame) => {
@@ -493,7 +600,7 @@ impl AtmosBridge {
                 log::warn!("{msg}");
                 self.reset_pipeline();
                 result.did_reset = true;
-                result.error_message = msg.into();
+                result.error_message = msg.as_str().into();
                 Err(())
             }
         }
