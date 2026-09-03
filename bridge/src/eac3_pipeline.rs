@@ -256,15 +256,52 @@ pub(crate) fn is_legacy_ac3_frame(frame: &[u8]) -> bool {
     legacy_ac3_info(frame).is_some()
 }
 
-/// Whether this access unit carries a JOC payload of its own.
+/// Whether this access unit carries a JOC payload at all.
 ///
-/// An independent frame that does is a complete presentation: the
-/// reconstruction wants only the core it arrived with, so it need not be held
-/// back to see whether a dependent follows.
+/// The payload rides in the last access unit of a presentation, so one that
+/// carries it ends the group.
 pub(crate) fn eac3_frame_carries_joc(frame: &[u8]) -> bool {
     inspect_access_unit(frame)
         .map(|info| info.joc_payload_count() > 0)
         .unwrap_or(false)
+}
+
+/// Whether this access unit carries a JOC payload its own channels satisfy.
+///
+/// An independent frame that does is already a complete presentation - the
+/// reconstruction wants only the core it arrived with - so it need not be held
+/// back to see whether a dependent follows. That is the five-channel downmix
+/// configurations, `joc_dmx_config_idx` 0 and 3, which a 5.1 independent
+/// supplies on its own.
+///
+/// The seven-channel configurations are a different matter. An independent
+/// substream carries 5.1 at most, so configuration 1's back pair and
+/// configurations 2 and 4's top front pair can only arrive in a dependent.
+/// Emitting such a frame on arrival hands the reconstruction a bed two
+/// channels short of what the payload's own header declares, which is how a
+/// height downmix came to be reconstructed from the surrounds; it waits for
+/// its dependents instead.
+///
+/// That second case is malformed input and this deliberately settles for a
+/// correct bed rather than objects. TS 103 420 clause 8.2 requires the EMDF
+/// container carrying OAMD and JOC to ride in the *last dependent* wherever a
+/// stream has dependents at all, so a payload in the independent means there
+/// are none - and then five channels is all it can declare. A wide declaration
+/// here is a stream that contradicts itself. Holding the frame lets its
+/// dependents reach the bed, and [`resolve_eac3_presentation`] then finds no
+/// JOC in the last of them and emits that bed: the extension channels are
+/// heard, the objects are not. Emitting on arrival instead would strand those
+/// dependents with no core to attach to and lose the channels as well, which
+/// is the worse of the two, and reconstructing from the independent's own
+/// payload is machinery for a stream shape the specification forbids.
+pub(crate) fn eac3_frame_carries_self_contained_joc(frame: &[u8]) -> bool {
+    let Ok(info) = inspect_access_unit(frame) else {
+        return false;
+    };
+    info.payloads().any(|payload| match &payload.parsed {
+        ParsedEmdfPayloadData::Joc(joc) => usize::from(info.fullband_channels) >= joc.channel_count,
+        _ => false,
+    })
 }
 
 pub(crate) fn is_dependent_eac3_frame(frame: &[u8]) -> bool {
@@ -1381,6 +1418,11 @@ mod presentation_assembly {
     /// A real independent E-AC-3 access unit, 2/0, carrying no JOC.
     const INDEPENDENT: &[u8] = include_bytes!("../../eac3/tests/data/aht_independent_stereo.bin");
 
+    /// A real independent 5.1 access unit carrying a JOC payload whose downmix
+    /// configuration is a five-channel one, so the frame satisfies it alone.
+    const SELF_CONTAINED_JOC: &[u8] =
+        include_bytes!("../../eac3/tests/data/short_packet_independent_joc.bin");
+
     /// The same access unit with `strmtyp` set to dependent. The two bits sit at
     /// the top of the byte after the sync word.
     fn dependent() -> Vec<u8> {
@@ -1416,6 +1458,26 @@ mod presentation_assembly {
         assert!(
             bridge.pending_eac3_core.is_some(),
             "the second independent is now the one being held"
+        );
+    }
+
+    /// A JOC payload the frame's own channels satisfy still costs no latency.
+    ///
+    /// Holding a frame back is for one that might be half a presentation. This
+    /// one is not: its payload declares a five-channel downmix and the frame is
+    /// 5.1, so the reconstruction has everything it reads. Buffering it would
+    /// put an access unit of latency on the common Atmos stream for nothing.
+    #[test]
+    fn a_joc_frame_its_own_channels_satisfy_is_emitted_on_arrival() {
+        let mut bridge = AtmosBridge::new(false);
+        assert_eq!(
+            push(&mut bridge, SELF_CONTAINED_JOC),
+            1,
+            "a self-contained JOC presentation must be emitted, not held"
+        );
+        assert!(
+            bridge.pending_eac3_core.is_none(),
+            "and nothing must be left pending behind it"
         );
     }
 

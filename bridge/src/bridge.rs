@@ -15,8 +15,8 @@ use crate::auro_pipeline::DtsAuroState;
 use crate::dts_pipeline::{DtsFoldConfig, DtsXState};
 use crate::eac3_pipeline::{
     diagnose_eac3_frame, eac3_frame_can_carry_dependents, eac3_frame_carries_joc,
-    is_dependent_eac3_frame, is_legacy_ac3_frame, is_temporary_eac3_silence_frame,
-    process_eac3_frame,
+    eac3_frame_carries_self_contained_joc, is_dependent_eac3_frame, is_legacy_ac3_frame,
+    is_temporary_eac3_silence_frame, process_eac3_frame,
 };
 use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::PcmStats;
@@ -542,33 +542,39 @@ impl AtmosBridge {
             }
         }
 
-        let decode_result =
-            if eac3_frame_can_carry_dependents(frame) && !eac3_frame_carries_joc(frame) {
-                // A plain independent core might be the first half of a group, and
-                // nothing in it says whether a dependent follows. Hold it until the
-                // next access unit answers that. A converted-AC-3 frame is excluded:
-                // ETSI allows it no dependents, so buffering it would add latency
-                // for a partner that cannot arrive.
-                match self.eac3_pcm_decoder.push_access_unit(frame) {
-                    Ok(push) => {
-                        diagnose_eac3_frame(self, frame);
-                        crate::eac3_pipeline::note_eac3_dialogue_level(self, &push.info);
-                        self.pending_eac3_core = Some(PendingEac3Presentation {
-                            core: PendingEac3Core::Independent(Box::new(push)),
-                            dependents: Vec::new(),
-                        });
-                        return Ok(());
-                    }
-                    Err(err) => Err(format!("E-AC3 core decode error: {err}")),
+        // A plain independent core might be the first half of a group, and
+        // nothing in it says whether a dependent follows. Hold it until the next
+        // access unit answers that. A converted-AC-3 frame is excluded: ETSI
+        // allows it no dependents, so buffering it would add latency for a
+        // partner that cannot arrive. An independent whose own JOC payload
+        // declares a downmix wider than the frame carries is the opposite case -
+        // its extension pair, the back channels or the top front ones, is in a
+        // dependent, and emitting the frame alone would reconstruct from a bed
+        // two channels short of its own header - so that one is held too.
+        let might_be_half_a_presentation =
+            eac3_frame_can_carry_dependents(frame) && !eac3_frame_carries_self_contained_joc(frame);
+
+        let decode_result = if might_be_half_a_presentation {
+            match self.eac3_pcm_decoder.push_access_unit(frame) {
+                Ok(push) => {
+                    diagnose_eac3_frame(self, frame);
+                    crate::eac3_pipeline::note_eac3_dialogue_level(self, &push.info);
+                    self.pending_eac3_core = Some(PendingEac3Presentation {
+                        core: PendingEac3Core::Independent(Box::new(push)),
+                        dependents: Vec::new(),
+                    });
+                    return Ok(());
                 }
-            } else {
-                // JOC in the independent frame itself is a complete presentation -
-                // the reconstruction takes the core it arrived with and wants no
-                // dependent - so it is emitted straight away rather than buffered.
-                // That keeps the common 5.1-core Atmos stream free of the access
-                // unit of latency buffering would add.
-                process_eac3_frame(self, frame)
-            };
+                Err(err) => Err(format!("E-AC3 core decode error: {err}")),
+            }
+        } else {
+            // A JOC payload the frame's own channels satisfy is a complete
+            // presentation - the reconstruction takes the core it arrived with
+            // and wants no dependent - so it is emitted straight away rather
+            // than buffered. That keeps the common 5.1-core Atmos stream free of
+            // the access unit of latency buffering would add.
+            process_eac3_frame(self, frame)
+        };
 
         match decode_result {
             Ok(decoded_frame) => {

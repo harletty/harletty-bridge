@@ -56,7 +56,16 @@ impl CorePcmFrame {
 /// Speaker positions a dependent-substream `chanmap` carries, in coded-channel
 /// order (MSB→LSB; pair bits emit left then right). Only the bits that map to a
 /// concrete bed position are emitted — enough for the common 5.1/7.1 channel
-/// extensions (e.g. 0x1A00 = Ls, Rs, Lrs/Rrs).
+/// extensions (e.g. 0x1A00 = Ls, Rs, Lrs/Rrs) and for the height pairs a
+/// 5.1.2 or 5.1.4 bed is carried as.
+///
+/// The bit numbering is TS 102 366 table E.1.4's, where bit 0 is the most
+/// significant of the sixteen — so its bit 11, the Vhl/Vhr pair, is `1 << 4`
+/// here. Vhl/Vhr are the front height speakers, the Tfl/Tfr that JOC downmix
+/// configurations 2 and 4 name as their sixth and seventh inputs; without them
+/// no bed can satisfy those configurations. Its bits 8 and 12, Ts and Vhc, have
+/// no [`BedChannel`] to land on and are left out, which the caller's
+/// count check turns into a declined merge rather than a misplaced channel.
 pub fn dependent_chanmap_positions(chanmap: u16) -> Vec<BedChannel> {
     use BedChannel::*;
     const TABLE: &[(u16, &[BedChannel])] = &[
@@ -68,6 +77,8 @@ pub fn dependent_chanmap_positions(chanmap: u16) -> Vec<BedChannel> {
         (1 << 9, &[RearLeft, RearRight]), // Lrs/Rrs (back surrounds)
         (1 << 8, &[RearCenter]),          // Cs
         (1 << 5, &[WideLeft, WideRight]), // Lw/Rw
+        (1 << 4, &[TopFrontLeft, TopFrontRight]), // Vhl/Vhr (front height)
+        (1 << 2, &[TopSurroundLeft, TopSurroundRight]), // Lts/Rts
     ];
     let mut out = Vec::new();
     for &(bit, chans) in TABLE {
@@ -79,34 +90,66 @@ pub fn dependent_chanmap_positions(chanmap: u16) -> Vec<BedChannel> {
 }
 
 /// Merge a decoded core (5.1) with its dependent E-AC-3 substream — the discrete
-/// surround/back channels of a 7.1 extension — into one bed, placing the
-/// dependent's channels by its `chanmap`. Returns `None` (caller falls back to
-/// the core alone) when the dependent can't be decoded or doesn't line up.
+/// surround/back channels of a 7.1 extension, or the height layer above it —
+/// into one bed. Returns `None` (caller falls back to the core alone) when the
+/// dependent can't be decoded or doesn't line up.
+///
+/// TS 102 366 clause E.2.8.2 gives the dependent's channels two ways of naming
+/// themselves and the same meaning either way: a channel the core also carries
+/// is overwritten by the dependent's, and one it does not extends the bed.
+/// `chanmape == 1` names them with the custom map; `chanmape == 0` leaves it to
+/// the dependent's own `acmod` and `lfeon`, which is the layout the decoder has
+/// already derived for it, so that case reads the order off the decoded frame
+/// rather than declining the merge. It is a narrower case than it sounds —
+/// `acmod` reaches no further than 3/2, so a map-less dependent can only
+/// replace base channels, never add a back or height pair — but replacing them
+/// is exactly what it is for, and ignoring it left the reconstruction reading
+/// core channels the dependent had already superseded.
 pub fn merge_core_with_dependent(
     dependent_decoder: &mut PcmDecoder,
     core: &CorePcmFrame,
     dependent_frame: &[u8],
 ) -> Option<CorePcmFrame> {
     let dep = dependent_decoder.push_access_unit(dependent_frame).ok()?;
-    let positions = dependent_chanmap_positions(dep.info.dependent_channel_map?);
-    let dep_pcm = dep.pcm;
-    if positions.len() != dep_pcm.fullband_channels.len()
-        || dep_pcm.samples_per_channel() != core.samples_per_channel()
+    overlay_dependent_on_core(core, &dep.pcm, dep.info.dependent_channel_map)
+}
+
+/// Overlay a decoded dependent substream onto the core it belongs to.
+///
+/// Split out from [`merge_core_with_dependent`] because this is the whole of
+/// clause E.2.8.2's rule and none of the bitstream: given the dependent's
+/// decoded channels and how it named them, the result follows. A dependent
+/// whose `chanmap` names a different number of channels than it decoded, or
+/// whose block length disagrees with the core's, is declined.
+///
+/// The LFE follows the same replace-or-keep rule, and clause E.2.8.2 says so in
+/// as many words: a dependent that carries one replaces the core's.
+fn overlay_dependent_on_core(
+    core: &CorePcmFrame,
+    dependent: &CorePcmFrame,
+    chanmap: Option<u16>,
+) -> Option<CorePcmFrame> {
+    let positions = match chanmap {
+        Some(chanmap) => dependent_chanmap_positions(chanmap),
+        None => dependent.fullband_channel_order.clone(),
+    };
+    if positions.len() != dependent.fullband_channels.len()
+        || dependent.samples_per_channel() != core.samples_per_channel()
     {
         return None;
     }
 
     // Start from the core's fullband channels, then overlay the dependent's:
     // replace a position the core also carried (discrete side surrounds) or
-    // append a new one (the back pair).
+    // append a new one (the back pair, or the height layer).
     let mut order: Vec<BedChannel> = core.fullband_channel_order.clone();
     let mut chans: Vec<Vec<f32>> = core.fullband_channels.clone();
     for (i, &pos) in positions.iter().enumerate() {
         match order.iter().position(|&b| b == pos) {
-            Some(idx) => chans[idx] = dep_pcm.fullband_channels[i].clone(),
+            Some(idx) => chans[idx] = dependent.fullband_channels[i].clone(),
             None => {
                 order.push(pos);
-                chans.push(dep_pcm.fullband_channels[i].clone());
+                chans.push(dependent.fullband_channels[i].clone());
             }
         }
     }
@@ -115,7 +158,10 @@ pub fn merge_core_with_dependent(
         sample_rate: core.sample_rate,
         fullband_channel_order: order,
         fullband_channels: chans,
-        lfe_channel: core.lfe_channel.clone(),
+        lfe_channel: dependent
+            .lfe_channel
+            .clone()
+            .or_else(|| core.lfe_channel.clone()),
     })
 }
 
@@ -1140,5 +1186,180 @@ mod tests {
                 BedChannel::RearRight,
             ]
         );
+    }
+
+    /// Table E.1.4 bit 11 is the Vhl/Vhr pair and bit 13 the Lts/Rts pair - the
+    /// two height pairs, and the only route by which a bed can carry the
+    /// Tfl/Tfr that JOC downmix configurations 2 and 4 read.
+    ///
+    /// The order of the emitted positions is the order of the enabled bits, not
+    /// the order the table is written in, so this asserts a chanmap that mixes
+    /// a height pair in among the surrounds rather than one bit at a time.
+    ///
+    /// Both maps below are ones a single dependent can actually carry. `acmod`
+    /// reaches 3/2 at most, so five full-band channels is the ceiling for one
+    /// substream and a map naming six positions describes no frame that can
+    /// exist — a 5.1.4 bed is two dependents, one pair each, not one map.
+    #[test]
+    fn chanmap_carries_the_height_pairs() {
+        // Ls, Rs and the front height pair: a 5.1.2 extension in one
+        // four-channel dependent (acmod 2/2).
+        assert_eq!(
+            dependent_chanmap_positions(0x1810),
+            vec![
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::TopFrontLeft,
+                BedChannel::TopFrontRight,
+            ]
+        );
+        // Both height pairs and nothing else: the top layer of a 5.1.4 bed,
+        // again four channels in one dependent.
+        assert_eq!(
+            dependent_chanmap_positions(0x0014),
+            vec![
+                BedChannel::TopFrontLeft,
+                BedChannel::TopFrontRight,
+                BedChannel::TopSurroundLeft,
+                BedChannel::TopSurroundRight,
+            ]
+        );
+    }
+
+    /// Build a bed whose every channel is a constant, so which array ended up
+    /// where is readable from one sample.
+    fn bed(order: &[BedChannel], values: &[f32], lfe: Option<f32>) -> CorePcmFrame {
+        CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: order.to_vec(),
+            fullband_channels: values.iter().map(|v| vec![*v; 256]).collect(),
+            lfe_channel: lfe.map(|v| vec![v; 256]),
+        }
+    }
+
+    fn first_samples(frame: &CorePcmFrame) -> Vec<f32> {
+        frame.fullband_channels.iter().map(|c| c[0]).collect()
+    }
+
+    const FIVE_ONE: [BedChannel; 5] = [
+        BedChannel::FrontLeft,
+        BedChannel::Center,
+        BedChannel::FrontRight,
+        BedChannel::SurroundLeft,
+        BedChannel::SurroundRight,
+    ];
+
+    /// A dependent with no custom channel map is not a dependent with no
+    /// channels.
+    ///
+    /// Clause E.2.8.2: with `chanmape` at 0 the dependent's own `acmod` and
+    /// `lfeon` identify what it carries, and those channels overwrite the
+    /// core's. Declining the merge instead — which is what reading the map as
+    /// mandatory did — left the reconstruction running on core channels the
+    /// dependent had already superseded.
+    #[test]
+    fn a_dependent_without_a_custom_map_replaces_by_its_own_channel_order() {
+        let core = bed(&FIVE_ONE, &[1.0, 2.0, 3.0, 4.0, 5.0], Some(9.0));
+        // acmod 3/0, as the decoder derived it for the dependent: L, C, R.
+        let dependent = bed(
+            &[
+                BedChannel::FrontLeft,
+                BedChannel::Center,
+                BedChannel::FrontRight,
+            ],
+            &[-1.0, -2.0, -3.0],
+            None,
+        );
+
+        let merged = overlay_dependent_on_core(&core, &dependent, None)
+            .expect("a map-less dependent must still merge");
+        assert_eq!(
+            merged.fullband_channel_order.as_slice(),
+            FIVE_ONE.as_slice(),
+            "replacing channels the core already has must not extend the bed"
+        );
+        assert_eq!(
+            first_samples(&merged),
+            vec![-1.0, -2.0, -3.0, 4.0, 5.0],
+            "the three channels it carries must overwrite the core's, and only those"
+        );
+    }
+
+    /// Clause E.2.8.2 names the LFE specifically: a dependent that carries one
+    /// replaces the core's. Keeping the core's unconditionally is what this
+    /// used to do.
+    #[test]
+    fn a_dependent_lfe_replaces_the_core_lfe() {
+        let core = bed(&FIVE_ONE, &[1.0; 5], Some(9.0));
+        let with_lfe = bed(&[BedChannel::Center], &[-2.0], Some(-9.0));
+        let merged = overlay_dependent_on_core(&core, &with_lfe, None).expect("merges");
+        assert_eq!(
+            merged.lfe_channel.as_ref().map(|c| c[0]),
+            Some(-9.0),
+            "the dependent's LFE must replace the core's"
+        );
+
+        // And a dependent with none leaves the core's alone.
+        let without_lfe = bed(&[BedChannel::Center], &[-2.0], None);
+        let merged = overlay_dependent_on_core(&core, &without_lfe, None).expect("merges");
+        assert_eq!(
+            merged.lfe_channel.as_ref().map(|c| c[0]),
+            Some(9.0),
+            "a dependent carrying no LFE must not take the core's away"
+        );
+    }
+
+    /// The custom map still wins where there is one, and a position the core
+    /// does not carry extends the bed rather than replacing something.
+    #[test]
+    fn a_custom_map_places_channels_the_core_does_not_carry() {
+        let core = bed(&FIVE_ONE, &[1.0, 2.0, 3.0, 4.0, 5.0], Some(9.0));
+        // 0x1810: Ls, Rs, then the front height pair.
+        let dependent = bed(
+            &[
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::TopFrontLeft,
+                BedChannel::TopFrontRight,
+            ],
+            &[-4.0, -5.0, -6.0, -7.0],
+            None,
+        );
+
+        let merged =
+            overlay_dependent_on_core(&core, &dependent, Some(0x1810)).expect("5.1.2 must merge");
+        assert_eq!(
+            merged.fullband_channel_order,
+            vec![
+                BedChannel::FrontLeft,
+                BedChannel::Center,
+                BedChannel::FrontRight,
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::TopFrontLeft,
+                BedChannel::TopFrontRight,
+            ],
+            "the height pair must extend the bed, giving the seven channels \
+             downmix configurations 2 and 4 read"
+        );
+        assert_eq!(
+            first_samples(&merged),
+            vec![1.0, 2.0, 3.0, -4.0, -5.0, -6.0, -7.0]
+        );
+    }
+
+    /// The map is authoritative when present: one naming a different number of
+    /// channels than the dependent decoded is a mismatch, not something to
+    /// merge halfway.
+    #[test]
+    fn a_map_that_does_not_match_the_decoded_channels_is_declined() {
+        let core = bed(&FIVE_ONE, &[1.0; 5], Some(9.0));
+        let dependent = bed(
+            &[BedChannel::SurroundLeft, BedChannel::SurroundRight],
+            &[-1.0, -2.0],
+            None,
+        );
+        // 0x1810 names four positions; the dependent decoded two.
+        assert!(overlay_dependent_on_core(&core, &dependent, Some(0x1810)).is_none());
     }
 }
