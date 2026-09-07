@@ -15,3 +15,8 @@ crate-type = ["lib"]
 log = "0.4"
 thiserror = "2.0"
 rustfft = "6.4"
+
+# Keep the offline parser's synthetic corruption tests in the normal CI suite.
+[[example]]
+name = "xll_private_metadata"
+test = true
