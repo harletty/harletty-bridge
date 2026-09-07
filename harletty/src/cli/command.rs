@@ -93,6 +93,22 @@ pub struct InfoArgs {
     /// Input TrueHD bitstream.
     #[arg(value_name = "INPUT")]
     pub input: PathBuf,
+
+    /// Print every matrix the stream declares, as it is declared or changed.
+    #[arg(long)]
+    pub matrices: bool,
+
+    /// Print each block's channel parameters: which channels say anything, and what.
+    #[arg(long)]
+    pub params: bool,
+
+    /// Total the block-level coding choices over the stream, per substream.
+    #[arg(long)]
+    pub stats: bool,
+
+    /// Stop after this many access units.
+    #[arg(long, value_name = "N")]
+    pub units: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
