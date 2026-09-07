@@ -13,6 +13,8 @@
 //!   headers included, with coefficients scaled to real numbers.
 //! - `--params` prints each block's channel parameters: which channels say
 //!   anything, and what.
+//! - `--filters` prints every prediction filter as it is restated, its taps
+//!   scaled to real numbers, so a stream's choice of predictors can be read.
 //! - `--stats` totals the same things over the whole stream, per substream.
 //!
 //! Sync word C sends coefficients without repeating a matrix's
@@ -115,6 +117,8 @@ struct Stats {
     iir_restated: u64,
     fir: [u64; MAX_ORDER + 1],
     iir: [u64; MAX_ORDER + 1],
+    /// Channel-blocks at each (first, second) order pair.
+    pairs: [[u64; MAX_ORDER + 1]; MAX_ORDER + 1],
     book: [u64; 4],
     lsbs: u64,
     shifts: [u64; 8],
@@ -252,11 +256,23 @@ impl Inspector<'_> {
                         state.fir[channel] = a.order as usize;
                         stats.fir_restated += 1;
                         said.push_str(&format!(" A{}q{}", a.order, a.coeff_q));
+                        if self.args.filters {
+                            println!(
+                                "AU {unit} ss{substream} blk{index} ch{channel} A {}",
+                                taps(a)
+                            );
+                        }
                     }
                     if let Some(b) = &params.coeffs_b {
                         state.iir[channel] = b.order as usize;
                         stats.iir_restated += 1;
                         said.push_str(&format!(" B{}q{}", b.order, b.coeff_q));
+                        if self.args.filters {
+                            println!(
+                                "AU {unit} ss{substream} blk{index} ch{channel} B {}",
+                                taps(b)
+                            );
+                        }
                     }
                     if let Some(offset) = params.huff_offset {
                         said.push_str(&format!(" off{offset}"));
@@ -273,6 +289,7 @@ impl Inspector<'_> {
             }
             stats.fir[state.fir[channel].min(MAX_ORDER)] += 1;
             stats.iir[state.iir[channel].min(MAX_ORDER)] += 1;
+            stats.pairs[state.fir[channel].min(MAX_ORDER)][state.iir[channel].min(MAX_ORDER)] += 1;
             stats.book[state.book[channel].min(3)] += 1;
             stats.lsbs += u64::from(state.lsbs[channel]);
             stats.shifts[state.shift[channel].clamp(0, 7) as usize] += 1;
@@ -442,6 +459,10 @@ impl Inspector<'_> {
                 histogram(&stats.iir, stats.channel_blocks)
             );
             println!(
+                "    order pairs           {}",
+                pairs(&stats.pairs, stats.channel_blocks)
+            );
+            println!(
                 "    codebooks             {}",
                 histogram(&stats.book, stats.channel_blocks).replace("0:", "raw:")
             );
@@ -464,6 +485,33 @@ impl Inspector<'_> {
     }
 }
 
+/// A filter's taps as the decoder applies them. Each coefficient is read at
+/// `coeff_bits` and shifted up by `coeff_shift` — the parser has already done
+/// that to the values it holds — and the whole sum is shifted down by
+/// `coeff_q`, so a tap is `coeff · 2^−coeff_q`. The order, the precision and
+/// the shift are printed with them, since they are what the description
+/// costs.
+fn taps(filter: &truehd::structs::filter::FilterCoeffs) -> String {
+    let values: Vec<String> = filter.coeff[..filter.order as usize]
+        .iter()
+        .map(|&c| {
+            format!(
+                "{:+.5}",
+                f64::from(c) * 2f64.powi(-i32::from(filter.coeff_q))
+            )
+        })
+        .collect();
+    format!(
+        "order {} q {} bits {} shift {}{}  [{}]",
+        filter.order,
+        filter.coeff_q,
+        filter.coeff_bits,
+        filter.coeff_shift,
+        if filter.new_states { " with state" } else { "" },
+        values.join(" ")
+    )
+}
+
 /// A coefficient as the decoder applies it: `frac_bits` fractional bits,
 /// then sync word C's whole-matrix shift.
 fn coefficient(raw: i32, frac_bits: u8, shift: i8) -> f64 {
@@ -476,6 +524,30 @@ fn percent(part: u64, whole: u64) -> f64 {
     } else {
         100.0 * part as f64 / whole as f64
     }
+}
+
+/// The (first, second) order pairs that account for most channel-blocks,
+/// largest first, until 95 % is explained or eight are listed.
+fn pairs(bins: &[[u64; MAX_ORDER + 1]; MAX_ORDER + 1], total: u64) -> String {
+    let mut all: Vec<(u64, usize, usize)> = Vec::new();
+    for (a, row) in bins.iter().enumerate() {
+        for (b, &count) in row.iter().enumerate() {
+            if count > 0 {
+                all.push((count, a, b));
+            }
+        }
+    }
+    all.sort_unstable_by(|x, y| y.cmp(x));
+    let mut shown = 0u64;
+    let mut out = Vec::new();
+    for (count, a, b) in all.into_iter().take(8) {
+        out.push(format!("{a}+{b}:{:.0}%", percent(count, total)));
+        shown += count;
+        if shown * 20 >= total * 19 {
+            break;
+        }
+    }
+    out.join("  ")
 }
 
 /// `value:share%` for every non-empty bin.
@@ -498,6 +570,15 @@ mod tests {
         assert_eq!(coefficient(-(1 << 13), 14, 0), -0.5);
         assert_eq!(coefficient(1 << 14, 14, 2), 4.0);
         assert_eq!(coefficient(3, 2, -1), 0.375);
+    }
+
+    #[test]
+    fn order_pairs_are_listed_largest_first() {
+        let mut bins = [[0u64; MAX_ORDER + 1]; MAX_ORDER + 1];
+        bins[6][2] = 60;
+        bins[7][1] = 30;
+        bins[8][0] = 10;
+        assert_eq!(pairs(&bins, 100), "6+2:60%  7+1:30%  8+0:10%");
     }
 
     #[test]
