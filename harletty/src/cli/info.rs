@@ -23,7 +23,7 @@ pub fn cmd_info(args: &InfoArgs, cli: &Cli, multi: Option<&MultiProgress>) -> Re
         return cmd_info_eac3(args);
     }
 
-    if args.matrices || args.params || args.stats {
+    if args.matrices || args.params || args.filters || args.stats {
         return super::inspect::run(args, cli);
     }
 

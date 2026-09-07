@@ -102,6 +102,10 @@ pub struct InfoArgs {
     #[arg(long)]
     pub params: bool,
 
+    /// Print every prediction filter as it is restated, taps scaled to real numbers.
+    #[arg(long)]
+    pub filters: bool,
+
     /// Total the block-level coding choices over the stream, per substream.
     #[arg(long)]
     pub stats: bool,
