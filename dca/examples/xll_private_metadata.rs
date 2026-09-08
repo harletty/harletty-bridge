@@ -224,6 +224,126 @@ struct Header241 {
     end_bit: usize,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct Position241 {
+    index: u8,
+    azimuth_code: u8,
+    elevation_code: u8,
+    distance_code: u8,
+    // Azimuth/elevation in half-degrees, distance in units of 1/64.
+    spherical_units: (i16, i16, u8),
+    reference_rows: [Vec<(usize, u8)>; 2],
+}
+
+fn spherical_units(azimuth: u8, elevation: u8, distance: u8) -> (i16, i16, u8) {
+    let azimuth = match azimuth {
+        47 => -220,
+        193 => 220,
+        value => (3 * i16::from(value) - 360).min(357),
+    };
+    let elevation = (3 * (i16::from(elevation) - 60)).min(180);
+    let distance = if distance == 0 { 0 } else { distance + 1 };
+    (azimuth, elevation, distance)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Dynamic241 {
+    positions: Vec<Position241>,
+    // Raw auxiliary declarations; no inferred labels or PCM routing.
+    auxiliary: Vec<(u8, u32, u8)>,
+    end_bit: usize,
+}
+
+fn sparse_codes(b: &mut Bits<'_>, columns: usize) -> Result<Vec<(usize, u8)>, Error> {
+    let mask = b.read(columns)?;
+    let mut row = Vec::new();
+    for index in 0..columns {
+        if mask & (1 << index) != 0 {
+            let code = b.read(6)? as u8;
+            if code > 61 {
+                return Err(Error::Unsupported("type-241 gain escape"));
+            }
+            row.push((index, code));
+        }
+    }
+    Ok(row)
+}
+
+// Consume the supported mode-1 variable form all the way to the type-3
+// boundary. Raw codes only: waveform identity and presentation are separate.
+fn type241_dynamic(bytes: &[u8]) -> Result<Dynamic241, Error> {
+    let header = type241_header(bytes)?;
+    let mut b = Bits {
+        bytes,
+        pos: header.end_bit,
+    };
+    let mut positions = Vec::new();
+    for declaration in &header.declarations {
+        if declaration.mode != 1 {
+            return Err(Error::Unsupported("type-241 dynamic mode"));
+        }
+        b.expect(3, 0, "type-241 record options")?;
+        b.expect(7, 0x20, "type-241 position options")?;
+        b.expect(1, 1, "type-241 gain present")?;
+        b.expect(1, 1, "type-241 position flag")?;
+        b.expect(2, 0, "type-241 position mode")?;
+        b.expect(6, 61, "type-241 position gain")?;
+        let distance_code = b.read(6)? as u8;
+        let azimuth_code = b.read(8)? as u8;
+        let elevation_code = b.read(7)? as u8;
+        b.expect(1, 0, "type-241 extent")?;
+        let present = [b.read(1)? != 0, b.read(1)? != 0];
+        let mut reference_rows = [Vec::new(), Vec::new()];
+        for (row, present) in reference_rows.iter_mut().zip(present) {
+            if present {
+                *row = sparse_codes(&mut b, 8)?;
+            }
+        }
+        positions.push(Position241 {
+            index: declaration.index,
+            azimuth_code,
+            elevation_code,
+            distance_code,
+            spherical_units: spherical_units(azimuth_code, elevation_code, distance_code),
+            reference_rows,
+        });
+    }
+    let mut auxiliary = Vec::new();
+    if b.read(1)? != 0 {
+        for declaration in &header.declarations {
+            if b.read(1)? == 0 {
+                continue;
+            }
+            let count = b.read(2)? + 1;
+            let width = b.read(5)? as usize;
+            for _ in 0..count {
+                let mask = b.read(width)?;
+                // Only the observed single-channel auxiliary form is known.
+                if mask != 0x80 {
+                    return Err(Error::Unsupported("type-241 auxiliary layout"));
+                }
+                b.expect(1, 1, "type-241 auxiliary flag")?;
+                b.expect(1, 1, "type-241 auxiliary route")?;
+                let code = b.read(6)? as u8;
+                if code > 61 {
+                    return Err(Error::Unsupported("type-241 auxiliary gain"));
+                }
+                auxiliary.push((declaration.index, mask, code));
+            }
+        }
+    }
+    let end_bit = b.pos;
+    let padding = (8 - b.pos % 8) % 8;
+    if b.read(padding)? != 0 || b.pos / 8 != bytes.len() {
+        return Err(Error::Invalid("type-241 end/padding"));
+    }
+    Ok(Dynamic241 {
+        positions,
+        auxiliary,
+        end_bit,
+    })
+}
+
 // Narrow static-declaration reader. The caller supplies only the portion
 // preceding type 3 in a CRC-validated envelope. These indices are metadata
 // indices, not yet verified PCM channel identities. Dynamic data remains unread.
@@ -337,7 +457,8 @@ fn describe(payload: &[u8]) -> Result<String, Error> {
                         let status = parse_matrix(&prefix[start..], 0x84b);
                         let rows = type3_rows_candidate(&prefix[start..]);
                         let declaration = type241_header(&prefix[..start]);
-                        candidates.push(format!("byte={start} header={header:?} matrix={status:?} unverified_rows12={rows:?} static241={declaration:?}"));
+                        let dynamic = type241_dynamic(&prefix[..start]);
+                        candidates.push(format!("byte={start} header={header:?} matrix={status:?} unverified_rows12={rows:?} static241={declaration:?} dynamic241={dynamic:?}"));
                     }
                 }
             }
@@ -552,6 +673,82 @@ mod tests {
             bytes[i / 8] |= bit << (7 - i % 8);
         }
         bytes
+    }
+
+    fn dynamic_fixture(azimuth: u32, target: u32, gain: u32, auxiliary: bool) -> Vec<u8> {
+        let header = declaration_fixture(&[0], 1);
+        let mut bits: Vec<u8> = (0..82)
+            .map(|i| (header[i / 8] >> (7 - i % 8)) & 1)
+            .collect();
+        let mut fields = vec![
+            (0, 3),
+            (0x20, 7),
+            (1, 1),
+            (1, 1),
+            (0, 2),
+            (61, 6),
+            (63, 6),
+            (azimuth, 8),
+            (90, 7),
+            (0, 1),
+            (1, 1),
+            (0, 1),
+            (target, 8),
+            (gain, 6),
+            (u32::from(auxiliary), 1),
+        ];
+        if auxiliary {
+            fields.extend([(1, 1), (0, 2), (8, 5), (0x80, 8), (1, 1), (1, 1), (61, 6)]);
+        }
+        for (value, width) in fields {
+            for bit in (0..width).rev() {
+                bits.push(((value >> bit) & 1) as u8);
+            }
+        }
+        let mut bytes = vec![0; bits.len().div_ceil(8)];
+        for (i, bit) in bits.into_iter().enumerate() {
+            bytes[i / 8] |= bit << (7 - i % 8);
+        }
+        bytes
+    }
+
+    #[test]
+    fn variable_positions_routes_and_auxiliary_are_read_from_fields() {
+        for auxiliary in [false, true] {
+            let bytes = dynamic_fixture(47, 2, 55, auxiliary);
+            let result = type241_dynamic(&bytes).unwrap();
+            assert_eq!(result.positions[0].azimuth_code, 47);
+            assert_eq!(result.positions[0].elevation_code, 90);
+            assert_eq!(result.positions[0].distance_code, 63);
+            assert_eq!(result.positions[0].spherical_units, (-220, 90, 64));
+            assert_eq!(result.positions[0].reference_rows, [vec![(1, 55)], vec![]]);
+            assert_eq!(
+                result.auxiliary,
+                if auxiliary {
+                    vec![(0, 0x80, 61)]
+                } else {
+                    vec![]
+                }
+            );
+            let changed = type241_dynamic(&dynamic_fixture(193, 16, 54, auxiliary)).unwrap();
+            assert_eq!(changed.positions[0].azimuth_code, 193);
+            assert_eq!(changed.positions[0].reference_rows[0], vec![(4, 54)]);
+            for end in 0..bytes.len() {
+                assert!(type241_dynamic(&bytes[..end]).is_err());
+            }
+            let mut extended = bytes;
+            extended.push(0);
+            assert!(type241_dynamic(&extended).is_err());
+        }
+        assert!(type241_dynamic(&dynamic_fixture(47, 2, 63, false)).is_err());
+    }
+
+    #[test]
+    fn spherical_calibration_handles_special_angles_and_limits() {
+        assert_eq!(spherical_units(193, 60, 0), (220, 0, 0));
+        assert_eq!(spherical_units(120, 77, 63), (0, 51, 64));
+        assert_eq!(spherical_units(23, 79, 63), (-291, 57, 64));
+        assert_eq!(spherical_units(255, 127, 1), (357, 180, 2));
     }
 
     #[test]

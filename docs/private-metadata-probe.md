@@ -129,7 +129,9 @@ these metadata forms. Mode numbers here are raw fields, not labels such as
 "fixed" or "moving". The counts agree with the first bare-XLL set's 1, 2
 and 4 decoded waveforms, but that agreement does not establish identity,
 ordering or a route into the type-3 matrix. The second four-waveform set
-and the meaning of control `0x3fa` remain unresolved.
+and the meaning of control `0x3fa` remain unresolved. The waveform comparison
+below supplies a bounded validation for D0 and D3, rather than a general
+association-table grammar.
 
 A fresh 64 MiB prefix pass read every static declaration successfully on
 25,169 D0 frames, 12,897 D1 frames and 66,016 D3 frames: **104,082 alternate
@@ -145,6 +147,68 @@ checks execute; three unrelated legacy fixture tests self-skip because their
 local files are absent. The eight-second compatible-bed bit comparison was
 repeated for all four profiles, again with nonzero reference audio and zero
 differing float bit patterns over 384,000 samples per channel.
+
+## Mode-1 variable data and waveform validation
+
+The probe now consumes the supported mode-1 data from the static declaration
+end through the exact byte boundary before type 3. It reads one position per
+declaration, two optional sparse rows over the eight reference channels, an
+optional auxiliary section, and zero alignment padding. It rejects extra
+bytes instead of silently ignoring unexplained trailing data. Unsupported
+options remain errors inside the diagnostic result.
+
+The observed position form uses a six-bit distance, eight-bit azimuth and
+seven-bit elevation. Calibrated integer units are:
+
+- Azimuth: `min(3 * raw - 360, 357)` half-degrees, with raw 47 and 193
+  representing -220 and +220 half-degrees respectively.
+- Elevation: `min(3 * (raw - 60), 180)` half-degrees.
+- Distance: raw zero gives zero; otherwise `(raw + 1) / 64`.
+
+The mode-1 records examined have gain code 61, no extent, and only the first
+of the two reference rows present. The probe reads row masks and coefficients
+from fields; it does not substitute a fixed list of targets. D0 also has an
+auxiliary declaration with raw layout mask `0x80` and gain code 61. That
+auxiliary mask is deliberately not assigned a speaker label here.
+
+| Profile / variant | Frames completely consumed | Result |
+| --- | ---: | --- |
+| D0 | 25,169 | Position, reference row and auxiliary section |
+| D1, longer prefix | 5,413 | Two positions and reference rows |
+| D3 | 66,016 | Four positions and reference rows |
+| Total supported mode 1 | 96,598 | Exact end boundary and zero padding |
+| D1, shorter prefix | 7,484 | Explicitly unsupported variable mode 0 |
+
+Six D3 input prefixes contain changes in the first declaration's angular
+codes within the same stream. This is evidence of transmitted position
+changes, not merely different static placements across programmes. It does
+not yet establish interpolation or a general runtime object-state contract.
+
+Independent local comparisons used the external diagnostic in an isolated
+environment without network access. Its D3 coordinate export agrees with the
+field conversion, for example `(-145.5, 28.5, 1)` and `(145.5, 27, 1)` in
+degrees and distance units. D0 agrees at `(0, 25.5, 1)`. These comparisons
+verify the examined states, not every possible coordinate form.
+
+More importantly, the exported waveform samples were compared to Harletty's
+additional PCM sources over **384,000 samples per waveform**. Each D3 export
+0–3 matches exactly one source, respectively additional sources 0–3, with
+zero differing float bit patterns and over 142,000 nonzero samples each.
+The D0 export matches additional source 0 exactly, including 826 nonzero
+samples. A first one-second silent comparison was discarded as inconclusive.
+The remaining four supplemental sources and the type-3 matrix direction are
+not resolved by these matches.
+
+The shorter D1 case is a useful counterexample to trusting the reference
+blindly: following its mode-0 field consumption reproduces its exported
+coordinates, but leaves unexplained nonzero data before type 3. Those values
+are not accepted by this probe. A speculative one-bit shift also fails to
+establish a consistent grammar and is not implemented.
+
+This remains offline work. No coordinates, auxiliary labels, fold changes
+or `has_objects` changes enter playback. Nine synthetic probe tests cover
+coordinate calibration, changed positions/targets/gains, auxiliary presence,
+truncation and exact end consumption in addition to the earlier CRC checks.
 
 ## Local validation
 
@@ -194,8 +258,8 @@ truncated frames, decode failures and invalid prefix CRCs. Unsupported
 metadata remains visibly unresolved. Its byte limit excludes a final frame
 that would cross the selected limit.
 
-Next work should recover the variable type-241 prefix and association
-navigation, explain the type-3 control word, then validate waveform-to-row
+Next work should recover the shorter D1 variable form and association
+navigation, explain the type-3 control word, then validate its waveform-to-row
 identity and matrix direction against independently rendered references.
 Until those relationships are established, no alternate presentation or
 `has_objects` behavior should change.
