@@ -3,7 +3,7 @@
 // runs in the decoder or determines a playback presentation.
 //
 // cargo run -p dca --release --example xll_private_metadata --
-//     [--max-mb 64] input.dts [input.dts ...]
+//     [--max-mb 64] [--segments] input.dts [input.dts ...]
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read};
@@ -76,6 +76,21 @@ struct Route {
     // Only calibration points verified against the existing Q15 downmix
     // table are exposed. Unknown codes must not silently get a default gain.
     calibrated_q15: Option<u16>,
+}
+
+// Six-bit gain codes verified against PCM so far. Every value is the decoder's
+// downmix-table entry at index `4 * code - 3`, i.e. half a decibel per code
+// with 61 as unity, but that relation is only established at these points:
+// 55 and 61 by the standard height fold, 46 and 58 by an exactly reproduced
+// object fold in the alternate corpus. Other codes stay raw.
+fn calibrated_q15(code: u8) -> Option<u16> {
+    match code {
+        46 => Some(13_818),
+        55 => Some(23_170),
+        58 => Some(27_571),
+        61 => Some(32_768),
+        _ => None,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -170,11 +185,7 @@ fn parse_matrix(bytes: &[u8], inherited_mask: u32) -> Result<Matrix, Error> {
                 source,
                 target,
                 gain_code,
-                calibrated_q15: match gain_code {
-                    55 => Some(23_170),
-                    61 => Some(32_768),
-                    _ => None,
-                },
+                calibrated_q15: calibrated_q15(gain_code),
             });
         }
     }
@@ -272,6 +283,13 @@ fn sparse_codes(b: &mut Bits<'_>, columns: usize) -> Result<Vec<(usize, u8)>, Er
 // Consume the supported mode-1 variable form all the way to the type-3
 // boundary. Raw codes only: waveform identity and presentation are separate.
 fn type241_dynamic(bytes: &[u8]) -> Result<Dynamic241, Error> {
+    type241_variable(bytes, false)
+}
+
+// Candidate only: mode 0 appears to carry a fourth record option bit and
+// omit the reference rows. Exact consumption is evidence, not a definition
+// of the extra bit or permission to use these positions during playback.
+fn type241_variable(bytes: &[u8], allow_mode0_candidate: bool) -> Result<Dynamic241, Error> {
     let header = type241_header(bytes)?;
     let mut b = Bits {
         bytes,
@@ -279,10 +297,13 @@ fn type241_dynamic(bytes: &[u8]) -> Result<Dynamic241, Error> {
     };
     let mut positions = Vec::new();
     for declaration in &header.declarations {
-        if declaration.mode != 1 {
+        if declaration.mode == 0 && allow_mode0_candidate {
+            b.expect(4, 1, "candidate mode-0 record options")?;
+        } else if declaration.mode == 1 {
+            b.expect(3, 0, "type-241 record options")?;
+        } else {
             return Err(Error::Unsupported("type-241 dynamic mode"));
         }
-        b.expect(3, 0, "type-241 record options")?;
         b.expect(7, 0x20, "type-241 position options")?;
         b.expect(1, 1, "type-241 gain present")?;
         b.expect(1, 1, "type-241 position flag")?;
@@ -292,7 +313,11 @@ fn type241_dynamic(bytes: &[u8]) -> Result<Dynamic241, Error> {
         let azimuth_code = b.read(8)? as u8;
         let elevation_code = b.read(7)? as u8;
         b.expect(1, 0, "type-241 extent")?;
-        let present = [b.read(1)? != 0, b.read(1)? != 0];
+        let present = if declaration.mode == 1 {
+            [b.read(1)? != 0, b.read(1)? != 0]
+        } else {
+            [false, false]
+        };
         let mut reference_rows = [Vec::new(), Vec::new()];
         for (row, present) in reference_rows.iter_mut().zip(present) {
             if present {
@@ -458,7 +483,15 @@ fn describe(payload: &[u8]) -> Result<String, Error> {
                         let rows = type3_rows_candidate(&prefix[start..]);
                         let declaration = type241_header(&prefix[..start]);
                         let dynamic = type241_dynamic(&prefix[..start]);
-                        candidates.push(format!("byte={start} header={header:?} matrix={status:?} unverified_rows12={rows:?} static241={declaration:?} dynamic241={dynamic:?}"));
+                        let mode0 = if matches!(
+                            dynamic,
+                            Err(Error::Unsupported("type-241 dynamic mode"))
+                        ) {
+                            Some(type241_variable(&prefix[..start], true))
+                        } else {
+                            None
+                        };
+                        candidates.push(format!("byte={start} header={header:?} matrix={status:?} unverified_rows12={rows:?} static241={declaration:?} dynamic241={dynamic:?} unverified_mode0={mode0:?}"));
                     }
                 }
             }
@@ -471,7 +504,22 @@ fn describe(payload: &[u8]) -> Result<String, Error> {
     }
 }
 
-fn probe(path: &str, limit: usize, input_index: usize) -> Result<(), String> {
+// One run of consecutive frames carrying the same observation, reported with
+// its bed-sample span so offline PCM analysis can align metadata to audio.
+struct Segment {
+    observation: String,
+    start_frame: usize,
+    start_sample: u64,
+}
+
+fn print_segment(segment: &Segment, end_frame: usize, end_sample: u64) {
+    println!(
+        "  segment frames={}..{} samples={}..{} {}",
+        segment.start_frame, end_frame, segment.start_sample, end_sample, segment.observation
+    );
+}
+
+fn probe(path: &str, limit: usize, input_index: usize, segments: bool) -> Result<(), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
     let mut reader = BufReader::new(file);
     let mut decoder = HdDecoder::new();
@@ -483,6 +531,8 @@ fn probe(path: &str, limit: usize, input_index: usize) -> Result<(), String> {
     let mut extension_errors = 0usize;
     let mut invalid_metadata = 0usize;
     let mut observations = BTreeMap::<String, usize>::new();
+    let mut sample_offset = 0u64;
+    let mut segment: Option<Segment> = None;
     let mut core = Vec::new();
     let mut exss = Vec::new();
     let mut incomplete_tail = false;
@@ -574,6 +624,24 @@ fn probe(path: &str, limit: usize, input_index: usize) -> Result<(), String> {
                         }
                     }
                 };
+                if segments {
+                    let changed = segment
+                        .as_ref()
+                        .is_none_or(|current| current.observation != observation);
+                    if changed {
+                        if let Some(previous) = segment.take() {
+                            print_segment(&previous, frames - 1, sample_offset);
+                        }
+                        segment = Some(Segment {
+                            observation: observation.clone(),
+                            start_frame: frames - 1,
+                            start_sample: sample_offset,
+                        });
+                    }
+                }
+                sample_offset = sample_offset
+                    .checked_add(frame.bed_sample_count() as u64)
+                    .ok_or("sample offset overflow")?;
                 *observations.entry(observation).or_default() += 1;
             }
             Err(HdError::Pending) => pending += 1,
@@ -583,6 +651,9 @@ fn probe(path: &str, limit: usize, input_index: usize) -> Result<(), String> {
     }
     if frames == 0 {
         return Err("no decoded frames; corpus was not exercised".into());
+    }
+    if let Some(last) = segment.take() {
+        print_segment(&last, frames, sample_offset);
     }
     println!(
         "input={input_index} frames={frames} pending={pending} bytes={offset} descriptor_matches={nav_matches} type69_marker_matches={type69_marker_matches} extension_errors={extension_errors} invalid_metadata={invalid_metadata} incomplete_tail={incomplete_tail}"
@@ -606,8 +677,11 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let mut limit = 64usize * 1024 * 1024;
     let mut count = 0;
+    let mut segments = false;
     while let Some(arg) = args.next() {
-        if arg == "--max-mb" {
+        if arg == "--segments" {
+            segments = true;
+        } else if arg == "--max-mb" {
             limit = args
                 .next()
                 .ok_or("missing --max-mb")?
@@ -618,11 +692,11 @@ fn run() -> Result<(), String> {
                 .ok_or("invalid byte limit")?;
         } else {
             count += 1;
-            probe(&arg, limit, count)?;
+            probe(&arg, limit, count, segments)?;
         }
     }
     if count == 0 {
-        return Err("usage: xll_private_metadata [--max-mb 64] input.dts ...".into());
+        return Err("usage: xll_private_metadata [--max-mb 64] [--segments] input.dts ...".into());
     }
     Ok(())
 }
@@ -752,6 +826,61 @@ mod tests {
     }
 
     #[test]
+    fn mode0_candidate_requires_an_option_bit_in_each_record() {
+        let header = declaration_fixture(&[0, 1], 0);
+        let mut bits: Vec<u8> = (0..100)
+            .map(|i| (header[i / 8] >> (7 - i % 8)) & 1)
+            .collect();
+        for azimuth in [100, 140] {
+            for (value, width) in [
+                (1, 4),
+                (0x20, 7),
+                (1, 1),
+                (1, 1),
+                (0, 2),
+                (61, 6),
+                (63, 6),
+                (azimuth, 8),
+                (80, 7),
+                (0, 1),
+            ] {
+                for bit in (0..width).rev() {
+                    bits.push(((value >> bit) & 1) as u8);
+                }
+            }
+        }
+        bits.push(0); // No auxiliary section.
+        let mut bytes = vec![0; bits.len().div_ceil(8)];
+        for (i, bit) in bits.into_iter().enumerate() {
+            bytes[i / 8] |= bit << (7 - i % 8);
+        }
+        assert_eq!(
+            type241_dynamic(&bytes),
+            Err(Error::Unsupported("type-241 dynamic mode"))
+        );
+        let candidate = type241_variable(&bytes, true).unwrap();
+        assert_eq!(candidate.end_bit, 187);
+        assert_eq!(candidate.positions[0].spherical_units, (-60, 60, 64));
+        assert_eq!(candidate.positions[1].spherical_units, (60, 60, 64));
+        assert!(
+            candidate
+                .positions
+                .iter()
+                .all(|p| p.reference_rows.iter().all(Vec::is_empty))
+        );
+        for option_bit in [103, 146] {
+            let mut missing = bytes.clone();
+            missing[option_bit / 8] &= !(1 << (7 - option_bit % 8));
+            assert!(type241_variable(&missing, true).is_err());
+        }
+        for end in 0..bytes.len() {
+            assert!(type241_variable(&bytes[..end], true).is_err());
+        }
+        bytes.push(0);
+        assert!(type241_variable(&bytes, true).is_err());
+    }
+
+    #[test]
     fn declaration_count_and_indices_are_read_not_inferred_from_profile() {
         for indices in [&[0][..], &[1, 0], &[3, 1, 0, 2], &[4, 2, 1, 0, 3]] {
             for mode in 0..=1 {
@@ -862,6 +991,13 @@ mod tests {
         assert_eq!(changed.routes[0].gain_code, 54);
         assert_eq!(matrix.routes[0].calibrated_q15, Some(23170));
         assert_eq!(changed.routes[0].calibrated_q15, None);
+        // The verified points and nothing in between.
+        assert_eq!(calibrated_q15(46), Some(13_818));
+        assert_eq!(calibrated_q15(58), Some(27_571));
+        assert_eq!(calibrated_q15(61), Some(32_768));
+        for code in [0, 45, 47, 54, 56, 57, 59, 60, 62, 63] {
+            assert_eq!(calibrated_q15(code), None, "code {code}");
+        }
     }
 
     #[test]
