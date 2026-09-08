@@ -104,6 +104,48 @@ The example keeps `matrix=Err(Unsupported(...))` separate from
 `unverified_rows12=...` so that candidates cannot accidentally be promoted to
 accepted playback metadata.
 
+## Type-241 static declarations
+
+The offline probe now reads the initial type-241 declaration fields inside
+the CRC-validated alternate envelope, bounded before the candidate type-3
+element. This is a partial reader: it stops before the variable data and
+does not claim to decode coordinates, motion or waveform associations.
+
+In the supported form, the four-bit count-minus-one is at bit 28. The
+explicit reference mask starts at bit 44 and is `0x084b`. Declarations start
+at bit 64; each consumes 18 bits: an active flag, a two-bit field equal to
+3, a three-bit index, a two-bit mode and ten component/parameter bits equal
+to zero. Other flag or component forms remain visibly unsupported.
+
+| Profile / observed variant | Declaration indices | Raw modes | End bit | Type-3 byte offset |
+| --- | --- | --- | ---: | --- |
+| D0 | 0 | 1 | 82 | 23 |
+| D1, shorter prefix | 0, 1 | 0, 0 | 100 | 24 |
+| D1, longer prefix | 0, 1 | 1, 1 | 100 | 29 |
+| D3 | 0, 1, 2, 3 | 1, 1, 1, 1 | 136 | 47–56, observed subset |
+
+The D1 distinction is material: its sync marker alone does not distinguish
+these metadata forms. Mode numbers here are raw fields, not labels such as
+"fixed" or "moving". The counts agree with the first bare-XLL set's 1, 2
+and 4 decoded waveforms, but that agreement does not establish identity,
+ordering or a route into the type-3 matrix. The second four-waveform set
+and the meaning of control `0x3fa` remain unresolved.
+
+A fresh 64 MiB prefix pass read every static declaration successfully on
+25,169 D0 frames, 12,897 D1 frames and 66,016 D3 frames: **104,082 alternate
+frames across 15 inputs**, with valid outer CRCs and no extension errors.
+Of the D1 frames, 7,484 use mode 0 and 5,413 use mode 1. Counts and indices
+are read from fields; synthetic tests also change their order and exercise
+a five-declaration form, rather than inferring them from a profile marker.
+All byte truncations of those synthetic declarations are rejected.
+
+At this follow-up checkpoint the warnings-denied all-target build passes,
+and the full suite reports 208 passing tests. All configured DTS:X corpus
+checks execute; three unrelated legacy fixture tests self-skip because their
+local files are absent. The eight-second compatible-bed bit comparison was
+repeated for all four profiles, again with nonzero reference audio and zero
+differing float bit patterns over 384,000 samples per channel.
+
 ## Local validation
 
 A bounded 64 MiB prefix pass, using anonymous input indices in output:

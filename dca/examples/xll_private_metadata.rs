@@ -211,6 +211,69 @@ fn alternate_prefix(payload: &[u8]) -> Result<&[u8], Error> {
     result.ok_or(Error::Invalid("alternate prefix CRC/boundary"))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct Declaration241 {
+    index: u8,
+    mode: u8,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Header241 {
+    reference_mask: u32,
+    declarations: Vec<Declaration241>,
+    end_bit: usize,
+}
+
+// Narrow static-declaration reader. The caller supplies only the portion
+// preceding type 3 in a CRC-validated envelope. These indices are metadata
+// indices, not yet verified PCM channel identities. Dynamic data remains unread.
+fn type241_header(bytes: &[u8]) -> Result<Header241, Error> {
+    let mut b = Bits { bytes, pos: 0 };
+    for (width, value) in [
+        (8, 241),
+        (8, 0x40),
+        (4, 0),
+        (1, 0),
+        (4, 1),
+        (1, 1),
+        (1, 0),
+        (1, 1),
+    ] {
+        b.expect(width, value, "type-241 header form")?;
+    }
+    let count = b.read(4)? as usize + 1;
+    for (width, value) in [(1, 0), (1, 0), (1, 1), (1, 1), (2, 0), (3, 0)] {
+        b.expect(width, value, "type-241 reference form")?;
+    }
+    let width = 4 * (b.read(3)? as usize + 1);
+    let reference_mask = b.read(width)?;
+    if reference_mask != 0x84b {
+        return Err(Error::Unsupported("type-241 reference layout"));
+    }
+    // No optional levels, additional layouts or timing parameters in the
+    // supported form. Precision zero gives two-bit and three-bit indices.
+    b.expect(8, 0, "type-241 optional fields/precision")?;
+    let mut declarations = Vec::with_capacity(count);
+    for _ in 0..count {
+        b.expect(1, 1, "inactive type-241 declaration")?;
+        b.expect(2, 3, "type-241 declaration field")?;
+        let index = b.read(3)? as u8;
+        let mode = b.read(2)? as u8;
+        if mode > 1 {
+            return Err(Error::Unsupported("type-241 declaration mode"));
+        }
+        // One component, component code zero, no optional parameter,
+        // parameter mode zero, one subcomponent.
+        b.expect(10, 0, "type-241 component form")?;
+        declarations.push(Declaration241 { index, mode });
+    }
+    Ok(Header241 {
+        reference_mask,
+        declarations,
+        end_bit: b.pos,
+    })
+}
+
 // Experimental type-3 reading: four sparse rows over the complete 12-channel
 // layout. Control semantics and waveform associations are NOT established.
 // Return indices/codes only, never playback routes or calibrated gains.
@@ -273,7 +336,8 @@ fn describe(payload: &[u8]) -> Result<String, Error> {
                     if header.output_mask == 0x886b {
                         let status = parse_matrix(&prefix[start..], 0x84b);
                         let rows = type3_rows_candidate(&prefix[start..]);
-                        candidates.push(format!("byte={start} header={header:?} matrix={status:?} unverified_rows12={rows:?}"));
+                        let declaration = type241_header(&prefix[..start]);
+                        candidates.push(format!("byte={start} header={header:?} matrix={status:?} unverified_rows12={rows:?} static241={declaration:?}"));
                     }
                 }
             }
@@ -452,6 +516,78 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn declaration_fixture(indices: &[u8], mode: u32) -> Vec<u8> {
+        let mut fields = vec![
+            (241, 8),
+            (0x40, 8),
+            (0, 4),
+            (0, 1),
+            (1, 4),
+            (1, 1),
+            (0, 1),
+            (1, 1),
+            (indices.len() as u32 - 1, 4),
+            (0, 1),
+            (0, 1),
+            (1, 1),
+            (1, 1),
+            (0, 2),
+            (0, 3),
+            (2, 3),
+            (0x84b, 12),
+            (0, 8),
+        ];
+        for &index in indices {
+            fields.extend([(1, 1), (3, 2), (u32::from(index), 3), (mode, 2), (0, 10)]);
+        }
+        let mut bits = Vec::new();
+        for (value, width) in fields {
+            for bit in (0..width).rev() {
+                bits.push(((value >> bit) & 1) as u8);
+            }
+        }
+        let mut bytes = vec![0; bits.len().div_ceil(8)];
+        for (i, bit) in bits.into_iter().enumerate() {
+            bytes[i / 8] |= bit << (7 - i % 8);
+        }
+        bytes
+    }
+
+    #[test]
+    fn declaration_count_and_indices_are_read_not_inferred_from_profile() {
+        for indices in [&[0][..], &[1, 0], &[3, 1, 0, 2], &[4, 2, 1, 0, 3]] {
+            for mode in 0..=1 {
+                let bytes = declaration_fixture(indices, mode);
+                let header = type241_header(&bytes).unwrap();
+                assert_eq!(header.end_bit, 64 + indices.len() * 18);
+                assert_eq!(header.reference_mask, 0x84b);
+                assert_eq!(
+                    header
+                        .declarations
+                        .iter()
+                        .map(|d| d.index)
+                        .collect::<Vec<_>>(),
+                    indices
+                );
+                assert!(header.declarations.iter().all(|d| d.mode == mode as u8));
+                for end in 0..bytes.len() {
+                    assert!(type241_header(&bytes[..end]).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn declaration_unsupported_forms_are_not_silently_skipped() {
+        assert!(type241_header(&declaration_fixture(&[0], 2)).is_err());
+        let mut bytes = declaration_fixture(&[0], 0);
+        bytes[7] = 1;
+        assert!(type241_header(&bytes).is_err());
+        bytes[7] = 0;
+        bytes[8] &= 0x7f;
+        assert!(type241_header(&bytes).is_err());
+    }
 
     // Construct metadata from fields, not an identifying corpus excerpt.
     fn fixture(gain: u32, first_target: u32) -> Vec<u8> {
