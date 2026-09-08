@@ -1167,6 +1167,62 @@ mod raw_transport_tests {
 }
 
 #[cfg(test)]
+mod dts_object_motion_tests {
+    use super::*;
+    use abi_stable::std_types::RSlice;
+    use bridge_api::RInputTransport;
+
+    /// A D3 stream with moving objects must produce position events whose
+    /// coordinates change over time: the bridge follows the per-frame
+    /// metadata rather than freezing the first position.
+    #[test]
+    fn d3_object_positions_follow_the_stream() {
+        let Some(path) = std::env::var("HARLETTY_D3_MOTION_CORPUS")
+            .ok()
+            .filter(|p| std::path::Path::new(p).is_file())
+        else {
+            eprintln!("skipping: HARLETTY_D3_MOTION_CORPUS is not set to a readable file");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read corpus");
+        let bytes = &bytes[..bytes.len().min(8_000_000)];
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("input_codec".into(), "dts".into()));
+        let mut positions: std::collections::BTreeMap<u32, Vec<[i64; 3]>> = Default::default();
+        let mut frames = 0usize;
+        for chunk in bytes.chunks(256 * 1024) {
+            let result = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+            assert!(result.error_message.is_empty(), "{}", result.error_message);
+            for frame in result.frames.iter() {
+                frames += 1;
+                for metadata in frame.metadata.iter() {
+                    for event in metadata.events.iter() {
+                        let quantised =
+                            [event.pos[0], event.pos[1], event.pos[2]].map(|v| (v * 1000.0) as i64);
+                        let list = positions.entry(event.id).or_default();
+                        if list.last() != Some(&quantised) {
+                            list.push(quantised);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(frames > 100, "corpus was not exercised ({frames} frames)");
+        assert!(bridge.has_objects());
+        let moving = positions.values().filter(|list| list.len() > 3).count();
+        eprintln!(
+            "frames={frames} objects={} distinct positions per object={:?}",
+            positions.len(),
+            positions.values().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert!(
+            moving >= 2,
+            "at least two objects must change position: {positions:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod stack_footprint_tests {
     use super::*;
 
