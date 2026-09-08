@@ -70,8 +70,8 @@ fn source_codec_for(presentation: XPresentation) -> SourceCodec {
     match presentation {
         XPresentation::Height => SourceCodec::DtsX714,
         XPresentation::FixedD0 => SourceCodec::DtsX715,
-        XPresentation::ObjectsD1 => SourceCodec::DtsX914,
-        XPresentation::ObjectsD3 => SourceCodec::DtsX71Plus8,
+        XPresentation::ObjectsD1 => SourceCodec::DtsX714Plus2,
+        XPresentation::ObjectsD3 => SourceCodec::DtsX714Plus4,
         XPresentation::ObjectOnly => SourceCodec::DtsX51Plus1,
     }
 }
