@@ -72,6 +72,7 @@ fn source_codec_for(presentation: XPresentation) -> SourceCodec {
         XPresentation::FixedD0 => SourceCodec::DtsX715,
         XPresentation::ObjectsD1 => SourceCodec::DtsX914,
         XPresentation::ObjectsD3 => SourceCodec::DtsX71Plus8,
+        XPresentation::ObjectOnly => SourceCodec::DtsX51Plus1,
     }
 }
 

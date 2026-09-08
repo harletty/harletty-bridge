@@ -134,6 +134,10 @@ pub enum SourceCodec {
     /// Experimental eight-feed object presentation (D3).
     #[serde(rename = "DTS:X-7.1+8")]
     DtsX71Plus8,
+    /// Object-only presentation on a 5.1 bed: one object waveform, no height
+    /// quartet (the D0 marker with a 5.1 reference layout).
+    #[serde(rename = "DTS:X-5.1+1")]
+    DtsX51Plus1,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

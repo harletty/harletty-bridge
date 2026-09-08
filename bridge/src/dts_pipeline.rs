@@ -1116,6 +1116,65 @@ mod tests {
     }
 
     #[test]
+    fn object_only_variant_presents_a_5_1_bed_plus_one_object() {
+        let object_pcm = vec![0.20, -0.10];
+        let dry_c = vec![0.05, -0.05];
+        let dry_l = vec![0.07, -0.02];
+        let code58 = gain_code_linear(58).unwrap();
+        let code46 = gain_code_linear(46).unwrap();
+        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
+        samples[0] = Some(folded(&dry_c, &[(&object_pcm, code58)]));
+        samples[1] = Some(folded(&dry_l, &[(&object_pcm, code46)]));
+        samples[2] = Some(vec![0.03, -0.03]);
+        samples[3] = Some(vec![0.04, -0.04]);
+        samples[4] = Some(vec![0.06, -0.06]);
+        samples[5] = Some(vec![0.08, -0.08]);
+        let mut hd = hd_frame(samples, vec![object_pcm.clone()]);
+        hd.x_present = false;
+        hd.x_imax = true;
+
+        let mut columns = [0.0; 8];
+        columns[0] = code58;
+        columns[1] = code46;
+        columns[2] = code46;
+        let source = object(0, 51, BedFold::Known(columns));
+        let mut state = state_with(XMetadata::from_sources_on(
+            &[source],
+            dca::REFERENCE_MASK_5_1,
+        ));
+        let (frame, emitted) = build(&hd, &mut state);
+
+        assert!(emitted, "the object is an object channel");
+        assert_eq!(state.locked, Some(XPresentation::ObjectOnly));
+        assert_eq!(frame.channel_count, 7);
+        assert_eq!(
+            frame.channel_labels.as_slice(),
+            &[
+                RChannelLabel::C,
+                RChannelLabel::L,
+                RChannelLabel::R,
+                RChannelLabel::Ls,
+                RChannelLabel::Rs,
+                RChannelLabel::LFE,
+                RChannelLabel::Object,
+            ]
+        );
+        for sample in 0..SAMPLE_COUNT {
+            let row = &frame.pcm[sample * 7..(sample + 1) * 7];
+            assert_pcm_close(row[0], dry_c[sample]);
+            assert_pcm_close(row[1], dry_l[sample]);
+            assert_pcm_close(row[3], hd.samples[3].as_ref().unwrap()[sample]);
+            assert_pcm_close(row[6], object_pcm[sample]);
+        }
+        assert_eq!(frame.metadata.len(), 1);
+        let metadata = &frame.metadata[0];
+        assert_eq!(metadata.object_channels.len(), 1);
+        assert_eq!(metadata.object_channels[0].channel, 6);
+        assert_eq!(metadata.events.len(), 1);
+        assert!(metadata.events[0].pos[2] > 0.0, "the object is raised");
+    }
+
+    #[test]
     fn alternate_frame_without_any_readable_metadata_mutes_its_feeds() {
         let extension: Vec<Vec<f32>> = (0..8).map(|_| vec![0.1; SAMPLE_COUNT]).collect();
         let composite_left = vec![0.25, -0.25];

@@ -1167,6 +1167,55 @@ mod raw_transport_tests {
 }
 
 #[cfg(test)]
+mod dts_object_only_tests {
+    use super::*;
+    use abi_stable::std_types::RSlice;
+    use bridge_api::RInputTransport;
+
+    /// The object-only variant on a 5.1 bed presents six labeled bed channels
+    /// plus one object channel, with a position on the object.
+    #[test]
+    fn object_only_stream_presents_5_1_plus_one_object() {
+        let Some(path) = std::env::var("HARLETTY_ALT_51_CORPUS")
+            .ok()
+            .filter(|p| std::path::Path::new(p).is_file())
+        else {
+            eprintln!("skipping: HARLETTY_ALT_51_CORPUS is not set to a readable file");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read corpus");
+        let bytes = &bytes[..bytes.len().min(4_000_000)];
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("input_codec".into(), "dts".into()));
+        let result = bridge.push_packet(RSlice::from_slice(bytes), RInputTransport::Raw, 0);
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(
+            bridge.has_objects(),
+            "the object-only variant declares its object"
+        );
+        use bridge_api::RChannelLabel::*;
+        let frame = result
+            .frames
+            .iter()
+            .find(|frame| frame.metadata.iter().any(|m| m.name_updates.len() == 1))
+            .expect("no object declaration");
+        assert_eq!(frame.channel_count, 7);
+        assert_eq!(
+            frame.channel_labels.as_slice(),
+            &[C, L, R, Ls, Rs, LFE, Object]
+        );
+        let metadata = frame
+            .metadata
+            .iter()
+            .find(|m| m.name_updates.len() == 1)
+            .unwrap();
+        assert_eq!(metadata.events.len(), 1);
+        assert!(metadata.events[0].has_pos && metadata.events[0].pos[2] > 0.0);
+        assert!(result.frames.len() > 100, "corpus was not exercised");
+    }
+}
+
+#[cfg(test)]
 mod dts_object_motion_tests {
     use super::*;
     use abi_stable::std_types::RSlice;

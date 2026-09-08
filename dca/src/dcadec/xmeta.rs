@@ -28,7 +28,7 @@
 use crate::dcadec::tables::DMIXTABLE;
 use crate::dcadec::xll::{
     DCA_SYNCWORD_XLL_X, DCA_SYNCWORD_XLL_X_ALT_D0, DCA_SYNCWORD_XLL_X_ALT_D1,
-    DCA_SYNCWORD_XLL_X_ALT_D3, XLL_X_ALT_OUTER_SUFFIX, crc16_ccitt,
+    DCA_SYNCWORD_XLL_X_ALT_D3, alternate_protected_prefix, crc16_ccitt,
 };
 use crate::spatial::SpatialChannel;
 
@@ -37,47 +37,100 @@ use crate::spatial::SpatialChannel;
 pub const MAX_SOURCES: usize = 8;
 /// Channels of the compatible reference layout the folds are expressed over.
 pub const REFERENCE_CHANNELS: usize = 8;
-/// DCA speaker index behind each reference-layout column. The reference mask
-/// `0x084b` lists, in bit order, C, L/R, LFE, Lsr/Rsr and Lss/Rss.
+/// DCA speaker index behind each column of the 7.1 reference layout
+/// (`0x084b`: C, L/R, LFE, Lsr/Rsr and Lss/Rss in bit order).
 pub const REFERENCE_SPEAKERS: [usize; REFERENCE_CHANNELS] = [0, 1, 2, 5, 7, 8, 3, 4];
+/// The 7.1 reference mask every seven-channel profile uses.
+pub const REFERENCE_MASK_7_1: u32 = 0x084b;
+/// The 5.1 reference mask of the object-only variant (C, L/R, Ls/Rs, LFE).
+pub const REFERENCE_MASK_5_1: u32 = 0x000f;
+
+/// DCA speaker index behind each column of a reference mask, in mask bit
+/// order, and the column count. A mask carrying an unknown speaker bit, or
+/// both surround pairs that map to the same DCA indices, has no layout.
+fn reference_speakers(mask: u32) -> Option<([u8; REFERENCE_CHANNELS], usize)> {
+    if mask & (1 << 2) != 0 && mask & (1 << 11) != 0 {
+        return None;
+    }
+    let mut speakers = [0u8; REFERENCE_CHANNELS];
+    let mut count = 0;
+    for bit in 0..16 {
+        if mask & (1 << bit) == 0 {
+            continue;
+        }
+        let members: &[u8] = match bit {
+            0 => &[0],
+            1 => &[1, 2],
+            2 => &[3, 4],
+            3 => &[5],
+            4 => &[6],
+            6 => &[7, 8],
+            11 => &[3, 4],
+            _ => return None,
+        };
+        for &member in members {
+            if count == REFERENCE_CHANNELS {
+                return None;
+            }
+            speakers[count] = member;
+            count += 1;
+        }
+    }
+    (count > 0).then_some((speakers, count))
+}
+
+/// Columns of a full output layout (reference mask plus the height mask):
+/// for each column, the reference column it stands for, or the height feed
+/// it names. Height columns come from bits 5 (Lh/Rh) and 15 (Lhr/Rhr).
+fn full_columns(
+    output_mask: u32,
+) -> Option<([Result<usize, SpatialChannel>; MAX_FULL_COLUMNS], usize)> {
+    let mut columns = [Ok(0usize); MAX_FULL_COLUMNS];
+    let mut count = 0;
+    let mut reference = 0;
+    for bit in 0..16 {
+        if output_mask & (1 << bit) == 0 {
+            continue;
+        }
+        let entries: [Result<usize, SpatialChannel>; 2] = match bit {
+            5 => [
+                Err(SpatialChannel::TopFrontLeft),
+                Err(SpatialChannel::TopFrontRight),
+            ],
+            15 => [
+                Err(SpatialChannel::TopBackLeft),
+                Err(SpatialChannel::TopBackRight),
+            ],
+            0 | 3 | 4 => {
+                reference += 1;
+                [Ok(reference - 1), Ok(usize::MAX)]
+            }
+            1 | 2 | 6 | 11 => {
+                reference += 2;
+                [Ok(reference - 2), Ok(reference - 1)]
+            }
+            _ => return None,
+        };
+        for entry in entries {
+            if entry == Ok(usize::MAX) {
+                continue;
+            }
+            if count == MAX_FULL_COLUMNS {
+                return None;
+            }
+            columns[count] = entry;
+            count += 1;
+        }
+    }
+    Some((columns, count))
+}
 /// DCA speaker indices a [`FoldPlan`] can address.
 pub const FOLD_SPEAKERS: usize = 16;
 
-const REFERENCE_MASK: u32 = 0x084b;
-const FULL_MASK: u32 = 0x886b;
 const HEIGHT_MASK: u32 = 0x8020;
-const FULL_COLUMNS: usize = 12;
-/// Reference column of each column of the full 12-channel layout (`0x886b`:
-/// C, L, R, LFE, Lh, Rh, Lsr, Rsr, Lss, Rss, Lhr, Rhr), `None` for a height.
-const FULL_TO_REFERENCE: [Option<usize>; FULL_COLUMNS] = [
-    Some(0),
-    Some(1),
-    Some(2),
-    Some(3),
-    None,
-    None,
-    Some(4),
-    Some(5),
-    Some(6),
-    Some(7),
-    None,
-    None,
-];
-/// Height speaker of each height column of the full layout.
-const FULL_TO_HEIGHT: [Option<SpatialChannel>; FULL_COLUMNS] = [
-    None,
-    None,
-    None,
-    None,
-    Some(SpatialChannel::TopFrontLeft),
-    Some(SpatialChannel::TopFrontRight),
-    None,
-    None,
-    None,
-    None,
-    Some(SpatialChannel::TopBackLeft),
-    Some(SpatialChannel::TopBackRight),
-];
+/// Columns of the widest full layout: eight reference channels plus the
+/// four heights.
+const MAX_FULL_COLUMNS: usize = REFERENCE_CHANNELS + 4;
 /// The standard profile's height mask `0x8020` lists Lh/Rh then Lhr/Rhr.
 const STANDARD_HEIGHTS: [SpatialChannel; 4] = [
     SpatialChannel::TopFrontLeft,
@@ -88,7 +141,6 @@ const STANDARD_HEIGHTS: [SpatialChannel; 4] = [
 const FIXED_HEIGHT_COUNT: usize = 4;
 /// Unread type-3 control word; every corpus stream carries this value.
 const TYPE3_CONTROL: u32 = 0x3fa;
-const MAX_PREFIX: usize = 96;
 const UNITY_CODE: u32 = 61;
 const CENTRE_HEIGHT_MASK: u32 = 0x80;
 
@@ -240,11 +292,14 @@ pub struct SourceMetadata {
     pub fold: BedFold,
 }
 
-/// One frame's metadata for every extension waveform, in waveform order.
+/// One frame's metadata for every extension waveform, in waveform order,
+/// with the reference layout its folds are expressed over.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct XMetadata {
     sources: [Option<SourceMetadata>; MAX_SOURCES],
     count: usize,
+    reference_speakers: [u8; REFERENCE_CHANNELS],
+    reference_count: usize,
 }
 
 impl XMetadata {
@@ -265,12 +320,19 @@ impl XMetadata {
         }
     }
 
-    /// Assemble metadata from already-decoded sources (consumers' tests and
-    /// fallbacks). `None` when there are more than [`MAX_SOURCES`].
+    /// Assemble metadata from already-decoded sources over the 7.1 reference
+    /// layout (consumers' tests and fallbacks). `None` when there are more
+    /// than [`MAX_SOURCES`].
     pub fn from_sources(sources: &[SourceMetadata]) -> Option<Self> {
+        Self::from_sources_on(sources, REFERENCE_MASK_7_1)
+    }
+
+    /// [`Self::from_sources`] over the reference layout `reference_mask`.
+    pub fn from_sources_on(sources: &[SourceMetadata], reference_mask: u32) -> Option<Self> {
         if sources.len() > MAX_SOURCES {
             return None;
         }
+        let (reference_speakers, reference_count) = reference_speakers(reference_mask)?;
         let mut stored = [None; MAX_SOURCES];
         for (slot, source) in stored.iter_mut().zip(sources) {
             *slot = Some(*source);
@@ -278,11 +340,18 @@ impl XMetadata {
         Some(Self {
             sources: stored,
             count: sources.len(),
+            reference_speakers,
+            reference_count,
         })
     }
 
     pub fn source_count(&self) -> usize {
         self.count
+    }
+
+    /// DCA speaker index behind each fold column.
+    pub fn reference_speakers(&self) -> &[u8] {
+        &self.reference_speakers[..self.reference_count]
     }
 
     pub fn source(&self, index: usize) -> Option<&SourceMetadata> {
@@ -339,9 +408,9 @@ impl FoldPlan {
         for (feed, source) in metadata.sources().enumerate() {
             match source.fold {
                 BedFold::Known(columns) => {
-                    for (column, &gain) in columns.iter().enumerate() {
+                    for (&speaker, &gain) in metadata.reference_speakers().iter().zip(&columns) {
                         if gain != 0.0 {
-                            let speaker = REFERENCE_SPEAKERS[column];
+                            let speaker = usize::from(speaker);
                             plan.gains[speaker][feed] = gain;
                             plan.used[speaker] |= 1 << feed;
                         }
@@ -397,8 +466,8 @@ fn parse_standard(payload: &[u8], source_count: usize) -> R<XMetadata> {
         bytes: payload,
         pos: 0,
     };
-    let (reference_mask, output_mask) = layout_header(&mut b, 2)?;
-    if reference_mask != REFERENCE_MASK || output_mask & !reference_mask != HEIGHT_MASK {
+    let (reference_mask, output_mask) = layout_header(&mut b, 2, REFERENCE_MASK_7_1)?;
+    if reference_mask != REFERENCE_MASK_7_1 || output_mask & !reference_mask != HEIGHT_MASK {
         return Err(XMetadataError::Unsupported("standard matrix layout"));
     }
     b.expect(5, 2, "matrix header field")?;
@@ -429,12 +498,14 @@ fn parse_standard(payload: &[u8], source_count: usize) -> R<XMetadata> {
     Ok(XMetadata {
         sources,
         count: FIXED_HEIGHT_COUNT,
+        reference_speakers: REFERENCE_SPEAKERS.map(|speaker| speaker as u8),
+        reference_count: REFERENCE_CHANNELS,
     })
 }
 
 /// Read the element header shared by the type-2 and type-3 layout elements.
 /// Every flag without a verified meaning is pinned to its observed value.
-fn layout_header(b: &mut Bits<'_>, kind: u32) -> R<(u32, u32)> {
+fn layout_header(b: &mut Bits<'_>, kind: u32, inherited: u32) -> R<(u32, u32)> {
     b.expect(8, kind, "element type")?;
     b.expect(8, 0, "element header byte")?;
     b.expect(1, 0, "header flag")?;
@@ -450,7 +521,7 @@ fn layout_header(b: &mut Bits<'_>, kind: u32) -> R<(u32, u32)> {
     } else {
         b.expect(1, 0, "implicit reference mask")?;
         b.expect(4, 0, "implicit reference field")?;
-        REFERENCE_MASK
+        inherited
     };
     b.expect(1, 1, "level field present")?;
     b.expect(6, UNITY_CODE, "level code")?;
@@ -475,52 +546,58 @@ fn sparse_row(b: &mut Bits<'_>, mask: u32, columns: usize) -> R<[f32; REFERENCE_
     Ok(row)
 }
 
-/// Length of the CRC-protected alternate prefix: the bytes before the outer
-/// control suffix whose CRC16 is zero. The same rule locates the audio.
-fn alternate_prefix_len(payload: &[u8]) -> R<usize> {
-    let mut result = None;
-    for end in 4..=payload.len().min(MAX_PREFIX) {
-        if payload.get(end..end + XLL_X_ALT_OUTER_SUFFIX.len()) == Some(&XLL_X_ALT_OUTER_SUFFIX)
-            && crc16_ccitt(&payload[..end]) == 0
-        {
-            if result.is_some() {
-                return Err(XMetadataError::Invalid("ambiguous alternate prefix"));
-            }
-            result = Some(end);
-        }
-    }
-    result.ok_or(XMetadataError::Invalid("alternate prefix CRC"))
+/// Length of the CRC-protected alternate prefix and the mask of channel
+/// sets that follow it, by the same rule the audio decoder applies.
+fn alternate_prefix_len(payload: &[u8]) -> R<(usize, u8)> {
+    alternate_protected_prefix(payload).map_err(|_| XMetadataError::Invalid("alternate prefix CRC"))
 }
 
 fn parse_alternate(payload: &[u8], source_count: usize) -> R<XMetadata> {
-    let object_count = source_count
-        .checked_sub(FIXED_HEIGHT_COUNT)
-        .filter(|&count| (1..=MAX_SOURCES - FIXED_HEIGHT_COUNT).contains(&count))
-        .ok_or(XMetadataError::Unsupported("alternate waveform count"))?;
-    let prefix = &payload[..alternate_prefix_len(payload)?];
+    let (prefix_len, _set_mask) = alternate_prefix_len(payload)?;
+    let prefix = &payload[..prefix_len];
     let mut sources = [None; MAX_SOURCES];
-    // The type-241 element is byte-aligned and self-delimiting; the type-3
-    // element follows it and must end exactly at the envelope CRC.
-    let type3_start = parse_type241(prefix, &mut sources[..object_count])?;
-    let heights = parse_type3(&prefix[type3_start..])?;
-    for (slot, height) in sources[object_count..source_count].iter_mut().zip(heights) {
-        *slot = Some(height);
+    // The type-241 element is byte-aligned and self-delimiting. Either the
+    // envelope CRC follows it directly (object-only variant), or a type-3
+    // element describing the height quartet does and must end exactly at
+    // the CRC.
+    let (type3_start, object_count, reference_mask) = parse_type241(prefix, &mut sources)?;
+    let (reference_speakers, reference_count) = reference_speakers(reference_mask)
+        .ok_or(XMetadataError::Unsupported("reference layout"))?;
+    let heights_present = type3_start + 2 != prefix.len();
+    let expected = if heights_present {
+        object_count + FIXED_HEIGHT_COUNT
+    } else {
+        object_count
+    };
+    if source_count != expected || source_count > MAX_SOURCES {
+        return Err(XMetadataError::Unsupported("alternate waveform count"));
+    }
+    if heights_present {
+        let heights = parse_type3(&prefix[type3_start..], reference_mask)?;
+        for (slot, height) in sources[object_count..source_count].iter_mut().zip(heights) {
+            *slot = Some(height);
+        }
     }
     Ok(XMetadata {
         sources,
         count: source_count,
+        reference_speakers,
+        reference_count,
     })
 }
 
-/// The type-3 element: four rows over the full 12-channel layout, one per
-/// fixed height in the order the second channel set decodes them. A row's
-/// height column names the feed; its reference columns are the feed's fold.
-fn parse_type3(bytes: &[u8]) -> R<[SourceMetadata; FIXED_HEIGHT_COUNT]> {
+/// The type-3 element: four rows over the full layout (reference channels
+/// plus the height pairs), one per fixed height in the order the second
+/// channel set decodes them. A row's height column names the feed; its
+/// reference columns are the feed's fold.
+fn parse_type3(bytes: &[u8], reference_mask: u32) -> R<[SourceMetadata; FIXED_HEIGHT_COUNT]> {
     let mut b = Bits { bytes, pos: 0 };
-    let (reference_mask, output_mask) = layout_header(&mut b, 3)?;
-    if reference_mask != REFERENCE_MASK || output_mask != FULL_MASK {
+    let (declared_reference, output_mask) = layout_header(&mut b, 3, reference_mask)?;
+    if declared_reference != reference_mask || output_mask != reference_mask | HEIGHT_MASK {
         return Err(XMetadataError::Unsupported("type-3 layout"));
     }
+    let (columns, column_count) =
+        full_columns(output_mask).ok_or(XMetadataError::Unsupported("type-3 layout"))?;
     b.expect(5, 2, "type-3 field")?;
     b.expect(6, 0, "type-3 value")?;
     b.expect(1, 1, "type-3 flag")?;
@@ -531,31 +608,30 @@ fn parse_type3(bytes: &[u8]) -> R<[SourceMetadata; FIXED_HEIGHT_COUNT]> {
         fold: BedFold::Unknown,
     }; FIXED_HEIGHT_COUNT];
     for height in &mut heights {
-        let mask = b.read(FULL_COLUMNS)?;
+        let mask = b.read(column_count)?;
         let mut identity = None;
-        let mut columns = [0.0; REFERENCE_CHANNELS];
-        for column in 0..FULL_COLUMNS {
+        let mut fold = [0.0; REFERENCE_CHANNELS];
+        for (column, entry) in columns.iter().enumerate().take(column_count) {
             if mask & (1 << column) == 0 {
                 continue;
             }
             let code = b.read(6)?;
-            match (FULL_TO_REFERENCE[column], FULL_TO_HEIGHT[column]) {
-                (Some(reference), _) => {
-                    columns[reference] = gain_code_linear(code)
+            match *entry {
+                Ok(reference) => {
+                    fold[reference] = gain_code_linear(code)
                         .ok_or(XMetadataError::Unsupported("type-3 gain code"))?;
                 }
-                (None, Some(speaker)) => {
+                Err(speaker) => {
                     if identity.replace(speaker).is_some() || code != UNITY_CODE {
                         return Err(XMetadataError::Unsupported("type-3 height column"));
                     }
                 }
-                (None, None) => return Err(XMetadataError::Unsupported("type-3 column")),
             }
         }
         let speaker = identity.ok_or(XMetadataError::Unsupported("type-3 row without height"))?;
         *height = SourceMetadata {
             role: SourceRole::Height(speaker),
-            fold: BedFold::Known(columns),
+            fold: BedFold::Known(fold),
         };
     }
     b.align("type-3 padding")?;
@@ -568,8 +644,9 @@ fn parse_type3(bytes: &[u8]) -> R<[SourceMetadata; FIXED_HEIGHT_COUNT]> {
 /// The type-241 element: object declarations, then one position record per
 /// object with optional reference rows, then optional auxiliary
 /// fixed-channel alternatives. Fills `objects` by declared index and returns
-/// the byte offset at which the next element starts.
-fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<usize> {
+/// the byte offset at which the next element starts, the declared object
+/// count and the reference mask the rows are expressed over.
+fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<(usize, usize, u32)> {
     let mut b = Bits { bytes, pos: 0 };
     for (width, value) in [
         (8, 241),
@@ -584,16 +661,16 @@ fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<usiz
         b.expect(width, value, "type-241 header")?;
     }
     let count = b.read(4)? as usize + 1;
-    if count != objects.len() {
+    if count > objects.len() {
         return Err(XMetadataError::Unsupported("type-241 declaration count"));
     }
     for (width, value) in [(1, 0), (1, 0), (1, 1), (1, 1), (2, 0), (3, 0)] {
         b.expect(width, value, "type-241 reference form")?;
     }
     let width = 4 * (b.read(3)? as usize + 1);
-    if b.read(width)? != REFERENCE_MASK {
-        return Err(XMetadataError::Unsupported("type-241 reference layout"));
-    }
+    let reference_mask = b.read(width)?;
+    let (_, columns) = reference_speakers(reference_mask)
+        .ok_or(XMetadataError::Unsupported("type-241 reference layout"))?;
     // No optional levels, additional layouts or timing parameters; precision
     // zero gives three-bit indices and two-bit modes.
     b.expect(8, 0, "type-241 optional fields")?;
@@ -601,7 +678,11 @@ fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<usiz
     let mut modes = [0u32; MAX_SOURCES];
     for record in 0..count {
         b.expect(1, 1, "inactive type-241 declaration")?;
-        b.expect(2, 3, "type-241 declaration field")?;
+        // A two-bit field with two observed values: 3 on the 7.1 profiles,
+        // 1 on the object-only 5.1 variant. Its meaning is not established.
+        if !matches!(b.read(2)?, 1 | 3) {
+            return Err(XMetadataError::Unsupported("type-241 declaration field"));
+        }
         let index = b.read(3)? as usize;
         if index >= count || indices[..record].contains(&index) {
             return Err(XMetadataError::Unsupported("type-241 declaration index"));
@@ -636,16 +717,16 @@ fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<usiz
         let fold = if modes[record] == 1 {
             let first = b.read(1)? != 0;
             let second = b.read(1)? != 0;
-            let columns = if first {
-                let mask = b.read(REFERENCE_CHANNELS)?;
-                sparse_row(&mut b, mask, REFERENCE_CHANNELS)?
+            let fold = if first {
+                let mask = b.read(columns)?;
+                sparse_row(&mut b, mask, columns)?
             } else {
                 [0.0; REFERENCE_CHANNELS]
             };
             if second {
                 return Err(XMetadataError::Unsupported("type-241 second reference row"));
             }
-            BedFold::Known(columns)
+            BedFold::Known(fold)
         } else {
             BedFold::Unknown
         };
@@ -688,7 +769,7 @@ fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<usiz
         }
     }
     b.align("type-241 padding")?;
-    Ok(b.pos / 8)
+    Ok((b.pos / 8, count, reference_mask))
 }
 
 #[cfg(test)]
@@ -697,6 +778,10 @@ pub(crate) mod fixtures {
     //! on values the corpus never shows.
 
     use super::*;
+    use crate::dcadec::xll::XLL_X_ALT_OUTER_SUFFIX;
+
+    /// The 7.1 full layout: reference channels plus the height pairs.
+    const FULL_MASK_7_1: u32 = REFERENCE_MASK_7_1 | HEIGHT_MASK;
 
     pub(crate) struct BitWriter {
         bits: Vec<u8>,
@@ -749,7 +834,7 @@ pub(crate) mod fixtures {
                 .push(0, 2)
                 .push(0, 3)
                 .push(2, 3)
-                .push(REFERENCE_MASK, 12);
+                .push(REFERENCE_MASK_7_1, 12);
         } else {
             w.push(0, 1).push(0, 1).push(0, 4);
         }
@@ -764,7 +849,7 @@ pub(crate) mod fixtures {
     /// height `i`, followed by the bare XLL bytes the decoder would find.
     pub(crate) fn standard_payload(rows: [(u32, u32); 4]) -> Vec<u8> {
         let mut w = BitWriter::new();
-        layout_header_bits(&mut w, 2, FULL_MASK, true);
+        layout_header_bits(&mut w, 2, FULL_MASK_7_1, true);
         w.push(2, 5)
             .push(0, 6)
             .push(1, 1)
@@ -834,7 +919,7 @@ pub(crate) mod fixtures {
             .push(1, 1)
             .push(0, 2)
             .push(0, 3);
-        w.push(2, 3).push(REFERENCE_MASK, 12).push(0, 8);
+        w.push(2, 3).push(REFERENCE_MASK_7_1, 12).push(0, 8);
         for record in records {
             w.push(1, 1)
                 .push(3, 2)
@@ -892,7 +977,7 @@ pub(crate) mod fixtures {
         let type241 = w.bytes();
 
         let mut w = BitWriter::new();
-        layout_header_bits(&mut w, 3, FULL_MASK, explicit_type3_mask);
+        layout_header_bits(&mut w, 3, FULL_MASK_7_1, explicit_type3_mask);
         w.push(2, 5)
             .push(0, 6)
             .push(1, 1)
@@ -900,10 +985,10 @@ pub(crate) mod fixtures {
             .push(TYPE3_CONTROL, 12);
         for (mask, code) in height_rows {
             w.push(mask, 12);
-            for column in 0..FULL_COLUMNS {
+            let (columns, column_count) = full_columns(FULL_MASK_7_1).unwrap();
+            for (column, entry) in columns.iter().enumerate().take(column_count) {
                 if mask & (1 << column) != 0 {
-                    let is_height = FULL_TO_HEIGHT[column].is_some();
-                    w.push(if is_height { UNITY_CODE } else { code }, 6);
+                    w.push(if entry.is_err() { UNITY_CODE } else { code }, 6);
                 }
             }
         }
@@ -914,6 +999,71 @@ pub(crate) mod fixtures {
         prefix.extend_from_slice(&type3);
         let mut payload = crc_appended(prefix);
         payload.extend_from_slice(&XLL_X_ALT_OUTER_SUFFIX);
+        payload.extend_from_slice(&[0xb2, 0, 0, 0, 0, 0, 0, 0]);
+        payload
+    }
+
+    /// The object-only variant on a 5.1 bed: one mode-1 record over the
+    /// reference mask `0x00f` (four-bit width field, six fold columns,
+    /// declaration field 1), no type-3 element, and an outer marker saying
+    /// that only the first channel set follows.
+    pub(crate) fn object_only_payload(record: &ObjectRecord) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.push(0xf1, 8)
+            .push(0x40, 8)
+            .push(0, 4)
+            .push(0, 1)
+            .push(1, 4)
+            .push(1, 1)
+            .push(0, 1)
+            .push(1, 1)
+            .push(0, 4);
+        w.push(0, 1)
+            .push(0, 1)
+            .push(1, 1)
+            .push(1, 1)
+            .push(0, 2)
+            .push(0, 3);
+        w.push(0, 3).push(REFERENCE_MASK_5_1, 4).push(0, 8);
+        w.push(1, 1)
+            .push(1, 2)
+            .push(record.index, 3)
+            .push(record.mode, 2)
+            .push(0, 10);
+        if record.mode == 0 {
+            w.push(1, 4);
+        } else {
+            w.push(0, 3);
+        }
+        w.push(0x20, 7)
+            .push(1, 1)
+            .push(1, 1)
+            .push(0, 2)
+            .push(UNITY_CODE, 6);
+        w.push(record.distance, 6)
+            .push(record.azimuth, 8)
+            .push(record.elevation, 7)
+            .push(0, 1);
+        if record.mode == 1 {
+            match record.row {
+                Some((mask, code)) => {
+                    w.push(1, 1).push(0, 1).push(mask, 6);
+                    for column in 0..6 {
+                        if mask & (1 << column) != 0 {
+                            w.push(code, 6);
+                        }
+                    }
+                }
+                None => {
+                    w.push(0, 1).push(0, 1);
+                }
+            }
+        }
+        w.push(0, 1); // no auxiliary section
+        w.align();
+        let mut payload = crc_appended(w.bytes());
+        payload.push(0x01);
+        payload.extend_from_slice(&crate::dcadec::xll::XLL_X_ALT_MARKER_TAIL);
         payload.extend_from_slice(&[0xb2, 0, 0, 0, 0, 0, 0, 0]);
         payload
     }
@@ -1253,7 +1403,7 @@ mod tests {
     #[test]
     fn every_truncation_and_extension_of_an_alternate_prefix_is_rejected() {
         let payload = alternate_payload(&d3_records(), HEIGHT_ROWS_55);
-        let prefix_len = alternate_prefix_len(&payload).unwrap();
+        let (prefix_len, _) = alternate_prefix_len(&payload).unwrap();
         for end in 0..prefix_len {
             assert!(XMetadata::parse(&payload[..end], 8).is_err(), "end {end}");
         }
@@ -1285,6 +1435,47 @@ mod tests {
             metadata.source(4).unwrap().role,
             SourceRole::Height(SpatialChannel::TopFrontLeft)
         );
+    }
+
+    #[test]
+    fn object_only_variant_on_a_5_1_bed_has_one_object_and_no_heights() {
+        let record = ObjectRecord {
+            mode: 1,
+            index: 0,
+            distance: 63,
+            azimuth: 120,
+            elevation: 77,
+            row: Some((1 << 0 | 1 << 1 | 1 << 2, 46)),
+            centre_height: false,
+        };
+        let payload = object_only_payload(&record);
+        let metadata = XMetadata::parse(&payload, 1).expect("object-only metadata");
+        assert_eq!(metadata.source_count(), 1);
+        assert_eq!(metadata.reference_speakers(), &[0, 1, 2, 3, 4, 5]);
+        let object = metadata.source(0).unwrap();
+        let SourceRole::Object { position, .. } = object.role else {
+            panic!("the single feed is an object");
+        };
+        assert_eq!(position.elevation_half_degrees, 51);
+        let code46 = gain_code_linear(46).unwrap();
+        assert_eq!(
+            object.fold,
+            BedFold::Known([code46, code46, code46, 0.0, 0.0, 0.0, 0.0, 0.0])
+        );
+        // Only the six 5.1 speakers can receive a fold; the front three do.
+        let plan = FoldPlan::from_metadata(&metadata);
+        let sources = vec![vec![0.5f32]];
+        assert!((plan.clean(0, 1.0, 0, &sources) - (1.0 - code46 * 0.5)).abs() < 1e-6);
+        assert!((plan.clean(2, 1.0, 0, &sources) - (1.0 - code46 * 0.5)).abs() < 1e-6);
+        assert_eq!(plan.clean(3, 1.0, 0, &sources), 1.0);
+        assert_eq!(plan.clean(7, 1.0, 0, &sources), 1.0);
+        assert!(plan.source_is_known(0));
+
+        // The waveform count must match: no height quartet here.
+        assert!(XMetadata::parse(&payload, 5).is_err());
+        for end in 0..payload.len() - 8 {
+            assert!(XMetadata::parse(&payload[..end], 1).is_err(), "end {end}");
+        }
     }
 
     #[test]
