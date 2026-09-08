@@ -1,8 +1,11 @@
 # Private metadata: standard matrix and alternate-profile candidates
 
-Status: offline research only. The decoder, ABI, fold configuration and output
-presentations are unchanged. `dca/examples/xll_private_metadata.rs` is an
-independent diagnostic; it is not a general DTS:X navigation parser.
+Status: the reading established here is now applied in playback. The
+realtime reader is `dca::XMetadata` (positions, bed folds) with the
+subtraction table `dca::FoldPlan`; the bridge and the offline exporter both
+present the extension waveforms from it. `dca/examples/xll_private_metadata.rs`
+remains the independent offline diagnostic that produced the evidence below;
+it is not a general DTS:X navigation parser.
 
 ## Confirmed standard result
 
@@ -396,25 +399,23 @@ that would cross the selected limit.
 
 The reading questions that gated playback work are now answered by the
 audio itself: which sources the type-3 rows describe, in which direction,
-at which gains, and what the mode-1 rows are. What remains is
-implementation-side:
+at which gains, and what the mode-1 rows are. The realtime reader lives in
+`dca::XMetadata` with the subtraction table in `dca::FoldPlan`; the bridge
+and the offline exporter both build their presentation from it (fixed
+heights as labeled channels, objects with transmitted positions, every
+stated fold removed from the bed, an unstated fold left in the bed with the
+feed muted). What remains:
 
-1. Subtract the embedded folds from the compatible bed using the decoded
-   metadata: the type-3 first entries for the four fixed heights and the
-   mode-1 reference rows for objects, with gain codes limited to the four
-   verified calibration points until the table relation is confirmed on
-   more codes.
-2. Recover the mode-0 panning law, which needs more mode-0 inputs than the
-   single one at hand; until then a mode-0 object cannot be removed from the
-   bed and must not be rendered a second time.
-3. Read positions per frame in playback and decide, with the renderer, how
-   transmitted positions replace the static D3 defaults, including the
-   auxiliary centre-height declaration.
-4. Explain the type-3 control word and the general association navigation,
+1. Recover the mode-0 panning law, which needs more mode-0 inputs than the
+   single one at hand; until then a mode-0 object stays in the bed and its
+   object channel is silent.
+2. Confirm the gain-code table relation on codes other than the four
+   verified points; the reader applies it to every code in 1..=61.
+3. Explain the type-3 control word and the general association navigation,
    which the corpus cannot distinguish from constants.
-5. A/B listen before any of this changes a presentation.
+4. A/B listen before merging any of this into a release.
 
-Until then no alternate presentation or `has_objects` behavior changes.
+
 
 ## Research provenance
 

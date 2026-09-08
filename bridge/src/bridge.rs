@@ -12,7 +12,7 @@ use std::time::Instant;
 use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, parse::Parser};
 
 use crate::ac3_native::NativeAc3Decoder;
-use crate::dts_pipeline::DtsFoldConfig;
+use crate::dts_pipeline::{DtsFoldConfig, DtsXState};
 use crate::eac3_pipeline::{
     diagnose_eac3_frame, is_dependent_eac3_frame, is_legacy_ac3_frame,
     is_temporary_eac3_silence_frame, process_eac3_dependent_frame_with_core, process_eac3_frame,
@@ -154,10 +154,9 @@ pub(crate) struct AtmosBridge {
     /// DTS-HD Master Audio lossless (5.1/7.1) decoder.
     pub(crate) dts_hd_decoder: Box<dca::HdDecoder>,
     pub(crate) dts_frame_count: u64,
-    /// Latches once a valid XLL-X height quartet has been emitted: fallback
-    /// frames then keep the 12-channel shape (composite bed + silent heights)
-    /// instead of renegotiating to 8 channels. Cleared with the pipeline.
-    pub(crate) dts_height_locked: bool,
+    /// DTS:X extension state: latched presentation shape, last readable
+    /// metadata, announced object positions. Cleared with the pipeline.
+    pub(crate) dts_x: DtsXState,
     /// True when the most recent `push_packet` used the DTS path.
     pub(crate) dts_active: bool,
     pub(crate) dts_fold_config: DtsFoldConfig,
@@ -239,7 +238,7 @@ impl AtmosBridge {
             dts_decoder: Box::new(dca::PcmDecoder::new()),
             dts_hd_decoder: Box::new(dca::HdDecoder::new()),
             dts_frame_count: 0,
-            dts_height_locked: false,
+            dts_x: DtsXState::default(),
             dts_active: false,
             dts_fold_config: DtsFoldConfig::from_env(),
             dts_objects_active: false,
@@ -299,7 +298,7 @@ impl AtmosBridge {
         self.dts_decoder.reset();
         self.dts_hd_decoder.reset();
         self.dts_frame_count = 0;
-        self.dts_height_locked = false;
+        self.dts_x = DtsXState::default();
         self.dts_active = false;
         self.dts_objects_active = false;
         // Re-sniff after reset, but keep any host-declared codec.
@@ -704,10 +703,10 @@ impl FormatBridge for AtmosBridge {
             if self.dts_objects_active {
                 return true;
             }
-            // DTS core and the standard/D0/D1 extension presentations are
+            // DTS core and the standard/D0 extension presentations are
             // labeled fixed channels. Whether they are placed directly or
-            // virtualized remains the renderer's channel-mode decision. D3 is
-            // the only current DTS presentation that declares object channels.
+            // virtualized remains the renderer's channel-mode decision. D1
+            // and D3 declare object channels for their object waveforms.
             return false;
         }
         if self.eac3_active {
@@ -1087,19 +1086,28 @@ mod raw_transport_tests {
         assert!(bridge.configure("input_codec".into(), "dts".into()));
         let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
         assert!(result.error_message.is_empty(), "{}", result.error_message);
-        assert!(!bridge.has_objects(), "D1 must remain fixed-channel");
+        assert!(bridge.has_objects(), "D1 declares its two objects");
 
         let frame = result
             .frames
             .iter()
             .find(|frame| {
-                [Tfl, Tfr, Lw, Rw, Tbl, Tbr]
+                [Tfl, Tfr, Tbl, Tbr]
                     .iter()
                     .all(|label| frame.channel_labels.contains(label))
+                    && frame
+                        .channel_labels
+                        .iter()
+                        .filter(|&&label| label == Object)
+                        .count()
+                        == 2
             })
-            .expect("no experimental fixed D1 declaration");
-        assert!(frame.metadata.is_empty());
-        assert!(!frame.channel_labels.contains(&Object));
+            .expect("no D1 presentation with four heights and two objects");
+        assert_eq!(frame.channel_count, 8 + 6);
+        assert!(
+            !frame.channel_labels.contains(&Lw),
+            "D1 carries no wide channels; its first two feeds are objects"
+        );
 
         let Some(d3_path) = corpus_path("HARLETTY_D3_CORPUS") else {
             eprintln!("skipping: HARLETTY_D3_CORPUS is not set to a readable file");
@@ -1124,25 +1132,37 @@ mod raw_transport_tests {
                     .iter()
                     .filter(|&&label| label == Object)
                     .count()
-                    == 8
+                    == 4
                     && frame
                         .metadata
                         .iter()
-                        .any(|metadata| metadata.name_updates.len() == 8)
+                        .any(|metadata| metadata.name_updates.len() == 4)
             })
-            .expect("no experimental D3 object declaration");
+            .expect("no D3 object declaration");
         assert_eq!(frame.channel_count, 16);
+        assert!(
+            [Tfl, Tfr, Tbl, Tbr]
+                .iter()
+                .all(|label| frame.channel_labels.contains(label)),
+            "the last four D3 feeds are the fixed heights"
+        );
         let metadata = frame
             .metadata
             .iter()
-            .find(|metadata| metadata.name_updates.len() == 8)
+            .find(|metadata| metadata.name_updates.len() == 4)
             .expect("no D3 name declaration");
-        for source in 0..8 {
+        for source in 0..4 {
             assert_eq!(
                 metadata.name_updates[source].name.as_str(),
                 format!("X{source}")
             );
         }
+        assert_eq!(
+            metadata.events.len(),
+            4,
+            "every object announces a position"
+        );
+        assert!(metadata.events.iter().all(|event| event.has_pos));
     }
 }
 

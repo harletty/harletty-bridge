@@ -13,8 +13,10 @@
 use super::dts_handler::DtsFrameMessage;
 use crate::input::InputReader;
 use anyhow::Result;
-use dca::{HdDecoder, HdError, PcmDecoder, XPresentation, exss_has_xll, exss_substream_size,
-    parse_header};
+use dca::{
+    HdDecoder, HdError, PcmDecoder, XMetadata, XPresentation, exss_has_xll, exss_substream_size,
+    parse_header,
+};
 use indicatif::ProgressBar;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -180,11 +182,16 @@ fn decode_one(
         match hd_decoder.decode(core, exss) {
             Ok(frame) => {
                 let presentation = XPresentation::detect(&frame);
+                // Unreadable metadata is reported by the handler once; the
+                // frame still plays with its bed as authored.
+                let metadata = presentation
+                    .and_then(|p| XMetadata::parse(&frame.x_payload, p.feed_count()).ok());
                 *frame_count += 1;
                 tick(pb);
                 let _ = tx.send(Ok(DtsFrameMessage::Hd {
                     frame: Box::new(frame),
                     presentation,
+                    metadata,
                 }));
                 return Ok(());
             }

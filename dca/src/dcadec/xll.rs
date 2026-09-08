@@ -19,15 +19,15 @@ const DCA_XLL_CHANNELS_MAX: usize = 8;
 const DCA_XLL_CHSETS_MAX: usize = 3;
 const DCA_XLL_PRED_ORDER_MAX: usize = 16;
 /// XLL-X (DTS:X spatial extension) end-of-frame syncword.
-const DCA_SYNCWORD_XLL_X: u32 = 0x0200_0850;
-const DCA_SYNCWORD_XLL_X_ALT_D0: u32 = 0xF140_00D0;
-const DCA_SYNCWORD_XLL_X_ALT_D1: u32 = 0xF140_00D1;
-const DCA_SYNCWORD_XLL_X_ALT_D3: u32 = 0xF140_00D3;
+pub(crate) const DCA_SYNCWORD_XLL_X: u32 = 0x0200_0850;
+pub(crate) const DCA_SYNCWORD_XLL_X_ALT_D0: u32 = 0xF140_00D0;
+pub(crate) const DCA_SYNCWORD_XLL_X_ALT_D1: u32 = 0xF140_00D1;
+pub(crate) const DCA_SYNCWORD_XLL_X_ALT_D3: u32 = 0xF140_00D3;
 const DCA_SYNCWORD_XLL: u32 = 0x41A2_9547;
 const XLL_X_ALT_FRAME_SAMPLES: usize = 512;
 const XLL_X_ALT_MAX_SEGMENTS: usize = 8;
 const XLL_X_ALT_MAX_INTERSTITIAL: usize = 20;
-const XLL_X_ALT_OUTER_SUFFIX: [u8; 6] = [0x03, 0x34, 0x38, 0x8c, 0x4f, 0x00];
+pub(crate) const XLL_X_ALT_OUTER_SUFFIX: [u8; 6] = [0x03, 0x34, 0x38, 0x8c, 0x4f, 0x00];
 const XLL_X_ALT_INNER_SUFFIX: [u8; 6] = [0x02, 0x34, 0x38, 0x8c, 0x4f, 0x00];
 const FF_DCA_DMIXTABLE_OFFSET: usize = 242 - 201; // SIZE - INV_SIZE
 const FF_DCA_DMIXTABLE_SIZE: usize = 242;
@@ -94,7 +94,7 @@ fn seek(gb: &mut BitReader, pos: usize) -> R<()> {
     }
 }
 
-fn crc16_ccitt(data: &[u8]) -> u16 {
+pub(crate) fn crc16_ccitt(data: &[u8]) -> u16 {
     let mut crc = 0xffffu16;
     for &byte in data {
         crc ^= (byte as u16) << 8;
