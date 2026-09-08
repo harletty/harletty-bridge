@@ -85,9 +85,13 @@ fn survey(bytes: &[u8]) -> Survey {
                 let parsed = XMetadata::parse(&frame.x_payload, frame.x_samples.len())
                     .unwrap_or_else(|error| panic!("frame {frames}: {error:?}"));
                 assert_eq!(parsed.source_count(), detected.feed_count());
-                // The last four feeds of every profile are the fixed heights
-                // (D0's first fixed feed is its centre-height object).
-                for feed in detected.feed_count() - 4..detected.feed_count() {
+                // The last four feeds of every profile with a height quartet
+                // are the fixed heights (D0's first fixed feed is its
+                // centre-height object); the object-only variant has none.
+                for feed in detected.feed_count().saturating_sub(4)..detected.feed_count() {
+                    if detected == XPresentation::ObjectOnly {
+                        break;
+                    }
                     assert!(
                         matches!(parsed.source(feed).unwrap().role, SourceRole::Height(_)),
                         "frame {frames}: feed {feed} is a fixed height"
@@ -205,6 +209,29 @@ fn d1_folds_heights_at_minus_3_db_and_reads_two_object_positions() {
             ))
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn object_only_variant_on_a_5_1_bed_parses_on_every_frame() {
+    let Some(bytes) = corpus("HARLETTY_ALT_51_CORPUS") else {
+        eprintln!("skipping: HARLETTY_ALT_51_CORPUS is not set");
+        return;
+    };
+    let survey = survey(&bytes);
+    assert_eq!(survey.presentation, XPresentation::ObjectOnly);
+    assert_eq!(survey.metadata.source_count(), 1);
+    assert_eq!(survey.metadata.reference_speakers(), &[0, 1, 2, 3, 4, 5]);
+    let object = survey.metadata.source(0).unwrap();
+    let SourceRole::Object { position, .. } = object.role else {
+        panic!("the single feed is an object");
+    };
+    assert_eq!(position.elevation_half_degrees, 51);
+    let BedFold::Known(columns) = object.fold else {
+        panic!("the object states its fold");
+    };
+    assert!(columns[0] > 0.8 && columns[1] > 0.4 && columns[2] > 0.4);
+    assert!(columns[3..].iter().all(|&gain| gain == 0.0));
+    eprintln!("object-only 5.1: {} frames", survey.frames);
 }
 
 #[test]

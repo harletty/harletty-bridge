@@ -24,7 +24,8 @@
 //! `docs/private-metadata-probe.md`): the last four feeds are the fixed
 //! heights named by the type-3 rows, the first feeds are the declared objects,
 //! and D0's single object also declares the centre-height speaker as its
-//! fixed alternative. They are exposed as presentations rather than as
+//! fixed alternative. The object-only variant on a 5.1 bed carries one
+//! declared object and no height quartet at all. They are exposed as presentations rather than as
 //! research defaults, but no listening sign-off exists yet.
 
 use crate::hd::HdFrame;
@@ -61,6 +62,9 @@ pub enum XPresentation {
     /// Eight-feed alternate profile: four objects, then the four fixed
     /// heights.
     ObjectsD3,
+    /// Single-feed alternate profile on a 5.1 bed: one object, no fixed
+    /// heights. Its envelope carries the first channel set only.
+    ObjectOnly,
 }
 
 const HEIGHT_CHANNELS: [SpatialChannel; 4] = [
@@ -106,9 +110,14 @@ impl XPresentation {
         if !frame.x_imax {
             return None;
         }
-        [Self::FixedD0, Self::ObjectsD1, Self::ObjectsD3]
-            .into_iter()
-            .find(|presentation| feeds_are(presentation.feed_count()))
+        [
+            Self::FixedD0,
+            Self::ObjectsD1,
+            Self::ObjectsD3,
+            Self::ObjectOnly,
+        ]
+        .into_iter()
+        .find(|presentation| feeds_are(presentation.feed_count()))
     }
 
     /// Number of extension waveforms this presentation carries.
@@ -118,6 +127,7 @@ impl XPresentation {
             Self::FixedD0 => 5,
             Self::ObjectsD1 => 6,
             Self::ObjectsD3 => 8,
+            Self::ObjectOnly => 1,
         }
     }
 
@@ -136,6 +146,7 @@ impl XPresentation {
         match self {
             Self::Height | Self::ObjectsD1 | Self::ObjectsD3 => &HEIGHT_CHANNELS,
             Self::FixedD0 => &D0_CHANNELS,
+            Self::ObjectOnly => &[],
         }
     }
 
@@ -183,6 +194,7 @@ mod tests {
             (5usize, XPresentation::FixedD0),
             (6, XPresentation::ObjectsD1),
             (8, XPresentation::ObjectsD3),
+            (1, XPresentation::ObjectOnly),
         ] {
             let f = frame_with(vec![vec![0.0; 512]; n], true, 512);
             assert_eq!(XPresentation::detect(&f), Some(expected));
@@ -207,7 +219,7 @@ mod tests {
         assert_eq!(XPresentation::detect(&frame_with(x, false, 512)), None);
 
         // Feed counts that match no presentation.
-        for n in [0usize, 1, 2, 3, 7, 9] {
+        for n in [0usize, 2, 3, 7, 9] {
             let f = frame_with(vec![vec![0.0; 512]; n], true, 512);
             assert_eq!(XPresentation::detect(&f), None, "{n} feeds");
         }
@@ -232,6 +244,7 @@ mod tests {
             (XPresentation::FixedD0, 0..0, 0..5),
             (XPresentation::ObjectsD1, 0..2, 2..6),
             (XPresentation::ObjectsD3, 0..4, 4..8),
+            (XPresentation::ObjectOnly, 0..1, 1..1),
         ] {
             assert_eq!(presentation.object_feeds(), objects, "{presentation:?}");
             assert_eq!(presentation.fixed_feeds(), fixed, "{presentation:?}");

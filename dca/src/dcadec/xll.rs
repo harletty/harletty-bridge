@@ -27,8 +27,20 @@ const DCA_SYNCWORD_XLL: u32 = 0x41A2_9547;
 const XLL_X_ALT_FRAME_SAMPLES: usize = 512;
 const XLL_X_ALT_MAX_SEGMENTS: usize = 8;
 const XLL_X_ALT_MAX_INTERSTITIAL: usize = 20;
+/// Tail of the marker that ends the CRC-protected prefix (outer) and the
+/// first channel set (inner). The byte before it is a mask of the channel
+/// sets that follow: `0x03` when the object set and the height quartet both
+/// follow the outer marker, `0x01` when only the object set does (the
+/// object-only variant on a 5.1 bed), `0x02` before the quartet.
+pub(crate) const XLL_X_ALT_MARKER_TAIL: [u8; 5] = [0x34, 0x38, 0x8c, 0x4f, 0x00];
+pub(crate) const XLL_X_ALT_SET_FIRST: u8 = 0x01;
+pub(crate) const XLL_X_ALT_SET_SECOND: u8 = 0x02;
+/// Outer marker of a payload carrying both channel sets (test fixtures).
+#[cfg(test)]
 pub(crate) const XLL_X_ALT_OUTER_SUFFIX: [u8; 6] = [0x03, 0x34, 0x38, 0x8c, 0x4f, 0x00];
 const XLL_X_ALT_INNER_SUFFIX: [u8; 6] = [0x02, 0x34, 0x38, 0x8c, 0x4f, 0x00];
+/// Shortest CRC-protected prefix seen: the object-only variant's 20 bytes.
+pub(crate) const XLL_X_ALT_MIN_PREFIX: usize = 16;
 const FF_DCA_DMIXTABLE_OFFSET: usize = 242 - 201; // SIZE - INV_SIZE
 const FF_DCA_DMIXTABLE_SIZE: usize = 242;
 const FF_DCA_INV_DMIXTABLE_SIZE: usize = 201;
@@ -62,9 +74,11 @@ enum AlternateProfile {
     D3,
 }
 
+#[derive(Clone, Copy)]
 struct AlternateLayout {
-    headers: [AlternateHeader; 2],
-    geometries: [AlternateGeometry; 2],
+    first: (AlternateHeader, AlternateGeometry),
+    /// The height quartet, absent from the object-only variant.
+    second: Option<(AlternateHeader, AlternateGeometry)>,
 }
 
 /// Allocation-free kind string for a failed XLL-X decode (the audio path
@@ -229,34 +243,45 @@ fn alternate_inner_control(payload: &[u8], second_header_offset: usize) -> R<&[u
     Ok(control)
 }
 
-fn alternate_outer_layout(payload: &[u8], profile: AlternateProfile) -> R<(usize, usize, usize)> {
+/// The CRC-protected prefix of an alternate payload: the bytes before an
+/// outer marker whose CRC16 is zero. Returns its length and the mask of the
+/// channel sets that follow. Shared with the metadata reader so both agree
+/// on the boundary.
+pub(crate) fn alternate_protected_prefix(payload: &[u8]) -> R<(usize, u8)> {
     const MAX_PREFIX_BYTES: usize = 96;
-
-    let minimum_prefix = match profile {
-        AlternateProfile::D0 => 48,
-        AlternateProfile::D1 | AlternateProfile::D3 => 49,
-    };
     let search_end = payload.len().min(MAX_PREFIX_BYTES);
-    let mut prefix_end = None;
-    for candidate in minimum_prefix..search_end {
-        let Some(suffix_end) = candidate.checked_add(XLL_X_ALT_OUTER_SUFFIX.len()) else {
+    let mut found = None;
+    for candidate in XLL_X_ALT_MIN_PREFIX..search_end {
+        let Some(tail_end) = candidate.checked_add(1 + XLL_X_ALT_MARKER_TAIL.len()) else {
             break;
         };
-        if suffix_end > payload.len() {
+        if tail_end > payload.len() {
             break;
         }
-        if payload.get(candidate..suffix_end) != Some(&XLL_X_ALT_OUTER_SUFFIX)
+        let set_mask = payload[candidate];
+        if payload[candidate + 1..tail_end] != XLL_X_ALT_MARKER_TAIL
+            || set_mask & !(XLL_X_ALT_SET_FIRST | XLL_X_ALT_SET_SECOND) != 0
+            || set_mask & XLL_X_ALT_SET_FIRST == 0
             || crc16_ccitt(&payload[..candidate]) != 0
         {
             continue;
         }
-        if prefix_end.replace(candidate).is_some() {
+        if found.replace((candidate, set_mask)).is_some() {
             return Err(XllError::Invalid("ambiguous alternate XLL prefix"));
         }
     }
-    let prefix_end = prefix_end.ok_or(XllError::Invalid("alternate XLL prefix CRC"))?;
+    found.ok_or(XllError::Invalid("alternate XLL prefix CRC"))
+}
+
+/// Control start, control size, second-header offset bias and channel-set
+/// mask of an alternate payload.
+fn alternate_outer_layout(
+    payload: &[u8],
+    profile: AlternateProfile,
+) -> R<(usize, usize, usize, u8)> {
+    let (prefix_end, set_mask) = alternate_protected_prefix(payload)?;
     let control_start = prefix_end
-        .checked_add(XLL_X_ALT_OUTER_SUFFIX.len())
+        .checked_add(1 + XLL_X_ALT_MARKER_TAIL.len())
         .ok_or(XllError::Invalid("alternate XLL control offset overflow"))?;
     let control_size = match payload.get(control_start) {
         Some(0xb2) => 7,
@@ -269,7 +294,7 @@ fn alternate_outer_layout(payload: &[u8], profile: AlternateProfile) -> R<(usize
             });
         }
     };
-    Ok((control_start, control_size, control_start + 12))
+    Ok((control_start, control_size, control_start + 12, set_mask))
 }
 
 fn alternate_layout(payload: &[u8]) -> R<AlternateLayout> {
@@ -284,7 +309,8 @@ fn alternate_layout(payload: &[u8]) -> R<AlternateLayout> {
         DCA_SYNCWORD_XLL_X_ALT_D3 => AlternateProfile::D3,
         _ => return Err(XllError::Invalid("unknown alternate XLL profile")),
     };
-    let (control_start, control_size, offset_bias) = alternate_outer_layout(payload, profile)?;
+    let (control_start, control_size, offset_bias, set_mask) =
+        alternate_outer_layout(payload, profile)?;
     let first_header_offset = control_start
         .checked_add(control_size)
         .ok_or(XllError::Invalid("alternate XLL header offset overflow"))?;
@@ -309,16 +335,23 @@ fn alternate_layout(payload: &[u8]) -> R<AlternateLayout> {
             "unexpected alternate XLL first channel count",
         ));
     }
-    let second_header = alternate_second_header(payload, outer_control, common_bit, offset_bias)?;
-    let inner_control = alternate_inner_control(payload, second_header.offset)?;
-    let second_geometry_start = match profile {
-        AlternateProfile::D0 => 18,
-        AlternateProfile::D1 | AlternateProfile::D3 => 19,
+    let second = if set_mask & XLL_X_ALT_SET_SECOND != 0 {
+        let second_header =
+            alternate_second_header(payload, outer_control, common_bit, offset_bias)?;
+        let inner_control = alternate_inner_control(payload, second_header.offset)?;
+        let second_geometry_start = match profile {
+            AlternateProfile::D0 => 18,
+            AlternateProfile::D1 | AlternateProfile::D3 => 19,
+        };
+        let (_, second_geometry) =
+            alternate_unique_geometry(inner_control, second_geometry_start, 26)?;
+        Some((second_header, second_geometry))
+    } else {
+        None
     };
-    let (_, second_geometry) = alternate_unique_geometry(inner_control, second_geometry_start, 26)?;
     Ok(AlternateLayout {
-        headers: [first_header, second_header],
-        geometries: [first_geometry, second_geometry],
+        first: (first_header, first_geometry),
+        second,
     })
 }
 
@@ -839,19 +872,25 @@ impl XllDecoder {
     /// set inherits the lossless bed's common XLL geometry.
     fn try_decode_alternate_x_extension_audio(&mut self, payload: &[u8]) -> R<()> {
         let layout = alternate_layout(payload)?;
+        let first_boundary = layout
+            .second
+            .map_or(payload.len(), |(header, _)| header.offset);
         let first = self.decode_alternate_channel_set(
             payload,
-            layout.headers[0],
-            layout.geometries[0],
-            layout.headers[1].offset,
+            layout.first.0,
+            layout.first.1,
+            first_boundary,
         )?;
-        let second = self.decode_alternate_channel_set(
-            payload,
-            layout.headers[1],
-            layout.geometries[1],
-            payload.len(),
-        )?;
-        if first.0.pcm_bit_res != second.0.pcm_bit_res {
+        let second = match layout.second {
+            Some((header, geometry)) => {
+                Some(self.decode_alternate_channel_set(payload, header, geometry, payload.len())?)
+            }
+            None => None,
+        };
+        if second
+            .as_ref()
+            .is_some_and(|second| first.0.pcm_bit_res != second.0.pcm_bit_res)
+        {
             return Err(XllError::Unsupported("mixed alternate XLL PCM resolutions"));
         }
         let pcm_bit_res = first.0.pcm_bit_res;
@@ -861,18 +900,20 @@ impl XllDecoder {
         let scale = 1i32
             .checked_shl(shift as u32)
             .ok_or(XllError::Invalid("alternate XLL PCM scale"))?;
+        let bits_consumed = second.as_ref().map_or(first.1, |second| second.1);
+        let second_channels = second.as_ref().map_or(0, |second| second.0.nchannels);
 
         self.x_output.clear();
-        self.x_output
-            .reserve(first.0.nchannels + second.0.nchannels);
-        for mut samples in first.0.band.msb.into_iter().chain(second.0.band.msb) {
+        self.x_output.reserve(first.0.nchannels + second_channels);
+        let second_samples = second.map(|second| second.0.band.msb).unwrap_or_default();
+        for mut samples in first.0.band.msb.into_iter().chain(second_samples) {
             for sample in &mut samples {
                 *sample = clip23(sample.wrapping_mul(scale));
             }
             self.x_output.push(samples);
         }
         self.x_pcm_bit_res = pcm_bit_res;
-        self.x_bits_consumed = second.1;
+        self.x_bits_consumed = bits_consumed;
         // This legacy diagnostic describes the single standard-profile header;
         // do not overload it with one of the alternate profile's two headers.
         self.x_header_tail_bits = 0;
@@ -1966,8 +2007,7 @@ mod alt_extension_tests {
         }
         let layout = alternate_layout(payload).ok()?;
         Some(
-            layout
-                .headers
+            [layout.first.0, layout.second?.0]
                 .map(|header| (header.offset, header.size, header.channels)),
         )
     }
@@ -1978,8 +2018,7 @@ mod alt_extension_tests {
         }
         let layout = alternate_layout(payload).ok()?;
         Some(
-            layout
-                .headers
+            [layout.first.0, layout.second?.0]
                 .map(|header| (header.offset, header.size, header.channels)),
         )
     }
@@ -2071,7 +2110,8 @@ mod alt_extension_tests {
                 Ok((
                     prefix.len() + XLL_X_ALT_OUTER_SUFFIX.len(),
                     7,
-                    prefix.len() + 18
+                    prefix.len() + 18,
+                    0x03
                 ))
             );
         }
@@ -2094,7 +2134,7 @@ mod alt_extension_tests {
         payload.push(0xc6);
         assert_eq!(
             alternate_outer_layout(&payload, AlternateProfile::D3),
-            Ok((79, 8, 91))
+            Ok((79, 8, 91, 0x03))
         );
     }
 
@@ -2149,10 +2189,11 @@ mod alt_extension_tests {
 
         for byte_offset in [
             48,
-            layout.headers[0].offset,
-            layout.headers[0].offset + layout.headers[0].size,
-            layout.headers[1].offset,
-            layout.headers[1].offset + layout.headers[1].size,
+            layout.first.0.offset,
+            layout.first.0.offset + layout.first.0.size,
+            layout.second.expect("height quartet").0.offset,
+            layout.second.expect("height quartet").0.offset
+                + layout.second.expect("height quartet").0.size,
         ] {
             let mut corrupt = payload.clone();
             corrupt[byte_offset] ^= 1;
@@ -2517,18 +2558,10 @@ mod alt_extension_tests {
             extension_payload_from_env(D1_CORPUS_PATH_ENV, 192).expect("adjacent corpus frame");
 
         let d1_candidates = immediate_navi_candidates(&d1, 764, 16, d1.len(), 16, None);
-        let d1_active_candidates = immediate_navi_candidates(
-            &d1_active,
-            1300,
-            18,
-            d1_active.len(),
-            16,
-            None,
-        );
+        let d1_active_candidates =
+            immediate_navi_candidates(&d1_active, 1300, 18, d1_active.len(), 16, None);
         eprintln!("D1 corpus terminal-quartet NAVI: {d1_candidates:?}");
-        eprintln!(
-            "D1 corpus active terminal-quartet NAVI: {d1_active_candidates:?}"
-        );
+        eprintln!("D1 corpus active terminal-quartet NAVI: {d1_active_candidates:?}");
         assert!(!d1_candidates.is_empty());
         assert!(!d1_active_candidates.is_empty());
     }
@@ -2573,11 +2606,8 @@ mod alt_extension_tests {
 
     #[test]
     fn alternate_d1_prefix_mode_decodes_active_channel_set_run() {
-        let Some((payloads, runtime_results)) = extension_payloads_from_env(
-            D1_CORPUS_PATH_ENV,
-            9_000,
-            64 * 1024 * 1024,
-        )
+        let Some((payloads, runtime_results)) =
+            extension_payloads_from_env(D1_CORPUS_PATH_ENV, 9_000, 64 * 1024 * 1024)
         else {
             eprintln!("skipping: alternate-extension corpus not present");
             return;
@@ -2731,7 +2761,13 @@ mod alt_extension_tests {
         };
         assert_eq!(payload.get(55), Some(&0xc3));
         let layout = alternate_layout(&payload).expect("valid D1 c3 layout");
-        assert_eq!(layout.headers.map(|header| header.channels), [2, 4]);
+        assert_eq!(
+            [
+                layout.first.0.channels,
+                layout.second.expect("height quartet").0.channels
+            ],
+            [2, 4]
+        );
 
         let mut decoder = XllDecoder::new();
         decoder
@@ -2748,11 +2784,8 @@ mod alt_extension_tests {
 
     #[test]
     fn alternate_d0_prefix_mode_decodes_active_channel_set_run() {
-        let Some((payloads, runtime_results)) = extension_payloads_from_env(
-            D0_CORPUS_PATH_ENV,
-            9_000,
-            64 * 1024 * 1024,
-        )
+        let Some((payloads, runtime_results)) =
+            extension_payloads_from_env(D0_CORPUS_PATH_ENV, 9_000, 64 * 1024 * 1024)
         else {
             eprintln!("skipping: alternate-extension corpus not present");
             return;

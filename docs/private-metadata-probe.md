@@ -329,6 +329,35 @@ heights and objects on top of a bed that still contains them, and cannot
 validate a subtraction. Coordinates and waveform identities from it remain
 useful; its rendering does not.
 
+### The object-only variant on a 5.1 bed
+
+A second alternate form exists that the corpus survey had not seen: the D0
+marker over a **5.1 reference layout** (mask `0x00f`, four-bit width
+field), found on an IMAX documentary with two such tracks. Its
+CRC-protected prefix is 20 bytes: the type-241 element declares one mode-1
+object at (0°, 25.5°, 1) with the same C:58, L:46, R:46 reference row as
+the 7.1 D0 object, over **six** fold columns, with a two-bit declaration
+field equal to 1 where the 7.1 profiles carry 3; there is no auxiliary
+section and **no type-3 element**. The outer marker reads `01 34 38 8c 4f
+00` instead of `03 …`: the byte before the constant tail is a mask of the
+channel sets that follow (`03` = object set and height quartet, `02` before
+the quartet, `01` = object set only), and this stream carries a single
+one-channel XLL set on every frame (2,000 frames checked, 2,000 first-set
+headers, never a four-channel header). So the variant is 5.1 plus one
+object, without fixed heights, which is why nothing describes a height
+fold.
+
+The decoder now accepts a payload whose outer marker announces the first
+set only, and the reader derives the fold columns and their DCA speakers
+from the declared reference mask instead of assuming the 7.1 layout. The
+compatible 5.1 bed stays bit-exact against FFmpeg on an eight-second
+excerpt (384,000 samples/channel, zero differing float bit patterns), the
+object waveform decodes with content, and its fold measures 0.840 in `C`
+in the clean blocks (code 58 is 0.8414) with nothing in `Ls`, `Rs` or
+`LFE`; `L` and `R` are masked by continuous programme. Both hosts present
+the stream as six labeled bed channels plus one object at its transmitted
+position, with the stated fold removed. The DAMF label is `DTS:X-5.1+1`.
+
 ### Remaining reading hypotheses
 
 - The control word `0x3fa` reads, against the type-2 grammar, as an inline
