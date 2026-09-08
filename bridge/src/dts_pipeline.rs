@@ -503,28 +503,39 @@ fn build_object_metadata(
     let heartbeat_period = u64::from(sample_rate) / HEARTBEAT_HZ;
     let heartbeat_due = heartbeat_period > 0 && sample_pos % heartbeat_period < sample_count as u64;
 
+    // The engine broadcasts the objects present in each metadata frame and
+    // clears the others as stale, so a frame must carry every object or none:
+    // emitting only the objects that moved makes the static ones flicker in
+    // monitoring clients.
+    let positions: Vec<(usize, SphericalPosition)> = object_feeds
+        .clone()
+        .filter_map(|feed| {
+            match metadata
+                .and_then(|metadata| metadata.source(feed))
+                .map(|source| source.role)
+            {
+                Some(SourceRole::Object { position, .. }) => Some((feed, position)),
+                _ => None,
+            }
+        })
+        .collect();
+    let moved = positions
+        .iter()
+        .any(|&(feed, position)| state.emitted_positions[feed] != Some(position));
     let mut events: RVec<REvent> = RVec::new();
-    for feed in object_feeds.clone() {
-        let Some(SourceRole::Object { position, .. }) = metadata
-            .and_then(|metadata| metadata.source(feed))
-            .map(|source| source.role)
-        else {
-            continue;
-        };
-        let slot = &mut state.emitted_positions[feed];
-        if *slot == Some(position) && declaration_unchanged && !heartbeat_due {
-            continue;
+    if moved || !declaration_unchanged || heartbeat_due {
+        for &(feed, position) in &positions {
+            state.emitted_positions[feed] = Some(position);
+            events.push(REvent {
+                id: OBJECT_ID_BASE + feed as u32,
+                sample_pos,
+                has_pos: true,
+                pos: position.to_adm_cartesian(),
+                gain_db: 0,
+                size: [0.0; 3],
+                ramp_duration: 0,
+            });
         }
-        *slot = Some(position);
-        events.push(REvent {
-            id: OBJECT_ID_BASE + feed as u32,
-            sample_pos,
-            has_pos: true,
-            pos: position.to_adm_cartesian(),
-            gain_db: 0,
-            size: [0.0; 3],
-            ramp_duration: 0,
-        });
     }
     if declaration_unchanged && events.is_empty() {
         return RVec::new();
@@ -921,6 +932,33 @@ mod tests {
         // Rear-left object: negative x, negative y, raised.
         assert!(metadata.events[0].pos[0] < 0.0 && metadata.events[0].pos[1] < 0.0);
         assert!(metadata.events[0].pos[2] > 0.0);
+
+        // One object moves: every object is announced again, so the engine's
+        // per-frame object list keeps its size and nothing flickers.
+        let mut moved = sources;
+        moved[2] = object(-280, 20, BedFold::Known([0.0; 8]));
+        state.last_metadata = XMetadata::from_sources(&moved);
+        let mut moved_hd = hd_frame(hd.samples.clone(), hd.x_samples.clone());
+        moved_hd.x_present = false;
+        moved_hd.x_imax = true;
+        let (frame_moved, _) = build_hd_frame_with_extensions(
+            &moved_hd,
+            &mut state,
+            &DtsFoldConfig::default(),
+            48_000 + 1024,
+            &mut declared,
+        )
+        .expect("valid D3 frame");
+        assert_eq!(frame_moved.metadata.len(), 1);
+        assert_eq!(
+            frame_moved.metadata[0].events.len(),
+            4,
+            "all objects, not only the mover"
+        );
+        assert!(
+            frame_moved.metadata[0].object_channels.is_empty(),
+            "declaration unchanged"
+        );
 
         // Same positions again: the declaration is cached and no event is due
         // between heartbeats.
