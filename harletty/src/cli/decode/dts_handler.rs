@@ -11,7 +11,7 @@ use crate::cli::command::{AudioFormat, WarpMode};
 use crate::dts_to_oamd::{BedSource, DtsLayout, convert_dts};
 use anyhow::Result;
 use damf::{Configuration, Event, SourceCodec};
-use dca::{CorePcmFrame, HdFrame, PcmPushResult, XPresentation};
+use dca::{CorePcmFrame, FoldPlan, HdFrame, PcmPushResult, XMetadata, XPresentation};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -21,6 +21,9 @@ pub enum DtsFrameMessage {
     Hd {
         frame: Box<HdFrame>,
         presentation: Option<XPresentation>,
+        /// The frame's private metadata (object positions and bed folds),
+        /// or `None` when it did not parse.
+        metadata: Option<XMetadata>,
     },
     /// A plain DTS core frame (5.1 lossy bed, no extension).
     Core(Box<PcmPushResult>),
@@ -52,6 +55,8 @@ pub struct DtsDecodeHandler {
     metadata_header_written: bool,
     /// Whether the dropped-channel warning has already been emitted.
     warned_dropped_channels: bool,
+    /// Whether the unreadable-metadata warning has already been emitted.
+    warned_unreadable_metadata: bool,
     /// Label for the master set, chosen from the presentation of the first
     /// spatial frame.
     source_codec: SourceCodec,
@@ -65,7 +70,7 @@ fn source_codec_for(presentation: XPresentation) -> SourceCodec {
     match presentation {
         XPresentation::Height => SourceCodec::DtsX714,
         XPresentation::FixedD0 => SourceCodec::DtsX715,
-        XPresentation::FixedD1 => SourceCodec::DtsX914,
+        XPresentation::ObjectsD1 => SourceCodec::DtsX914,
         XPresentation::ObjectsD3 => SourceCodec::DtsX71Plus8,
     }
 }
@@ -86,6 +91,7 @@ impl Default for DtsDecodeHandler {
             last_layout: None,
             metadata_header_written: false,
             warned_dropped_channels: false,
+            warned_unreadable_metadata: false,
             source_codec: SourceCodec::DtsX714,
         }
     }
@@ -103,7 +109,8 @@ impl DtsDecodeHandler {
             DtsFrameMessage::Hd {
                 frame,
                 presentation,
-            } => self.handle_hd_frame(&frame, presentation, base_path, format, no_audio),
+                metadata,
+            } => self.handle_hd_frame(&frame, presentation, metadata, base_path, format, no_audio),
             DtsFrameMessage::Core(push) => {
                 self.handle_core_frame(&push.pcm, base_path, format, no_audio)
             }
@@ -114,6 +121,7 @@ impl DtsDecodeHandler {
         &mut self,
         frame: &HdFrame,
         presentation: Option<XPresentation>,
+        metadata: Option<XMetadata>,
         base_path: &Option<PathBuf>,
         format: AudioFormat,
         no_audio: bool,
@@ -128,7 +136,8 @@ impl DtsDecodeHandler {
             .filter(|&s| frame.samples[s].is_some())
             .collect();
 
-        let layout = DtsLayout::from_hd(&active, presentation);
+        let layout = DtsLayout::from_hd(&active, presentation, metadata.as_ref());
+        let plan = self.fold_plan(presentation, metadata.as_ref());
         // The output carries exactly what the master set declares: the bed the
         // layout resolved (speakers with no OAMD name, i.e. rear centre, are
         // dropped from both) plus one channel per object.
@@ -165,7 +174,7 @@ impl DtsDecodeHandler {
                 format
             };
             self.ensure_audio_writer(base_path, audio_format, frame.sample_rate, total_channels)?;
-            self.write_hd_pcm(frame, &active, &layout, sample_count, total_channels)?;
+            self.write_hd_pcm(frame, &active, &layout, &plan, sample_count, total_channels)?;
         }
 
         self.decoded_samples += sample_count as u64;
@@ -223,19 +232,18 @@ impl DtsDecodeHandler {
             self.has_spatial = true;
             if let Some(base_path) = base_path {
                 let oamd = convert_dts(layout);
-                if let Err(e) = create_damf_header_file(
-                    base_path,
-                    &oamd,
-                    self.warp_mode,
-                    self.source_codec,
-                ) {
+                if let Err(e) =
+                    create_damf_header_file(base_path, &oamd, self.warp_mode, self.source_codec)
+                {
                     log::error!("failed to write .atmos header: {e}");
                 }
             }
         }
 
         match &self.last_layout {
-            Some(previous) if previous != layout => {
+            Some(previous)
+                if previous.bed != layout.bed || previous.objects.len() != layout.objects.len() =>
+            {
                 log::warn!(
                     "DTS layout changed mid-stream ({} bed / {} objects -> {} bed / {} objects); \
                      the master set describes the first layout",
@@ -262,16 +270,50 @@ impl DtsDecodeHandler {
         log::info!(
             "DTS:X spatial presentation: {presentation:?} ({} extension feeds, {})",
             presentation.feed_count(),
-            match presentation.object_positions() {
-                Some(positions) => format!("{} objects", positions.len()),
-                None => "fixed channels".to_string(),
+            match presentation.object_feeds().len() {
+                0 => "fixed channels".to_string(),
+                objects => format!("{objects} objects"),
             }
         );
         if presentation.is_experimental() {
             log::warn!(
-                "DTS:X {presentation:?} is an experimental presentation: its channel identities \
-                 are inferred from a research corpus, not decoded metadata"
+                "DTS:X {presentation:?} is an experimental presentation: its feed identities rest \
+                 on corpus evidence; positions and bed folds come from the stream's metadata"
             );
+        }
+    }
+
+    /// The bed-fold plan for this frame, mirroring the realtime bridge: the
+    /// frame's metadata when readable, the standard -3 dB height fold when a
+    /// standard frame's matrix is unreadable, otherwise nothing is removed
+    /// and every extension feed is muted so nothing plays twice.
+    fn fold_plan(
+        &mut self,
+        presentation: Option<XPresentation>,
+        metadata: Option<&XMetadata>,
+    ) -> FoldPlan {
+        const STANDARD_HEIGHT_GAIN: f32 = 23_170.0 / 32_768.0;
+        match (presentation, metadata) {
+            (Some(_), Some(metadata)) => FoldPlan::from_metadata(metadata),
+            (Some(presentation), None) => {
+                if !self.warned_unreadable_metadata {
+                    self.warned_unreadable_metadata = true;
+                    log::warn!(
+                        "DTS:X {presentation:?} metadata unreadable: {}",
+                        if presentation == XPresentation::Height {
+                            "assuming the standard -3 dB height fold"
+                        } else {
+                            "keeping the bed as authored and muting the extension feeds"
+                        }
+                    );
+                }
+                if presentation == XPresentation::Height {
+                    FoldPlan::standard_heights(STANDARD_HEIGHT_GAIN)
+                } else {
+                    FoldPlan::all_unknown(presentation.feed_count())
+                }
+            }
+            (None, _) => FoldPlan::all_unknown(0),
         }
     }
 
@@ -311,24 +353,37 @@ impl DtsDecodeHandler {
         frame: &HdFrame,
         active: &[usize],
         layout: &DtsLayout,
+        plan: &FoldPlan,
         sample_count: usize,
         total_channels: usize,
     ) -> Result<()> {
         let Some(ref mut writer) = self.audio_writer else {
             return Ok(());
         };
+        // A feed whose bed fold is not stated stays in the bed and is muted
+        // on its own channel, exactly as the realtime bridge does.
+        let feed_at = |feed: usize, idx: usize| -> f32 {
+            if !plan.source_is_known(feed) {
+                return 0.0;
+            }
+            frame
+                .x_samples
+                .get(feed)
+                .and_then(|channel| channel.get(idx).copied())
+                .unwrap_or(0.0)
+        };
         let sample_at = |source: BedSource, idx: usize| -> f32 {
             match source {
                 BedSource::Speaker(position) => active
                     .get(position)
-                    .and_then(|&speaker| frame.samples[speaker].as_ref())
-                    .and_then(|channel| channel.get(idx).copied())
+                    .and_then(|&speaker| {
+                        frame.samples[speaker]
+                            .as_ref()
+                            .and_then(|channel| channel.get(idx).copied())
+                            .map(|value| plan.clean(speaker, value, idx, &frame.x_samples))
+                    })
                     .unwrap_or(0.0),
-                BedSource::Feed(feed) => frame
-                    .x_samples
-                    .get(feed)
-                    .and_then(|channel| channel.get(idx).copied())
-                    .unwrap_or(0.0),
+                BedSource::Feed(feed) => feed_at(feed, idx),
             }
         };
 
@@ -338,13 +393,7 @@ impl DtsDecodeHandler {
                 interleaved.push(float_to_i24(sample_at(source, sample_idx)));
             }
             for &feed in &layout.object_sources {
-                interleaved.push(float_to_i24(
-                    frame
-                        .x_samples
-                        .get(feed)
-                        .and_then(|channel| channel.get(sample_idx).copied())
-                        .unwrap_or(0.0),
-                ));
+                interleaved.push(float_to_i24(feed_at(feed, sample_idx)));
             }
         }
         writer.write_pcm_samples(&interleaved, total_channels)?;
