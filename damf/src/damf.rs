@@ -125,15 +125,21 @@ pub enum SourceCodec {
     /// Standard DTS:X: 7.1 bed plus four height feeds.
     #[serde(rename = "DTS:X-7.1.4")]
     DtsX714,
-    /// Experimental five-feed presentation (D0).
+    /// Five-feed presentation (D0): 7.1 bed, four fixed heights and one
+    /// object whose record also declares the centre-height speaker, so it is
+    /// presented as that fixed channel.
     #[serde(rename = "DTS:X-7.1.5")]
     DtsX715,
-    /// Experimental six-feed presentation (D1): four heights plus wides.
-    #[serde(rename = "DTS:X-9.1.4")]
-    DtsX914,
-    /// Experimental eight-feed object presentation (D3).
-    #[serde(rename = "DTS:X-7.1+8")]
-    DtsX71Plus8,
+    /// Six-feed presentation (D1): 7.1 bed, four fixed heights and two
+    /// objects. (Formerly labelled `DTS:X-9.1.4` when the two objects were
+    /// taken for wide channels; Atmos Ranker maps that label onto this one.)
+    #[serde(rename = "DTS:X-7.1.4+2")]
+    DtsX714Plus2,
+    /// Eight-feed presentation (D3): 7.1 bed, four fixed heights and four
+    /// objects. (Formerly `DTS:X-7.1+8`, when the height quartet was counted
+    /// among the objects; mapped likewise.)
+    #[serde(rename = "DTS:X-7.1.4+4")]
+    DtsX714Plus4,
     /// Object-only presentation on a 5.1 bed: one object waveform, no height
     /// quartet (the D0 marker with a 5.1 reference layout).
     #[serde(rename = "DTS:X-5.1+1")]
@@ -1039,8 +1045,7 @@ presentations:
       - ID: 23
       - ID: 24
 "#,
-        TEST_TOOL.name,
-        TEST_TOOL.version
+        TEST_TOOL.name, TEST_TOOL.version
     );
 
     let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
