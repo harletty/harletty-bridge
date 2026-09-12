@@ -79,7 +79,9 @@ pub struct DecodeArgs {
     #[arg(long)]
     pub no_estimate_progress: bool,
 
-    /// Enable bed conformance for Atmos content
+    /// Keep the bed to what an Atmos bed can hold. TrueHD: declare a 7.1.2
+    /// bed. DTS:X and Auro-3D: the corner heights and wides leave the bed for
+    /// static objects at their speaker positions.
     #[arg(long)]
     pub bed_conform: bool,
 

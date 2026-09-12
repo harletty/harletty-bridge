@@ -102,7 +102,7 @@ harletty decode [OPTIONS] <INPUT>
 | `--format` | `caf`, `pcm`, `w64` | `caf` | Audio container. **Ignored for Atmos output**, which is always CAF; see [Output files](#output-files). `pcm` is raw 24-bit little-endian, `w64` is Wave64 with a `.wav` extension. |
 | `--no-audio` | flag | off | Skip the audio file; still write `.atmos` and `.atmos.metadata`. Much faster when you only want the object automation. |
 | `--presentation <0-3>` | index | `3` | Which TrueHD presentation to decode. `3` is the 16-channel Atmos presentation; `0`–`2` are the stereo/5.1/7.1 downmixes carried in the same stream. **TrueHD only** — silently ignored for E-AC-3 and DTS, which have no equivalent. |
-| `--bed-conform` | flag | off | Force the Atmos bed to a conformant 7.1.2 layout. |
+| `--bed-conform` | flag | off | Keep the bed to what an Atmos bed can hold. TrueHD: declare a 7.1.2 bed. DTS:X and Auro-3D: the corner heights (and wides) leave the bed for static objects at their speaker positions, so the master set can feed an Atmos encoder. |
 | `--no-fold-estimate` | flag | off | DTS:X only. A waveform whose bed fold the stream does not state is normally given a fold estimated from the bed's audio, so it plays at its position and leaves the bed. With this flag it stays in the bed and its own channel is muted. |
 | `--warp-mode` | `normal`, `warping`, `prologiciix`, `loro` | *(from stream)* | Downmix warp mode to declare when the metadata does not carry one. |
 | `--no-estimate-progress` | flag | off | Skip the pre-pass that counts frames for the progress bar. Automatic for stdin, which cannot be pre-scanned. |
@@ -149,6 +149,21 @@ OAMD         : yes
 JOC          : yes
 Frames seen  : 47
 ```
+
+DTS (a file or a pipe: `ffmpeg … -c copy -f dts - | harletty info -`),
+read for at most twenty seconds, usually far less:
+
+```
+Codec        : DTS-HD MA
+Channels     : 8
+Sample rate  : 48000 Hz
+Spatial      : DTS:X-7.1.4+5 (ObjectsD4: 5 objects, 4 fixed heights)
+Frames seen  : 33 (0.4 s)
+```
+
+`Spatial` names the presentation the way `decode` labels the master set
+(`DTS:X-7.1.4`, `DTS:X-7.1.4+2`, `Auro-3D-13.1 (7.1_5H_1T carried in
+7.1)`, …), or `none` for a track that carries neither.
 
 ## Output files
 

@@ -16,7 +16,12 @@ use truehd::structs::channel::{ChannelGroup, ChannelLabel};
 
 pub fn cmd_info(args: &InfoArgs, cli: &Cli, multi: Option<&MultiProgress>) -> Result<()> {
     let mut probe_reader = InputReader::new(&args.input)?;
-    let (codec, _prefix) = probe_codec(&mut probe_reader, cli.codec)?;
+    let (codec, prefix) = probe_codec(&mut probe_reader, cli.codec)?;
+
+    if codec == Codec::Dts {
+        // Keeps reading the same handle: the input may be a pipe.
+        return super::dts_info::cmd_info_dts(&mut probe_reader, prefix, args);
+    }
     drop(probe_reader);
 
     if codec == Codec::Eac3 {
