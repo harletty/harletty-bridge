@@ -77,6 +77,9 @@ pub struct DtsDecodeHandler {
     /// Estimate the fold of a waveform the stream states none for, from the
     /// bed's audio, rather than keeping it in the bed muted.
     pub estimate_folds: bool,
+    /// Keep the bed to what an Atmos bed can hold (7.1.2 at most): a DTS:X
+    /// or Auro-3D layout's corner heights and wides become static objects.
+    pub bed_conform: bool,
     estimator: FoldEstimator,
     /// Whether the estimation has been announced.
     noted_estimation: bool,
@@ -96,6 +99,18 @@ fn auro_source_codec(original: auro::Layout) -> SourceCodec {
         "Auro-3D-11.1" => SourceCodec::Auro3d111,
         "Auro-3D-13.1" => SourceCodec::Auro3d131,
         _ => SourceCodec::Auro3d,
+    }
+}
+
+/// The DAMF codec label of a spatial presentation, as the header writes it.
+pub(crate) fn presentation_label(presentation: XPresentation) -> &'static str {
+    match presentation {
+        XPresentation::Height => "DTS:X-7.1.4",
+        XPresentation::FixedD0 => "DTS:X-7.1.5",
+        XPresentation::ObjectsD1 => "DTS:X-7.1.4+2",
+        XPresentation::ObjectsD3 => "DTS:X-7.1.4+4",
+        XPresentation::ObjectsD4 => "DTS:X-7.1.4+5",
+        XPresentation::ObjectOnly => "DTS:X-5.1+1",
     }
 }
 
@@ -133,6 +148,7 @@ impl Default for DtsDecodeHandler {
             warned_dropped_channels: false,
             warned_unreadable_metadata: false,
             estimate_folds: true,
+            bed_conform: false,
             estimator: FoldEstimator::new(),
             noted_estimation: false,
             source_codec: SourceCodec::DtsX714,
@@ -182,7 +198,7 @@ impl DtsDecodeHandler {
             return Ok(());
         }
         let sample_count = frame.samples.len() / ns;
-        let layout = DtsLayout::from_auro(&frame.streams);
+        let layout = DtsLayout::from_auro(&frame.streams, self.bed_conform);
         let total_channels = layout.bed.len() + layout.objects.len();
         if total_channels < ns {
             self.warn_dropped_channels(ns - total_channels);
@@ -261,7 +277,7 @@ impl DtsDecodeHandler {
             .filter(|&s| frame.samples[s].is_some())
             .collect();
 
-        let layout = DtsLayout::from_hd(&active, presentation, metadata.as_ref());
+        let layout = DtsLayout::from_hd(&active, presentation, metadata.as_ref(), self.bed_conform);
         let mut plan = self.fold_plan(presentation, metadata.as_ref());
         if presentation.is_some() && self.estimate_folds && plan.has_unknown() {
             if !self.noted_estimation {
