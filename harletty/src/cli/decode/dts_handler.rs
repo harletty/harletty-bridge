@@ -80,6 +80,9 @@ pub struct DtsDecodeHandler {
     /// Keep the bed to what an Atmos bed can hold (7.1.2 at most): a DTS:X
     /// or Auro-3D layout's corner heights and wides become static objects.
     pub bed_conform: bool,
+    /// Write one mono WAV per channel, `<prefix>_<n>.wav`, instead of the
+    /// interleaved audio file.
+    pub mono_prefix: Option<PathBuf>,
     estimator: FoldEstimator,
     /// Whether the estimation has been announced.
     noted_estimation: bool,
@@ -149,6 +152,7 @@ impl Default for DtsDecodeHandler {
             warned_unreadable_metadata: false,
             estimate_folds: true,
             bed_conform: false,
+            mono_prefix: None,
             estimator: FoldEstimator::new(),
             noted_estimation: false,
             source_codec: SourceCodec::DtsX714,
@@ -484,6 +488,14 @@ impl DtsDecodeHandler {
         let Some(base_path) = base_path else {
             return Ok(());
         };
+        if let Some(prefix) = &self.mono_prefix {
+            log::info!(
+                "Creating {channel_count} mono audio files: {}",
+                super::output::mono_path(prefix, 0).display()
+            );
+            self.audio_writer = Some(AudioWriter::create_mono(prefix, sample_rate, channel_count)?);
+            return Ok(());
+        }
         let (audio_path, _) = create_output_paths(base_path, format, self.has_spatial);
         log::info!("Creating audio file: {}", audio_path.display());
         let writer = match (format, self.has_spatial) {

@@ -67,6 +67,14 @@ pub struct DecodeArgs {
     #[arg(long, value_enum, default_value_t = AudioFormat::Caf)]
     pub format: AudioFormat,
 
+    /// Write the audio as one mono 24-bit WAV per channel, `<PREFIX>_<n>.wav`
+    /// with n from 0 in the order of the interleaved file (a master set's bed,
+    /// then its objects), instead of one interleaved file. The `.atmos` and
+    /// `.atmos.metadata` files are written as usual; the header still names
+    /// the interleaved audio file, which is not written.
+    #[arg(long, value_name = "PREFIX")]
+    pub mono_prefix: Option<PathBuf>,
+
     /// Disable audio file output (metadata files are still generated when available).
     #[arg(long)]
     pub no_audio: bool,

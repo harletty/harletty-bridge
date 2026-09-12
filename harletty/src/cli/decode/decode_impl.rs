@@ -113,6 +113,11 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
     // Handle decoded frames
     let mut handler = DecodeHandler::default();
     handler.source_codec = SourceCodec::TrueHD;
+    handler.mono_prefix = args.mono_prefix.clone();
+    if args.mono_prefix.is_some() && args.bed_conform {
+        // TrueHD bed conformance re-lays the interleaved file out after the fact.
+        anyhow::bail!("--bed-conform is not available with --mono-prefix on a TrueHD stream");
+    }
     let start_time = std::time::Instant::now();
 
     let effective_format = if args.presentation == 3 {
@@ -236,6 +241,7 @@ fn cmd_decode_eac3(
 
     let mut handler = Eac3DecodeHandler::default();
     handler.warp_mode = args.warp_mode;
+    handler.mono_prefix = args.mono_prefix.clone();
     let start_time = std::time::Instant::now();
 
     while let Ok(result) = rx.recv() {
@@ -317,6 +323,7 @@ fn cmd_decode_dts(
     handler.warp_mode = args.warp_mode;
     handler.estimate_folds = !args.no_fold_estimate;
     handler.bed_conform = args.bed_conform;
+    handler.mono_prefix = args.mono_prefix.clone();
     let start_time = std::time::Instant::now();
 
     while let Ok(result) = rx.recv() {
