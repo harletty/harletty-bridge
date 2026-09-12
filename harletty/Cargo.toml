@@ -24,6 +24,7 @@ truehdd-macros = "0.1.1"
 truehd = { version = "0.7.1" }
 eac3 = { version = "0.7.4", path = "../eac3" }
 dca = { version = "0.7.4", path = "../dca" }
+auro = { version = "0.7.4", path = "../auro" }
 damf = { version = "0.7.4", path = "../damf" }
 
 anyhow = "1.0.99"

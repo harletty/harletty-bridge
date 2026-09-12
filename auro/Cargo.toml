@@ -1,0 +1,17 @@
+[package]
+name = "auro"
+version = "0.7.4"
+edition = "2024"
+license = "Apache-2.0"
+description = "Auro-Codec side-channel detector: finds the Auro-3D layout carried in the low bits of 24-bit PCM"
+repository = "https://github.com/harletty/harletty-bridge"
+rust-version = "1.87.0"
+
+[lib]
+name = "auro"
+crate-type = ["lib"]
+
+# Deliberately dependency-free: the detector runs inside the realtime decode
+# path on every lossless sample, so it must stay as small as the bit twiddling
+# it does.
+[dependencies]

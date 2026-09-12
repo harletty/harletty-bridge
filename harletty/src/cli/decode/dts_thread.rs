@@ -37,6 +37,9 @@ struct DtsDecodeState {
     buffer: Vec<u8>,
     core: PcmDecoder,
     hd: HdDecoder,
+    /// Auro-Codec side-channel detector over the lossless output. Built on
+    /// the first HD frame, once the speaker count is known.
+    auro: Option<auro::Detector>,
     frame_count: u64,
     strict_mode: bool,
 }
@@ -55,6 +58,7 @@ pub fn spawn_dts_decoder_thread(config: DtsDecoderThreadConfig) -> thread::JoinH
             buffer: prefix,
             core: PcmDecoder::new(),
             hd: HdDecoder::new(),
+            auro: None,
             frame_count: 0,
             strict_mode,
         };
@@ -133,6 +137,7 @@ fn drain_frames(
         let DtsDecodeState {
             core: core_decoder,
             hd: hd_decoder,
+            auro,
             frame_count,
             strict_mode,
             ..
@@ -141,6 +146,7 @@ fn drain_frames(
             DecodeTargets {
                 core_decoder,
                 hd_decoder,
+                auro,
                 frame_count,
                 strict_mode: *strict_mode,
             },
@@ -161,6 +167,7 @@ fn drain_frames(
 struct DecodeTargets<'a> {
     core_decoder: &'a mut PcmDecoder,
     hd_decoder: &'a mut HdDecoder,
+    auro: &'a mut Option<auro::Detector>,
     frame_count: &'a mut u64,
     strict_mode: bool,
 }
@@ -175,12 +182,22 @@ fn decode_one(
     let DecodeTargets {
         core_decoder,
         hd_decoder,
+        auro,
         frame_count,
         strict_mode,
     } = targets;
     if let Some(exss) = exss {
         match hd_decoder.decode(core, exss) {
             Ok(frame) => {
+                // The side channel lives in the low bits of the lossless
+                // integers, so it is read off the decoder's integer tap, not
+                // off the float frame.
+                let detector = auro.get_or_insert_with(|| auro::Detector::new(frame.samples.len()));
+                for (speaker, samples) in hd_decoder.lossless_samples() {
+                    if let Some(detection) = detector.push(speaker, samples) {
+                        let _ = tx.send(Ok(DtsFrameMessage::Auro(detection)));
+                    }
+                }
                 let presentation = XPresentation::detect(&frame);
                 // Unreadable metadata is reported by the handler once; the
                 // frame still plays with its bed as authored.

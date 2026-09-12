@@ -27,6 +27,9 @@ pub enum DtsFrameMessage {
     },
     /// A plain DTS core frame (5.1 lossy bed, no extension).
     Core(Box<PcmPushResult>),
+    /// The lossless PCM turned out to be an Auro-Codec carrier. Sent once,
+    /// when the side channel's configuration is confirmed.
+    Auro(auro::Detection),
 }
 
 pub struct DtsDecodeHandler {
@@ -60,6 +63,8 @@ pub struct DtsDecodeHandler {
     /// Label for the master set, chosen from the presentation of the first
     /// spatial frame.
     source_codec: SourceCodec,
+    /// The Auro-Codec carrier the lossless PCM was found to be, if any.
+    pub auro: Option<auro::Detection>,
 }
 
 /// Which DAMF codec label a spatial presentation is stored under.
@@ -96,6 +101,7 @@ impl Default for DtsDecodeHandler {
             warned_dropped_channels: false,
             warned_unreadable_metadata: false,
             source_codec: SourceCodec::DtsX714,
+            auro: None,
         }
     }
 }
@@ -117,7 +123,28 @@ impl DtsDecodeHandler {
             DtsFrameMessage::Core(push) => {
                 self.handle_core_frame(&push.pcm, base_path, format, no_audio)
             }
+            DtsFrameMessage::Auro(detection) => {
+                self.note_auro(detection);
+                Ok(())
+            }
         }
+    }
+
+    /// Say what the carrier holds. The height layer is not reconstructed:
+    /// the output stays the carrier bed, which is what the disc plays as on
+    /// anything without an Auro decoder.
+    fn note_auro(&mut self, detection: auro::Detection) {
+        let name = |layout: auro::Layout| layout.name().unwrap_or("unknown layout");
+        log::info!(
+            "Auro-3D carrier: {} folded into {} ({}-sample blocks, channel configuration {}). \
+             Height channels are not reconstructed; the output is the {} carrier.",
+            name(detection.original),
+            name(detection.carrier),
+            detection.block_size,
+            detection.config.0,
+            name(detection.carrier),
+        );
+        self.auro = Some(detection);
     }
 
     fn handle_hd_frame(

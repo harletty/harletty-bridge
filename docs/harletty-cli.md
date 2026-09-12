@@ -244,6 +244,13 @@ of drift.
   extension block that this decoder does not read. A DTS:X master set is
   therefore fine for layout inspection and useless for anything that
   measures movement.
+- **Auro-3D height channels are not reconstructed.** A DTS-HD MA track
+  that carries an Auro-Codec side channel in its low bits is recognised
+  (the log names the original layout, `7.1_5H_1T` say, and the carrier it
+  was folded into) but decoded as its carrier bed only: the folded height
+  layer stays in the mix, as it does on any player without an Auro
+  decoder. Only the layout part of the side channel is publicly
+  described; the residual layer that undoes the fold is not.
 - **ffmpeg cannot open the 6-channel CAF files this writer produces.**
   12-channel files are fine. This predates the rename and is not a
   regression — the reference implementation emits byte-identical headers
