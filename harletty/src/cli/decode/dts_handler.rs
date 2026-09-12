@@ -65,13 +65,15 @@ pub struct DtsDecodeHandler {
 /// Which DAMF codec label a spatial presentation is stored under.
 ///
 /// The taxonomy is Atmos Ranker's, derived independently at scan time from the
-/// D0/D1/D3 syncwords; both sides must agree or the Rank codec filter splits.
+/// alternate-profile syncwords; both sides must agree or the Rank codec filter
+/// splits. [`SourceCodec`] says what that agreement rests on.
 fn source_codec_for(presentation: XPresentation) -> SourceCodec {
     match presentation {
         XPresentation::Height => SourceCodec::DtsX714,
         XPresentation::FixedD0 => SourceCodec::DtsX715,
         XPresentation::ObjectsD1 => SourceCodec::DtsX714Plus2,
         XPresentation::ObjectsD3 => SourceCodec::DtsX714Plus4,
+        XPresentation::ObjectsD4 => SourceCodec::DtsX714Plus5,
         XPresentation::ObjectOnly => SourceCodec::DtsX51Plus1,
     }
 }

@@ -62,6 +62,9 @@ pub enum XPresentation {
     /// Eight-feed alternate profile: four objects, then the four fixed
     /// heights.
     ObjectsD3,
+    /// Nine-feed alternate profile: five objects, then the four fixed
+    /// heights.
+    ObjectsD4,
     /// Single-feed alternate profile on a 5.1 bed: one object, no fixed
     /// heights. Its envelope carries the first channel set only.
     ObjectOnly,
@@ -114,6 +117,7 @@ impl XPresentation {
             Self::FixedD0,
             Self::ObjectsD1,
             Self::ObjectsD3,
+            Self::ObjectsD4,
             Self::ObjectOnly,
         ]
         .into_iter()
@@ -127,6 +131,7 @@ impl XPresentation {
             Self::FixedD0 => 5,
             Self::ObjectsD1 => 6,
             Self::ObjectsD3 => 8,
+            Self::ObjectsD4 => 9,
             Self::ObjectOnly => 1,
         }
     }
@@ -144,7 +149,7 @@ impl XPresentation {
     /// Speaker position of each fixed feed, in feed order.
     pub fn fixed_channels(self) -> &'static [SpatialChannel] {
         match self {
-            Self::Height | Self::ObjectsD1 | Self::ObjectsD3 => &HEIGHT_CHANNELS,
+            Self::Height | Self::ObjectsD1 | Self::ObjectsD3 | Self::ObjectsD4 => &HEIGHT_CHANNELS,
             Self::FixedD0 => &D0_CHANNELS,
             Self::ObjectOnly => &[],
         }
@@ -194,6 +199,7 @@ mod tests {
             (5usize, XPresentation::FixedD0),
             (6, XPresentation::ObjectsD1),
             (8, XPresentation::ObjectsD3),
+            (9, XPresentation::ObjectsD4),
             (1, XPresentation::ObjectOnly),
         ] {
             let f = frame_with(vec![vec![0.0; 512]; n], true, 512);
@@ -219,7 +225,7 @@ mod tests {
         assert_eq!(XPresentation::detect(&frame_with(x, false, 512)), None);
 
         // Feed counts that match no presentation.
-        for n in [0usize, 2, 3, 7, 9] {
+        for n in [0usize, 2, 3, 7, 10] {
             let f = frame_with(vec![vec![0.0; 512]; n], true, 512);
             assert_eq!(XPresentation::detect(&f), None, "{n} feeds");
         }

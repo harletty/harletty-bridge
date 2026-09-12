@@ -160,7 +160,9 @@ pub(crate) struct AtmosBridge {
     /// True when the most recent `push_packet` used the DTS path.
     pub(crate) dts_active: bool,
     pub(crate) dts_fold_config: DtsFoldConfig,
-    /// Live stream fact: the latest DTS frame carried presented D3 objects.
+    /// Live stream fact: the latest DTS frame emitted object channels. Set
+    /// from what the frame presented rather than from its profile, so every
+    /// object-bearing presentation reaches it by the same route.
     pub(crate) dts_objects_active: bool,
     // ── Shared ───────────────────────────────────────────────────────
     pub(crate) presentation: u8,
@@ -703,10 +705,13 @@ impl FormatBridge for AtmosBridge {
             if self.dts_objects_active {
                 return true;
             }
-            // DTS core and the standard/D0 extension presentations are
-            // labeled fixed channels. Whether they are placed directly or
-            // virtualized remains the renderer's channel-mode decision. D1
-            // and D3 declare object channels for their object waveforms.
+            // DTS core, and the presentations whose feeds are all fixed - the
+            // standard height quartet and D0's five - are labeled fixed
+            // channels. Whether those are placed directly or virtualized
+            // remains the renderer's channel-mode decision. A presentation
+            // that declares objects labels those feeds as object channels
+            // instead: D1, D3 and D4 over the height quartet, and the
+            // object-only variant for the single one it carries alone.
             return false;
         }
         if self.eac3_active {

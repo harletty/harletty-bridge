@@ -116,12 +116,17 @@ pub enum SourceCodec {
     // DTS:X, one label per spatial presentation.
     //
     // These strings are not free choices. Atmos Ranker classifies DTS:X tracks
-    // at scan time by looking for the D0/D1/D3 syncwords in the elementary
-    // stream, and stores the result under exactly these names; its
+    // at scan time by looking for the alternate-profile syncwords in the
+    // elementary stream, and stores the result under exactly these names; its
     // `canonical_codec` maps them to themselves. Emitting anything else here —
     // a generic "DTS-X", say — would leave the same physical codec stored under
     // two different strings depending on whether it was scanned or decoded,
     // which is precisely what that function exists to prevent.
+    //
+    // The scanner's syncword list is not visible from this repository, so the
+    // agreement is an expectation held here rather than a thing checked here.
+    // A label that decodes but never ranks is the shape that disagreement
+    // takes, and the profile added most recently is where to look for it.
     /// Standard DTS:X: 7.1 bed plus four height feeds.
     #[serde(rename = "DTS:X-7.1.4")]
     DtsX714,
@@ -140,6 +145,10 @@ pub enum SourceCodec {
     /// among the objects; mapped likewise.)
     #[serde(rename = "DTS:X-7.1.4+4")]
     DtsX714Plus4,
+    /// Nine-feed presentation (D4): 7.1 bed, four fixed heights and five
+    /// objects.
+    #[serde(rename = "DTS:X-7.1.4+5")]
+    DtsX714Plus5,
     /// Object-only presentation on a 5.1 bed: one object waveform, no height
     /// quartet (the D0 marker with a 5.1 reference layout).
     #[serde(rename = "DTS:X-5.1+1")]
