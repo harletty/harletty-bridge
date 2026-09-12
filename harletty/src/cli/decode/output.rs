@@ -1,10 +1,10 @@
+use anyhow::Result;
 use damf::caf::CAFWriter;
 use damf::wav::WAVWriter;
-use anyhow::Result;
-use truehd::structs::channel::ChannelLabel;
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
+use truehd::structs::channel::ChannelLabel;
 
 use super::super::command::AudioFormat;
 
@@ -67,6 +67,118 @@ pub enum AudioWriter {
     Pcm(BufWriter<File>),
     Caf(CAFWriter<BufWriter<File>>),
     W64(WAVWriter<File>),
+    /// One mono RIFF WAV per channel, `<prefix>_<n>.wav`, n from 0 in the
+    /// order the interleaved file would have had.
+    Mono(MonoWavSet),
+}
+
+/// A set of mono 24-bit RIFF WAV files written in lockstep, one per channel.
+/// Plain RIFF rather than Wave64: a mono channel of a feature film is under
+/// a gigabyte, and the readers these files are for expect RIFF.
+pub struct MonoWavSet {
+    files: Vec<BufWriter<File>>,
+    /// Bytes of PCM written to each file so far.
+    data_bytes: u64,
+    /// Scratch, one per channel, reused across calls: no allocation per frame.
+    scratch: Vec<Vec<u8>>,
+}
+
+impl MonoWavSet {
+    const HEADER: u64 = 44;
+
+    /// Create `<prefix>_<n>.wav` for n in 0..channel_count, headers written
+    /// with placeholder sizes that `finish` fills in.
+    pub fn create(prefix: &Path, sample_rate: u32, channel_count: usize) -> Result<Self> {
+        let mut files = Vec::with_capacity(channel_count);
+        for n in 0..channel_count {
+            let path = mono_path(prefix, n);
+            let mut file = BufWriter::new(File::create(&path)?);
+            write_riff_header(&mut file, sample_rate, 0)?;
+            files.push(file);
+        }
+        Ok(Self {
+            files,
+            data_bytes: 0,
+            scratch: vec![Vec::new(); channel_count],
+        })
+    }
+
+    pub fn channel_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// De-interleave `samples` (24-bit values in i32) into the files.
+    pub fn write_interleaved(&mut self, samples: &[i32], channel_count: usize) -> Result<()> {
+        if channel_count != self.files.len() {
+            anyhow::bail!(
+                "mono export: {} channels written to a set of {}",
+                channel_count,
+                self.files.len()
+            );
+        }
+        let frames = samples.len() / channel_count;
+        for (channel, scratch) in self.scratch.iter_mut().enumerate() {
+            scratch.clear();
+            scratch.reserve(frames * 3);
+            for frame in 0..frames {
+                let bytes = samples[frame * channel_count + channel].to_le_bytes();
+                scratch.extend_from_slice(&bytes[..3]);
+            }
+            self.files[channel].write_all(scratch)?;
+        }
+        self.data_bytes += (frames * 3) as u64;
+        Ok(())
+    }
+
+    /// Patch the RIFF and data sizes and flush every file.
+    pub fn finish(&mut self) -> Result<()> {
+        for file in &mut self.files {
+            file.flush()?;
+            let end = file.stream_position()?;
+            let data = end.saturating_sub(Self::HEADER).min(u64::from(u32::MAX));
+            file.seek(std::io::SeekFrom::Start(4))?;
+            file.write_all(&((data + Self::HEADER - 8) as u32).to_le_bytes())?;
+            file.seek(std::io::SeekFrom::Start(40))?;
+            file.write_all(&(data as u32).to_le_bytes())?;
+            file.flush()?;
+            file.seek(std::io::SeekFrom::Start(end))?;
+        }
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        for file in &mut self.files {
+            file.flush()?;
+        }
+        Ok(())
+    }
+}
+
+/// `<prefix>_<n>.wav`.
+pub fn mono_path(prefix: &Path, n: usize) -> PathBuf {
+    let mut name = prefix
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(format!("_{n}.wav"));
+    prefix.with_file_name(name)
+}
+
+/// A 44-byte canonical RIFF header for mono 24-bit PCM.
+fn write_riff_header(w: &mut impl Write, sample_rate: u32, data_bytes: u32) -> Result<()> {
+    w.write_all(b"RIFF")?;
+    w.write_all(&(36 + data_bytes).to_le_bytes())?;
+    w.write_all(b"WAVEfmt ")?;
+    w.write_all(&16u32.to_le_bytes())?;
+    w.write_all(&1u16.to_le_bytes())?; // PCM
+    w.write_all(&1u16.to_le_bytes())?; // mono
+    w.write_all(&sample_rate.to_le_bytes())?;
+    w.write_all(&(sample_rate * 3).to_le_bytes())?;
+    w.write_all(&3u16.to_le_bytes())?; // block align
+    w.write_all(&24u16.to_le_bytes())?;
+    w.write_all(b"data")?;
+    w.write_all(&data_bytes.to_le_bytes())?;
+    Ok(())
 }
 
 impl AudioWriter {
@@ -88,6 +200,14 @@ impl AudioWriter {
         caf_writer.configure_audio_format(sample_rate, channel_count, 24, labels)?;
         caf_writer.write_header()?;
         Ok(AudioWriter::Caf(caf_writer))
+    }
+
+    pub fn create_mono(prefix: &Path, sample_rate: u32, channel_count: usize) -> Result<Self> {
+        Ok(AudioWriter::Mono(MonoWavSet::create(
+            prefix,
+            sample_rate,
+            channel_count,
+        )?))
     }
 
     pub fn create_w64(path: PathBuf, sample_rate: u32, channel_count: u32) -> Result<Self> {
@@ -114,6 +234,9 @@ impl AudioWriter {
             AudioWriter::W64(w64_writer) => {
                 w64_writer.write_pcm_24bit_as_packed(samples)?;
             }
+            AudioWriter::Mono(set) => {
+                set.write_interleaved(samples, channel_count)?;
+            }
         }
         Ok(())
     }
@@ -132,6 +255,10 @@ impl AudioWriter {
                 w.finish()?;
                 drop(w);
             }
+            AudioWriter::Mono(mut set) => {
+                set.finish()?;
+                drop(set);
+            }
         }
         Ok(())
     }
@@ -147,12 +274,18 @@ impl AudioWriter {
             AudioWriter::W64(w64_writer) => {
                 w64_writer.finish()?;
             }
+            AudioWriter::Mono(set) => {
+                set.finish()?;
+            }
         }
         Ok(())
     }
 
     pub fn flush(&mut self) -> Result<()> {
         match self {
+            AudioWriter::Mono(set) => {
+                set.flush()?;
+            }
             AudioWriter::Pcm(pcm_writer) => {
                 pcm_writer.flush()?;
             }
@@ -209,10 +342,61 @@ pub fn create_caf_writer_from_existing_file(file: File) -> Result<CAFWriter<BufW
 
 #[cfg(test)]
 mod tests {
-    use super::{I24_MAX, I24_MIN, float_to_i24};
+    use super::{I24_MAX, I24_MIN, MonoWavSet, float_to_i24, mono_path};
 
     /// The decoders divide by 2^23; this must be the exact inverse, or lossless
     /// output stops matching a reference decoder sample for sample.
+    #[test]
+    fn mono_set_writes_one_riff_wav_per_channel_in_lockstep() {
+        let dir = std::env::temp_dir().join(format!("harletty-mono-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("ch");
+        let mut set = MonoWavSet::create(&prefix, 48_000, 3).unwrap();
+        // Two frames of three channels, then one more frame.
+        set.write_interleaved(&[1, 2, 3, 4, 5, 6], 3).unwrap();
+        set.write_interleaved(&[-1, -2, -3], 3).unwrap();
+        assert!(
+            set.write_interleaved(&[0, 0], 2).is_err(),
+            "channel count is fixed"
+        );
+        set.finish().unwrap();
+        drop(set);
+
+        for (n, expected) in [(0usize, [1i32, 4, -1]), (1, [2, 5, -2]), (2, [3, 6, -3])] {
+            let bytes = std::fs::read(mono_path(&prefix, n)).unwrap();
+            assert_eq!(
+                bytes.len(),
+                44 + 9,
+                "channel {n}: header + 3 samples of 3 bytes"
+            );
+            assert_eq!(&bytes[..4], b"RIFF");
+            assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 36 + 9);
+            assert_eq!(&bytes[8..16], b"WAVEfmt ");
+            assert_eq!(
+                u16::from_le_bytes(bytes[22..24].try_into().unwrap()),
+                1,
+                "mono"
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+                48_000
+            );
+            assert_eq!(u16::from_le_bytes(bytes[34..36].try_into().unwrap()), 24);
+            assert_eq!(&bytes[36..40], b"data");
+            assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 9);
+            let samples: Vec<i32> = bytes[44..]
+                .chunks(3)
+                .map(|c| (i32::from_le_bytes([c[0], c[1], c[2], 0]) << 8) >> 8)
+                .collect();
+            assert_eq!(samples, expected, "channel {n}");
+        }
+        assert_eq!(
+            mono_path(std::path::Path::new("/tmp/out/vo"), 12),
+            std::path::PathBuf::from("/tmp/out/vo_12.wav")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn float_to_i24_round_trips_every_24_bit_value() {
         for n in [

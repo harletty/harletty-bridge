@@ -64,7 +64,7 @@ impl AudioFormatHandler {
                 Self::rename_and_recreate_caf_writer(current_path, new_path, state)
             }
             // These cases should never happen for presentation 3 due to effective_format forcing CAF
-            AudioWriter::Pcm(_) | AudioWriter::W64(_) => {
+            AudioWriter::Pcm(_) | AudioWriter::W64(_) | AudioWriter::Mono(_) => {
                 unreachable!(
                     "PCM/W64 writers should not exist for presentation 3 (Atmos) due to format forcing"
                 )
@@ -110,7 +110,7 @@ impl AudioFormatHandler {
                 drop(w);
             }
             // These should not happen due to effective_format forcing CAF
-            AudioWriter::Pcm(_) | AudioWriter::W64(_) => {
+            AudioWriter::Pcm(_) | AudioWriter::W64(_) | AudioWriter::Mono(_) => {
                 unreachable!("PCM/W64 writers should not exist for presentation 3 bed conformance")
             }
         }
@@ -310,6 +310,11 @@ pub struct DecodeHandler {
     pub is_segmented: bool,         // Track if we're in segmented mode
     pub segment_start_samples: u64, // Sample position when current segment started
     pub source_codec: SourceCodec,
+    /// Write one mono WAV per channel, `<prefix>_<n>.wav`, instead of the
+    /// interleaved audio file. The files are named by channel index, so the
+    /// Atmos rename of the interleaved file has nothing to rename; a new
+    /// segment gets its own set, `<prefix>_<au>_<n>.wav`.
+    pub mono_prefix: Option<PathBuf>,
 }
 
 impl Default for DecodeHandler {
@@ -328,6 +333,7 @@ impl Default for DecodeHandler {
             au_index: 0,
             segment_index: 0,
             is_segmented: false,
+            mono_prefix: None,
             segment_start_samples: 0,
             source_codec: SourceCodec::TrueHD,
         }
@@ -493,8 +499,9 @@ impl DecodeHandler {
                 }
             }
 
-            // Handle file renaming for first Atmos detection (but not if we're in segmented mode)
-            if !was_atmos && self.audio_writer.is_some() && !self.is_segmented {
+            // Handle file renaming for first Atmos detection (but not if we're in segmented mode).
+            // Mono files are named by channel index, whatever the content: nothing to rename.
+            if !was_atmos && self.audio_writer.is_some() && !self.is_segmented && self.mono_prefix.is_none() {
                 if bed_conform {
                     self.handle_atmos_file_rename_with_bed_conform(
                         base_path,
@@ -773,9 +780,18 @@ impl DecodeHandler {
 
                 let (audio_path, _) =
                     create_output_paths(base_path, effective_format, self.has_atmos);
-                log::info!("Creating audio file: {}", audio_path.display());
-
                 self.current_audio_path = Some(audio_path.clone());
+
+                if let Some(prefix) = &self.mono_prefix {
+                    log::info!(
+                        "Creating {channel_count} mono audio files: {}",
+                        super::output::mono_path(prefix, 0).display()
+                    );
+                    self.audio_writer =
+                        Some(AudioWriter::create_mono(prefix, sample_rate, channel_count)?);
+                    return Ok(());
+                }
+                log::info!("Creating audio file: {}", audio_path.display());
 
                 match effective_format {
                     AudioFormat::Caf => {
@@ -906,6 +922,9 @@ impl DecodeHandler {
                     AudioWriter::W64(mut w) => {
                         w.finish()?;
                     }
+                    AudioWriter::Mono(mut set) => {
+                        set.finish()?;
+                    }
                 }
             }
 
@@ -948,7 +967,13 @@ impl DecodeHandler {
 
             if !no_audio {
                 // Create new audio writer based on format
-                let audio_writer = match format {
+                let audio_writer = match (&self.mono_prefix, format) {
+                    (Some(prefix), _) => AudioWriter::create_mono(
+                        &self.add_segment_suffix(prefix, &segment_suffix),
+                        sample_rate,
+                        effective_channel_count,
+                    )?,
+                    (None, format) => match format {
                     AudioFormat::Pcm => AudioWriter::create_pcm(new_audio_path.clone())?,
                     AudioFormat::Caf => AudioWriter::create_caf(
                         new_audio_path.clone(),
@@ -961,6 +986,7 @@ impl DecodeHandler {
                         sample_rate,
                         effective_channel_count as u32,
                     )?,
+                    },
                 };
                 self.audio_writer = Some(audio_writer);
                 self.current_audio_path = Some(new_audio_path);
