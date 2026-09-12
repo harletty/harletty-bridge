@@ -105,7 +105,7 @@ fn joc_master_set_matches_golden() {
     // hash pins one target rather than the algorithm. Decoding this same
     // fixture with the same source:
     //
-    //     x86_64-unknown-linux-gnu     70be2fef…   (the committed hash)
+    //     x86_64-unknown-linux-gnu     4c8132a4…   (the committed hash)
     //     aarch64-unknown-linux-musl   —           (NEON QMF path, differs)
     //
     // Both are correct decodes. Asserting the hash off x86_64 would report a
@@ -114,15 +114,26 @@ fn joc_master_set_matches_golden() {
     // The aarch64 value moved with the last rebase below and was not
     // recomputed; nothing asserts it, so it is left unstated rather than stale.
     //
-    // Rebased four times: once when `float_to_i24` stopped scaling by
+    // Rebased five times: once when `float_to_i24` stopped scaling by
     // 2^23 - 1 and truncating (1.6% of samples moved one count away from zero,
     // no sign flips, max delta 1), once when the QMF scalar fallbacks stopped
     // accumulating into a single sum, once when the JOC parameter bands started
-    // being expanded onto the subbands they cover on every path, and once when
+    // being expanded onto the subbands they cover on every path, once when
     // the core was delayed to meet the objects it is written beside
     // (`JOC_LATENCY_SAMPLES`) — the bed channels of every JOC frame shift 577
-    // samples later. The last two change the audio on purpose; that is what
-    // they are for.
+    // samples later — and once when the two short transforms stopped reading
+    // the flat coefficient array at the long transform's stride. This fixture
+    // carries exactly one short block: frame 31 of its 47 sets `blkswe`, and
+    // its last block, block 5, switches the front-left channel. That one block
+    // moves 785 of 72 192 samples, 1.1%, every one of them inside the five
+    // consecutive 256-sample blocks running from it to four blocks into frame
+    // 32 - the block after a short block reads back the delay it left behind,
+    // so the damage outlives the block that caused it. Two of the twenty-one
+    // master-set channels carry it; the other nineteen, and every other frame,
+    // are bit-identical. Both moved channels are near full scale there, so most
+    // of the moved samples change sign rather than shift; the clip's peak does
+    // not move (0.999969 and 0.999970, before and after). The last three change
+    // the audio on purpose; that is what they are for.
     #[cfg(target_arch = "x86_64")]
     {
         let produced_audio = sha256_of(&audio_path);
