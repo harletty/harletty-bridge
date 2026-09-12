@@ -103,6 +103,7 @@ harletty decode [OPTIONS] <INPUT>
 | `--no-audio` | flag | off | Skip the audio file; still write `.atmos` and `.atmos.metadata`. Much faster when you only want the object automation. |
 | `--presentation <0-3>` | index | `3` | Which TrueHD presentation to decode. `3` is the 16-channel Atmos presentation; `0`–`2` are the stereo/5.1/7.1 downmixes carried in the same stream. **TrueHD only** — silently ignored for E-AC-3 and DTS, which have no equivalent. |
 | `--bed-conform` | flag | off | Force the Atmos bed to a conformant 7.1.2 layout. |
+| `--no-fold-estimate` | flag | off | DTS:X only. A waveform whose bed fold the stream does not state is normally given a fold estimated from the bed's audio, so it plays at its position and leaves the bed. With this flag it stays in the bed and its own channel is muted. |
 | `--warp-mode` | `normal`, `warping`, `prologiciix`, `loro` | *(from stream)* | Downmix warp mode to declare when the metadata does not carry one. |
 | `--no-estimate-progress` | flag | off | Skip the pre-pass that counts frames for the progress bar. Automatic for stdin, which cannot be pre-scanned. |
 

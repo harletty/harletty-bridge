@@ -11,7 +11,9 @@ use crate::cli::command::{AudioFormat, WarpMode};
 use crate::dts_to_oamd::{BedSource, DtsLayout, convert_dts};
 use anyhow::Result;
 use damf::{Configuration, Event, SourceCodec};
-use dca::{CorePcmFrame, FoldPlan, HdFrame, PcmPushResult, XMetadata, XPresentation};
+use dca::{
+    CorePcmFrame, FoldEstimator, FoldPlan, HdFrame, PcmPushResult, XMetadata, XPresentation,
+};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -72,6 +74,12 @@ pub struct DtsDecodeHandler {
     warned_dropped_channels: bool,
     /// Whether the unreadable-metadata warning has already been emitted.
     warned_unreadable_metadata: bool,
+    /// Estimate the fold of a waveform the stream states none for, from the
+    /// bed's audio, rather than keeping it in the bed muted.
+    pub estimate_folds: bool,
+    estimator: FoldEstimator,
+    /// Whether the estimation has been announced.
+    noted_estimation: bool,
     /// Label for the master set, chosen from the presentation of the first
     /// spatial frame.
     source_codec: SourceCodec,
@@ -124,6 +132,9 @@ impl Default for DtsDecodeHandler {
             metadata_header_written: false,
             warned_dropped_channels: false,
             warned_unreadable_metadata: false,
+            estimate_folds: true,
+            estimator: FoldEstimator::new(),
+            noted_estimation: false,
             source_codec: SourceCodec::DtsX714,
             auro: None,
         }
@@ -251,7 +262,18 @@ impl DtsDecodeHandler {
             .collect();
 
         let layout = DtsLayout::from_hd(&active, presentation, metadata.as_ref());
-        let plan = self.fold_plan(presentation, metadata.as_ref());
+        let mut plan = self.fold_plan(presentation, metadata.as_ref());
+        if presentation.is_some() && self.estimate_folds && plan.has_unknown() {
+            if !self.noted_estimation {
+                self.noted_estimation = true;
+                log::info!(
+                    "DTS:X {:?} carries waveform(s) without a stated bed fold; estimating their fold from the bed",
+                    presentation.expect("checked")
+                );
+            }
+            self.estimator
+                .refine(&mut plan, &frame.samples, &frame.x_samples);
+        }
         // The output carries exactly what the master set declares: the bed the
         // layout resolved (speakers with no OAMD name, i.e. rear centre, are
         // dropped from both) plus one channel per object.
@@ -416,6 +438,8 @@ impl DtsDecodeHandler {
                         "DTS:X {presentation:?} metadata unreadable: {}",
                         if presentation == XPresentation::Height {
                             "assuming the standard -3 dB height fold"
+                        } else if self.estimate_folds {
+                            "estimating the extension feeds' fold from the bed"
                         } else {
                             "keeping the bed as authored and muting the extension feeds"
                         }
