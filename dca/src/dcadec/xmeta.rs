@@ -316,9 +316,7 @@ impl XMetadata {
             DCA_SYNCWORD_XLL_X_ALT_D0
             | DCA_SYNCWORD_XLL_X_ALT_D1
             | DCA_SYNCWORD_XLL_X_ALT_D3
-            | DCA_SYNCWORD_XLL_X_ALT_D4 => {
-                parse_alternate(payload, source_count)
-            }
+            | DCA_SYNCWORD_XLL_X_ALT_D4 => parse_alternate(payload, source_count),
             _ => Err(XMetadataError::Unsupported("extension profile")),
         }
     }
@@ -372,6 +370,10 @@ impl XMetadata {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FoldPlan {
     gains: [[f32; MAX_SOURCES]; FOLD_SPEAKERS],
+    /// Per-sample change of each gain across the frame, so a gain that was
+    /// estimated rather than stated can ramp from the previous frame's value
+    /// to this frame's without a step. Zero for every stated fold.
+    slope: [[f32; MAX_SOURCES]; FOLD_SPEAKERS],
     /// Bit `k` set when waveform `k` contributes to that speaker. Sixteen bits
     /// because the widest profile carries nine waveforms, one more than a byte.
     used: [u16; FOLD_SPEAKERS],
@@ -387,6 +389,7 @@ impl FoldPlan {
         let count = source_count.min(MAX_SOURCES);
         Self {
             gains: [[0.0; MAX_SOURCES]; FOLD_SPEAKERS],
+            slope: [[0.0; MAX_SOURCES]; FOLD_SPEAKERS],
             used: [0; FOLD_SPEAKERS],
             unknown: (1u16 << count) - 1,
             count,
@@ -435,6 +438,21 @@ impl FoldPlan {
         feed < self.count && self.unknown & (1 << feed) == 0
     }
 
+    /// Whether any waveform of this frame has no stated fold.
+    pub fn has_unknown(&self) -> bool {
+        self.unknown != 0
+    }
+
+    /// The gain of waveform `feed` in `speaker` at the start of the frame
+    /// (zero when it contributes nothing there).
+    pub fn gain(&self, speaker: usize, feed: usize) -> f32 {
+        if speaker < FOLD_SPEAKERS && feed < self.count && self.used[speaker] & (1 << feed) != 0 {
+            self.gains[speaker][feed]
+        } else {
+            0.0
+        }
+    }
+
     /// Whether any subtraction applies to `speaker`.
     pub fn touches(&self, speaker: usize) -> bool {
         self.used.get(speaker).is_some_and(|&used| used != 0)
@@ -452,13 +470,232 @@ impl FoldPlan {
             return bed;
         }
         let gains = &self.gains[speaker];
+        let slope = &self.slope[speaker];
+        let position = sample as f32;
         let mut value = bed;
         for (feed, source) in sources.iter().enumerate().take(self.count) {
             if used & (1 << feed) != 0 {
-                value -= gains[feed] * source.get(sample).copied().unwrap_or(0.0);
+                value -= (gains[feed] + slope[feed] * position)
+                    * source.get(sample).copied().unwrap_or(0.0);
             }
         }
         value
+    }
+}
+
+/// Estimates, from the audio itself, the fold of every waveform whose fold
+/// the stream does not state.
+///
+/// Every extension waveform was mixed into the compatible bed by the encoder;
+/// a record without reference rows only withholds the gains. Measured on such
+/// streams, the waveform is present in the bed sample-aligned, at gains that
+/// are constant (a wide channel) or follow the transmitted position (an object
+/// panned into the bed by the encoder's own renderer, whose law differs from
+/// one encoder generation to the next). Rather than guess the law, this solves
+/// for the gains directly: per frame and per bed speaker, the least-squares
+/// fit of the bed on the unstated waveforms, jointly so that two waveforms
+/// sharing content are not both credited with it. The fit never adds energy
+/// to a speaker within the frame; what it removes is what the waveforms
+/// explain. A waveform silent in the frame keeps its last gains. Gains ramp
+/// across the frame from the previous frame's estimate, so a moving object
+/// leaves no steps in the bed.
+///
+/// Fixed-size state, no allocation per frame: a K×K normal system with K the
+/// number of unstated waveforms (at most [`MAX_SOURCES`]), solved by Cholesky.
+#[derive(Clone, Copy, Debug)]
+pub struct FoldEstimator {
+    gains: [[f32; MAX_SOURCES]; FOLD_SPEAKERS],
+    /// Bit `k` set once waveform `k` has an estimate to ramp from.
+    primed: u16,
+}
+
+impl Default for FoldEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FoldEstimator {
+    /// Squared-sample floor under which a waveform counts as silent in the
+    /// frame (about -100 dBFS RMS for full-scale 1.0): its gains cannot be
+    /// measured and its last ones stand.
+    const SILENCE_ENERGY_PER_SAMPLE: f64 = 1e-10;
+    /// Ridge added to the normal matrix, relative to its largest diagonal:
+    /// keeps two nearly identical waveforms from cancelling each other with
+    /// huge opposite gains.
+    const RIDGE: f64 = 1e-4;
+    /// Gains beyond this are not a fold; the estimate is discarded and the
+    /// previous one stands.
+    const MAX_GAIN: f32 = 4.0;
+    /// Share of each frame's measurement taken into the running gain. One
+    /// frame's fit carries noise from whatever else the speaker plays (about
+    /// 0.04 for content at the waveform's own level); averaging two frames
+    /// halves its power at the cost of one frame of lag on a moving object.
+    const SMOOTHING: f32 = 0.5;
+
+    pub const fn new() -> Self {
+        Self {
+            gains: [[0.0; MAX_SOURCES]; FOLD_SPEAKERS],
+            primed: 0,
+        }
+    }
+
+    /// Forget every estimate (a new stream, or a presentation change).
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Fill in the unstated folds of `plan` from this frame's audio: `bed` is
+    /// indexed by DCA speaker like `HdFrame::samples`, `sources` are the
+    /// extension waveforms. Afterwards every waveform is known to the plan,
+    /// so it is rendered on its own channel and removed from the bed.
+    pub fn refine(&mut self, plan: &mut FoldPlan, bed: &[Option<Vec<f32>>], sources: &[Vec<f32>]) {
+        if plan.unknown == 0 {
+            return;
+        }
+        let count = plan.count.min(sources.len());
+        let length = sources.iter().take(count).map(Vec::len).min().unwrap_or(0);
+        if length == 0 {
+            return;
+        }
+        // The unstated waveforms with something to measure this frame.
+        let mut feeds = [0usize; MAX_SOURCES];
+        let mut k = 0usize;
+        for feed in 0..count {
+            if plan.unknown & (1 << feed) == 0 {
+                continue;
+            }
+            let energy: f64 = sources[feed][..length]
+                .iter()
+                .map(|&v| f64::from(v) * f64::from(v))
+                .sum();
+            if energy >= Self::SILENCE_ENERGY_PER_SAMPLE * length as f64 {
+                feeds[k] = feed;
+                k += 1;
+            }
+        }
+
+        // Normal matrix over the active waveforms, once per frame.
+        let mut gram = [[0.0f64; MAX_SOURCES]; MAX_SOURCES];
+        let mut max_diagonal = 0.0f64;
+        for i in 0..k {
+            for j in 0..=i {
+                let dot: f64 = sources[feeds[i]][..length]
+                    .iter()
+                    .zip(&sources[feeds[j]][..length])
+                    .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                    .sum();
+                gram[i][j] = dot;
+                gram[j][i] = dot;
+            }
+            max_diagonal = max_diagonal.max(gram[i][i]);
+        }
+        let ridge = Self::RIDGE * max_diagonal;
+        for (i, row) in gram.iter_mut().enumerate().take(k) {
+            row[i] += ridge;
+        }
+        let cholesky = cholesky(&gram, k);
+
+        for (speaker, channel) in bed.iter().enumerate().take(FOLD_SPEAKERS) {
+            let Some(channel) = channel.as_deref() else {
+                continue;
+            };
+            if channel.len() < length {
+                continue;
+            }
+            let mut estimate = [0.0f64; MAX_SOURCES];
+            if let Some(factor) = cholesky.as_ref() {
+                let mut rhs = [0.0f64; MAX_SOURCES];
+                for (i, &feed) in feeds.iter().enumerate().take(k) {
+                    rhs[i] = sources[feed][..length]
+                        .iter()
+                        .zip(&channel[..length])
+                        .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                        .sum();
+                }
+                solve(factor, k, &mut rhs);
+                estimate[..k].copy_from_slice(&rhs[..k]);
+            }
+            for feed in 0..count {
+                if plan.unknown & (1 << feed) == 0 {
+                    continue;
+                }
+                let bit = 1u16 << feed;
+                let previous = self.gains[speaker][feed];
+                let measured = feeds[..k]
+                    .iter()
+                    .position(|&f| f == feed)
+                    .map(|i| estimate[i] as f32)
+                    .filter(|g| g.is_finite() && g.abs() <= Self::MAX_GAIN);
+                let target = match measured {
+                    Some(measured) if self.primed & bit != 0 => {
+                        previous + Self::SMOOTHING * (measured - previous)
+                    }
+                    Some(measured) => measured,
+                    None => previous,
+                };
+                let start = if self.primed & bit != 0 {
+                    previous
+                } else {
+                    target
+                };
+                plan.gains[speaker][feed] = start;
+                plan.slope[speaker][feed] = (target - start) / length as f32;
+                plan.used[speaker] |= bit;
+                self.gains[speaker][feed] = target;
+            }
+        }
+        // Every measured waveform is now accounted for and may be rendered.
+        let unknown = plan.unknown & ((1u16 << count) - 1);
+        self.primed |= unknown;
+        plan.unknown &= !unknown;
+    }
+}
+
+/// Lower-triangular Cholesky factor of the leading `k`×`k` block, or `None`
+/// when the matrix is not positive definite (all waveforms silent).
+fn cholesky(
+    matrix: &[[f64; MAX_SOURCES]; MAX_SOURCES],
+    k: usize,
+) -> Option<[[f64; MAX_SOURCES]; MAX_SOURCES]> {
+    if k == 0 {
+        return None;
+    }
+    let mut l = [[0.0f64; MAX_SOURCES]; MAX_SOURCES];
+    for i in 0..k {
+        for j in 0..=i {
+            let mut sum = matrix[i][j];
+            for p in 0..j {
+                sum -= l[i][p] * l[j][p];
+            }
+            if i == j {
+                if sum <= 0.0 {
+                    return None;
+                }
+                l[i][i] = sum.sqrt();
+            } else {
+                l[i][j] = sum / l[j][j];
+            }
+        }
+    }
+    Some(l)
+}
+
+/// Solve L Lᵀ x = b in place, for the leading `k` unknowns.
+fn solve(l: &[[f64; MAX_SOURCES]; MAX_SOURCES], k: usize, b: &mut [f64; MAX_SOURCES]) {
+    for i in 0..k {
+        let mut sum = b[i];
+        for p in 0..i {
+            sum -= l[i][p] * b[p];
+        }
+        b[i] = sum / l[i][i];
+    }
+    for i in (0..k).rev() {
+        let mut sum = b[i];
+        for p in i + 1..k {
+            sum -= l[p][i] * b[p];
+        }
+        b[i] = sum / l[i][i];
     }
 }
 
@@ -1480,6 +1717,176 @@ mod tests {
         for end in 0..payload.len() - 8 {
             assert!(XMetadata::parse(&payload[..end], 1).is_err(), "end {end}");
         }
+    }
+
+    /// Deterministic pseudo-noise in [-1, 1].
+    fn noise(seed: u64, length: usize) -> Vec<f32> {
+        // splitmix64: streams from neighbouring seeds are uncorrelated,
+        // which a linear congruential generator would not give.
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..length)
+            .map(|_| {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                ((z >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn quiet(signal: &[f32]) -> Vec<f32> {
+        signal.iter().map(|v| v * 0.3).collect()
+    }
+
+    fn mixed(dry: &[f32], parts: &[(&[f32], f32)]) -> Vec<f32> {
+        dry.iter()
+            .enumerate()
+            .map(|(s, &v)| v + parts.iter().map(|(x, g)| x[s] * g).sum::<f32>())
+            .collect()
+    }
+
+    fn unknown_objects(count: usize) -> XMetadata {
+        let sources: Vec<SourceMetadata> = (0..count)
+            .map(|i| SourceMetadata {
+                role: SourceRole::Object {
+                    position: SphericalPosition {
+                        azimuth_half_degrees: (i as i16) * 60,
+                        elevation_half_degrees: 0,
+                        distance_64ths: 64,
+                    },
+                    centre_height_alternative: false,
+                },
+                fold: BedFold::Unknown,
+            })
+            .collect();
+        XMetadata::from_sources(&sources).expect("metadata")
+    }
+
+    #[test]
+    fn estimator_recovers_an_unstated_fold_from_the_bed() {
+        let n = 2048;
+        let x = [noise(1, n), noise(2, n)];
+        let dry = [quiet(&noise(3, n)), quiet(&noise(4, n))];
+        let mut bed: Vec<Option<Vec<f32>>> = vec![None; 9];
+        // L carries feed 0 at 0.92 and feed 1 at 0.10; Rs carries feed 1 at 0.34.
+        bed[1] = Some(mixed(&dry[0], &[(&x[0], 0.92), (&x[1], 0.10)]));
+        bed[4] = Some(mixed(&dry[1], &[(&x[1], 0.34)]));
+        bed[0] = Some(dry[0].clone());
+
+        let mut plan = FoldPlan::from_metadata(&unknown_objects(2));
+        assert!(plan.has_unknown());
+        let mut estimator = FoldEstimator::new();
+        estimator.refine(&mut plan, &bed, &x);
+
+        assert!(!plan.has_unknown());
+        assert!(plan.source_is_known(0) && plan.source_is_known(1));
+        assert!(
+            (plan.gain(1, 0) - 0.92).abs() < 0.03,
+            "L/feed0 {}",
+            plan.gain(1, 0)
+        );
+        assert!(
+            (plan.gain(1, 1) - 0.10).abs() < 0.03,
+            "L/feed1 {}",
+            plan.gain(1, 1)
+        );
+        assert!(
+            (plan.gain(4, 1) - 0.34).abs() < 0.03,
+            "Rs/feed1 {}",
+            plan.gain(4, 1)
+        );
+        assert!(plan.gain(4, 0).abs() < 0.03, "Rs/feed0 {}", plan.gain(4, 0));
+        assert!(plan.gain(0, 0).abs() < 0.03, "C carries nothing");
+        // The cleaned L is the dry signal, within the fit's noise.
+        let residual: f32 = (0..n)
+            .map(|s| (plan.clean(1, bed[1].as_ref().unwrap()[s], s, &x) - dry[0][s]).powi(2))
+            .sum::<f32>()
+            / n as f32;
+        assert!(residual < 1e-4, "residual {residual}");
+        // Untouched speakers pass through.
+        assert_eq!(plan.clean(7, 0.25, 3, &x), 0.25);
+    }
+
+    #[test]
+    fn estimator_separates_waveforms_that_share_content() {
+        let n = 2048;
+        let a = noise(11, n);
+        let b: Vec<f32> = noise(12, n)
+            .iter()
+            .zip(&a)
+            .map(|(&y, &x)| 0.6 * x + 0.5 * y)
+            .collect();
+        let x = [a.clone(), b];
+        let mut bed: Vec<Option<Vec<f32>>> = vec![None; 9];
+        // Only feed 0 is in L; a one-at-a-time fit would credit feed 1 too.
+        bed[1] = Some(mixed(&quiet(&noise(13, n)), &[(&x[0], 1.0)]));
+
+        let mut plan = FoldPlan::from_metadata(&unknown_objects(2));
+        FoldEstimator::new().refine(&mut plan, &bed, &x);
+        assert!((plan.gain(1, 0) - 1.0).abs() < 0.05, "{}", plan.gain(1, 0));
+        assert!(plan.gain(1, 1).abs() < 0.05, "{}", plan.gain(1, 1));
+    }
+
+    #[test]
+    fn estimator_ramps_from_the_previous_frame_and_holds_through_silence() {
+        let n = 2048;
+        let x = [noise(21, n)];
+        let mut bed: Vec<Option<Vec<f32>>> = vec![None; 9];
+        bed[2] = Some(mixed(&quiet(&noise(22, n)), &[(&x[0], 0.5)]));
+        let mut estimator = FoldEstimator::new();
+
+        // First frame: no history, the estimate applies flat.
+        let mut plan = FoldPlan::from_metadata(&unknown_objects(1));
+        estimator.refine(&mut plan, &bed, &x);
+        assert!((plan.gain(2, 0) - 0.5).abs() < 0.05);
+        assert_eq!(plan.slope[2][0], 0.0);
+
+        // Second frame at a new gain: starts at the old one and ramps halfway
+        // to the new measurement.
+        bed[2] = Some(mixed(&quiet(&noise(23, n)), &[(&x[0], 0.9)]));
+        let mut plan = FoldPlan::from_metadata(&unknown_objects(1));
+        estimator.refine(&mut plan, &bed, &x);
+        let start = plan.gain(2, 0);
+        let end = start + plan.slope[2][0] * n as f32;
+        assert!((start - 0.5).abs() < 0.05, "start {start}");
+        assert!((end - 0.7).abs() < 0.05, "end {end}");
+        let first = plan.clean(2, bed[2].as_ref().unwrap()[0], 0, &x);
+        assert!((first - (bed[2].as_ref().unwrap()[0] - start * x[0][0])).abs() < 1e-6);
+
+        // Third frame, the waveform silent: the last gains stand, flat, and the
+        // waveform is still rendered (as silence).
+        let silent = [vec![0.0f32; n]];
+        let mut plan = FoldPlan::from_metadata(&unknown_objects(1));
+        estimator.refine(&mut plan, &bed, &silent);
+        assert!(plan.source_is_known(0));
+        assert!((plan.gain(2, 0) - end).abs() < 1e-6);
+        assert_eq!(plan.slope[2][0], 0.0);
+    }
+
+    #[test]
+    fn estimator_leaves_stated_folds_alone() {
+        let n = 2048;
+        let x = [noise(31, n), noise(32, n)];
+        let mut bed: Vec<Option<Vec<f32>>> = vec![None; 9];
+        bed[1] = Some(mixed(&quiet(&noise(33, n)), &[(&x[0], 0.7), (&x[1], 0.7)]));
+        let mut known = [0.0f32; REFERENCE_CHANNELS];
+        known[1] = 0.25; // states feed 0 in L at 0.25, whatever the audio says
+        let sources = [
+            SourceMetadata {
+                role: SourceRole::Height(SpatialChannel::TopFrontLeft),
+                fold: BedFold::Known(known),
+            },
+            unknown_objects(1).source(0).copied().unwrap(),
+        ];
+        let mut plan = FoldPlan::from_metadata(&XMetadata::from_sources(&sources).unwrap());
+        FoldEstimator::new().refine(&mut plan, &bed, &x);
+        assert_eq!(plan.gain(1, 0), 0.25, "a stated gain is not re-estimated");
+        assert!(plan.source_is_known(1));
+        // Feed 1's estimate absorbs what feed 0's stated gain under-removes only
+        // insofar as the two are correlated; independent noise leaves it at 0.7.
+        assert!((plan.gain(1, 1) - 0.7).abs() < 0.1, "{}", plan.gain(1, 1));
     }
 
     #[test]

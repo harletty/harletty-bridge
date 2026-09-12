@@ -7,9 +7,9 @@ use super::handler::{DecodeHandler, FrameHandlerContext, WriterState};
 use super::progress::{create_progress_bar, estimate_total_frames};
 use crate::cli::command::{AudioFormat, Cli, DecodeArgs};
 use crate::codec_probe::{Codec, probe_codec};
-use damf::SourceCodec;
 use crate::input::InputReader;
 use anyhow::Result;
+use damf::SourceCodec;
 use indicatif::{MultiProgress, ProgressStyle};
 use log::Level;
 use std::sync::mpsc;
@@ -315,6 +315,7 @@ fn cmd_decode_dts(
 
     let mut handler = DtsDecodeHandler::default();
     handler.warp_mode = args.warp_mode;
+    handler.estimate_folds = !args.no_fold_estimate;
     let start_time = std::time::Instant::now();
 
     while let Ok(result) = rx.recv() {

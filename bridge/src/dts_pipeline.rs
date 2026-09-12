@@ -13,7 +13,9 @@
 // gains the stream's private metadata states; that contribution is removed
 // from the bed before the waveform is emitted at its own position, so nothing
 // plays twice. A waveform whose fold is not stated (an object record without
-// reference rows) stays in the bed and its own channel is silent.
+// reference rows) has its fold estimated from the audio (`dca::FoldEstimator`)
+// and is treated the same; with estimation off it stays in the bed and its
+// own channel is silent.
 
 use abi_stable::std_types::{RString, RVec};
 use bridge_api::RPushResult;
@@ -21,8 +23,8 @@ use bridge_api::{
     RChannelLabel, RDecodedFrame, REvent, RMetadataFrame, RNameUpdate, RObjectChannel,
 };
 use dca::{
-    CorePcmFrame, FoldPlan, HdError, HdFrame, MAX_SOURCES, SourceRole, SphericalPosition,
-    XMetadata, XPresentation, exss_has_xll, exss_substream_size, parse_header,
+    CorePcmFrame, FoldEstimator, FoldPlan, HdError, HdFrame, MAX_SOURCES, SourceRole,
+    SphericalPosition, XMetadata, XPresentation, exss_has_xll, exss_substream_size, parse_header,
 };
 use serde::Deserialize;
 
@@ -62,6 +64,15 @@ pub(crate) struct FoldSource {
 pub(crate) struct DtsFoldConfig {
     #[serde(default)]
     pub sources: Vec<FoldSource>,
+    /// Estimate the fold of a waveform the stream does not state one for,
+    /// from the bed's own audio, so the waveform plays at its position and
+    /// leaves the bed. Off, such a waveform stays in the bed and is muted.
+    #[serde(default = "default_true")]
+    pub estimate_unknown: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for DtsFoldConfig {
@@ -114,6 +125,10 @@ pub(crate) struct DtsXState {
     pub(crate) last_metadata: Option<XMetadata>,
     /// Position last announced per object feed, for sparse events.
     emitted_positions: [Option<SphericalPosition>; MAX_SOURCES],
+    /// Running fold estimates for the waveforms whose fold is not stated.
+    estimator: FoldEstimator,
+    /// Whether the estimation has been announced for this stream.
+    estimation_noted: bool,
     parse_failures: u64,
     feed_dropouts: u64,
 }
@@ -371,6 +386,7 @@ fn build_hd_frame_with_extensions(
                     "dts: extension presentation changed {:?} -> {detected:?}; channel shape changes",
                     state.locked
                 );
+                state.estimator.reset();
             }
             state.locked = Some(detected);
             detected
@@ -388,11 +404,21 @@ fn build_hd_frame_with_extensions(
     } else {
         &[]
     };
-    let plan = if detected.is_some() {
+    let mut plan = if detected.is_some() {
         resolve_plan(hd, presentation, state, fold_config)
     } else {
         FoldPlan::all_unknown(presentation.feed_count())
     };
+    if detected.is_some() && fold_config.estimate_unknown && plan.has_unknown() {
+        if !state.estimation_noted {
+            state.estimation_noted = true;
+            log::info!(
+                "dts: {:?} carries waveform(s) without a stated bed fold; estimating their fold from the bed",
+                presentation
+            );
+        }
+        state.estimator.refine(&mut plan, &hd.samples, feeds);
+    }
     let metadata = detected.and(state.last_metadata);
 
     let fixed_feeds = presentation.fixed_feeds();
@@ -698,6 +724,30 @@ mod tests {
         let mut declared = None;
         build_hd_frame_with_extensions(hd, state, &DtsFoldConfig::default(), 0, &mut declared)
             .expect("valid frame")
+    }
+
+    fn build_without_estimation(hd: &HdFrame, state: &mut DtsXState) -> (RDecodedFrame, bool) {
+        let mut declared = None;
+        let config = DtsFoldConfig {
+            estimate_unknown: false,
+            ..DtsFoldConfig::default()
+        };
+        build_hd_frame_with_extensions(hd, state, &config, 0, &mut declared).expect("valid frame")
+    }
+
+    /// Deterministic pseudo-noise in [-1, 1] (splitmix64).
+    fn noise(seed: u64, length: usize) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..length)
+            .map(|_| {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                ((z >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+            })
+            .collect()
     }
 
     fn folded(dry: &[f32], sources: &[(&[f32], f32)]) -> Vec<f32> {
@@ -1073,7 +1123,66 @@ mod tests {
     }
 
     #[test]
-    fn d1_objects_without_a_stated_fold_stay_in_the_bed_and_are_muted() {
+    fn d1_objects_without_a_stated_fold_are_estimated_out_of_the_bed_and_played() {
+        let n = 2048;
+        let extension: Vec<Vec<f32>> = (0..6).map(|i| noise(100 + i, n)).collect();
+        let dry: Vec<Vec<f32>> = (0..9)
+            .map(|i| noise(200 + i, n).iter().map(|v| v * 0.3).collect())
+            .collect();
+        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
+        for idx in [0usize, 2, 3, 5, 7, 8] {
+            samples[idx] = Some(dry[idx].clone());
+        }
+        // L holds object 0 at 0.92 plus TFL (feed 2) at the stated Q55; Rs
+        // holds object 1 at 0.34.
+        samples[1] = Some(folded(
+            &dry[1],
+            &[(&extension[0], 0.9152), (&extension[2], Q55)],
+        ));
+        samples[4] = Some(folded(&dry[4], &[(&extension[1], 0.34)]));
+        let mut hd = hd_frame(samples, extension);
+        hd.xll_segment_samples = n;
+        hd.x_present = false;
+        hd.x_imax = true;
+
+        let mut sources = vec![
+            object(-69, 24, BedFold::Unknown),
+            object(69, 24, BedFold::Unknown),
+        ];
+        sources.extend(heights(Q55));
+        let mut state = state_with(XMetadata::from_sources(&sources));
+        let (frame, emitted) = build(&hd, &mut state);
+
+        assert!(emitted);
+        assert_eq!(frame.channel_count, 8 + 6);
+        let mut l_residual = 0.0f64;
+        let mut rs_residual = 0.0f64;
+        for sample in 0..n {
+            let row = &frame.pcm[sample * 14..(sample + 1) * 14];
+            l_residual += f64::from(row[1] as f32 / 8_388_608.0 - dry[1][sample]).powi(2);
+            rs_residual += f64::from(row[4] as f32 / 8_388_608.0 - dry[4][sample]).powi(2);
+            // Both objects now play on their own channels.
+            assert_pcm_close(row[12], hd.x_samples[0][sample]);
+            assert_pcm_close(row[13], hd.x_samples[1][sample]);
+        }
+        // What is left in L and Rs is the dry content: the objects are gone to
+        // within the fit's noise (-30 dB of the dry level at least).
+        let dry_l: f64 = dry[1].iter().map(|v| f64::from(*v).powi(2)).sum();
+        let dry_rs: f64 = dry[4].iter().map(|v| f64::from(*v).powi(2)).sum();
+        assert!(
+            l_residual / dry_l < 5e-3,
+            "L residual {}",
+            l_residual / dry_l
+        );
+        assert!(
+            rs_residual / dry_rs < 5e-3,
+            "Rs residual {}",
+            rs_residual / dry_rs
+        );
+    }
+
+    #[test]
+    fn d1_objects_without_a_stated_fold_stay_in_the_bed_and_are_muted_without_estimation() {
         let extension: Vec<Vec<f32>> = (0..6)
             .map(|index| vec![0.01 * (index + 1) as f32, -0.01 * (index + 1) as f32])
             .collect();
@@ -1094,7 +1203,7 @@ mod tests {
         ];
         sources.extend(heights(Q55));
         let mut state = state_with(XMetadata::from_sources(&sources));
-        let (frame, emitted) = build(&hd, &mut state);
+        let (frame, emitted) = build_without_estimation(&hd, &mut state);
 
         assert!(emitted, "D1 declares object channels");
         assert_eq!(state.locked, Some(XPresentation::ObjectsD1));
@@ -1199,7 +1308,7 @@ mod tests {
         hd.x_imax = true;
 
         let mut state = DtsXState::default();
-        let (frame, emitted) = build(&hd, &mut state);
+        let (frame, emitted) = build_without_estimation(&hd, &mut state);
         assert!(emitted);
         assert_eq!(frame.channel_count, 16);
         assert_eq!(state.parse_failures, 1);

@@ -83,6 +83,12 @@ pub struct DecodeArgs {
     #[arg(long)]
     pub bed_conform: bool,
 
+    /// Keep a DTS:X waveform whose bed fold the stream does not state in the
+    /// bed, muted on its own channel, instead of estimating its fold from
+    /// the bed and playing it at its position.
+    #[arg(long)]
+    pub no_fold_estimate: bool,
+
     /// Specify warp mode when not present in metadata
     #[arg(long, value_enum)]
     pub warp_mode: Option<WarpMode>,

@@ -28,7 +28,8 @@ pub use hd::{exss_has_xll, exss_substream_size, HdDecoder, HdError, HdFrame};
 pub use pcm::{CorePcmFrame, DecodeError, PcmDecoder, PcmPushResult, bed_layout};
 pub use spatial::{SpatialChannel, XPresentation};
 pub use dcadec::xmeta::{
-    BedFold, FoldPlan, MAX_SOURCES, REFERENCE_CHANNELS, REFERENCE_MASK_5_1, REFERENCE_MASK_7_1,
+    BedFold, FoldEstimator, FoldPlan, MAX_SOURCES, REFERENCE_CHANNELS, REFERENCE_MASK_5_1,
+    REFERENCE_MASK_7_1,
     REFERENCE_SPEAKERS, SourceMetadata, SourceRole, SphericalPosition, XMetadata, XMetadataError,
     gain_code_linear,
 };

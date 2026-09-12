@@ -2,8 +2,14 @@
 # could not be read: the four height feeds' contribution to the compatible
 # 7.1 bed. Every stream examined states code 55 (Q15 23170/32768) here. A
 # `dts-fold.yaml` in the working directory overrides this bundled default.
-# Alternate profiles carry their folds in per-frame metadata and ignore this
-# file.
+# Alternate profiles carry their folds in per-frame metadata and ignore the
+# `sources` list.
+#
+# `estimate_unknown`: a waveform whose fold the stream does not state (an
+# object record without reference rows) has its fold measured from the bed's
+# own audio, frame by frame, so it plays at its position and leaves the bed.
+# Set to false to keep such a waveform in the bed and mute its own channel.
+estimate_unknown: true
 sources:
   - source: TFL
     routes: [{target: L, gain_db: -3.0104780234}]
