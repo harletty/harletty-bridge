@@ -10,6 +10,7 @@
 //! the realtime path. Kept separate on purpose: that one is a streaming
 //! push-model driven by an audio callback, this one owns a file and can block.
 
+use super::auro_stage::AuroStage;
 use super::dts_handler::DtsFrameMessage;
 use crate::input::InputReader;
 use anyhow::Result;
@@ -37,9 +38,9 @@ struct DtsDecodeState {
     buffer: Vec<u8>,
     core: PcmDecoder,
     hd: HdDecoder,
-    /// Auro-Codec side-channel detector over the lossless output. Built on
-    /// the first HD frame, once the speaker count is known.
-    auro: Option<auro::Detector>,
+    /// Auro-Codec detection and unfolding over the lossless output; owns
+    /// the frames it holds back while deciding.
+    auro: AuroStage,
     frame_count: u64,
     strict_mode: bool,
 }
@@ -58,7 +59,7 @@ pub fn spawn_dts_decoder_thread(config: DtsDecoderThreadConfig) -> thread::JoinH
             buffer: prefix,
             core: PcmDecoder::new(),
             hd: HdDecoder::new(),
-            auro: None,
+            auro: AuroStage::new(),
             frame_count: 0,
             strict_mode,
         };
@@ -72,6 +73,7 @@ pub fn spawn_dts_decoder_thread(config: DtsDecoderThreadConfig) -> thread::JoinH
 
         // A trailing frame can still be complete after EOF.
         drain_frames(&mut state, &pb_clone, &tx)?;
+        state.auro.finish(&tx);
 
         log::info!("DTS decode complete: {} frames", state.frame_count);
         Ok(())
@@ -167,7 +169,7 @@ fn drain_frames(
 struct DecodeTargets<'a> {
     core_decoder: &'a mut PcmDecoder,
     hd_decoder: &'a mut HdDecoder,
-    auro: &'a mut Option<auro::Detector>,
+    auro: &'a mut AuroStage,
     frame_count: &'a mut u64,
     strict_mode: bool,
 }
@@ -189,15 +191,6 @@ fn decode_one(
     if let Some(exss) = exss {
         match hd_decoder.decode(core, exss) {
             Ok(frame) => {
-                // The side channel lives in the low bits of the lossless
-                // integers, so it is read off the decoder's integer tap, not
-                // off the float frame.
-                let detector = auro.get_or_insert_with(|| auro::Detector::new(frame.samples.len()));
-                for (speaker, samples) in hd_decoder.lossless_samples() {
-                    if let Some(detection) = detector.push(speaker, samples) {
-                        let _ = tx.send(Ok(DtsFrameMessage::Auro(detection)));
-                    }
-                }
                 let presentation = XPresentation::detect(&frame);
                 // Unreadable metadata is reported by the handler once; the
                 // frame still plays with its bed as authored.
@@ -205,11 +198,21 @@ fn decode_one(
                     .and_then(|p| XMetadata::parse(&frame.x_payload, p.feed_count()).ok());
                 *frame_count += 1;
                 tick(pb);
-                let _ = tx.send(Ok(DtsFrameMessage::Hd {
-                    frame: Box::new(frame),
+                // The Auro side channel lives in the low bits of the lossless
+                // integers, so it is read off the decoder's integer tap, not
+                // off the float frame. The stage decides whether the frame
+                // goes out as it is or unfolded.
+                let lossless: Vec<(usize, Vec<i32>)> = hd_decoder
+                    .lossless_samples()
+                    .map(|(speaker, samples)| (speaker, samples.to_vec()))
+                    .collect();
+                auro.frame(
+                    Box::new(frame),
                     presentation,
                     metadata,
-                }));
+                    lossless.into_iter(),
+                    tx,
+                );
                 return Ok(());
             }
             // Peak-bitrate buffering: this packet yields no frame, which is
@@ -228,6 +231,8 @@ fn decode_one(
         Ok(push) => {
             *frame_count += 1;
             tick(pb);
+            // A lossy core frame cannot carry the side channel.
+            auro.not_a_carrier(tx);
             let _ = tx.send(Ok(DtsFrameMessage::Core(Box::new(push))));
         }
         Err(err) => {

@@ -30,6 +30,18 @@ pub enum DtsFrameMessage {
     /// The lossless PCM turned out to be an Auro-Codec carrier. Sent once,
     /// when the side channel's configuration is confirmed.
     Auro(auro::Detection),
+    /// Unfolded Auro-3D audio: the streams of the original layout,
+    /// interleaved. Replaces the `Hd` frames from the moment the carrier
+    /// is confirmed.
+    AuroFrame(Box<AuroFrame>),
+}
+
+pub struct AuroFrame {
+    pub sample_rate: u32,
+    /// The streams, in interleaving order.
+    pub streams: Vec<auro::StreamId>,
+    /// `frames * streams.len()` samples, 24-bit in `i32`.
+    pub samples: Vec<i32>,
 }
 
 pub struct DtsDecodeHandler {
@@ -65,6 +77,21 @@ pub struct DtsDecodeHandler {
     source_codec: SourceCodec,
     /// The Auro-Codec carrier the lossless PCM was found to be, if any.
     pub auro: Option<auro::Detection>,
+}
+
+/// Which DAMF codec label an unfolded Auro-3D layout is stored under: its
+/// channel count when it is one of the common ones.
+fn auro_source_codec(original: auro::Layout) -> SourceCodec {
+    let Some(streams) = original.streams() else {
+        return SourceCodec::Auro3d;
+    };
+    match streams.len {
+        10 => SourceCodec::Auro3d91,
+        11 => SourceCodec::Auro3d101,
+        12 => SourceCodec::Auro3d111,
+        14 => SourceCodec::Auro3d131,
+        _ => SourceCodec::Auro3d,
+    }
 }
 
 /// Which DAMF codec label a spatial presentation is stored under.
@@ -127,22 +154,82 @@ impl DtsDecodeHandler {
                 self.note_auro(detection);
                 Ok(())
             }
+            DtsFrameMessage::AuroFrame(frame) => {
+                self.handle_auro_frame(&frame, base_path, no_audio)
+            }
         }
     }
 
-    /// Say what the carrier holds. The height layer is not reconstructed:
-    /// the output stays the carrier bed, which is what the disc plays as on
-    /// anything without an Auro decoder.
+    /// Write one unfolded Auro-3D frame. The output is always a master
+    /// set: the bed the layout resolved plus the centre height and top as
+    /// static objects.
+    fn handle_auro_frame(
+        &mut self,
+        frame: &AuroFrame,
+        base_path: &Option<PathBuf>,
+        no_audio: bool,
+    ) -> Result<()> {
+        let ns = frame.streams.len();
+        if ns == 0 || frame.samples.len() < ns {
+            return Ok(());
+        }
+        let sample_count = frame.samples.len() / ns;
+        let layout = DtsLayout::from_auro(&frame.streams);
+        let total_channels = layout.bed.len() + layout.objects.len();
+        if total_channels < ns {
+            self.warn_dropped_channels(ns - total_channels);
+        }
+        if !self.has_spatial {
+            self.source_codec = self
+                .auro
+                .map(|d| auro_source_codec(d.original))
+                .unwrap_or(SourceCodec::Auro3d);
+        }
+        self.note_frame(frame.sample_rate, total_channels, &layout, true, base_path)?;
+        if let Some(base_path) = base_path {
+            let oamd = convert_dts(&layout);
+            self.write_metadata_event(&oamd, frame.sample_rate, base_path)?;
+        }
+        if !no_audio {
+            self.ensure_audio_writer(
+                base_path,
+                AudioFormat::Caf,
+                frame.sample_rate,
+                total_channels,
+            )?;
+            if let Some(ref mut writer) = self.audio_writer {
+                let mut interleaved: Vec<i32> = Vec::with_capacity(sample_count * total_channels);
+                for sample_idx in 0..sample_count {
+                    let row = &frame.samples[sample_idx * ns..(sample_idx + 1) * ns];
+                    for &source in &layout.bed_sources {
+                        let BedSource::Speaker(index) = source else {
+                            continue;
+                        };
+                        interleaved.push(row[index]);
+                    }
+                    for &index in &layout.object_sources {
+                        interleaved.push(row[index]);
+                    }
+                }
+                writer.write_pcm_samples(&interleaved, total_channels)?;
+            }
+        }
+        self.decoded_samples += sample_count as u64;
+        self.decoded_frames += 1;
+        Ok(())
+    }
+
+    /// Say what the carrier holds and what the output will be.
     fn note_auro(&mut self, detection: auro::Detection) {
         let name = |layout: auro::Layout| layout.name().unwrap_or("unknown layout");
         log::info!(
-            "Auro-3D carrier: {} folded into {} ({}-sample blocks, channel configuration {}). \
-             Height channels are not reconstructed; the output is the {} carrier.",
+            "Auro-3D carrier: {} folded into {} ({}-sample blocks, channel configuration {}); \
+             unfolding to a {} master set",
             name(detection.original),
             name(detection.carrier),
             detection.block_size,
             detection.config.0,
-            name(detection.carrier),
+            name(detection.original),
         );
         self.auro = Some(detection);
     }

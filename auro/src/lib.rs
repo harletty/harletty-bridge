@@ -10,20 +10,30 @@
 //! On disc the carrier is usually a DTS-HD MA track, so the side channel
 //! survives only a bit-exact lossless decode.
 //!
-//! This crate reads the part of that side channel that is public: the block
-//! sync, its CRC, and the ADOL configuration that names the original and
-//! carrier layouts. It says *that* a stream is an Auro carrier and *what* it
-//! holds; it does not reconstruct the height channels. The residual layer
-//! (predictor seeds, Golomb-Rice residuals, the unmix) is not publicly
-//! specified.
+//! This crate reads the whole side channel. [`block`] and [`detect`] find
+//! the blocks, check their CRC and read the ADOL configuration that names
+//! the original and carrier layouts. [`stream`], [`rice`] and [`unmix`]
+//! then read what each carrier folded — the seeds, gains, codebook and
+//! Golomb-Rice residuals — and restore the folded streams sample by sample,
+//! so that a 7.1 carrier gives back its 7.1 bed and its height layer.
+//! [`decode`] runs the whole chain on one carrier channel.
 //!
-//! Sources: the public reverse-engineering by almirus (Orua-D3, MIT;
-//! MediaInfoLib PR #2531). The tables in [`layout`] are theirs.
+//! The layout layer follows the public description by almirus (Orua-D3,
+//! MIT; MediaInfoLib PR #2531). The residual layer was worked out here by
+//! analysis; it is checked against a published original/encoded pair.
 
 pub mod block;
+pub mod decode;
 pub mod detect;
 pub mod layout;
+pub mod rice;
+pub mod stream;
+pub mod unfold;
+pub mod unmix;
 
 pub use block::{BlockError, BlockInfo, SyncHeader, parse_block, parse_sync};
+pub use decode::{ChannelDecoder, DecodeError, Decoded, StreamId};
 pub use detect::{ChannelStats, Detection, Detector};
-pub use layout::{ChannelConfig, Layout};
+pub use layout::{ChannelConfig, Layout, Streams};
+pub use stream::{StreamBlock, StreamError};
+pub use unfold::Unfolder;

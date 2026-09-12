@@ -93,6 +93,121 @@ impl Layout {
     }
 }
 
+/// The stream ids a layout is made of, in the order this crate reports
+/// them: bed first (the ids of [`crate::decode::StreamId`]), then heights,
+/// then the top.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Streams {
+    pub ids: [u8; 16],
+    pub len: usize,
+}
+
+impl Streams {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.ids[..self.len]
+    }
+}
+
+impl Layout {
+    /// Which streams the layout holds, read off its name: `7.1_5H_1T` is
+    /// L R C LFE Ls Rs Lb Rb, then HL HR HC HLs HRs, then T. `None` when
+    /// the name is unknown or does not follow the bed/height/top grammar.
+    pub fn streams(self) -> Option<Streams> {
+        let name = self.name()?;
+        let mut ids = [0u8; 16];
+        let mut len = 0usize;
+        let mut push = |id: u8| {
+            if len < 16 {
+                ids[len] = id;
+                len += 1;
+            }
+        };
+        let mut parts = name.split('_');
+        let bed = parts.next()?;
+        let (fronts, lfe) = bed.split_once('.')?;
+        let fronts: u8 = fronts.parse().ok()?;
+        let lfe: u8 = lfe.parse().ok()?;
+        let no_c = name.ends_with("_no_C");
+        match fronts {
+            1 => push(2),
+            2 => {
+                push(0);
+                push(1);
+            }
+            3 => {
+                push(0);
+                push(1);
+                push(2);
+            }
+            4 => {
+                push(0);
+                push(1);
+                push(4);
+                push(5);
+            }
+            5 | 6 => {
+                push(0);
+                push(1);
+                push(2);
+                push(4);
+                push(5);
+                if fronts == 6 {
+                    push(6);
+                }
+            }
+            7 => {
+                push(0);
+                push(1);
+                if !no_c {
+                    push(2);
+                }
+                push(4);
+                push(5);
+                push(7);
+                push(8);
+            }
+            _ => return None,
+        }
+        if lfe == 1 {
+            push(3);
+        }
+        for part in parts {
+            match part {
+                "2H" => {
+                    push(9);
+                    push(10);
+                }
+                "3H" => {
+                    push(9);
+                    push(10);
+                    push(11);
+                }
+                "4H" => {
+                    push(9);
+                    push(10);
+                    push(13);
+                    push(14);
+                }
+                "5H" => {
+                    push(9);
+                    push(10);
+                    push(11);
+                    push(13);
+                    push(14);
+                }
+                "1T" => push(12),
+                "2T" => {
+                    push(12);
+                    push(15);
+                }
+                "no" | "C" => {}
+                _ => return None,
+            }
+        }
+        Some(Streams { ids, len })
+    }
+}
+
 /// A channel-input configuration: which original layout was folded into
 /// which carrier. Announced by ADOL instruction `0x1E`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -172,6 +287,32 @@ mod tests {
                 other => panic!("config {id} is half-defined: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn layout_names_expand_to_stream_ids() {
+        assert_eq!(
+            Layout(32703).streams().unwrap().as_slice(),
+            &[0, 1, 2, 4, 5, 7, 8, 3, 9, 10, 11, 13, 14, 12]
+        );
+        assert_eq!(
+            Layout(26175).streams().unwrap().as_slice(),
+            &[0, 1, 2, 4, 5, 3, 9, 10, 13, 14]
+        );
+        assert_eq!(
+            Layout(63).streams().unwrap().as_slice(),
+            &[0, 1, 2, 4, 5, 3]
+        );
+        assert_eq!(Layout(11).streams().unwrap().as_slice(), &[0, 1, 3]);
+        assert_eq!(
+            Layout(26163).streams().unwrap().as_slice(),
+            &[0, 1, 4, 5, 9, 10, 13, 14]
+        );
+        assert_eq!(
+            Layout(26555).streams().unwrap().as_slice(),
+            &[0, 1, 4, 5, 7, 8, 3, 9, 10, 13, 14]
+        );
+        assert!(Layout(0xFFFFFF).streams().is_none());
     }
 
     #[test]

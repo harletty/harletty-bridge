@@ -1,9 +1,10 @@
 # Auro-Codec: the side channel in 24-bit PCM
 
-Status: detection implemented (`auro` crate, 2026-09-12). This note records
-what the format is, what is known publicly, and where the line to a full
-decoder lies. It replaces an earlier draft (2026-07-23) that reasoned from a
-patent example the shipped streams do not follow.
+Status: decoded (`auro` crate, 2026-09-12): detection, the stream layer and
+the unfold, checked against a published original/encoded pair. This note
+records what the format is and where each part of the knowledge comes
+from. It replaces an earlier draft (2026-07-23) that reasoned from a patent
+example the shipped streams do not follow.
 
 ## What it is
 
@@ -50,10 +51,47 @@ channel-input configuration, which maps to an original layout (what a full
 decode restores) and a carrier layout (what is physically in the PCM). The
 crate's `layout.rs` carries both tables.
 
-The rest of the payload is the residual layer: predictor seeds,
-Golomb-Rice coded residuals and the parameters of the unmix (two outputs
-from one carrier, or three for the heavier layouts). Its coding is not
-publicly described.
+## The stream layer
+
+Everything after the layout bytecode was worked out here by analysis of the
+carriers and confirmed on the published original/encoded pair
+(`auro/tests/pair.rs`: correlation 0.99999 per channel, gain within
+0.01 dB). Per block and per carrier:
+
+- A 112-bit header: a 16-bit field (`0x010A` on every stream seen), a
+  32-bit word holding the Rice parameter (bits 27..24), an adaptive-Rice
+  flag (bit 30), the codebook count code (bits 23..16), the ADOL block
+  count (bits 15..8) and the codebook entry width (bits 7..0); then the
+  four stream-id slots (`0xFF` = empty) and four unused bytes.
+- Predictor seeds: two 32-bit words when two streams are folded, five for
+  three, none for one.
+- The ADOL blocks. Besides `0x1E` (layout), `0x40` carries a per-stream
+  gain code (channel, scaler) in tenths of a dB and `0x41` an offset added
+  to every code.
+- The codebook: `count` entries of `width` bits, sign and magnitude; twice
+  for a three-stream fold. `count` is `2c + 8` for codes below 5, `4c` up
+  to 15, `8c - 64` up to `0x53`.
+- The Golomb-Rice stream: one index per sample (unary prefix, then `k`
+  suffix bits least-significant first), selecting a codebook entry — the
+  same index selects from both codebooks in a three-stream fold.
+
+The stream ids: 0 L, 1 R, 2 C, 3 LFE, 4 Ls, 5 Rs, 7 Lb, 8 Rb, 9 HL, 10 HR,
+11 HC, 12 T, 13 HLs, 14 HRs, read off the channel-identification material.
+
+## The unfold
+
+With its borrowed bits dropped, the carrier is the exact sum of the folded
+streams. Each sample one stream is extrapolated from its recent history —
+`2a - b` for two streams, a three-phase `(b + 3(4a - 3b)) / 4` for three —
+and the others are derived from the sum; the residual corrects the derived
+value before it feeds the next prediction. Outputs are then scaled by
+their gain codes (`10^(code/200)`, with exact powers of two pinned every
+60 codes) and clamped to 24 bits. Blocks are independent (state resets at
+each), so output lags input by one block.
+
+The outputs sum back to the carrier exactly; each one carries the other's
+extrapolation error, which is what "virtually lossless" means here: about
+50 dB below the signal on real material.
 
 ## Sources
 
@@ -69,10 +107,13 @@ publicly described.
 
 ## What harletty does with it
 
-`harletty decode` runs the detector over every lossless DTS-HD frame and,
-once three consecutive blocks agree, logs the original and carrier layouts.
-The output is the carrier bed. Reconstructing the height layer is a
-separate piece of work; see the crate documentation for the boundary.
+`harletty decode` runs the detector over every lossless DTS-HD frame,
+holding the frames back until three consecutive blocks agree. Then it
+unfolds every carrier, joins the streams (`auro::Unfolder`) and writes a
+master set of the original layout: the bed and the four corner heights as
+bed channels, the centre height and the top as static objects. Samples no
+block claims (before the first block, after the last) play as the carrier.
+A track that turns out not to be a carrier is written as before.
 
 ## Corpus
 

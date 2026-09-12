@@ -194,6 +194,64 @@ impl DtsLayout {
     }
 }
 
+/// Map an Auro stream to its OAMD speaker. The bed and the four corner
+/// heights have names; the centre height and the top do not and become
+/// static objects instead (see [`DtsLayout::from_auro`]).
+pub fn auro_stream_to_speaker(stream: auro::StreamId) -> Option<SpeakerLabels> {
+    Some(match stream.0 {
+        0 => SpeakerLabels::L,
+        1 => SpeakerLabels::R,
+        2 => SpeakerLabels::C,
+        3 => SpeakerLabels::LFE,
+        4 => SpeakerLabels::Lss,
+        5 => SpeakerLabels::Rss,
+        7 => SpeakerLabels::Lrs,
+        8 => SpeakerLabels::Rrs,
+        9 => SpeakerLabels::Lfh,
+        10 => SpeakerLabels::Rfh,
+        13 => SpeakerLabels::Lrh,
+        14 => SpeakerLabels::Rrh,
+        _ => return None,
+    })
+}
+
+/// Where an Auro stream with no OAMD speaker sits, in DAMF space: the
+/// centre height on the front wall at the ceiling, the top overhead.
+pub fn auro_stream_object_position(stream: auro::StreamId) -> Option<[f64; 3]> {
+    Some(match stream.0 {
+        11 => [0.0, 1.0, 1.0],
+        12 => [0.0, 0.0, 1.0],
+        _ => return None,
+    })
+}
+
+impl DtsLayout {
+    /// Layout of an unfolded Auro-3D stream: `streams` in the order the
+    /// unfolder interleaves them. Streams with a speaker name join the bed;
+    /// the centre height and the top become objects at fixed positions;
+    /// anything else (a rear centre) is dropped.
+    pub fn from_auro(streams: &[auro::StreamId]) -> Self {
+        let mut pairs = Vec::new();
+        let mut objects = Vec::new();
+        let mut object_sources = Vec::new();
+        for (index, stream) in streams.iter().enumerate() {
+            if let Some(speaker) = auro_stream_to_speaker(*stream) {
+                pairs.push((speaker, BedSource::Speaker(index)));
+            } else if let Some(position) = auro_stream_object_position(*stream) {
+                objects.push(position);
+                object_sources.push(index);
+            }
+        }
+        let (bed, bed_sources) = Self::from_pairs(pairs);
+        Self {
+            bed,
+            bed_sources,
+            objects,
+            object_sources,
+        }
+    }
+}
+
 /// Convert a DAMF-space coordinate (`-1.0..=1.0`) to the OAMD `pos3d` encoding.
 ///
 /// OAMD stores x and y in `0.0..=1.0` and z in `-1.0..=1.0`, and its y axis runs
@@ -529,6 +587,29 @@ mod tests {
                 assert!((read_back[index][0][axis] - expected[axis]).abs() < 1e-9);
             }
         }
+    }
+
+    #[test]
+    fn an_unfolded_thirteen_one_is_a_twelve_channel_bed_plus_two_objects() {
+        let streams: Vec<auro::StreamId> = auro::Layout(32703)
+            .streams()
+            .unwrap()
+            .as_slice()
+            .iter()
+            .map(|&id| auro::StreamId(id))
+            .collect();
+        let layout = DtsLayout::from_auro(&streams);
+        assert_eq!(layout.bed.len(), 12);
+        assert_eq!(layout.objects.len(), 2);
+        // HC (index 10 in the stream order) then T (index 13).
+        assert_eq!(layout.object_sources, vec![10, 13]);
+        assert_eq!(layout.objects[0], [0.0, 1.0, 1.0]);
+        assert_eq!(layout.objects[1], [0.0, 0.0, 1.0]);
+        // The bed is declared in DAMF order with matching sources.
+        assert_eq!(layout.bed[0], SpeakerLabels::L);
+        assert_eq!(layout.bed_sources[0], BedSource::Speaker(0));
+        assert_eq!(layout.bed[3], SpeakerLabels::LFE);
+        assert_eq!(layout.bed_sources[3], BedSource::Speaker(7));
     }
 
     #[test]

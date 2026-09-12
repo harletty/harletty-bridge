@@ -8,7 +8,9 @@
 // Storage is allocated once, at construction, and nothing is allocated per
 // sample: this runs inside the realtime decode path.
 
-use crate::block::{BlockError, BlockInfo, MAX_BLOCK, SYNC_SAMPLES, parse_block, parse_sync};
+use crate::block::{
+    BlockError, BlockInfo, MAX_BLOCK, SYNC_SAMPLES, SyncHeader, parse_block, parse_sync,
+};
 use crate::layout::{ChannelConfig, Layout};
 
 /// Ring capacity per channel. A power of two so indexing is a mask; larger
@@ -49,7 +51,7 @@ struct Candidate {
     block_size: u16,
 }
 
-struct ChannelDetector {
+pub(crate) struct ChannelDetector {
     ring: Box<[i32]>,
     /// Samples pushed so far; the next sample lands at `count & RING_MASK`.
     count: u64,
@@ -60,7 +62,7 @@ struct ChannelDetector {
 }
 
 impl ChannelDetector {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             ring: vec![0; RING].into_boxed_slice(),
             count: 0,
@@ -74,6 +76,22 @@ impl ChannelDetector {
         }
     }
 
+    pub(crate) fn reset(&mut self) {
+        self.count = 0;
+        self.run_ones = 0;
+        self.pending_len = 0;
+        self.stats = ChannelStats::default();
+    }
+
+    pub(crate) fn stats(&self) -> ChannelStats {
+        self.stats
+    }
+
+    /// Samples pushed so far.
+    pub(crate) fn count(&self) -> u64 {
+        self.count
+    }
+
     #[inline]
     fn at(&self, index: u64) -> i32 {
         self.ring[(index & RING_MASK) as usize]
@@ -85,8 +103,15 @@ impl ChannelDetector {
         }
     }
 
-    /// Push samples; every validated block is handed to `on_block`.
-    fn push(&mut self, samples: &[i32], scratch: &mut [i32], mut on_block: impl FnMut(BlockInfo)) {
+    /// Push samples; every validated block is handed to `on_block` with its
+    /// samples, its header and what its ADOL layer said. `start` is the
+    /// absolute index of the block's first sample in this channel's stream.
+    pub(crate) fn push(
+        &mut self,
+        samples: &[i32],
+        scratch: &mut [i32],
+        mut on_block: impl FnMut(u64, &[i32], SyncHeader, BlockInfo),
+    ) {
         for &s in samples {
             self.ring[(self.count & RING_MASK) as usize] = s;
             self.count += 1;
@@ -119,7 +144,11 @@ impl ChannelDetector {
     }
 
     /// Validate every candidate whose block is now complete.
-    fn settle(&mut self, scratch: &mut [i32], on_block: &mut impl FnMut(BlockInfo)) {
+    fn settle(
+        &mut self,
+        scratch: &mut [i32],
+        on_block: &mut impl FnMut(u64, &[i32], SyncHeader, BlockInfo),
+    ) {
         let mut i = 0;
         while i < self.pending_len {
             let Candidate { start, block_size } = self.pending[i];
@@ -148,7 +177,7 @@ impl ChannelDetector {
                     if m > self.stats.max_lsb_bits {
                         self.stats.max_lsb_bits = m;
                     }
-                    on_block(info);
+                    on_block(start, block, header, info);
                 }
                 Err(BlockError::Truncated) => unreachable!("block copied whole"),
                 Err(_) => self.stats.rejected += 1,
@@ -193,7 +222,7 @@ impl Detector {
         let scratch = &mut self.scratch;
         let latched = &mut self.latched;
         let candidate = &mut self.candidate;
-        det.push(samples, scratch, |info| {
+        det.push(samples, scratch, |_, _, _, info| {
             if latched.is_some() {
                 return;
             }
@@ -235,10 +264,7 @@ impl Detector {
     /// Forget everything; storage is kept.
     pub fn reset(&mut self) {
         for c in &mut self.channels {
-            c.count = 0;
-            c.run_ones = 0;
-            c.pending_len = 0;
-            c.stats = ChannelStats::default();
+            c.reset();
         }
         self.latched = None;
         self.candidate = None;
