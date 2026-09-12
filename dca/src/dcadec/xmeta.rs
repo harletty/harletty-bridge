@@ -28,13 +28,13 @@
 use crate::dcadec::tables::DMIXTABLE;
 use crate::dcadec::xll::{
     DCA_SYNCWORD_XLL_X, DCA_SYNCWORD_XLL_X_ALT_D0, DCA_SYNCWORD_XLL_X_ALT_D1,
-    DCA_SYNCWORD_XLL_X_ALT_D3, alternate_protected_prefix, crc16_ccitt,
+    DCA_SYNCWORD_XLL_X_ALT_D3, DCA_SYNCWORD_XLL_X_ALT_D4, alternate_protected_prefix, crc16_ccitt,
 };
 use crate::spatial::SpatialChannel;
 
-/// Most extension waveforms any known profile carries (four objects plus the
+/// Most extension waveforms any known profile carries (five objects plus the
 /// four fixed heights).
-pub const MAX_SOURCES: usize = 8;
+pub const MAX_SOURCES: usize = 9;
 /// Channels of the compatible reference layout the folds are expressed over.
 pub const REFERENCE_CHANNELS: usize = 8;
 /// DCA speaker index behind each column of the 7.1 reference layout
@@ -313,7 +313,10 @@ impl XMetadata {
             .ok_or(XMetadataError::Truncated)?;
         match syncword {
             DCA_SYNCWORD_XLL_X => parse_standard(payload, source_count),
-            DCA_SYNCWORD_XLL_X_ALT_D0 | DCA_SYNCWORD_XLL_X_ALT_D1 | DCA_SYNCWORD_XLL_X_ALT_D3 => {
+            DCA_SYNCWORD_XLL_X_ALT_D0
+            | DCA_SYNCWORD_XLL_X_ALT_D1
+            | DCA_SYNCWORD_XLL_X_ALT_D3
+            | DCA_SYNCWORD_XLL_X_ALT_D4 => {
                 parse_alternate(payload, source_count)
             }
             _ => Err(XMetadataError::Unsupported("extension profile")),
@@ -369,10 +372,11 @@ impl XMetadata {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FoldPlan {
     gains: [[f32; MAX_SOURCES]; FOLD_SPEAKERS],
-    /// Bit `k` set when waveform `k` contributes to that speaker.
-    used: [u8; FOLD_SPEAKERS],
+    /// Bit `k` set when waveform `k` contributes to that speaker. Sixteen bits
+    /// because the widest profile carries nine waveforms, one more than a byte.
+    used: [u16; FOLD_SPEAKERS],
     /// Bit `k` set when waveform `k` has no known fold.
-    unknown: u8,
+    unknown: u16,
     count: usize,
 }
 
@@ -384,7 +388,7 @@ impl FoldPlan {
         Self {
             gains: [[0.0; MAX_SOURCES]; FOLD_SPEAKERS],
             used: [0; FOLD_SPEAKERS],
-            unknown: ((1u16 << count) - 1) as u8,
+            unknown: (1u16 << count) - 1,
             count,
         }
     }

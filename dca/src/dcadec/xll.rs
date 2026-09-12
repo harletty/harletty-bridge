@@ -23,6 +23,7 @@ pub(crate) const DCA_SYNCWORD_XLL_X: u32 = 0x0200_0850;
 pub(crate) const DCA_SYNCWORD_XLL_X_ALT_D0: u32 = 0xF140_00D0;
 pub(crate) const DCA_SYNCWORD_XLL_X_ALT_D1: u32 = 0xF140_00D1;
 pub(crate) const DCA_SYNCWORD_XLL_X_ALT_D3: u32 = 0xF140_00D3;
+pub(crate) const DCA_SYNCWORD_XLL_X_ALT_D4: u32 = 0xF140_00D4;
 const DCA_SYNCWORD_XLL: u32 = 0x41A2_9547;
 const XLL_X_ALT_FRAME_SAMPLES: usize = 512;
 const XLL_X_ALT_MAX_SEGMENTS: usize = 8;
@@ -72,6 +73,7 @@ enum AlternateProfile {
     D0,
     D1,
     D3,
+    D4,
 }
 
 #[derive(Clone, Copy)]
@@ -291,6 +293,7 @@ fn alternate_outer_layout(
                 AlternateProfile::D0 => XllError::Invalid("alternate D0 control tag"),
                 AlternateProfile::D1 => XllError::Invalid("alternate D1 control tag"),
                 AlternateProfile::D3 => XllError::Invalid("alternate D3 control tag"),
+                AlternateProfile::D4 => XllError::Invalid("alternate D4 control tag"),
             });
         }
     };
@@ -307,6 +310,7 @@ fn alternate_layout(payload: &[u8]) -> R<AlternateLayout> {
         DCA_SYNCWORD_XLL_X_ALT_D0 => AlternateProfile::D0,
         DCA_SYNCWORD_XLL_X_ALT_D1 => AlternateProfile::D1,
         DCA_SYNCWORD_XLL_X_ALT_D3 => AlternateProfile::D3,
+        DCA_SYNCWORD_XLL_X_ALT_D4 => AlternateProfile::D4,
         _ => return Err(XllError::Invalid("unknown alternate XLL profile")),
     };
     let (control_start, control_size, offset_bias, set_mask) =
@@ -317,8 +321,19 @@ fn alternate_layout(payload: &[u8]) -> R<AlternateLayout> {
     let outer_control = payload
         .get(control_start..first_header_offset)
         .ok_or(XllError::Invalid("short alternate XLL outer control"))?;
+    // D4 needs the extra bit for its `c6` outer control, which puts the
+    // geometry at 26 where every other form of the same profile puts it at 25
+    // or below. `c6` is rare, and it arrives late: 273 frames in 46,169 across
+    // six streams, absent entirely from three of them, and in the three that
+    // carry it the first one is 15 to 18 seconds in - past the 4 MiB prefix the
+    // corpus tests read. Every stream here parses clean at a bound of 25 when
+    // only its prefix is measured, so this bound has to be measured over whole
+    // streams or it reads as settled while it is silently dropping the
+    // extension on those frames. Widening it costs nothing: no frame in the
+    // corpus has a second valid geometry at 26 to become ambiguous with.
     let first_geometry_end = match profile {
         AlternateProfile::D3 => 31,
+        AlternateProfile::D4 => 26,
         AlternateProfile::D0 | AlternateProfile::D1 => 25,
     };
     let (common_bit, first_geometry) =
@@ -329,6 +344,7 @@ fn alternate_layout(payload: &[u8]) -> R<AlternateLayout> {
         AlternateProfile::D0 => 1,
         AlternateProfile::D1 => 2,
         AlternateProfile::D3 => 4,
+        AlternateProfile::D4 => 5,
     };
     if first_header.channels != expected_first_channels {
         return Err(XllError::Invalid(
@@ -341,7 +357,7 @@ fn alternate_layout(payload: &[u8]) -> R<AlternateLayout> {
         let inner_control = alternate_inner_control(payload, second_header.offset)?;
         let second_geometry_start = match profile {
             AlternateProfile::D0 => 18,
-            AlternateProfile::D1 | AlternateProfile::D3 => 19,
+            AlternateProfile::D1 | AlternateProfile::D3 | AlternateProfile::D4 => 19,
         };
         let (_, second_geometry) =
             alternate_unique_geometry(inner_control, second_geometry_start, 26)?;
@@ -740,7 +756,10 @@ impl XllDecoder {
         match gb.show_bits(32) {
             Some(DCA_SYNCWORD_XLL_X) => self.x_syncword_present = true,
             Some(
-                DCA_SYNCWORD_XLL_X_ALT_D0 | DCA_SYNCWORD_XLL_X_ALT_D1 | DCA_SYNCWORD_XLL_X_ALT_D3,
+                DCA_SYNCWORD_XLL_X_ALT_D0
+                | DCA_SYNCWORD_XLL_X_ALT_D1
+                | DCA_SYNCWORD_XLL_X_ALT_D3
+                | DCA_SYNCWORD_XLL_X_ALT_D4,
             ) => self.x_imax_syncword_present = true,
             _ => return,
         }
