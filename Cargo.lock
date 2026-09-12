@@ -137,6 +137,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "auro"
+version = "0.7.4"
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -569,6 +573,7 @@ name = "harletty"
 version = "0.7.4"
 dependencies = [
  "anyhow",
+ "auro",
  "chrono",
  "clap",
  "damf",
@@ -593,6 +598,7 @@ version = "0.7.4"
 dependencies = [
  "abi_stable",
  "anyhow",
+ "auro",
  "bridge_api",
  "dca",
  "eac3",

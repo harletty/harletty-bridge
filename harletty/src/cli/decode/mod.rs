@@ -1,4 +1,5 @@
 pub mod atmos;
+pub mod auro_stage;
 mod decode_impl;
 pub mod decoder_thread;
 pub mod dts_handler;

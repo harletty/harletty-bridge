@@ -1,159 +1,135 @@
-# PCM auxiliary-layer / Auro-Codec research
+# Auro-Codec: the side channel in 24-bit PCM
 
-Status: exploratory notes, last updated 2026-07-23. This is not yet an
-implementation specification. The commercial bitstream may differ from the
-public patent examples, so a real bit-perfect Auro-Codec carrier remains the
-required oracle.
+Status: decoded (`auro` crate, 2026-09-12): detection, the stream layer and
+the unfold, checked against a published original/encoded pair. This note
+records what the format is and where each part of the knowledge comes
+from. It replaces an earlier draft (2026-07-23) that reasoned from a patent
+example the shipped streams do not follow.
 
-## Main finding
+## What it is
 
-The height channels should not be treated as raw PCM serialized directly into
-the least-significant bits. The public Aurophonic carrier patent describes a
-different construction:
+Auro-3D delivers its height layer inside an ordinary lossless 5.1 or 7.1
+track. The encoder mixes the height channels into the carrier channels with
+its own gains, then borrows the `m` least-significant bits of every carrier
+sample for a serial side channel. Without a decoder the track plays as the
+carrier mix; a decoder reads the side channel and separates bed and height
+again. On disc the carrier is a DTS-HD MA track, so the side channel
+survives only a bit-exact lossless decode: any gain, dither or float round
+trip ahead of the reader destroys it. In harletty it is read off
+`dca::HdDecoder::lossless_samples`, the integer XLL output, before the
+conversion to `f32`.
 
-- two audio signals are alternately sample-rate-reduced and added into the
-  significant PCM portion of one backwards-compatible carrier channel;
-- the freed LSBs carry the information required to undo that mix: sync, block
-  length, PCM offset, seed samples, attenuation, optional error/index tables,
-  and a CRC;
-- the decoder reconstructs two channel waveforms from the significant carrier
-  PCM plus this auxiliary information, then interpolates the missing samples
-  and applies the transmitted correction/gain data.
+`m` is chosen per block and per channel. On the demo material at hand it
+runs from 3 (metadata only: the LFE and rear channels of a 7.1 carrier
+never carry more) to 10 on loud front channels.
 
-The patent gives common 24-bit divisions of 20+4 and 18+6 bits, also mentions
-2/4/6 auxiliary bits per sample, and allows the width to be selected
-dynamically. The width therefore must be detected from valid framing, not from
-LSB entropy alone.
+## Block layout
 
-Primary public description:
-
-- <https://patents.google.com/patent/WO2008043858A1/en>
-- <https://www.auro-3d.com/consumer_2024/>
-- <https://www.auro-3d.com/content/>
-
-## Proposed detector
-
-The detector must receive the exact decoded integer PCM. No volume operation,
-dither, resampling, or float round trip may occur before detection. Harletty
-currently converts the XLL output from 24-bit integers to `f32` in
-`dca/src/hd.rs`, and later converts it back to `i32` in `src/dts_pipeline.rs`.
-An implementation must tap or retain the integer XLL output before that
-conversion.
-
-For each carrier channel and each candidate auxiliary width `q` (initially
-2, 4, and 6; 1 through 8 in the research tool):
+The side channel is framed in blocks of `block_size` samples, 1000 on every
+stream seen so far. The first sixteen samples of a block are its header:
 
 ```text
-mask      = (1 << q) - 1
-symbol[n] = unsigned(sample[n]) & mask
-audio[n]  = signed(sample[n] & ~mask)
+bit 0 of samples 0..16   sync: all ones
+bit 1 of samples 0..16   CRC-16/CCITT of the block, MSB first
+bit 2 of samples 0..8    block-size code (size = code * 16 + 16; 0x3D means 1000)
+bit 2 of samples 8..12   four flag bits
+bit 2 of samples 12..16  14 - m
 ```
 
-Build one symbol stream per carrier channel first. Also test interleaved
-channel order as a secondary hypothesis, plus both possible bit orders inside
-each `q`-bit symbol.
+The CRC covers the three bytes of every sample of the block, low byte
+first, with bit 1 of the header samples masked out, and is inverted at the
+end. Bits 3..m of the header samples and the low `m` bits of every later
+sample, MSB first, form the payload; one bit every `16 * m` payload
+positions is reserved and must be zero. The first reserved bit is bit 0 of
+sample 16, which is what stops the sync run at exactly sixteen ones.
 
-Score a candidate only from structure across multiple consecutive blocks:
+The payload opens with a fixed set of fields (widths known, meanings not
+public), four stream-id slots, an optional small table, then one or more
+ADOL blocks: a bytecode of one-byte opcodes with 0-, 8-, 16-, 24- or
+32-bit operands, terminated by opcode 0. Opcode `0x1E` names the
+channel-input configuration, which maps to an original layout (what a full
+decode restores) and a carrier layout (what is physically in the PCM). The
+crate's `layout.rs` carries both tables.
 
-1. Find repeated sync candidates. The patent example is a rotating one-hot
-   sequence, e.g. `1, 2, 4, 8` for `q=4`.
-2. Parse the following 12-bit block length and signed 12-bit PCM offset.
-3. Require plausible bounds and a repeatable block cadence.
-4. Parse the seed samples and verify that they reproduce the next stored seed
-   under the unmix recurrence.
-5. Determine the CRC width/polynomial and require repeated CRC success over
-   both the significant PCM and auxiliary data.
+## The stream layer
 
-Marginal entropy is only a diagnostic. Dithered PCM and compressed auxiliary
-data can both have nearly perfect one/zero balance.
+Everything after the layout bytecode was worked out here by analysis of the
+carriers and confirmed on the published original/encoded pair
+(`auro/tests/pair.rs`: correlation 0.99999 per channel, gain within
+0.01 dB). Per block and per carrier:
 
-## Two-channel reconstruction described by the patent
+- A 112-bit header: a 16-bit field (`0x010A` on every stream seen), a
+  32-bit word holding the Rice parameter (bits 27..24), an adaptive-Rice
+  flag (bit 30), the codebook count code (bits 23..16), the ADOL block
+  count (bits 15..8) and the codebook entry width (bits 7..0); then the
+  four stream-id slots (`0xFF` = empty) and four unused bytes.
+- Predictor seeds: two 32-bit words when two streams are folded, five for
+  three, none for one.
+- The ADOL blocks. Besides `0x1E` (layout), `0x40` carries a per-stream
+  gain code (channel, scaler) in tenths of a dB and `0x41` an offset added
+  to every code.
+- The codebook: `count` entries of `width` bits, sign and magnitude; twice
+  for a three-stream fold. `count` is `2c + 8` for codes below 5, `4c` up
+  to 15, `8c - 64` up to `0x53`.
+- The Golomb-Rice stream: one index per sample (unary prefix, then `k`
+  suffix bits least-significant first), selecting a codebook entry — the
+  same index selects from both codebooks in a three-stream fold.
 
-Let `C[n]` be the carrier sample with the auxiliary LSBs cleared. Given seed
-samples `A[0]` and `B[1]` at the block's declared PCM offset:
+The stream ids: 0 L, 1 R, 2 C, 3 LFE, 4 Ls, 5 Rs, 7 Lb, 8 Rb, 9 HL, 10 HR,
+11 HC, 12 T, 13 HLs, 14 HRs, read off the channel-identification material.
 
-```text
-B[0] = C[0] - A[0]
-A[1] = C[1] - B[1]
+## The unfold
 
-even n >= 2: B[n] = B[n-1]; A[n] = C[n] - B[n]
-odd  n >= 3: A[n] = A[n-1]; B[n] = C[n] - A[n]
-```
+With its borrowed bits dropped, the carrier is the exact sum of the folded
+streams. Each sample one stream is extrapolated from its recent history —
+`2a - b` for two streams, a three-phase `(b + 3(4a - 3b)) / 4` for three —
+and the others are derived from the sum; the residual corrects the derived
+value before it feeds the next prediction. Outputs are then scaled by
+their gain codes (`10^(code/200)`, with exact powers of two pinned every
+60 codes) and clamped to 24 bits. Blocks are independent (state resets at
+each), so output lags input by one block.
 
-This yields the alternating exact samples of the two reduced streams. Fill the
-missing samples with interpolation, then apply any error-approximation table
-and undo the declared attenuation. Channel identity and layout must come from
-validated stream information; fixed Auro presentations must be emitted as
-labeled fixed channels, never fabricated objects.
+The outputs sum back to the carrier exactly; each one carries the other's
+extrapolation error, which is what "virtually lossless" means here: about
+50 dB below the signal on real material.
 
-## Harletty implementation outline
+## Sources
 
-1. Add an offline integer-PCM probe before touching the realtime bridge.
-2. Preserve the lossless XLL output as integer PCM through `dca::HdFrame` (or
-   provide an integer analysis tap without doubling steady-state buffers).
-3. Implement a bounded streaming synchronizer/parser with fixed reusable
-   storage and checked lengths/offset arithmetic.
-4. Latch the detected format only after several valid blocks and CRCs.
-5. Add the unmix/interpolation stage, then emit stable labeled-channel frames.
-6. Keep all research logging and corpus dumping outside the shipped ABI hot
-   path.
+- almirus, *Auro-3D: how height channels are hidden in ordinary PCM*,
+  Habr, August 2026 — <https://habr.com/ru/articles/1068212/>.
+- almirus/Orua-D3 on GitHub (MIT): the Python detector these tables come
+  from, and the archived Auro white papers.
+- MediaArea/MediaInfoLib pull request 2531: the same detector in C++.
+- The commercial decoder `orua3d-decode` (closed, Windows, non-commercial
+  licence) is the only public implementation of the residual layer. It can
+  serve as an oracle for testing a clean-room decoder; nothing in it may be
+  copied.
 
-## Local corpus comparison
+## What harletty does with it
 
-The official content page was compared on 2026-07-23 against:
+`harletty decode` runs the detector over every lossless DTS-HD frame,
+holding the frames back until three consecutive blocks agree. Then it
+unfolds every carrier, joins the streams (`auro::Unfolder`) and writes a
+master set of the original layout: the bed and the four corner heights as
+bed channels, the centre height and the top as static objects. Samples no
+block claims (before the first block, after the last) play as the carrier.
+A track that turns out not to be a carrier is written as before.
 
-- 351 MKV files under the local `Films`/`atmos` directories;
-- 89 MKV files under `/mnt/nas/backup/Videos`;
-- 440 MKV files total.
+The realtime bridge does the same on its DTS-HD path (`bridge/src/
+auro_pipeline.rs`): frames are held back until the verdict — at most two
+of the largest blocks when no block validates, four when blocks validate
+but the layout has not latched — then replayed into the unfolder, and
+every frame from then on is the unfolded layout as labelled fixed
+channels (the corner heights as Tfl/Tfr/Tbl/Tbr, the centre height as
+Tfc, the top as Tc). Output lags input by one block (21 ms at 48 kHz for
+1000-sample blocks); the last block of a stream stays in the unfolder,
+as the bridge has no end-of-stream flush.
 
-The official page has two materially different categories:
+## Corpus
 
-- **Cinema** means the film had an Auro theatrical mix. It does not prove that
-  an arbitrary Blu-ray/UHD edition contains an Auro carrier.
-- **Movies (Blu-ray/Digital)** identifies home releases, but territory and
-  edition still matter.
-
-### Matching home-release titles
-
-| Official title | Local/NAS edition | Observed audio | Assessment |
-|---|---|---|---|
-| Ballerina (2025) | `/mnt/local/HDD_F/Films/Ballerina.2025.Multi.Truefrench.2160p.Bluray.Remux.DV.HDR10.HEVC-BDHD.mkv` | French and English TrueHD Atmos 7.1/24-bit | Matching title, but this remux contains Atmos rather than an identifiable Auro carrier. The official entry is territory-specific. |
-| Blade Runner 2049 | `/mnt/nas/backup/Videos/TrueHD_Atmos/Blade.Runner.2049.2017.Multi.2160p.BluRay.REMUX.HEVC.HYBRID.DoVi.TrueHD.Atmos.7.1-ONLY.mkv` | English TrueHD Atmos 7.1/24-bit; French DTS-HD MA 5.1/16-bit | No plausible 24-bit Auro carrier in this remux. |
-| Borderlands (2024) | `/mnt/nas/backup/Videos/TrueHD_Atmos/Borderlands.2024.MULTi.TRUEFRENCH.2160p.UHD.BluRay.REMUX.DV.HDR10.TrueHD.7.1.HEVC-REBiRTH.mkv` | French and English TrueHD 7.1/24-bit, no Atmos profile reported | Initially promising, but both tracks have their low four bits almost entirely zero over a 20-second probe and no patent sync signature. This is not the listed Benelux Auro carrier, or its auxiliary layer is absent. |
-| Everything Everywhere All at Once (2022) | `/mnt/nas/backup/Videos/TrueHD_Atmos/Everything.Everywhere.All.at.Once.2022.MULTI.VFF.2160p.UHD.BLURAY.REMUX.DV.HDR.TrueHD.7.1.x265-OPTIMUM.mkv` | French and English TrueHD Atmos 7.1/24-bit | Correct title/4K class, but not the specific Auro edition. |
-| Everything Everywhere All at Once (2022) | `/mnt/local/SSD_A-CT4000/Films/[ Torrent911.cc ] Everything.Everywhere.All.at.Once.2022.MULTi.1080p.BluRay.DTS.x264-EXTREME.mkv` | French and English lossy DTS 5.1 | Lossy transport cannot preserve the auxiliary LSB layer. |
-| Salyut 7 (2017) | `/mnt/local/HDD_D/Films/Salyut.7.2017.2160p.UHD.BLURAY.REMUX.HDR.HEVC.MULTI.DTS-HDMA.mkv` | Russian DTS-HD MA 7.1/48 kHz/16-bit; French lossy DTS 5.1 | Not the Russian 3D Blu-ray Auro edition. The 16-bit Russian LSBs show no structured auxiliary signature. |
-| Salyut 7 (2017) | `/mnt/nas/backup/Videos/Salyut.7.-.La.storia.di.un.impresa.(2017).1080p.BluRay.DTS.ITA.AC3.RUS.Subs.x264.mkv` | Italian lossy DTS 5.1; Russian AC-3 5.1 | Cannot carry the bit-perfect auxiliary layer. |
-
-The local `Jumanji.1995` is not a match: the official table links to IMDb
-`tt2283362` (the 2017 film). `Ford v Ferrari`, `Guardians of the Galaxy`,
-`Twisters`, `Despicable Me 4`, and `John Wick 3/4` were also rejected as title
-matcher false positives for different films or sequels.
-
-### Matching cinema-only titles
-
-These local files match films in the official Cinema list, but their local
-home editions do not thereby inherit the theatrical Auro mix:
-
-| Film | Local file / relevant audio | Result |
-|---|---|---|
-| American Sniper (2014) | `/mnt/local/HDD_B/Films/American.Sniper.2014.UHD.MULTi.VFi.2160p.UHD.BluRay.REMUX.HDR.HEVC.TrueHD.7.1.Atmos-ONLY.mkv` — TrueHD Atmos | Not an Auro test carrier. |
-| Everest (2015) | `/mnt/local/HDD_D/Films/Everest.2015.MULTi.VFF.VFQ.Hybrid.2160p.UHD.BluRay.REMUX.CUSTOM.DV.HDR10Plus.HEVC.TrueHD.7.1.Atmos-ONLY.mkv` — TrueHD Atmos | Not an Auro test carrier. |
-| First Man (2018) | `/mnt/local/HDD_A/Films/TrueHD Atmos/First.Man.2018.MULTI.VFF.2160p.UHD.BLURAY.REMUX.DV.HDR10.TrueHD.7.1.HEVC-BREMBO.mkv` — English TrueHD Atmos, French E-AC-3 | Not an Auro test carrier. |
-| In the Heart of the Sea (2015) | `/mnt/local/HDD_D/Films/Au.cœur.de.l.Océan.2015.mkv` — French and English TrueHD Atmos | Not an Auro test carrier. |
-| Lucy (2014) | `/mnt/local/HDD_A/Films/TrueHD Atmos/Lucy.2014.2160p.UHD.BLURAY.REMUX.HDR.HEVC.MULTI.VFF.DTS-HDMA.x265-EXTREME.mkv` — French DTS-HD MA 5.1/24-bit, English TrueHD Atmos | The French DTS-HD track was probed. Its low bits are uniformly dither-like; the patent `q=4` hits occur at chance rate and no `q=6` sync is present. Not currently promising. |
-| Minions (2015) | `/mnt/local/HDD_D/Films/Minions.2015.MULTI.VFF.2160p.UHD.BluRay.Remux.HDR.EAC3.7.1.Atmos.HEVC-D5T0.mkv` — E-AC-3/TrueHD Atmos | Not an Auro test carrier. |
-| Sing (2016) | `/mnt/local/HDD_D/Films/Tous.En.Scene.2016.MULTI.VF2.2160p.UHD.BluRay.Remux.HDR.EAC3.7.1.Atmos-tlub.mkv` — TrueHD/E-AC-3 Atmos | Not an Auro test carrier. |
-| The Legend of Tarzan (2016) | `/mnt/local/HDD_A/Films/The.Legend.of.Tarzan.2016.MULTi.VFF.VFQ.2160p.UHD.BluRay.REMUX.CUSTOM.HEVC.HDR.DV.TrueHD.Atmos.7.1-HDForever.mkv` — TrueHD Atmos | Not an Auro test carrier. |
-| The Mummy (2017) | `/mnt/nas/backup/Videos/EAC3_Atmos/La.Momie.2017.mkv` — E-AC-3/TrueHD Atmos | Correct film (IMDb `tt2345759`), wrong home audio carrier. |
-| The Secret Life of Pets (2016) | `/mnt/local/HDD_D/Films/Comme.Des.Betes.2016.MULTI.VF2.2160p.UHD.BluRay.Remux.HDR.EAC3.TrueHD.7.1.Atmos.HEVC-TSC.mkv` — includes English DTS-HD MA 7.1/24-bit | The DTS-HD track has zero/padded low bits rather than an auxiliary stream. |
-| Warcraft (2016) | `/mnt/local/HDD_F/Films/Warcraft.Le.Commencement.2016..mkv` — French and English TrueHD Atmos | Not an Auro test carrier. |
-
-## Current conclusion and required sample
-
-No scanned MKV is currently confirmed as an Auro-Codec carrier. The highest
-value next sample remains the Russian 3D Blu-ray edition of *Salyut 7*, expected
-to expose a 5.1, 48 kHz, 24-bit lossless carrier. A 30-60 second bit-perfect
-DTS-HD MA extract from that exact edition should be sufficient to establish the
-auxiliary width, sync ordering, and initial block grammar before implementing
-the realtime decoder.
+The Trinnov Auro demo clips (DTS-HD MA 7.1 and 5.1, 48 kHz, 24-bit): every
+clip without a DTS:X extension is a carrier, configuration 62
+(`7.1_5H_1T` on a 7.1 carrier) for the 7.1 clips and 50 (`5.1_5H_1T` on
+5.1) for the 5.1 ones. The two clips flagged DTS:X carry no side channel.
+`auro/tests/corpus.rs` checks one such extract when
+`HARLETTY_AURO_CORPUS` points at it.

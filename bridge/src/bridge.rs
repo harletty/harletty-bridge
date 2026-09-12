@@ -12,6 +12,7 @@ use std::time::Instant;
 use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, parse::Parser};
 
 use crate::ac3_native::NativeAc3Decoder;
+use crate::auro_pipeline::DtsAuroState;
 use crate::dts_pipeline::{DtsFoldConfig, DtsXState};
 use crate::eac3_pipeline::{
     diagnose_eac3_frame, is_dependent_eac3_frame, is_legacy_ac3_frame,
@@ -164,6 +165,9 @@ pub(crate) struct AtmosBridge {
     /// from what the frame presented rather than from its profile, so every
     /// object-bearing presentation reaches it by the same route.
     pub(crate) dts_objects_active: bool,
+    /// Auro-3D detection and unfolding over the lossless DTS-HD output.
+    /// Holds the first frames back until the carrier question is settled.
+    pub(crate) dts_auro: DtsAuroState,
     // ── Shared ───────────────────────────────────────────────────────
     pub(crate) presentation: u8,
     pub(crate) strict: bool,
@@ -244,6 +248,7 @@ impl AtmosBridge {
             dts_active: false,
             dts_fold_config: DtsFoldConfig::from_env(),
             dts_objects_active: false,
+            dts_auro: DtsAuroState::default(),
             presentation,
             strict,
             total_samples: 0,
@@ -303,6 +308,7 @@ impl AtmosBridge {
         self.dts_x = DtsXState::default();
         self.dts_active = false;
         self.dts_objects_active = false;
+        self.dts_auro.reset();
         // Re-sniff after reset, but keep any host-declared codec.
         self.raw_codec = None;
 
@@ -978,6 +984,38 @@ mod raw_transport_tests {
     // End-to-end: feed a raw DTS core stream through the FormatBridge and check
     // it emits 5.1 bed frames with the expected channel labels. Skips when the
     // (uncommitted) corpus is absent.
+    #[test]
+    fn dts_hd_auro_carrier_unfolds_into_its_layout() {
+        let Some(dts) = corpus_path("HARLETTY_AURO_DTS_CORPUS") else {
+            eprintln!("skipping: HARLETTY_AURO_DTS_CORPUS is not set to a readable file");
+            return;
+        };
+        let bytes = std::fs::read(dts).unwrap();
+        let mut bridge = AtmosBridge::new(false);
+        let mut frames = Vec::new();
+        for chunk in bytes.chunks(16 * 1024) {
+            let result = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+            assert!(result.error_message.is_empty(), "{}", result.error_message);
+            frames.extend(result.frames.into_iter());
+        }
+        assert!(bridge.dts_auro.is_unfolding(), "the carrier was not confirmed");
+        assert!(!bridge.has_objects(), "Auro is fixed channels, not objects");
+        // Every frame that came out is the unfolded layout: the carrier was
+        // held back until the verdict, never emitted as 7.1.
+        let channels = frames[0].channel_count;
+        assert!(channels > 8, "expected more than the carrier's channels, got {channels}");
+        assert!(frames.iter().all(|f| f.channel_count == channels));
+        let labels = &frames[0].channel_labels;
+        assert!(
+            labels.contains(&bridge_api::RChannelLabel::Tfl)
+                && labels.contains(&bridge_api::RChannelLabel::Tbr)
+        );
+        // Output is one block behind input, and no more.
+        let emitted: u64 = frames.iter().map(|f| u64::from(f.sample_count)).sum();
+        assert!(bridge.total_samples - emitted <= 4096, "{} held back", bridge.total_samples - emitted);
+        eprintln!("{} frames, {} channels, {emitted}/{} samples out", frames.len(), channels, bridge.total_samples);
+    }
+
     #[test]
     fn dts_raw_transport_emits_bed_frames() {
         let Some(dts) = corpus_path("HARLETTY_DTS_CORE_CORPUS") else {

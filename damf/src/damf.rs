@@ -153,6 +153,19 @@ pub enum SourceCodec {
     /// quartet (the D0 marker with a 5.1 reference layout).
     #[serde(rename = "DTS:X-5.1+1")]
     DtsX51Plus1,
+    // Auro-3D, by the channel count of the layout the carrier unfolds to:
+    // bed plus heights plus top. Layouts with no common name fall back to
+    // the bare label.
+    #[serde(rename = "Auro-3D-9.1")]
+    Auro3d91,
+    #[serde(rename = "Auro-3D-10.1")]
+    Auro3d101,
+    #[serde(rename = "Auro-3D-11.1")]
+    Auro3d111,
+    #[serde(rename = "Auro-3D-13.1")]
+    Auro3d131,
+    #[serde(rename = "Auro-3D")]
+    Auro3d,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

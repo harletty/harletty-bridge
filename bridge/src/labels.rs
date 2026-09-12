@@ -119,3 +119,28 @@ pub(crate) fn oamd_speaker_to_label(speaker_index: usize) -> RChannelLabel {
         _ => RChannelLabel::Unknown,
     }
 }
+
+/// Map an Auro stream to the renderer's channel label. Auro's height layer
+/// sits at about 30 degrees of elevation rather than overhead, and its
+/// centre height and top have no closer labels than the top-front-centre
+/// and top-centre ones; the renderer's channel mode places them.
+pub(crate) fn auro_stream_to_r(stream: auro::StreamId) -> RChannelLabel {
+    match stream.0 {
+        0 => RChannelLabel::L,
+        1 => RChannelLabel::R,
+        2 => RChannelLabel::C,
+        3 => RChannelLabel::LFE,
+        4 => RChannelLabel::Ls,
+        5 => RChannelLabel::Rs,
+        6 => RChannelLabel::Cb,
+        7 => RChannelLabel::Lb,
+        8 => RChannelLabel::Rb,
+        9 => RChannelLabel::Tfl,
+        10 => RChannelLabel::Tfr,
+        11 => RChannelLabel::Tfc,
+        12 => RChannelLabel::Tc,
+        13 => RChannelLabel::Tbl,
+        14 => RChannelLabel::Tbr,
+        _ => RChannelLabel::Unknown,
+    }
+}

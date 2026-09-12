@@ -130,6 +130,19 @@ impl HdDecoder {
         self.xll.reset();
     }
 
+    /// The lossless 24-bit samples of the last decoded frame, by DCA speaker
+    /// index, as integers — before the float conversion `decode` hands out.
+    /// Active speakers only. This is the tap for anything that reads the low
+    /// bits of the PCM (an Auro-Codec carrier keeps its side channel there),
+    /// which a float round trip would not preserve.
+    pub fn lossless_samples(&self) -> impl Iterator<Item = (usize, &[i32])> {
+        self.xll
+            .output
+            .iter()
+            .enumerate()
+            .filter_map(|(speaker, channel)| channel.as_deref().map(|v| (speaker, v)))
+    }
+
     /// Decode one DTS-HD frame from its core access unit + EXSS substream bytes.
     pub fn decode(&mut self, core_au: &[u8], exss: &[u8]) -> Result<HdFrame, HdError> {
         // 1) Core bitstream decode (the residual base).
