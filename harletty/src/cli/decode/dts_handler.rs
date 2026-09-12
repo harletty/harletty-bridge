@@ -82,14 +82,11 @@ pub struct DtsDecodeHandler {
 /// Which DAMF codec label an unfolded Auro-3D layout is stored under: its
 /// channel count when it is one of the common ones.
 fn auro_source_codec(original: auro::Layout) -> SourceCodec {
-    let Some(streams) = original.streams() else {
-        return SourceCodec::Auro3d;
-    };
-    match streams.len {
-        10 => SourceCodec::Auro3d91,
-        11 => SourceCodec::Auro3d101,
-        12 => SourceCodec::Auro3d111,
-        14 => SourceCodec::Auro3d131,
+    match original.source_codec_label() {
+        "Auro-3D-9.1" => SourceCodec::Auro3d91,
+        "Auro-3D-10.1" => SourceCodec::Auro3d101,
+        "Auro-3D-11.1" => SourceCodec::Auro3d111,
+        "Auro-3D-13.1" => SourceCodec::Auro3d131,
         _ => SourceCodec::Auro3d,
     }
 }

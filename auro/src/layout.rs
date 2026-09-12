@@ -208,6 +208,23 @@ impl Layout {
     }
 }
 
+impl Layout {
+    /// The label a decoded stream is catalogued under, by the channel count
+    /// of the layout: `Auro-3D-13.1` for `7.1_5H_1T`, `Auro-3D-9.1` for
+    /// `5.1_4H`, and the bare `Auro-3D` for the layouts with no common
+    /// name. Shared by the DAMF `sourceCodec` and the catalogue's probe so
+    /// the same layout is never stored under two strings.
+    pub fn source_codec_label(self) -> &'static str {
+        match self.streams().map(|s| s.len) {
+            Some(10) => "Auro-3D-9.1",
+            Some(11) => "Auro-3D-10.1",
+            Some(12) => "Auro-3D-11.1",
+            Some(14) => "Auro-3D-13.1",
+            _ => "Auro-3D",
+        }
+    }
+}
+
 /// A channel-input configuration: which original layout was folded into
 /// which carrier. Announced by ADOL instruction `0x1E`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -313,6 +330,16 @@ mod tests {
             &[0, 1, 4, 5, 7, 8, 3, 9, 10, 13, 14]
         );
         assert!(Layout(0xFFFFFF).streams().is_none());
+    }
+
+    #[test]
+    fn catalogue_labels_count_the_channels() {
+        assert_eq!(Layout(32703).source_codec_label(), "Auro-3D-13.1");
+        assert_eq!(Layout(26175).source_codec_label(), "Auro-3D-9.1");
+        assert_eq!(Layout(32319).source_codec_label(), "Auro-3D-11.1");
+        assert_eq!(Layout(26559).source_codec_label(), "Auro-3D-11.1");
+        assert_eq!(Layout(30271).source_codec_label(), "Auro-3D-10.1");
+        assert_eq!(Layout(26163).source_codec_label(), "Auro-3D");
     }
 
     #[test]
