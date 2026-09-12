@@ -239,12 +239,14 @@ of drift.
 
 ## Known limitations
 
-- **DTS:X object positions are not decoded.** Spatial presentations are
-  exported with their channel layout and labels, but objects sit at
-  static positions; the per-frame trajectories live in a proprietary
-  extension block that this decoder does not read. A DTS:X master set is
-  therefore fine for layout inspection and useless for anything that
-  measures movement.
+- **DTS:X objects are positioned from the stream's own metadata**, frame
+  by frame, so an object that moves in the mix moves in the master set;
+  the fixed heights become bed channels. The private metadata is read
+  from corpus evidence rather than a specification, so the alternate
+  profiles (D0, D1, D3, D4, 5.1+1) are reported as experimental. A
+  waveform whose bed fold the stream does not state has that fold
+  estimated from the bed's audio (see `--no-fold-estimate`), so it plays
+  on its own track and leaves the bed.
 - **Auro-3D is unfolded, not decoded bit-exactly.** A DTS-HD MA track
   that carries an Auro-Codec side channel in its low bits is recognised
   and unfolded into the layout it was encoded from: a `7.1_5H_1T` carrier
