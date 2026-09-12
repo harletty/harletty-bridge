@@ -598,6 +598,7 @@ version = "0.7.4"
 dependencies = [
  "abi_stable",
  "anyhow",
+ "auro",
  "bridge_api",
  "dca",
  "eac3",

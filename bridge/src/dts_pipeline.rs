@@ -196,7 +196,19 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                             &mut bridge.declared_object_channels,
                         ) {
                             bridge.dts_objects_active = emitted_objects;
-                            result.frames.push(frame);
+                            // The Auro side channel lives in the low bits of
+                            // the lossless integers, read off the decoder's
+                            // integer tap. The stage decides whether the
+                            // frame goes out as it is or unfolded.
+                            let active: Vec<usize> = (0..hd.samples.len())
+                                .filter(|&s| hd.samples[s].is_some())
+                                .collect();
+                            bridge.dts_auro.route(
+                                frame,
+                                &active,
+                                bridge.dts_hd_decoder.lossless_samples(),
+                                &mut result.frames,
+                            );
                         }
                         bridge.total_samples += n as u64;
                         bridge.dts_frame_count += 1;
@@ -221,6 +233,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 match bridge.dts_decoder.push_access_unit(&rest[..fs]) {
                     Ok(push) => {
                         bridge.dts_objects_active = false;
+                        bridge.dts_auro.not_a_carrier(&mut result.frames);
                         result.frames.push(build_core_frame(&push.pcm));
                         bridge.total_samples += push.pcm.samples_per_channel() as u64;
                         bridge.dts_frame_count += 1;
@@ -243,6 +256,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 Ok(push) => {
                     let frame = build_core_frame(&push.pcm);
                     bridge.dts_objects_active = false;
+                    bridge.dts_auro.not_a_carrier(&mut result.frames);
                     bridge.total_samples += push.pcm.samples_per_channel() as u64;
                     bridge.dts_frame_count += 1;
                     result.frames.push(frame);
@@ -276,7 +290,7 @@ fn hd_samples(hd: &HdFrame) -> usize {
 }
 
 /// DCA speaker index -> renderer channel label, for the DTS-HD bed.
-fn speaker_to_label(spkr: usize) -> RChannelLabel {
+pub(crate) fn speaker_to_label(spkr: usize) -> RChannelLabel {
     match spkr {
         0 => RChannelLabel::C,
         1 => RChannelLabel::L,

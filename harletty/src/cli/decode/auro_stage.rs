@@ -214,6 +214,7 @@ impl AuroStage {
         };
         let sample_rate = first.frame.sample_rate;
         let mut unfolder = Unfolder::new(&carrier_ids, &outputs);
+        unfolder.set_latency(usize::from(detection.block_size));
         let mut scratch = Vec::new();
         // Replay what was held: the floats are the 24-bit integers exactly.
         for h in held {

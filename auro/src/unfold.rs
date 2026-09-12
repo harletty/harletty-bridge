@@ -152,6 +152,13 @@ impl Unfolder {
         self.latency = 0;
     }
 
+    /// Lag output by `samples` instead of the default [`LATENCY`]. One block
+    /// is enough once the block size is known: a block decodes the moment
+    /// its last sample arrives. Never below what has already been released.
+    pub fn set_latency(&mut self, samples: usize) {
+        self.latency = samples.min(LATENCY);
+    }
+
     /// Take up to `out.len() / ids.len()` frames, interleaved in the order
     /// of `ids`. Returns the frames written.
     pub fn take(&mut self, ids: &[StreamId], out: &mut [i32]) -> usize {

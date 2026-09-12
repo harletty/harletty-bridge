@@ -115,6 +115,16 @@ bed channels, the centre height and the top as static objects. Samples no
 block claims (before the first block, after the last) play as the carrier.
 A track that turns out not to be a carrier is written as before.
 
+The realtime bridge does the same on its DTS-HD path (`bridge/src/
+auro_pipeline.rs`): frames are held back until the verdict — at most two
+of the largest blocks when no block validates, four when blocks validate
+but the layout has not latched — then replayed into the unfolder, and
+every frame from then on is the unfolded layout as labelled fixed
+channels (the corner heights as Tfl/Tfr/Tbl/Tbr, the centre height as
+Tfc, the top as Tc). Output lags input by one block (21 ms at 48 kHz for
+1000-sample blocks); the last block of a stream stays in the unfolder,
+as the bridge has no end-of-stream flush.
+
 ## Corpus
 
 The Trinnov Auro demo clips (DTS-HD MA 7.1 and 5.1, 48 kHz, 24-bit): every
