@@ -559,6 +559,13 @@ impl Configuration {
             Vec::new()
         };
 
+        // Dynamic objects take the IDs 10, 11, … in the order they appear,
+        // matching the `objects:` list of the header. Counting them as they
+        // come, rather than subtracting the bed size from the index, keeps
+        // the IDs right whether or not the bed objects precede them in
+        // `object_data`: a TrueHD payload lists the bed first, a payload
+        // synthesised for a DTS:X or Auro-3D track lists no bed at all.
+        let mut dynamic_rank = 0usize;
         for i in 0..object_count {
             let object_data = &object_element.object_data[i][0];
             let id = if object_data.b_object_in_bed_or_isf {
@@ -572,7 +579,8 @@ impl Configuration {
                     _ => index + 120,
                 }
             } else {
-                i + 10 - bed_index_vec.len()
+                dynamic_rank += 1;
+                dynamic_rank + 9
             };
 
             let mut event: Event = Event::with_id(id as u32);

@@ -366,6 +366,53 @@ mod tests {
 
     /// Guards the y inversion specifically — a mirrored mapping would still
     /// round-trip if it were applied symmetrically, so pin the encoding too.
+    /// The metadata events must carry the IDs the header declares for the
+    /// objects (10, 11, …), or a DAMF reader cannot pair them with their
+    /// tracks. A synthesised payload lists no bed objects, which once made
+    /// the IDs wrap below zero.
+    #[test]
+    fn event_ids_match_the_declared_objects() {
+        use damf::{Configuration, CreationTool, Data, SourceCodec};
+
+        let layout = DtsLayout {
+            bed: vec![SpeakerLabels::L, SpeakerLabels::R, SpeakerLabels::C],
+            bed_sources: vec![
+                BedSource::Speaker(1),
+                BedSource::Speaker(2),
+                BedSource::Speaker(0),
+            ],
+            objects: vec![[-0.5, 0.75, 0.25], [0.5, -0.75, 0.0], [0.0, 0.0, 1.0]],
+            object_sources: vec![0, 1, 2],
+        };
+        let oamd = convert_dts(&layout);
+        let tool = CreationTool {
+            name: "test",
+            version: "0",
+        };
+        let header = Data::with_oamd_payload(
+            &oamd,
+            std::path::Path::new("test"),
+            SourceCodec::DtsX714Plus4,
+            tool,
+        );
+        // Read the IDs back from the serialised YAML, the form a reader sees.
+        let ids_in = |yaml: &str| -> Vec<u32> {
+            yaml.lines()
+                .filter_map(|line| line.trim().strip_prefix("- ID: "))
+                .filter_map(|id| id.trim().parse().ok())
+                .collect()
+        };
+        let declared: Vec<u32> = ids_in(&header.serialize_damf())
+            .into_iter()
+            .filter(|id| *id >= 10)
+            .collect();
+        assert_eq!(declared, vec![10, 11, 12]);
+
+        let mut events = Configuration::with_oamd_payload(&oamd, 48_000, 0).expect("payload");
+        let ids = ids_in(&events.serialize_events(false));
+        assert_eq!(ids, declared, "events name the declared objects");
+    }
+
     #[test]
     fn oamd_y_axis_is_inverted_relative_to_damf() {
         let front = damf_pos_to_oamd([0.0, 1.0, 0.0]);
