@@ -447,17 +447,106 @@ fn decode_parameter_points(
             if channel_indices.len() != data_points || vectors.len() != data_points {
                 return Err(ParseError::InvalidHeader("joc_sparse_points"));
             }
-            // The public documentation for this sparse coding path is ambiguous and
-            // reconstructing it naively produces obvious artifacts, so fall back to a zero
-            // matrix until the coding path is specified well enough to decode safely.
+            // Clause 6.6.2 Pseudocode 2. Sparse mode sources each parameter band
+            // from exactly one input channel, so instead of a coefficient per
+            // channel it transmits the channel to use and a single coefficient.
+            // Both arrive differentially, as steps around the previous band.
+            //
+            // Three things about that pseudocode do not survive contact with
+            // real streams, and between them they are why this path used to be
+            // stubbed out. Each was settled on eleven E-AC-3 JOC streams
+            // carrying 1 940 sparse frames between them - 29 100 sparse
+            // objects, all on the coarse quantizer - by comparing every one
+            // against the nearest dense frame on each side, which cannot have
+            // moved much in 32 ms. The figures below are that correlation. For
+            // scale, one dense frame predicts the next at 0,714 on the same
+            // measure, so the 0,667 this code reaches is most of what the
+            // measure allows, while Pseudocode 2 read exactly as printed
+            // scores 0,047 - no agreement at all.
+            //
+            // Pseudocode 2 uses one `offset` - 50, or 100 for the fine
+            // quantizer - for two different jobs, and only one of them is right.
+            //
+            // As the value the chain starts from it is correct as published.
+            // Raising it improves agreement smoothly up to 0,667 at 50 and then
+            // collapses to -0,312 at 51, because 50 is the largest start the
+            // coded chains survive: the same 111 911 bands wrap past the top of
+            // the quantizer at every start from 45 to 50, and 2 287 more do at
+            // 51. Pseudocode 3 beside it seeds the dense chain from a different
+            // constant - 48 or 96, the quantizer's zero - so the sparse 50 is a
+            // deliberate coded offset and not a drafting slip.
+            //
+            // As the value every *other* channel takes it is wrong, because
+            // clause 6.6.4 dequantizes about joc_num_quant/2 - 48 or 96 - so an
+            // unnamed channel would come out at a gain of 0,4, at either
+            // quantizer, rather than silent, which is the opposite of sparse.
+            // Filling those channels with the quantizer's zero instead scores
+            // 0,667 against 0,648. The successor tool agrees: A-JOC, in ETSI
+            // TS 103 190-2, fills the channels its sparse mask does not select
+            // with (nquant-1)/2, which its dequantization table maps to exactly
+            // 0, and clause 6.3.6.2.6 says an untransmitted matrix element
+            // "shall be set to a default value of 0,0" because that input "is
+            // not mixed into the reconstruction". So the chain starts at 50/100
+            // and unnamed channels take the quantizer's zero.
+            //
+            // Its channel step is written as the sum of two *transmitted*
+            // indices, `joc_channel_idx[pb-1] + joc_channel_idx[pb]`. Read that
+            // way an unbroken run of zeroes walks the object off its channel
+            // after one band. Read as a running total - what the accumulator's
+            // own name, joc_channel_idx_mod, points at, and what makes the 1-bit
+            // Huffman codeword for a step of zero mean "same channel as the last
+            // band" - agreement nearly triples (0,233 to 0,667). So the step
+            // applies to the previous band's *resolved* channel.
+            //
+            // Its coefficient step is written as `joc_mix_mtx_q[ch][pb-1]` for
+            // the named channel, which restarts the chain from whatever that
+            // channel last held - the fill value - every time the object moves
+            // to a different channel. The chain belongs to the object rather
+            // than to the channel: carrying it across those moves agrees better
+            // (0,667 against 0,557) and lands fewer bands on the quantizer's
+            // rails.
+            let gain_step = 0.2f32 - quantization_table as f32 * 0.1f32;
+            // joc_num_quant, and the quantized value that clause 6.6.4
+            // dequantizes to a gain of zero.
+            let quantization_steps = (quantization_table as i32 + 1) * 96;
+            let center = quantization_steps / 2;
+            // The chain's own starting point, the `offset` Pseudocode 2
+            // publishes: two coarse steps above that zero, four fine ones, and
+            // a gain of 0,4 either way.
+            let chain_offset = (quantization_table as i32 + 1) * 50;
+
             for data_point in 0..data_points {
                 if channel_indices[data_point].len() != bands || vectors[data_point].len() != bands
                 {
                     return Err(ParseError::InvalidHeader("joc_sparse_bands"));
                 }
-                for channel in &mut mix_matrix[data_point] {
-                    for band in &mut channel[..bands] {
-                        *band = 0.0;
+                let mut carried = chain_offset;
+                let mut source_channel = 0usize;
+                for band_index in 0..bands {
+                    let step = channel_indices[data_point][band_index] as usize;
+                    source_channel = if band_index == 0 {
+                        step
+                    } else {
+                        (source_channel + step) % channel_count
+                    };
+                    if source_channel >= channel_count {
+                        return Err(ParseError::InvalidHeader("joc_channel_idx"));
+                    }
+
+                    let step = vectors[data_point][band_index] as i32;
+                    carried = (carried + step).rem_euclid(quantization_steps);
+                    for (channel_index, channel) in mix_matrix[data_point][..channel_count]
+                        .iter_mut()
+                        .enumerate()
+                    {
+                        // Only the named channel carries the object; the rest of
+                        // the column is silent, not offset.
+                        let quantized = if channel_index == source_channel {
+                            carried
+                        } else {
+                            center
+                        };
+                        channel[band_index] = (quantized - center) as f32 * gain_step;
                     }
                 }
             }
@@ -583,8 +672,18 @@ mod tests {
         assert_eq!(indices, vec![0, 1, 2, 3, 4, 3, 4]);
     }
 
+    /// Clause 6.6.2 Pseudocode 2 as this decoder reads it, worked through by
+    /// hand.
+    ///
+    /// Point 0 names channel 0 and then steps by 1 and 0, so its bands land on
+    /// channels 0, 1 and 1. The coefficient chain starts at the transmitted
+    /// offset of 50 and never restarts: 50+4, then 54+5 even though that band
+    /// moved to another channel, then 59+6, each dequantized about the
+    /// quantizer's zero of 48. Band 1 is the load-bearing one - restarting the
+    /// chain for the newly named channel would make it 1,4 instead of 2,2.
+    /// Point 1 names channels 1, 1 and 2 and starts its own chain.
     #[test]
-    fn sparse_joc_falls_back_to_silence() {
+    fn sparse_joc_carries_its_chain_across_a_channel_change() {
         let object = JocObject {
             active: true,
             bands_index: Some(1),
@@ -605,18 +704,151 @@ mod tests {
         decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5)
             .expect("points");
 
-        // The zeroed parameter bands are expanded across every subband on the
-        // way out, so whatever the matrices held before is gone entirely.
-        assert!(
-            mix_matrix[0]
-                .iter()
-                .all(|channel| channel.iter().all(|value| *value == 0.0))
-        );
-        assert!(
-            mix_matrix[1]
-                .iter()
-                .all(|channel| channel.iter().all(|value| *value == 0.0))
-        );
+        // Table 54, three-band column: subband 0 is band 0, subbands 3 to 13
+        // are band 1, and everything from 14 up is band 2 - so each band's
+        // value, once decoded, is expected across the whole row it covers, not
+        // just at the raw parameter-band slot it was computed into.
+        const BAND_1: usize = 3;
+        const BAND_2: usize = 14;
+
+        let expected_point_0 = [
+            [1.2, 0.0, 0.0],
+            [0.0, 2.2, 3.4],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ];
+        let expected_point_1 = [
+            [0.0, 0.0, 0.0],
+            [1.8, 3.4, 0.0],
+            [0.0, 0.0, 5.2],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ];
+        for (channel, expected) in mix_matrix[0].iter().zip(expected_point_0) {
+            assert!(
+                (channel[0] - expected[0]).abs() < 1e-6,
+                "{channel:?} {expected:?}"
+            );
+            for subband in [BAND_1, 13] {
+                assert!(
+                    (channel[subband] - expected[1]).abs() < 1e-6,
+                    "{channel:?} {expected:?}"
+                );
+            }
+            for subband in [BAND_2, 63] {
+                assert!(
+                    (channel[subband] - expected[2]).abs() < 1e-6,
+                    "{channel:?} {expected:?}"
+                );
+            }
+        }
+        for (channel, expected) in mix_matrix[1].iter().zip(expected_point_1) {
+            assert!(
+                (channel[0] - expected[0]).abs() < 1e-6,
+                "{channel:?} {expected:?}"
+            );
+            for subband in [BAND_1, 13] {
+                assert!(
+                    (channel[subband] - expected[1]).abs() < 1e-6,
+                    "{channel:?} {expected:?}"
+                );
+            }
+            for subband in [BAND_2, 63] {
+                assert!(
+                    (channel[subband] - expected[2]).abs() < 1e-6,
+                    "{channel:?} {expected:?}"
+                );
+            }
+        }
+    }
+
+    /// A step that walks past the last channel wraps, and a coefficient step
+    /// that walks past the quantizer's top wraps too - clause 6.6.2 takes both
+    /// modulo, so a chain near the top of the range reappears at the bottom
+    /// rather than saturating.
+    #[test]
+    fn sparse_joc_wraps_channel_and_coefficient_steps() {
+        let object = JocObject {
+            active: true,
+            bands_index: Some(1),
+            bands: 3,
+            sparse_coded: true,
+            quantization_table: Some(0),
+            steep_slope: false,
+            data_points: 1,
+            timeslot_offsets: Vec::new(),
+            // Channel 4 stepped by 3 wraps round to channel 2. The chain wraps
+            // on every band too: 50+90 to 44, 44+90 to 38, 38+90 to 32.
+            data: Some(JocObjectData::Sparse {
+                channel_indices: vec![vec![4, 3, 0]],
+                vectors: vec![vec![90, 90, 90]],
+            }),
+        };
+
+        // Seeded with a value no band should leave behind, so "silent" below
+        // means the decode wrote a zero rather than that nothing was written.
+        let mut mix_matrix = [vec![[7.0; 64]; 5], vec![[7.0; 64]; 5]];
+        let mut timeslot_offsets = [0; 2];
+        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5)
+            .expect("points");
+
+        // Table 54, three-band column: subband 0 is band 0, subbands 3 to 13
+        // are band 1, and everything from 14 up is band 2 - each band's value
+        // is expected across the whole row it covers, not just the raw
+        // parameter-band slot it was computed into.
+        const BAND_1: usize = 3;
+        const BAND_2: usize = 14;
+
+        // Band 0 on channel 4: (50 + 90) % 96 = 44, so (44 - 48) * 0.2.
+        assert!((mix_matrix[0][4][0] - -0.8).abs() < 1e-6);
+        assert!((mix_matrix[0][4][2] - -0.8).abs() < 1e-6);
+        // Band 1 moves to channel 2 and the chain carries: (44 + 90) % 96 = 38.
+        assert!((mix_matrix[0][2][BAND_1] - -2.0).abs() < 1e-6);
+        assert!((mix_matrix[0][2][13] - -2.0).abs() < 1e-6);
+        // Band 2 stays on channel 2: (38 + 90) % 96 = 32.
+        assert!((mix_matrix[0][2][BAND_2] - -3.2).abs() < 1e-6);
+        assert!((mix_matrix[0][2][63] - -3.2).abs() < 1e-6);
+        // Everything the bands did not name is silent, not offset - channel 0
+        // across the whole row, and channel 4 outside band 0's row.
+        assert_eq!(mix_matrix[0][0][0], 0.0);
+        assert_eq!(mix_matrix[0][0][63], 0.0);
+        assert_eq!(mix_matrix[0][4][BAND_1], 0.0);
+        assert_eq!(mix_matrix[0][4][BAND_2], 0.0);
+    }
+
+    /// The fine quantizer doubles every constant in the sparse path: 192 steps
+    /// instead of 96, a zero at 96 instead of 48, a chain starting at 100
+    /// instead of 50, and half the gain per step. Only the coarse quantizer
+    /// appears in the streams to hand, so this pins the scaling that the coarse
+    /// tests cannot reach.
+    #[test]
+    fn fine_quantizer_scales_the_sparse_constants() {
+        let object = JocObject {
+            active: true,
+            bands_index: Some(0),
+            bands: 1,
+            sparse_coded: true,
+            quantization_table: Some(1),
+            steep_slope: false,
+            data_points: 1,
+            timeslot_offsets: Vec::new(),
+            data: Some(JocObjectData::Sparse {
+                channel_indices: vec![vec![2]],
+                vectors: vec![vec![5]],
+            }),
+        };
+
+        let mut mix_matrix = [vec![[7.0; 64]; 5], vec![[7.0; 64]; 5]];
+        let mut timeslot_offsets = [0; 2];
+        decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5)
+            .expect("points");
+
+        // (100 + 5) % 192 = 105, dequantized about 96 at 0.1 per step.
+        assert!((mix_matrix[0][2][0] - 0.9).abs() < 1e-6);
+        // And the channels band 0 did not name are silent here too.
+        assert_eq!(mix_matrix[0][0][0], 0.0);
+        assert_eq!(mix_matrix[0][4][0], 0.0);
     }
 
     /// The smooth branches are the ones nearly every block takes, and both
