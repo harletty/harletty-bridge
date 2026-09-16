@@ -105,17 +105,10 @@ fn auro_source_codec(original: auro::Layout) -> SourceCodec {
     }
 }
 
-/// The DAMF codec label of a spatial presentation, as the header writes it.
+/// The DAMF codec label of a spatial presentation, as the header writes it
+/// and as `info --json` reports it.
 pub(crate) fn presentation_label(presentation: XPresentation) -> &'static str {
-    match presentation {
-        XPresentation::Height => "DTS:X-7.1.4",
-        XPresentation::FixedD0 => "DTS:X-7.1.5",
-        XPresentation::ObjectsD1 => "DTS:X-7.1.4+2",
-        XPresentation::ObjectsD3 => "DTS:X-7.1.4+4",
-        XPresentation::ObjectsD4 => "DTS:X-7.1.4+5",
-        XPresentation::ObjectsD0 => "DTS:X-7.1.4+3",
-        XPresentation::ObjectOnly => "DTS:X-5.1+1",
-    }
+    source_codec_for(presentation).label()
 }
 
 /// Which DAMF codec label a spatial presentation is stored under.

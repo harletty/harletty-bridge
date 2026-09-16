@@ -73,6 +73,7 @@ harletty [GLOBAL OPTIONS] <COMMAND>
 
   decode   Decode a stream into audio + Atmos master files
   info     Print stream information and exit
+  taxonomy Print the label taxonomy version as JSON
   help     Print help for a command
 ```
 
@@ -165,6 +166,44 @@ Frames seen  : 33 (0.4 s)
 `Spatial` names the presentation the way `decode` labels the master set
 (`DTS:X-7.1.4`, `DTS:X-7.1.4+2`, `Auro-3D-13.1 (7.1_5H_1T carried in
 7.1)`, …), or `none` for a track that carries neither.
+
+#### Machine-readable info
+
+```sh
+harletty info --json [--max-seconds SECONDS] <INPUT>
+harletty taxonomy
+```
+
+`--json` prints one JSON object on one line of stdout instead of the
+report; logs stay on stderr (`--loglevel off` silences them). It is the
+form a catalogue asks for, so that the decoders and the label set live
+here alone. `--max-seconds` stops the read after about that much audio,
+whatever the codec: the DTS report stops on its own within twenty seconds
+(give it at least two, the time a plain track takes to be called plain);
+TrueHD and E-AC-3 otherwise read the whole input. `taxonomy` prints the
+version fields alone, so a caller knows which label set a binary speaks
+before probing anything.
+
+| Field | Meaning |
+|---|---|
+| `schema` | Shape of the object. Bumped only when a field is removed or changes meaning; a field added keeps it. |
+| `harletty`, `build` | Crate version, and the build line (`git describe`, library version, timestamp). |
+| `taxonomy` | The set of strings `spatial.label` can carry. Bumped whenever a label is added or renamed. |
+| `codec` | `TrueHD`, `EAC3`, `DTS` (core only) or `DTS-HD MA`; `null` when no frame was found, with `error` saying why. |
+| `channels`, `sample_rate` | The compatible bed. TrueHD: the highest channel-based presentation. |
+| `spatial` | `null` for a plain track. Otherwise `label` (the `sourceCodec` `decode` writes), `kind` (`atmos`, `joc`, `dtsx`, `auro`), `objects` and `fixed` (waveform counts when the presentation states them), `experimental`, and for DTS:X the decoder's `presentation` name. |
+| `truehd` | `max_presentation`, `atmos`, `substreams`. |
+| `eac3` | `oamd`, `joc`, `spx` (Spectral Extension seen in use within the bound; measured only here, it takes a decode), `bitstream_id`. |
+| `auro` | `carrier` and `original` layouts. |
+| `frames_seen`, `seconds_seen` | How much was read before the report settled or the bound was reached. |
+
+```json
+{"schema":1,"harletty":"0.7.4","build":"…","taxonomy":1,"codec":"DTS-HD MA",
+ "channels":8,"sample_rate":48000,
+ "spatial":{"label":"DTS:X-7.1.4+3","kind":"dtsx","objects":3,"fixed":4,
+            "experimental":true,"presentation":"ObjectsD0"},
+ "frames_seen":1,"seconds_seen":0.0106}
+```
 
 ## Output files
 

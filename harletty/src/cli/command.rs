@@ -51,6 +51,10 @@ pub enum Commands {
 
     /// Print stream information
     Info(InfoArgs),
+
+    /// Print, as JSON, the version of the label taxonomy `info --json` and
+    /// `decode` emit, and the binary's version.
+    Taxonomy,
 }
 
 #[derive(Debug, Args)]
@@ -129,6 +133,18 @@ pub struct InfoArgs {
     /// Stop after this many access units.
     #[arg(long, value_name = "N")]
     pub units: Option<usize>,
+
+    /// Print one JSON object instead of the report: codec, bed, the spatial
+    /// presentation as `decode` labels it, and the taxonomy version those
+    /// labels belong to. See docs/harletty-cli.md, "Machine-readable info".
+    #[arg(long)]
+    pub json: bool,
+
+    /// Stop after about this many seconds of audio, whatever the codec. The
+    /// DTS report already stops on its own within twenty seconds; TrueHD
+    /// and E-AC-3 otherwise read the whole input.
+    #[arg(long, value_name = "SECONDS")]
+    pub max_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

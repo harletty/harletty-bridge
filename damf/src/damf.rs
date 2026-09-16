@@ -173,6 +173,49 @@ pub enum SourceCodec {
     Auro3d,
 }
 
+impl SourceCodec {
+    /// Every label, for the taxonomy checks.
+    pub const ALL: [SourceCodec; 14] = [
+        SourceCodec::TrueHD,
+        SourceCodec::Eac3Joc,
+        SourceCodec::DtsX714,
+        SourceCodec::DtsX715,
+        SourceCodec::DtsX714Plus2,
+        SourceCodec::DtsX714Plus4,
+        SourceCodec::DtsX714Plus5,
+        SourceCodec::DtsX714Plus3,
+        SourceCodec::DtsX51Plus1,
+        SourceCodec::Auro3d91,
+        SourceCodec::Auro3d101,
+        SourceCodec::Auro3d111,
+        SourceCodec::Auro3d131,
+        SourceCodec::Auro3d,
+    ];
+
+    /// The string this codec is written as: the `sourceCodec` of the DAMF
+    /// header, and the label `harletty info --json` reports. The same
+    /// strings as the serde names above, kept in step by a test, so a
+    /// caller can hold the label without serialising a header.
+    pub fn label(self) -> &'static str {
+        match self {
+            SourceCodec::TrueHD => "TrueHD",
+            SourceCodec::Eac3Joc => "EAC3-JOC",
+            SourceCodec::DtsX714 => "DTS:X-7.1.4",
+            SourceCodec::DtsX715 => "DTS:X-7.1.5",
+            SourceCodec::DtsX714Plus2 => "DTS:X-7.1.4+2",
+            SourceCodec::DtsX714Plus4 => "DTS:X-7.1.4+4",
+            SourceCodec::DtsX714Plus5 => "DTS:X-7.1.4+5",
+            SourceCodec::DtsX714Plus3 => "DTS:X-7.1.4+3",
+            SourceCodec::DtsX51Plus1 => "DTS:X-5.1+1",
+            SourceCodec::Auro3d91 => "Auro-3D-9.1",
+            SourceCodec::Auro3d101 => "Auro-3D-10.1",
+            SourceCodec::Auro3d111 => "Auro-3D-11.1",
+            SourceCodec::Auro3d131 => "Auro-3D-13.1",
+            SourceCodec::Auro3d => "Auro-3D",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 enum Fps {
     #[serde(rename = "23.976")]
@@ -938,6 +981,21 @@ fn unquote(scalar: &str) -> String {
 /// `CreationTool { name: env!("CARGO_PKG_NAME"), version: env!("CARGO_PKG_VERSION") }`,
 /// so pinning a fixture here checks that whatever the caller declares reaches
 /// `creationTool` verbatim.
+#[test]
+fn source_codec_labels_are_the_serde_names() {
+    for codec in SourceCodec::ALL {
+        let written = serde_yaml_ng::to_string(&codec).unwrap();
+        assert_eq!(written.trim(), codec.label(), "{codec:?}");
+    }
+    let distinct: std::collections::BTreeSet<&str> =
+        SourceCodec::ALL.iter().map(|codec| codec.label()).collect();
+    assert_eq!(
+        distinct.len(),
+        SourceCodec::ALL.len(),
+        "labels are distinct"
+    );
+}
+
 #[cfg(test)]
 const TEST_TOOL: CreationTool = CreationTool {
     name: "harletty",
