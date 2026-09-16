@@ -149,6 +149,11 @@ pub enum SourceCodec {
     /// objects.
     #[serde(rename = "DTS:X-7.1.4+5")]
     DtsX714Plus5,
+    /// Seven-feed presentation (the D0 marker over a three-channel first
+    /// set): 7.1 bed, four fixed heights and the single declared object as
+    /// three components at the bed's C, L and R positions.
+    #[serde(rename = "DTS:X-7.1.4+3")]
+    DtsX714Plus3,
     /// Object-only presentation on a 5.1 bed: one object waveform, no height
     /// quartet (the D0 marker with a 5.1 reference layout).
     #[serde(rename = "DTS:X-5.1+1")]

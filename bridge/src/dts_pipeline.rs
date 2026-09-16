@@ -1239,6 +1239,77 @@ mod tests {
     }
 
     #[test]
+    fn three_component_d0_form_presents_the_bed_plus_three_objects_and_heights() {
+        let component = vec![0.20, -0.10];
+        let copy: Vec<f32> = component.iter().map(|s| s * 0.365).collect();
+        let heights_pcm: Vec<Vec<f32>> =
+            (0..4).map(|k| noise(7 + k as u64, SAMPLE_COUNT)).collect();
+        let dry_c = vec![0.05, -0.05];
+        let dry_l = vec![0.07, -0.02];
+        let dry_r = vec![-0.03, 0.06];
+        let mut samples = full_bed();
+        samples[0] = Some(folded(&dry_c, &[(&component, 1.0)]));
+        samples[1] = Some(folded(&dry_l, &[(&copy, 1.0), (&heights_pcm[0], Q55)]));
+        samples[2] = Some(folded(&dry_r, &[(&copy, 1.0), (&heights_pcm[1], Q55)]));
+        let mut extension = vec![component.clone(), copy.clone(), copy.clone()];
+        extension.extend(heights_pcm.iter().cloned());
+        let mut hd = hd_frame(samples, extension);
+        hd.x_present = false;
+        hd.x_imax = true;
+
+        let unity = |column: usize| {
+            let mut columns = [0.0; 8];
+            columns[column] = 1.0;
+            BedFold::Known(columns)
+        };
+        let sources = [
+            object(0, 0, unity(0)),
+            object(-60, 0, unity(1)),
+            object(60, 0, unity(2)),
+            heights(Q55)[0],
+            heights(Q55)[1],
+            heights(Q55)[2],
+            heights(Q55)[3],
+        ];
+        let mut state = state_with(XMetadata::from_sources(&sources));
+        let (frame, emitted) = build(&hd, &mut state);
+
+        assert!(emitted, "the components are object channels");
+        assert_eq!(state.locked, Some(XPresentation::ObjectsD0));
+        assert_eq!(frame.channel_count, 8 + 4 + 3);
+        assert_eq!(
+            &frame.channel_labels.as_slice()[8..],
+            &[
+                RChannelLabel::Tfl,
+                RChannelLabel::Tfr,
+                RChannelLabel::Tbl,
+                RChannelLabel::Tbr,
+                RChannelLabel::Object,
+                RChannelLabel::Object,
+                RChannelLabel::Object,
+            ]
+        );
+        for sample in 0..SAMPLE_COUNT {
+            let row = &frame.pcm[sample * 15..(sample + 1) * 15];
+            assert_pcm_close(row[0], dry_c[sample]);
+            assert_pcm_close(row[1], dry_l[sample]);
+            assert_pcm_close(row[2], dry_r[sample]);
+            for (slot, feed) in (3..7).chain(0..3).enumerate() {
+                assert_pcm_close(row[8 + slot], hd.x_samples[feed][sample]);
+            }
+        }
+        assert_eq!(frame.metadata.len(), 1);
+        let metadata = &frame.metadata[0];
+        assert_eq!(metadata.object_channels.len(), 3);
+        assert_eq!(metadata.events.len(), 3);
+        assert_eq!(metadata.events[0].pos[2], 0.0, "ear level");
+        assert!(
+            metadata.events[1].pos[0] < 0.0 && metadata.events[2].pos[0] > 0.0,
+            "the left and right components sit on their sides"
+        );
+    }
+
+    #[test]
     fn object_only_variant_presents_a_5_1_bed_plus_one_object() {
         let object_pcm = vec![0.20, -0.10];
         let dry_c = vec![0.05, -0.05];

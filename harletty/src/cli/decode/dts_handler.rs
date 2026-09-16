@@ -113,6 +113,7 @@ pub(crate) fn presentation_label(presentation: XPresentation) -> &'static str {
         XPresentation::ObjectsD1 => "DTS:X-7.1.4+2",
         XPresentation::ObjectsD3 => "DTS:X-7.1.4+4",
         XPresentation::ObjectsD4 => "DTS:X-7.1.4+5",
+        XPresentation::ObjectsD0 => "DTS:X-7.1.4+3",
         XPresentation::ObjectOnly => "DTS:X-5.1+1",
     }
 }
@@ -129,6 +130,7 @@ fn source_codec_for(presentation: XPresentation) -> SourceCodec {
         XPresentation::ObjectsD1 => SourceCodec::DtsX714Plus2,
         XPresentation::ObjectsD3 => SourceCodec::DtsX714Plus4,
         XPresentation::ObjectsD4 => SourceCodec::DtsX714Plus5,
+        XPresentation::ObjectsD0 => SourceCodec::DtsX714Plus3,
         XPresentation::ObjectOnly => SourceCodec::DtsX51Plus1,
     }
 }

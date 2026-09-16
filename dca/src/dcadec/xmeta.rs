@@ -10,7 +10,9 @@
 //!   position without first removing that contribution plays it twice. The
 //!   standard profile states the fold in its type-2 matrix; the alternate
 //!   profiles state the height fold in their type-3 rows and each object's
-//!   fold in the sparse reference rows attached to its position record.
+//!   fold in the sparse reference rows attached to its position record. The
+//!   three-component form under the D0 marker names, for each component,
+//!   the bed speaker it was added to; its fold there is unity.
 //! - **Where the objects sit.** Alternate-profile records carry a spherical
 //!   position per object.
 //!
@@ -143,6 +145,14 @@ const FIXED_HEIGHT_COUNT: usize = 4;
 const TYPE3_CONTROL: u32 = 0x3fa;
 const UNITY_CODE: u32 = 61;
 const CENTRE_HEIGHT_MASK: u32 = 0x80;
+/// Optional-field value selecting the component form of the type-241
+/// element.
+const TYPE241_COMPONENT_FORM: u32 = 0x04;
+/// Continuation field after a component's position: another one follows.
+const COMPONENT_CONTINUES: u32 = 3;
+/// Most components one declared object can carry: the feeds the widest
+/// profile has beside its height quartet.
+const MAX_COMPONENTS: usize = MAX_SOURCES - FIXED_HEIGHT_COUNT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XMetadataError {
@@ -910,11 +920,24 @@ fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<(usi
     }
     let width = 4 * (b.read(3)? as usize + 1);
     let reference_mask = b.read(width)?;
-    let (_, columns) = reference_speakers(reference_mask)
+    let (speakers, columns) = reference_speakers(reference_mask)
         .ok_or(XMetadataError::Unsupported("type-241 reference layout"))?;
-    // No optional levels, additional layouts or timing parameters; precision
-    // zero gives three-bit indices and two-bit modes.
-    b.expect(8, 0, "type-241 optional fields")?;
+    // The optional-field byte. Zero: no optional levels, additional layouts
+    // or timing parameters, and precision zero gives three-bit indices and
+    // two-bit modes. The one other value seen selects the component form.
+    match b.read(8)? {
+        0 => {}
+        TYPE241_COMPONENT_FORM => {
+            return parse_type241_components(
+                &mut b,
+                count,
+                &speakers[..columns],
+                reference_mask,
+                objects,
+            );
+        }
+        _ => return Err(XMetadataError::Unsupported("type-241 optional fields")),
+    }
     let mut indices = [0usize; MAX_SOURCES];
     let mut modes = [0u32; MAX_SOURCES];
     for record in 0..count {
@@ -1011,6 +1034,94 @@ fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<(usi
     }
     b.align("type-241 padding")?;
     Ok((b.pos / 8, count, reference_mask))
+}
+
+/// The component form of the type-241 element, seen on one IMAX-labelled
+/// stream under the D0 marker. The single declared object is transmitted as
+/// three waveforms, its contributions to the compatible bed's C, L and R,
+/// and this element carries one position per waveform naming that speaker
+/// (0°, -30° and +30° at ear level, distance 1). The bits between the
+/// optional-field byte and the first position have no established reading;
+/// they are pinned to their observed values, so any other form is reported
+/// rather than guessed at. Each component's fold is unity into the speaker
+/// its position names, measured on the stream's audio: subtracting the three
+/// waveforms from C, L and R leaves residuals uncorrelated with them (see
+/// the repository's `docs/private-metadata-probe.md`).
+fn parse_type241_components(
+    b: &mut Bits<'_>,
+    count: usize,
+    reference_speakers: &[u8],
+    reference_mask: u32,
+    objects: &mut [Option<SourceMetadata>],
+) -> R<(usize, usize, u32)> {
+    if count != 1 {
+        return Err(XMetadataError::Unsupported(
+            "component-form declaration count",
+        ));
+    }
+    // One active declaration whose two-bit field is 1, as on the
+    // IMAX-labelled 5.1 variant, then forty bits of declaration and
+    // parameter fields in their observed form.
+    b.expect(1, 1, "inactive component-form declaration")?;
+    b.expect(2, 1, "component-form declaration field")?;
+    b.expect(20, 0x81000, "component-form declaration")?;
+    b.expect(20, 0x00940, "component-form parameters")?;
+    // The record header of the other forms, with a four-bit option field of
+    // 3 where mode-0 records carry 1.
+    b.expect(4, 3, "component record options")?;
+    b.expect(7, 0x20, "component position options")?;
+    b.expect(1, 1, "component gain present")?;
+    b.expect(1, 1, "component position flag")?;
+    let mut components = 0usize;
+    loop {
+        if components == MAX_COMPONENTS {
+            return Err(XMetadataError::Unsupported("component count"));
+        }
+        b.expect(2, 0, "component position mode")?;
+        b.expect(6, UNITY_CODE, "component position gain")?;
+        let distance = b.read(6)?;
+        let azimuth = b.read(8)?;
+        let elevation = b.read(7)?;
+        b.expect(1, 0, "component extent")?;
+        let position = SphericalPosition::from_codes(azimuth, elevation, distance);
+        objects[components] = Some(SourceMetadata {
+            role: SourceRole::Object {
+                position,
+                centre_height_alternative: false,
+            },
+            fold: component_fold(position, reference_speakers),
+        });
+        components += 1;
+        match b.read(2)? {
+            COMPONENT_CONTINUES => {}
+            0 => break,
+            _ => return Err(XMetadataError::Unsupported("component continuation")),
+        }
+    }
+    b.align("component-form padding")?;
+    Ok((b.pos / 8, components, reference_mask))
+}
+
+/// Unity into the reference column of the bed speaker a component's
+/// position names: centre, left or right at ear level. A component at any
+/// other position, or naming a speaker the reference layout lacks, has no
+/// established fold.
+fn component_fold(position: SphericalPosition, reference_speakers: &[u8]) -> BedFold {
+    let speaker = match (
+        position.azimuth_half_degrees,
+        position.elevation_half_degrees,
+    ) {
+        (0, 0) => 0,
+        (-60, 0) => 1,
+        (60, 0) => 2,
+        _ => return BedFold::Unknown,
+    };
+    let Some(column) = reference_speakers.iter().position(|&s| s == speaker) else {
+        return BedFold::Unknown;
+    };
+    let mut fold = [0.0; REFERENCE_CHANNELS];
+    fold[column] = 1.0;
+    BedFold::Known(fold)
 }
 
 #[cfg(test)]
@@ -1215,8 +1326,18 @@ pub(crate) mod fixtures {
             }
         }
         w.align();
-        let type241 = w.bytes();
+        let mut prefix = w.bytes();
+        prefix.extend_from_slice(&type3_bytes(height_rows, explicit_type3_mask));
+        let mut payload = crc_appended(prefix);
+        payload.extend_from_slice(&XLL_X_ALT_OUTER_SUFFIX);
+        payload.extend_from_slice(&[0xb2, 0, 0, 0, 0, 0, 0, 0]);
+        payload
+    }
 
+    /// The type-3 element over the 7.1 full layout: `height_rows[i]` is
+    /// `(full-layout mask, bed gain code)` for height row `i`; its height
+    /// column is set at unity.
+    fn type3_bytes(height_rows: [(u32, u32); 4], explicit_type3_mask: bool) -> Vec<u8> {
         let mut w = BitWriter::new();
         layout_header_bits(&mut w, 3, FULL_MASK_7_1, explicit_type3_mask);
         w.push(2, 5)
@@ -1234,10 +1355,89 @@ pub(crate) mod fixtures {
             }
         }
         w.align();
-        let type3 = w.bytes();
+        w.bytes()
+    }
 
-        let mut prefix = type241;
-        prefix.extend_from_slice(&type3);
+    /// One component position as `(distance, azimuth, elevation)` codes.
+    pub(crate) type ComponentPosition = (u32, u32, u32);
+
+    /// The three component positions of the corpus stream: C, L and R at
+    /// ear level, distance 1.
+    pub(crate) const CORPUS_COMPONENTS: [ComponentPosition; 3] =
+        [(63, 120, 60), (63, 100, 60), (63, 140, 60)];
+
+    /// The smallest (silent) frame's extension payload from the
+    /// three-component corpus stream: the 52-byte metadata prefix, the
+    /// outer control, a three-channel first set and the height quartet.
+    pub(crate) const D0_THREE_COMPONENT_PAYLOAD: [u8; 124] = [
+        0xf1, 0x40, 0x00, 0xd0, 0x30, 0x28, 0x4b, 0x04, 0xb0, 0x20, 0x00, 0x01, 0x28, 0x06, 0x83,
+        0x3d, 0xfd, 0xe1, 0xe3, 0x3d, 0xfd, 0x91, 0xe3, 0x3d, 0xfe, 0x31, 0xe0, 0x03, 0x00, 0x08,
+        0x81, 0xf4, 0xe2, 0x1a, 0xc4, 0x04, 0x7f, 0x40, 0x25, 0xbf, 0xa0, 0x49, 0xbf, 0xa8, 0x81,
+        0xbf, 0xb1, 0x01, 0xbf, 0xa0, 0x28, 0x3f, 0x03, 0x34, 0x38, 0x8c, 0x4f, 0x00, 0xb2, 0x7c,
+        0x06, 0x08, 0x04, 0x12, 0x67, 0x02, 0x4b, 0xde, 0xf8, 0x05, 0x20, 0x00, 0x00, 0x0b, 0xb4,
+        0x08, 0x00, 0x94, 0xa6, 0x80, 0x00, 0x40, 0x00, 0x00, 0x00, 0x02, 0x34, 0x38, 0x8c, 0x4f,
+        0x00, 0xc2, 0xc6, 0x03, 0x04, 0x38, 0x00, 0xf1, 0xa3, 0x03, 0xcf, 0xef, 0x7c, 0x02, 0x9c,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xcf, 0xc4, 0x08, 0x00, 0x94, 0xa6, 0x80,
+        0x00, 0x40, 0x00, 0x00,
+    ];
+
+    /// The component form under the D0 marker: one declaration, the
+    /// observed fixed fields, one position per component, then the type-3
+    /// element, the outer control suffix and a few bytes.
+    pub(crate) fn component_payload(
+        components: &[ComponentPosition],
+        height_rows: [(u32, u32); 4],
+    ) -> Vec<u8> {
+        component_payload_with(
+            components,
+            height_rows,
+            TYPE241_COMPONENT_FORM,
+            COMPONENT_CONTINUES,
+        )
+    }
+
+    /// `optional_field` and `continues` let a test write the unfamiliar
+    /// values the reader must refuse.
+    pub(crate) fn component_payload_with(
+        components: &[ComponentPosition],
+        height_rows: [(u32, u32); 4],
+        optional_field: u32,
+        continues: u32,
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.push(0xf1, 8)
+            .push(0x40, 8)
+            .push(0, 4)
+            .push(0, 1)
+            .push(1, 4)
+            .push(1, 1)
+            .push(0, 1)
+            .push(1, 1)
+            .push(0, 4);
+        w.push(0, 1)
+            .push(0, 1)
+            .push(1, 1)
+            .push(1, 1)
+            .push(0, 2)
+            .push(0, 3);
+        w.push(2, 3)
+            .push(REFERENCE_MASK_7_1, 12)
+            .push(optional_field, 8);
+        w.push(1, 1).push(1, 2).push(0x81000, 20).push(0x00940, 20);
+        w.push(3, 4).push(0x20, 7).push(1, 1).push(1, 1);
+        for (index, &(distance, azimuth, elevation)) in components.iter().enumerate() {
+            w.push(0, 2)
+                .push(UNITY_CODE, 6)
+                .push(distance, 6)
+                .push(azimuth, 8)
+                .push(elevation, 7)
+                .push(0, 1);
+            let last = index + 1 == components.len();
+            w.push(if last { 0 } else { continues }, 2);
+        }
+        w.align();
+        let mut prefix = w.bytes();
+        prefix.extend_from_slice(&type3_bytes(height_rows, false));
         let mut payload = crc_appended(prefix);
         payload.extend_from_slice(&XLL_X_ALT_OUTER_SUFFIX);
         payload.extend_from_slice(&[0xb2, 0, 0, 0, 0, 0, 0, 0]);
@@ -1639,6 +1839,133 @@ mod tests {
         // C receives the object only; L receives the object and TFL at unity.
         assert!((plan.clean(0, 1.0, 0, &sources) - (1.0 - code46 * 0.1)).abs() < 1e-6);
         assert!((plan.clean(1, 1.0, 0, &sources) - (1.0 - code46 * 0.1 - 0.2)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn component_form_is_three_objects_at_c_l_r_with_unity_folds_and_heights() {
+        let payload = component_payload(&CORPUS_COMPONENTS, HEIGHT_ROWS_55);
+        assert_eq!(
+            &payload[..52],
+            &D0_THREE_COMPONENT_PAYLOAD[..52],
+            "the fixture reproduces the corpus prefix, CRC included"
+        );
+        let metadata = XMetadata::parse(&payload, 7).expect("component-form metadata");
+        assert_eq!(metadata.source_count(), 7);
+        assert_eq!(metadata.reference_speakers(), &[0, 1, 2, 5, 7, 8, 3, 4]);
+        for (feed, (azimuth, column)) in [(0i16, 0usize), (-60, 1), (60, 2)].into_iter().enumerate()
+        {
+            let source = metadata.source(feed).unwrap();
+            let SourceRole::Object {
+                position,
+                centre_height_alternative,
+            } = source.role
+            else {
+                panic!("feed {feed} is an object");
+            };
+            assert!(!centre_height_alternative);
+            assert_eq!(position.azimuth_half_degrees, azimuth);
+            assert_eq!(position.elevation_half_degrees, 0);
+            assert_eq!(position.distance_64ths, 64);
+            let mut expected = [0.0; 8];
+            expected[column] = 1.0;
+            assert_eq!(source.fold, BedFold::Known(expected));
+        }
+        for (feed, speaker) in (3..7).zip(STANDARD_HEIGHTS) {
+            let source = metadata.source(feed).unwrap();
+            assert_eq!(source.role, SourceRole::Height(speaker));
+            let BedFold::Known(columns) = source.fold else {
+                panic!()
+            };
+            assert_eq!(columns.iter().filter(|&&g| g != 0.0).count(), 1);
+            assert_eq!(columns.iter().sum::<f32>(), Q55);
+        }
+
+        let plan = FoldPlan::from_metadata(&metadata);
+        let sources: Vec<Vec<f32>> = (0..7).map(|k| vec![0.01 * (k + 1) as f32]).collect();
+        // C receives component 0 at unity; L component 1 at unity and TFL
+        // (feed 3) at code 55; R component 2 and TFR (feed 4) likewise.
+        assert!((plan.clean(0, 1.0, 0, &sources) - (1.0 - 0.01)).abs() < 1e-6);
+        assert!((plan.clean(1, 1.0, 0, &sources) - (1.0 - 0.02 - Q55 * 0.04)).abs() < 1e-6);
+        assert!((plan.clean(2, 1.0, 0, &sources) - (1.0 - 0.03 - Q55 * 0.05)).abs() < 1e-6);
+        assert!((0..7).all(|feed| plan.source_is_known(feed)));
+        assert!(!plan.touches(3) && !plan.touches(5));
+
+        // The corpus frame itself reads the same way.
+        let corpus = XMetadata::parse(&D0_THREE_COMPONENT_PAYLOAD, 7).expect("corpus frame");
+        assert_eq!(corpus, metadata);
+    }
+
+    #[test]
+    fn component_form_rejects_other_counts_and_unfamiliar_values() {
+        let payload = component_payload(&CORPUS_COMPONENTS, HEIGHT_ROWS_55);
+        for count in [1usize, 3, 5, 6, 8, 9] {
+            assert!(
+                XMetadata::parse(&payload, count).is_err(),
+                "{count} waveforms"
+            );
+        }
+
+        // A component the reader cannot place keeps its position but has no
+        // fold, so the estimator (or muting) takes over for that feed only.
+        let mut components = CORPUS_COMPONENTS;
+        components[1] = (63, 23, 79);
+        let metadata =
+            XMetadata::parse(&component_payload(&components, HEIGHT_ROWS_55), 7).unwrap();
+        assert_eq!(metadata.source(1).unwrap().fold, BedFold::Unknown);
+        assert!(matches!(
+            metadata.source(0).unwrap().fold,
+            BedFold::Known(_)
+        ));
+        let plan = FoldPlan::from_metadata(&metadata);
+        assert!(plan.has_unknown() && !plan.source_is_known(1) && plan.source_is_known(2));
+
+        // The component count is read, not assumed, and the waveform count
+        // must follow it.
+        let two = component_payload(&CORPUS_COMPONENTS[..2], HEIGHT_ROWS_55);
+        assert_eq!(XMetadata::parse(&two, 6).unwrap().source_count(), 6);
+        assert!(XMetadata::parse(&two, 7).is_err());
+        let six = [(63, 120, 60); 6];
+        assert!(XMetadata::parse(&component_payload(&six, HEIGHT_ROWS_55), 9).is_err());
+
+        // Unfamiliar optional-field and continuation values are refused.
+        for optional in [1u32, 2, 3, 5, 8, 0xff] {
+            let payload = component_payload_with(
+                &CORPUS_COMPONENTS,
+                HEIGHT_ROWS_55,
+                optional,
+                COMPONENT_CONTINUES,
+            );
+            assert!(
+                XMetadata::parse(&payload, 7).is_err(),
+                "optional field {optional}"
+            );
+        }
+        for continues in [1u32, 2] {
+            let payload = component_payload_with(
+                &CORPUS_COMPONENTS,
+                HEIGHT_ROWS_55,
+                TYPE241_COMPONENT_FORM,
+                continues,
+            );
+            assert!(
+                XMetadata::parse(&payload, 7).is_err(),
+                "continuation {continues}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_truncation_and_corruption_of_a_component_form_prefix_is_rejected() {
+        let payload = component_payload(&CORPUS_COMPONENTS, HEIGHT_ROWS_55);
+        let (prefix_len, _) = alternate_prefix_len(&payload).unwrap();
+        for end in 0..prefix_len {
+            assert!(XMetadata::parse(&payload[..end], 7).is_err(), "end {end}");
+        }
+        for bit in 0..prefix_len * 8 {
+            let mut damaged = payload.clone();
+            damaged[bit / 8] ^= 1 << (bit % 8);
+            assert!(XMetadata::parse(&damaged, 7).is_err(), "bit {bit}");
+        }
     }
 
     #[test]

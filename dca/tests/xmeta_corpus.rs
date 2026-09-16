@@ -2,8 +2,9 @@
 //! Corpus-gated checks of the private-metadata reader against real streams.
 //!
 //! Inputs come from the `HARLETTY_DTSX_STANDARD_CORPUS`, `HARLETTY_D0_CORPUS`,
-//! `HARLETTY_D1_CORPUS` and `HARLETTY_D3_CORPUS` environment variables; each
-//! test self-skips, loudly, when its input is absent. A green run without the
+//! `HARLETTY_D1_CORPUS`, `HARLETTY_D3_CORPUS`, `HARLETTY_ALT_51_CORPUS` and
+//! `HARLETTY_ALT_LCR_CORPUS` environment variables; each test self-skips,
+//! loudly, when its input is absent. A green run without the
 //! corpus therefore proves nothing about the reader; run these locally.
 
 use std::io::Read;
@@ -232,6 +233,35 @@ fn object_only_variant_on_a_5_1_bed_parses_on_every_frame() {
     assert!(columns[0] > 0.8 && columns[1] > 0.4 && columns[2] > 0.4);
     assert!(columns[3..].iter().all(|&gain| gain == 0.0));
     eprintln!("object-only 5.1: {} frames", survey.frames);
+}
+
+#[test]
+fn three_component_d0_form_parses_on_every_frame() {
+    let Some(bytes) = corpus("HARLETTY_ALT_LCR_CORPUS") else {
+        eprintln!("skipping: HARLETTY_ALT_LCR_CORPUS is not set");
+        return;
+    };
+    let survey = survey(&bytes);
+    assert_eq!(survey.presentation, XPresentation::ObjectsD0);
+    assert_eq!(survey.metadata.source_count(), 7);
+    let folds = height_fold_columns(&survey.metadata, survey.presentation);
+    assert_eq!(folds, vec![(1, Q55), (2, Q55), (4, Q55), (5, Q55)]);
+    for (feed, (azimuth, column)) in [(0i16, 0usize), (-60, 1), (60, 2)].into_iter().enumerate() {
+        let source = survey.metadata.source(feed).unwrap();
+        let SourceRole::Object { position, .. } = source.role else {
+            panic!("feed {feed} is a component of the object");
+        };
+        assert_eq!(position.azimuth_half_degrees, azimuth);
+        assert_eq!(position.elevation_half_degrees, 0);
+        let BedFold::Known(columns) = source.fold else {
+            panic!("a component states its fold");
+        };
+        assert_eq!(columns[column], 1.0);
+        assert_eq!(columns.iter().filter(|&&gain| gain != 0.0).count(), 1);
+    }
+    let plan = FoldPlan::from_metadata(&survey.metadata);
+    assert!((0..7).all(|feed| plan.source_is_known(feed)));
+    eprintln!("three-component D0: {} frames", survey.frames);
 }
 
 #[test]

@@ -340,13 +340,19 @@ fn alternate_layout(payload: &[u8]) -> R<AlternateLayout> {
         alternate_unique_geometry(outer_control, 18, first_geometry_end)?;
     let first_header = alternate_header_at(payload, first_header_offset)
         .ok_or(XllError::Invalid("invalid alternate XLL first header"))?;
-    let expected_first_channels = match profile {
-        AlternateProfile::D0 => 1,
-        AlternateProfile::D1 => 2,
-        AlternateProfile::D3 => 4,
-        AlternateProfile::D4 => 5,
+    // The first set carries the declared objects: one for D0, two for D1,
+    // four for D3, five for D4. The D0 marker also fronts a three-channel
+    // first set, seen on one IMAX-labelled stream whose single declared
+    // object is transmitted as its three contributions to the compatible bed
+    // (C, L, R); the header is CRC-checked like any other, so the channel
+    // count alone tells the two D0 forms apart.
+    let first_channels_known = match profile {
+        AlternateProfile::D0 => matches!(first_header.channels, 1 | 3),
+        AlternateProfile::D1 => first_header.channels == 2,
+        AlternateProfile::D3 => first_header.channels == 4,
+        AlternateProfile::D4 => first_header.channels == 5,
     };
-    if first_header.channels != expected_first_channels {
+    if !first_channels_known {
         return Err(XllError::Invalid(
             "unexpected alternate XLL first channel count",
         ));
@@ -1914,6 +1920,7 @@ mod alt_extension_tests {
 
     const D0_CORPUS_PATH_ENV: &str = "HARLETTY_D0_CORPUS";
     const D1_CORPUS_PATH_ENV: &str = "HARLETTY_D1_CORPUS";
+    const THREE_COMPONENT_CORPUS_PATH_ENV: &str = "HARLETTY_ALT_LCR_CORPUS";
 
     fn exss_size_from_prefix(data: &[u8]) -> Option<usize> {
         let mut bits = BitReader::new(data);
@@ -2172,6 +2179,90 @@ mod alt_extension_tests {
             common_geometry_candidates_between(&d0_outer, 18, 25),
             [(2, 10)]
         );
+    }
+
+    /// The D0 marker over a three-channel first set: the smallest (silent)
+    /// frame of the stream decodes into seven complete waveforms, and the
+    /// same truncations and corruptions that fail the one-channel form fail
+    /// this one.
+    #[test]
+    fn alternate_d0_three_channel_first_set_decodes_seven_sources() {
+        use crate::dcadec::xmeta::fixtures::D0_THREE_COMPONENT_PAYLOAD;
+
+        let payload = D0_THREE_COMPONENT_PAYLOAD.to_vec();
+        let layout = alternate_layout(&payload).expect("three-channel D0 layout");
+        assert_eq!(layout.first.0.channels, 3);
+        let quartet = layout.second.expect("height quartet");
+        assert_eq!(quartet.0.channels, 4);
+
+        let mut decoder = XllDecoder::new();
+        decoder
+            .try_decode_alternate_x_extension_audio(&payload)
+            .expect("decode the three-channel D0 payload");
+        assert_eq!(decoder.x_output.len(), 7);
+        assert!(
+            decoder
+                .x_output
+                .iter()
+                .all(|channel| channel.len() == XLL_X_ALT_FRAME_SAMPLES)
+        );
+        assert!(
+            decoder.x_output.iter().flatten().all(|&sample| sample == 0),
+            "the fixture frame is silent"
+        );
+
+        let required_bytes = decoder.x_bits_consumed.div_ceil(8);
+        let tail_start = required_bytes.saturating_sub(64);
+        for length in (0..96).chain(tail_start..required_bytes) {
+            let mut decoder = XllDecoder::new();
+            assert!(
+                decoder
+                    .try_decode_alternate_x_extension_audio(&payload[..length])
+                    .is_err(),
+                "accepted truncated three-channel D0 payload at {length} bytes"
+            );
+            assert!(decoder.x_output.is_empty());
+        }
+        for byte_offset in [
+            48,
+            layout.first.0.offset,
+            layout.first.0.offset + layout.first.0.size,
+            quartet.0.offset,
+            quartet.0.offset + quartet.0.size,
+        ] {
+            let mut corrupt = payload.clone();
+            corrupt[byte_offset] ^= 1;
+            let mut decoder = XllDecoder::new();
+            assert!(
+                decoder
+                    .try_decode_alternate_x_extension_audio(&corrupt)
+                    .is_err(),
+                "accepted a corrupt byte at {byte_offset}"
+            );
+            assert!(decoder.x_output.is_empty());
+        }
+    }
+
+    #[test]
+    fn alternate_d0_three_channel_corpus_decodes_seven_sources_on_every_frame() {
+        let Some((payloads, runtime_results)) =
+            extension_payloads_from_env(THREE_COMPONENT_CORPUS_PATH_ENV, 9_000, 64 * 1024 * 1024)
+        else {
+            eprintln!("skipping: three-component alternate corpus not present");
+            return;
+        };
+        assert!(
+            !payloads.is_empty(),
+            "the corpus carries extension payloads"
+        );
+        for (payload, result) in payloads.iter().zip(&runtime_results) {
+            assert_eq!(
+                *result,
+                (7, true, None),
+                "a {}-byte payload did not decode into seven complete sources",
+                payload.len()
+            );
+        }
     }
 
     #[test]
