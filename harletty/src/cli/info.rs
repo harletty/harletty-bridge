@@ -67,6 +67,9 @@ fn cmd_info_eac3(args: &InfoArgs) -> Result<()> {
     let mut oamd_seen = false;
     let mut spx_seen = false;
     let mut first_info: Option<eac3::AccessUnitInfo> = None;
+    // The header of the first independent frame, for the report: a dependent
+    // frame describes only the channels it adds to the programme.
+    let mut first_header: Option<eac3::FrameInfo> = None;
     let mut frames = 0u64;
     // Samples of the independent frames, for the bound; a dependent frame
     // extends the same audio and is not counted twice.
@@ -79,6 +82,13 @@ fn cmd_info_eac3(args: &InfoArgs) -> Result<()> {
             Err(_) => None,
         } {
             frames += 1;
+            let header = frame.info();
+            if header.stream_type != eac3::StreamType::Dependent {
+                samples += u64::from(header.samples);
+                if first_header.is_none() {
+                    first_header = Some(header);
+                }
+            }
             if let Ok(info) = eac3::inspect_access_unit(frame.as_bytes()) {
                 for payload in info.payloads() {
                     match payload.parsed {
@@ -86,9 +96,6 @@ fn cmd_info_eac3(args: &InfoArgs) -> Result<()> {
                         eac3::ParsedEmdfPayloadData::Oamd(_) => oamd_seen = true,
                         _ => {}
                     }
-                }
-                if info.frame_type != eac3::FrameType::Dependent {
-                    samples += u64::from(info.num_blocks) * 256;
                 }
                 if first_info.is_none() {
                     first_info = Some(info);
@@ -99,8 +106,8 @@ fn cmd_info_eac3(args: &InfoArgs) -> Result<()> {
                     spx_seen = true;
                 }
             }
-            if let (Some(max), Some(info)) = (args.max_seconds, first_info.as_ref()) {
-                if info.sample_rate > 0 && samples as f64 / f64::from(info.sample_rate) >= max {
+            if let (Some(max), Some(header)) = (args.max_seconds, first_header.as_ref()) {
+                if header.sample_rate > 0 && samples as f64 / f64::from(header.sample_rate) >= max {
                     return Ok(false);
                 }
             }
@@ -112,13 +119,13 @@ fn cmd_info_eac3(args: &InfoArgs) -> Result<()> {
     })?;
 
     if args.json {
-        let Some(info) = first_info.as_ref() else {
-            return InfoReport::not_found("no EAC3 syncframe found in the input").print();
+        let Some(header) = first_header else {
+            return InfoReport::not_found("no independent EAC3 frame found in the input").print();
         };
         let mut report = InfoReport::new();
         report.codec = Some("EAC3");
-        report.channels = Some(u32::from(info.fullband_channels) + u32::from(info.lfe_on));
-        report.sample_rate = Some(info.sample_rate);
+        report.channels = Some(u32::from(header.channels()));
+        report.sample_rate = Some(header.sample_rate);
         report.spatial = joc_seen.then(|| Spatial {
             label: damf::SourceCodec::Eac3Joc.label().to_string(),
             kind: "joc",
@@ -131,10 +138,10 @@ fn cmd_info_eac3(args: &InfoArgs) -> Result<()> {
             oamd: oamd_seen,
             joc: joc_seen,
             spx: spx_seen,
-            bitstream_id: info.bitstream_id,
+            bitstream_id: header.bitstream_id,
         });
         report.frames_seen = frames;
-        report.seconds_seen = samples as f64 / f64::from(info.sample_rate.max(1));
+        report.seconds_seen = samples as f64 / f64::from(header.sample_rate.max(1));
         return report.print();
     }
 
