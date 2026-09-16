@@ -259,7 +259,7 @@ of drift.
   by frame, so an object that moves in the mix moves in the master set;
   the fixed heights become bed channels. The private metadata is read
   from corpus evidence rather than a specification, so the alternate
-  profiles (D0, D1, D3, D4, 5.1+1) are reported as experimental. A
+  profiles (D0, D1, D3, D4, 5.1+1, 7.1.4+3) are reported as experimental. A
   waveform whose bed fold the stream does not state has that fold
   estimated from the bed's audio (see `--no-fold-estimate`), so it plays
   on its own track and leaves the bed.

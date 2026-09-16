@@ -25,8 +25,11 @@
 //! heights named by the type-3 rows, the first feeds are the declared objects,
 //! and D0's single object also declares the centre-height speaker as its
 //! fixed alternative. The object-only variant on a 5.1 bed carries one
-//! declared object and no height quartet at all. They are exposed as presentations rather than as
-//! research defaults, but no listening sign-off exists yet.
+//! declared object and no height quartet at all. A three-channel first set
+//! under the D0 marker carries the single declared object as its three
+//! components at the compatible bed's C, L and R, then the height quartet.
+//! They are exposed as presentations rather than as research defaults, but
+//! no listening sign-off exists yet.
 
 use crate::hd::HdFrame;
 
@@ -65,6 +68,11 @@ pub enum XPresentation {
     /// Nine-feed alternate profile: five objects, then the four fixed
     /// heights.
     ObjectsD4,
+    /// Seven-feed alternate form under the D0 marker: the single declared
+    /// object transmitted as three components, each its contribution to the
+    /// compatible bed at the position it names (C, L and R at ear level),
+    /// then the four fixed heights.
+    ObjectsD0,
     /// Single-feed alternate profile on a 5.1 bed: one object, no fixed
     /// heights. Its envelope carries the first channel set only.
     ObjectOnly,
@@ -118,6 +126,7 @@ impl XPresentation {
             Self::ObjectsD1,
             Self::ObjectsD3,
             Self::ObjectsD4,
+            Self::ObjectsD0,
             Self::ObjectOnly,
         ]
         .into_iter()
@@ -132,6 +141,7 @@ impl XPresentation {
             Self::ObjectsD1 => 6,
             Self::ObjectsD3 => 8,
             Self::ObjectsD4 => 9,
+            Self::ObjectsD0 => 7,
             Self::ObjectOnly => 1,
         }
     }
@@ -149,7 +159,11 @@ impl XPresentation {
     /// Speaker position of each fixed feed, in feed order.
     pub fn fixed_channels(self) -> &'static [SpatialChannel] {
         match self {
-            Self::Height | Self::ObjectsD1 | Self::ObjectsD3 | Self::ObjectsD4 => &HEIGHT_CHANNELS,
+            Self::Height
+            | Self::ObjectsD1
+            | Self::ObjectsD3
+            | Self::ObjectsD4
+            | Self::ObjectsD0 => &HEIGHT_CHANNELS,
             Self::FixedD0 => &D0_CHANNELS,
             Self::ObjectOnly => &[],
         }
@@ -187,7 +201,7 @@ mod tests {
 
     #[test]
     fn alternate_profiles_need_the_imax_flag() {
-        for n in [5usize, 6, 8] {
+        for n in [5usize, 6, 7, 8] {
             let f = frame_with(vec![vec![0.0; 512]; n], false, 512);
             assert_eq!(XPresentation::detect(&f), None, "{n} feeds without x_imax");
         }
@@ -200,6 +214,7 @@ mod tests {
             (6, XPresentation::ObjectsD1),
             (8, XPresentation::ObjectsD3),
             (9, XPresentation::ObjectsD4),
+            (7, XPresentation::ObjectsD0),
             (1, XPresentation::ObjectOnly),
         ] {
             let f = frame_with(vec![vec![0.0; 512]; n], true, 512);
@@ -225,7 +240,7 @@ mod tests {
         assert_eq!(XPresentation::detect(&frame_with(x, false, 512)), None);
 
         // Feed counts that match no presentation.
-        for n in [0usize, 2, 3, 7, 10] {
+        for n in [0usize, 2, 3, 10, 11] {
             let f = frame_with(vec![vec![0.0; 512]; n], true, 512);
             assert_eq!(XPresentation::detect(&f), None, "{n} feeds");
         }
@@ -250,6 +265,7 @@ mod tests {
             (XPresentation::FixedD0, 0..0, 0..5),
             (XPresentation::ObjectsD1, 0..2, 2..6),
             (XPresentation::ObjectsD3, 0..4, 4..8),
+            (XPresentation::ObjectsD0, 0..3, 3..7),
             (XPresentation::ObjectOnly, 0..1, 1..1),
         ] {
             assert_eq!(presentation.object_feeds(), objects, "{presentation:?}");

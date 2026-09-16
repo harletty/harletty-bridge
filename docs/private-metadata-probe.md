@@ -358,6 +358,39 @@ in the clean blocks (code 58 is 0.8414) with nothing in `Ls`, `Rs` or
 the stream as six labeled bed channels plus one object at its transmitted
 position, with the stated fold removed. The DAMF label is `DTS:X-5.1+1`.
 
+### The three-component form under the D0 marker
+
+A third form under the D0 marker, found on one IMAX-labelled demonstration
+stream (4,626 frames on a 7.1 bed), fronts a **three-channel** first set
+where the D0 form has one channel; the height quartet follows as usual and
+the compatible bed decodes unchanged. Its CRC-protected prefix is 52 bytes
+(D0: 48). The type-241 element declares one object, as the marker's low
+nibble says, but its optional-field byte is `0x04` where every other stream
+carries zero, its two-bit declaration field is 1 (as on the 5.1 variant),
+and the record grammar of the other forms does not apply past that byte.
+What can be read: after forty bits of declaration and parameter fields that
+are constant on the stream, a record header (four-bit options 3, position
+options `0x20`, gain and position flags) introduces **three position
+entries**, each a position mode of 0, gain code 61, distance 1 and a
+position at (0°, 0°), (−30°, 0°) and (+30°, 0°), separated by a two-bit
+continuation field of 3 and closed by 0; the type-3 element then starts on
+the next byte and reads as the D1/D3 one (heights at code 55).
+
+The audio identifies the three waveforms: they are perfectly correlated
+(r = 1.000), the second and third being the first at −8.76 dB, and they
+are exactly the declared object's contributions to C, L and R —
+subtracting waveform 0 from C, 1 from L and 2 from R leaves residuals with
+no correlation to them (r = 0.0005, 0.0016 and 0.0003 over the whole
+stream). Each entry therefore labels the bed speaker its waveform was added
+to, at unity. The decoder accepts the three-channel first set under the D0
+marker; the reader maps an entry at one of those three positions to a unity
+fold into that reference column and leaves an entry at any other position
+without a fold. Both hosts present the stream as the 7.1 bed, the four
+heights and three objects at the transmitted positions, under the label
+`DTS:X-7.1.4+3`. One stream is one data point: the constant fields are
+pinned to their observed values and any deviation is reported, not
+interpreted. Corpus check: `HARLETTY_ALT_LCR_CORPUS`.
+
 ### Remaining reading hypotheses
 
 - The control word `0x3fa` reads, against the type-2 grammar, as an inline

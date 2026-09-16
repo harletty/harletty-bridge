@@ -670,6 +670,40 @@ mod tests {
     }
 
     #[test]
+    fn three_component_d0_form_is_three_objects_and_four_heights() {
+        let bed_only = DtsLayout::from_hd(&[0, 1, 2, 3, 4, 5, 7, 8], None, None, false);
+        let layout = DtsLayout::from_hd(
+            &[0, 1, 2, 3, 4, 5, 7, 8],
+            Some(XPresentation::ObjectsD0),
+            None,
+            false,
+        );
+        assert_eq!(
+            layout.bed.len(),
+            bed_only.bed.len() + 4,
+            "the four heights join the bed"
+        );
+        assert_eq!(
+            layout.object_sources,
+            vec![0, 1, 2],
+            "the three components are the objects"
+        );
+        let feeds: Vec<_> = layout
+            .bed_sources
+            .iter()
+            .filter_map(|s| match s {
+                BedSource::Feed(feed) => Some(*feed),
+                BedSource::Speaker(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            feeds,
+            vec![3, 4, 5, 6],
+            "heights are feeds 3..7, in bed order"
+        );
+    }
+
+    #[test]
     fn d1_is_two_objects_and_four_heights() {
         let bed_only = DtsLayout::from_hd(&[0, 1, 2, 3, 4, 5, 7, 8], None, None, false);
         let layout = DtsLayout::from_hd(
