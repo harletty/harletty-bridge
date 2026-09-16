@@ -138,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "auro"
-version = "0.7.4"
+version = "0.8.0"
 
 [[package]]
 name = "autocfg"
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "damf"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_yaml_ng",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "dca"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "log",
  "rustfft",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "eac3"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "log",
  "rustfft",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "harletty"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "auro",
@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "harletty-bridge"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "abi_stable",
  "anyhow",

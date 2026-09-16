@@ -1,6 +1,6 @@
 [package]
 name = "harletty-bridge"
-version = "0.7.4"
+version = "0.8.0"
 edition = "2024"
 # The sources in this crate are Apache-2.0 like the rest of the workspace, but
 # the built library links bridge_api, spdif and sys from Omniphony, which are
@@ -27,9 +27,9 @@ bridge_api = { version = "0.3.0", path = "../../Omniphony/omniphony-renderer/bri
 spdif = { version = "0.1.0", path = "../../Omniphony/omniphony-renderer/spdif" }
 sys = { version = "0.1.0", path = "../../Omniphony/omniphony-renderer/sys" }
 truehd = { version = "0.7.1" }
-eac3 = { version = "0.7.4", path = "../eac3" }
-dca = { version = "0.7.4", path = "../dca" }
-auro = { version = "0.7.4", path = "../auro" }
+eac3 = { version = "0.8.0", path = "../eac3" }
+dca = { version = "0.8.0", path = "../dca" }
+auro = { version = "0.8.0", path = "../auro" }
 abi_stable = "0.11"
 log = "0.4"
 anyhow = "1.0"
