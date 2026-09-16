@@ -15,18 +15,22 @@ use dca::{
 
 use super::command::InfoArgs;
 use super::decode::dts_handler::presentation_label;
+use super::info_report::{AuroFacts, InfoReport, Spatial};
 use crate::input::InputReader;
 
 const CORE_SYNC: [u8; 4] = dca::SYNCWORD_CORE_BE.to_be_bytes();
 const SUBSTREAM_SYNC: [u8; 4] = dca::SYNCWORD_SUBSTREAM.to_be_bytes();
 /// Seconds of audio inspected at most, for a stream whose lossless frames
-/// are slow to come (peak-bitrate buffering).
-const MAX_SECONDS: u64 = 20;
+/// are slow to come (peak-bitrate buffering), unless `--max-seconds` says
+/// otherwise.
+const DEFAULT_MAX_SECONDS: f64 = 20.0;
 /// Bytes read at most, whatever the sample rate says.
 const MAX_BYTES: usize = 96 * 1024 * 1024;
 
 #[derive(Default)]
 struct Survey {
+    /// Seconds of audio to read at most.
+    max_seconds: f64,
     frames: u64,
     samples: u64,
     sample_rate: u32,
@@ -44,11 +48,49 @@ impl Survey {
     /// or the other; a plain track is called plain once the carrier verdict
     /// is in and two seconds went by without a presentation.
     fn done(&self) -> bool {
-        let seconds = self.samples / u64::from(self.sample_rate.max(1));
+        let seconds = self.seconds();
         self.presentation.is_some()
             || self.auro.is_some()
-            || (self.auro_decided && seconds >= 2)
-            || seconds >= MAX_SECONDS
+            || (self.auro_decided && seconds >= 2.0)
+            || seconds >= self.max_seconds
+    }
+
+    fn seconds(&self) -> f64 {
+        self.samples as f64 / f64::from(self.sample_rate.max(1))
+    }
+
+    /// The same facts as [`Self::print`], for `--json`.
+    fn report(&self) -> InfoReport {
+        let mut report = InfoReport::new();
+        report.codec = Some(if self.lossless { "DTS-HD MA" } else { "DTS" });
+        report.channels = Some(self.bed_channels as u32);
+        report.sample_rate = Some(self.sample_rate);
+        report.frames_seen = self.frames;
+        report.seconds_seen = self.seconds();
+        if let Some(presentation) = self.presentation {
+            report.spatial = Some(Spatial {
+                label: presentation_label(presentation).to_string(),
+                kind: "dtsx",
+                objects: Some(presentation.object_feeds().len() as u32),
+                fixed: Some(presentation.fixed_feeds().len() as u32),
+                experimental: presentation.is_experimental(),
+                presentation: Some(format!("{presentation:?}")),
+            });
+        } else if let Some(detection) = &self.auro {
+            report.spatial = Some(Spatial {
+                label: detection.original.source_codec_label().to_string(),
+                kind: "auro",
+                objects: Some(0),
+                fixed: None,
+                experimental: false,
+                presentation: None,
+            });
+            report.auro = Some(AuroFacts {
+                carrier: detection.carrier.name(),
+                original: detection.original.name(),
+            });
+        }
+        report
     }
 
     fn hd_frame(&mut self, frame: &dca::HdFrame, decoder: &HdDecoder) {
@@ -136,7 +178,10 @@ pub fn cmd_info_dts(reader: &mut InputReader, prefix: Vec<u8>, args: &InfoArgs) 
     let mut buffer = prefix;
     let mut core = PcmDecoder::new();
     let mut hd = HdDecoder::new();
-    let mut survey = Survey::default();
+    let mut survey = Survey {
+        max_seconds: args.max_seconds.unwrap_or(DEFAULT_MAX_SECONDS),
+        ..Survey::default()
+    };
     let mut total = buffer.len();
     let mut chunk = vec![0u8; 256 * 1024];
     loop {
@@ -152,8 +197,14 @@ pub fn cmd_info_dts(reader: &mut InputReader, prefix: Vec<u8>, args: &InfoArgs) 
         buffer.extend_from_slice(&chunk[..read]);
     }
     if survey.frames == 0 {
+        if args.json {
+            return InfoReport::not_found("no DTS frame found in the input").print();
+        }
         println!("No DTS frame found in the input.");
         return Ok(());
+    }
+    if args.json {
+        return survey.report().print();
     }
     survey.print();
     Ok(())

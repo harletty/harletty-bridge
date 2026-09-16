@@ -74,6 +74,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Decode(ref args) => cmd_decode(args, &cli, pb)?,
         Commands::Info(ref args) => cmd_info(args, &cli, pb)?,
+        Commands::Taxonomy => cli::info_report::cmd_taxonomy()?,
     }
 
     Ok(())

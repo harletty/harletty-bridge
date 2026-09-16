@@ -3,6 +3,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::Level;
 
 use super::command::{Cli, InfoArgs};
+use super::info_report::{Eac3Facts, InfoReport, Spatial, TrueHdFacts};
 use crate::codec_probe::{Codec, probe_codec};
 use crate::input::InputReader;
 use crate::timestamp::time_str;
@@ -34,7 +35,11 @@ pub fn cmd_info(args: &InfoArgs, cli: &Cli, multi: Option<&MultiProgress>) -> Re
 
     log::info!("Analyzing TrueHD stream: {}", args.input.display());
 
-    let analysis_result = analyze_stream(&args.input, cli, multi)?;
+    let analysis_result = analyze_stream(&args.input, cli, multi, args.json, args.max_seconds)?;
+
+    if args.json {
+        return truehd_report(analysis_result.as_ref()).print();
+    }
 
     match analysis_result {
         Some((stream_info, _timestamp, frame_count, total_bytes)) => {
@@ -55,10 +60,20 @@ fn cmd_info_eac3(args: &InfoArgs) -> Result<()> {
 
     let mut reader = InputReader::new(&args.input)?;
     let mut extractor = eac3::Extractor::default();
+    // Spectral Extension shows only in a decoded frame; the text report
+    // never paid for that decode and still does not.
+    let mut decoder = args.json.then(eac3::PcmDecoder::new);
     let mut joc_seen = false;
     let mut oamd_seen = false;
+    let mut spx_seen = false;
     let mut first_info: Option<eac3::AccessUnitInfo> = None;
+    // The header of the first independent frame, for the report: a dependent
+    // frame describes only the channels it adds to the programme.
+    let mut first_header: Option<eac3::FrameInfo> = None;
     let mut frames = 0u64;
+    // Samples of the independent frames, for the bound; a dependent frame
+    // extends the same audio and is not counted twice.
+    let mut samples = 0u64;
 
     reader.process_chunks(64 * 1024, |chunk| {
         extractor.push_bytes(chunk);
@@ -67,6 +82,13 @@ fn cmd_info_eac3(args: &InfoArgs) -> Result<()> {
             Err(_) => None,
         } {
             frames += 1;
+            let header = frame.info();
+            if header.stream_type != eac3::StreamType::Dependent {
+                samples += u64::from(header.samples);
+                if first_header.is_none() {
+                    first_header = Some(header);
+                }
+            }
             if let Ok(info) = eac3::inspect_access_unit(frame.as_bytes()) {
                 for payload in info.payloads() {
                     match payload.parsed {
@@ -79,6 +101,16 @@ fn cmd_info_eac3(args: &InfoArgs) -> Result<()> {
                     first_info = Some(info);
                 }
             }
+            if let Some(decoder) = decoder.as_mut() {
+                if decoder.push_access_unit(frame.as_bytes()).is_ok() && decoder.last_spx_in_use() {
+                    spx_seen = true;
+                }
+            }
+            if let (Some(max), Some(header)) = (args.max_seconds, first_header.as_ref()) {
+                if header.sample_rate > 0 && samples as f64 / f64::from(header.sample_rate) >= max {
+                    return Ok(false);
+                }
+            }
             if frames > 200 && joc_seen && oamd_seen {
                 return Ok(false);
             }
@@ -86,12 +118,43 @@ fn cmd_info_eac3(args: &InfoArgs) -> Result<()> {
         Ok(true)
     })?;
 
+    if args.json {
+        let Some(header) = first_header else {
+            return InfoReport::not_found("no independent EAC3 frame found in the input").print();
+        };
+        let mut report = InfoReport::new();
+        report.codec = Some("EAC3");
+        report.channels = Some(u32::from(header.channels()));
+        report.sample_rate = Some(header.sample_rate);
+        report.spatial = joc_seen.then(|| Spatial {
+            label: damf::SourceCodec::Eac3Joc.label().to_string(),
+            kind: "joc",
+            objects: None,
+            fixed: None,
+            experimental: false,
+            presentation: None,
+        });
+        report.eac3 = Some(Eac3Facts {
+            oamd: oamd_seen,
+            joc: joc_seen,
+            spx: spx_seen,
+            bitstream_id: header.bitstream_id,
+        });
+        report.frames_seen = frames;
+        report.seconds_seen = samples as f64 / f64::from(header.sample_rate.max(1));
+        return report.print();
+    }
+
     if let Some(info) = first_info {
         println!("Codec        : EAC3 (Dolby Digital Plus)");
         println!("Bitstream ID : {}", info.bitstream_id);
         println!("Frame type   : {}", info.frame_type);
         println!("Sample rate  : {} Hz", info.sample_rate);
-        println!("Channel mode : {} ch + {}", info.fullband_channels, if info.lfe_on { "LFE" } else { "no LFE" });
+        println!(
+            "Channel mode : {} ch + {}",
+            info.fullband_channels,
+            if info.lfe_on { "LFE" } else { "no LFE" }
+        );
         println!("OAMD         : {}", if oamd_seen { "yes" } else { "no" });
         println!("JOC          : {}", if joc_seen { "yes" } else { "no" });
         println!("Frames seen  : {frames}");
@@ -108,10 +171,71 @@ type AnalysisResultTuple = (
     usize,
 );
 
+/// The TrueHD facts of `analysis`, for `--json`: the bed's channel count is
+/// that of the highest channel-based presentation the stream declares
+/// (presentation 2 when there are three or more substreams), the spatial
+/// block is present when the major sync flags Atmos.
+fn truehd_report(analysis: Option<&AnalysisResultTuple>) -> InfoReport {
+    let Some((analysis, _, frame_count, _)) = analysis else {
+        return InfoReport::not_found("no TrueHD major sync found in the input");
+    };
+    let major_sync = analysis
+        .access_unit
+        .major_sync_info
+        .as_ref()
+        .expect("an analysis result carries its major sync");
+    let map = PresentationMap::for_format_sync(
+        major_sync.format_sync,
+        major_sync.substream_info,
+        major_sync.extended_substream_info,
+    );
+    let presentations =
+        PresentationBuilder::new(major_sync, &analysis.access_unit).build_all_presentations();
+    let channel_presentation = major_sync.substreams.min(3).saturating_sub(1);
+    let seconds = major_sync
+        .format_info
+        .samples_per_au()
+        .map(|samples_per_au| {
+            (*frame_count * samples_per_au) as f64
+                / f64::from(analysis.stream_info.sampling_frequency.max(1))
+        })
+        .unwrap_or(0.0);
+
+    let mut report = InfoReport::new();
+    report.codec = Some("TrueHD");
+    report.channels = presentations
+        .get(channel_presentation)
+        .map(|presentation| u32::from(presentation.channels));
+    report.sample_rate = Some(analysis.stream_info.sampling_frequency);
+    report.spatial = analysis.stream_info.is_atmos.then(|| Spatial {
+        label: damf::SourceCodec::TrueHD.label().to_string(),
+        kind: "atmos",
+        objects: None,
+        fixed: None,
+        experimental: false,
+        presentation: None,
+    });
+    report.truehd = Some(TrueHdFacts {
+        max_presentation: map
+            .max_independent_presentation()
+            .and_then(|presentation| u8::try_from(presentation).ok()),
+        atmos: analysis.stream_info.is_atmos,
+        substreams: major_sync.substreams as u32,
+    });
+    report.frames_seen = *frame_count as u64;
+    report.seconds_seen = seconds;
+    report
+}
+
+/// Read the stream: every frame when `max_seconds` is `None`, otherwise
+/// about that much audio past the major sync. `quiet` keeps the running
+/// report off stdout, for a caller that wants the JSON alone.
 fn analyze_stream(
     input_path: &std::path::Path,
     cli: &Cli,
     multi: Option<&MultiProgress>,
+    quiet: bool,
+    max_seconds: Option<f64>,
 ) -> Result<Option<AnalysisResultTuple>> {
     let mut input_reader = InputReader::new(input_path)?;
     let mut extractor = Extractor::default();
@@ -125,7 +249,11 @@ fn analyze_stream(
     };
     parser.set_fail_level(fail_level);
 
-    let mut context = AnalysisContext::default();
+    let mut context = AnalysisContext {
+        quiet,
+        max_seconds,
+        ..AnalysisContext::default()
+    };
 
     // Create progress bar for frame counting if enabled
     if let Some(multi) = multi {
@@ -147,6 +275,9 @@ fn analyze_stream(
             };
 
             context.process_frame(&frame, &mut parser, cli)?;
+            if context.stop {
+                return Ok(false);
+            }
         }
 
         Ok(true)
@@ -164,6 +295,12 @@ struct AnalysisContext {
     info_displayed: bool,
     pb: Option<ProgressBar>,
     total_bytes: usize,
+    /// Nothing on stdout while reading.
+    quiet: bool,
+    /// Stop once this much audio has gone by, counted from the first frame.
+    max_seconds: Option<f64>,
+    /// Set once the bound is reached.
+    stop: bool,
 }
 
 struct AnalysisResult {
@@ -194,7 +331,9 @@ impl AnalysisContext {
 
                             // Display immediate info now that we have the major sync
                             if !self.info_displayed {
-                                self.display_immediate_info();
+                                if !self.quiet {
+                                    self.display_immediate_info();
+                                }
                                 self.info_displayed = true;
                             }
                         }
@@ -207,7 +346,8 @@ impl AnalysisContext {
 
                                 // Print trim detection immediately when available
                                 // Temporarily pause progress bar for clean output
-                                if let Some(ref pb) = self.pb {
+                                if self.quiet {
+                                } else if let Some(ref pb) = self.pb {
                                     pb.suspend(|| {
                                         print!("Trim detection              ");
                                         if timing != 0 {
@@ -244,6 +384,21 @@ impl AnalysisContext {
         }
 
         self.frame_count += 1;
+
+        if let (Some(max), Some(result)) = (self.max_seconds, &self.analysis_result) {
+            let major_sync = result
+                .access_unit
+                .major_sync_info
+                .as_ref()
+                .expect("an analysis result carries its major sync");
+            if let Ok(samples_per_au) = major_sync.format_info.samples_per_au() {
+                let seconds = (self.frame_count * samples_per_au) as f64
+                    / f64::from(result.stream_info.sampling_frequency.max(1));
+                if seconds >= max {
+                    self.stop = true;
+                }
+            }
+        }
 
         if self.frame_count.is_multiple_of(100) {
             if let Some(ref pb) = self.pb {
