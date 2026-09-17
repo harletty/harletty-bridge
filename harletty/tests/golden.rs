@@ -130,23 +130,31 @@ fn joc_master_set_matches_golden() {
     // 32 - the block after a short block reads back the delay it left behind,
     // so the damage outlives the block that caused it. Two of the twenty-one
     // master-set channels carry it; the other nineteen, and every other frame,
-    // are bit-identical. Both moved channels are near full scale there, so most
-    // of the moved samples change sign rather than shift; the clip's peak does
-    // not move (0.999969 and 0.999970, before and after). And once when the JOC
-    // dequantization step became clause 6.6.4's exact 820/4096 rather than 0,2.
-    // That reads like a 0,098 % correction and is not one: the dense chain
-    // wraps in floating point against a `max` that is itself a multiple of the
-    // step, and 820/4096 is 205/1024, so every product is exact in f32 and the
-    // wrap lands where the integer arithmetic puts it. 0,2 is not representable
-    // in binary, and the rounding drifts chains across that boundary - a band
-    // belonging near the top of the quantizer comes back near the bottom, the
-    // whole 19,2 range wrong. One of the twenty-one channels carries it here;
-    // the other twenty are bit-identical. Channel 6 moves 22 892 of its 72 192
-    // samples, 31,7 %, in 142 runs confined to the last third of the clip
-    // (1,017 s to 1,504 s); 10 645 of those change sign, and the largest delta
-    // is 1,98 full scale - what a near-full-scale sample inverting looks like.
-    // The peak does not move (0.999970 either way). The last four change the
-    // audio on purpose; that is what they are for.
+    // are bit-identical. Neither is anywhere near full scale there, 0,021 and
+    // 0,015 of it at most, and the change is small: 785 samples on channel 6
+    // (samples 49 064 to 50 348) and 510 on channel 0 (49 474 to 49 984), by
+    // at most 40 496 counts of 2^23, 0,0048 full scale, with 60 sign flips on
+    // each; the clip's peak, 0,470 full scale, does not move. And once when the
+    // JOC dequantization step became clause 6.6.4's exact 820/4096 rather than
+    // 0,2. That can be more than a 0,098 % correction: the dense chain wraps in
+    // floating point against a `max` that is itself a multiple of the step,
+    // and 820/4096 is 205/1024, so every product is exact in f32 and the wrap
+    // lands where the integer arithmetic puts it, whereas 0,2 is not
+    // representable in binary and its rounding can drift a chain across that
+    // boundary - a band belonging near the top of the quantizer comes back
+    // near the bottom, the whole 19,2 range wrong. Not here, though: this
+    // fixture's dense coefficients all sit on the fine quantizer ten steps
+    // above zero, a gain of 1,0 that becomes 1,001, and no chain in it lands
+    // on the boundary, so what moves is the 0,098 % alone. One of the
+    // twenty-one channels carries it: channel 6 moves 22 892 of its 72 192
+    // samples, 31,7 %, in 142 runs between 1,017 s and 1,504 s, by at most
+    // 3 853 counts of 2^23 (0,00046 full scale, -67 dBFS) and with no sign
+    // flips; the peak sits on that channel and moves with it, 0,470330 to
+    // 0,470770. These figures were measured on the decoded CAF, 24-bit
+    // big-endian signed, after each merge; the ones this note carried before
+    // for the last two rebases - near-full-scale channels, thousands of sign
+    // flips, a peak of 0,99997 - did not describe this file. The last four
+    // change the audio on purpose; that is what they are for.
     #[cfg(target_arch = "x86_64")]
     {
         let produced_audio = sha256_of(&audio_path);

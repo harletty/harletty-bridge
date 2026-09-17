@@ -635,17 +635,19 @@ fn lerp_matrix(
 }
 
 #[cfg(test)]
-// The expected coefficients below are written out to their last dyadic digit -
-// 1.201171875 is exactly six steps of 820/4096, and 1.2011719 is only the
-// shortest thing that round-trips. Writing what the step actually is keeps the
-// expectations derivable by hand and independent of the constant the decoder
-// uses, which is the whole point of asserting them.
-#[allow(clippy::excessive_precision)]
 mod tests {
     use super::{
         build_object_timeslots, decode_parameter_points, expanded_parameter_band_mapping,
         map_input_channel_indices,
     };
+
+    /// The dequantization step of clause 6.6.4, 820 / (4096 * (1 + idx)) for
+    /// joc_num_quant_idx = 0 and 1: one coarse step, and one fine step, half of
+    /// it. The expected coefficients below are written as multiples of these
+    /// rather than as the decimals they come to, so each can be checked by hand
+    /// against the quantized values the test feeds in.
+    const COARSE_STEP: f32 = 820.0 / 4096.0;
+    const FINE_STEP: f32 = 820.0 / (4096.0 * 2.0);
     use crate::{BedChannel, CorePcmFrame, JocObject, JocObjectData};
 
     #[test]
@@ -737,16 +739,16 @@ mod tests {
         // 17 steps above the quantizer's zero on point 0, and 9, 17 and 26 on
         // point 1.
         let expected_point_0 = [
-            [1.201171875, 0.0, 0.0],
-            [0.0, 2.2021484375, 3.4033203125],
+            [6.0 * COARSE_STEP, 0.0, 0.0],
+            [0.0, 11.0 * COARSE_STEP, 17.0 * COARSE_STEP],
             [0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0],
         ];
         let expected_point_1 = [
             [0.0, 0.0, 0.0],
-            [1.8017578125, 3.4033203125, 0.0],
-            [0.0, 0.0, 5.205078125],
+            [9.0 * COARSE_STEP, 17.0 * COARSE_STEP, 0.0],
+            [0.0, 0.0, 26.0 * COARSE_STEP],
             [0.0, 0.0, 0.0],
             [0.0, 0.0, 0.0],
         ];
@@ -806,8 +808,8 @@ mod tests {
     /// happens to contain. Every start value on both quantizers is swept, and
     /// the two deltas after it carry the chain past the top of the range, so
     /// the first band exercises the `offset + value` branch and the two after
-    /// it the running one. It is also the only place the fine quantizer's dense
-    /// path is decoded end to end.
+    /// it the running one. The golden fixture decodes the fine quantizer's
+    /// dense path too, but only this sweep pins its arithmetic band by band.
     #[test]
     fn dense_decode_wraps_exactly_like_the_integer_quantizer() {
         // Table 54's three-band column: band 0 covers subband 0, band 1 starts
@@ -896,14 +898,14 @@ mod tests {
         const BAND_2: usize = 14;
 
         // Band 0 on channel 4: (50 + 90) % 96 = 44, so (44 - 48) * 820/4096.
-        assert!((mix_matrix[0][4][0] - -0.80078125).abs() < 1e-6);
-        assert!((mix_matrix[0][4][2] - -0.80078125).abs() < 1e-6);
+        assert!((mix_matrix[0][4][0] + 4.0 * COARSE_STEP).abs() < 1e-6);
+        assert!((mix_matrix[0][4][2] + 4.0 * COARSE_STEP).abs() < 1e-6);
         // Band 1 moves to channel 2 and the chain carries: (44 + 90) % 96 = 38.
-        assert!((mix_matrix[0][2][BAND_1] - -2.001953125).abs() < 1e-6);
-        assert!((mix_matrix[0][2][13] - -2.001953125).abs() < 1e-6);
+        assert!((mix_matrix[0][2][BAND_1] + 10.0 * COARSE_STEP).abs() < 1e-6);
+        assert!((mix_matrix[0][2][13] + 10.0 * COARSE_STEP).abs() < 1e-6);
         // Band 2 stays on channel 2: (38 + 90) % 96 = 32.
-        assert!((mix_matrix[0][2][BAND_2] - -3.203125).abs() < 1e-6);
-        assert!((mix_matrix[0][2][63] - -3.203125).abs() < 1e-6);
+        assert!((mix_matrix[0][2][BAND_2] + 16.0 * COARSE_STEP).abs() < 1e-6);
+        assert!((mix_matrix[0][2][63] + 16.0 * COARSE_STEP).abs() < 1e-6);
         // Everything the bands did not name is silent, not offset - channel 0
         // across the whole row, and channel 4 outside band 0's row.
         assert_eq!(mix_matrix[0][0][0], 0.0);
@@ -941,7 +943,7 @@ mod tests {
             .expect("points");
 
         // (100 + 5) % 192 = 105, dequantized about 96 at 820/8192 per step.
-        assert!((mix_matrix[0][2][0] - 0.90087890625).abs() < 1e-6);
+        assert!((mix_matrix[0][2][0] - 9.0 * FINE_STEP).abs() < 1e-6);
         // And the channels band 0 did not name are silent here too.
         assert_eq!(mix_matrix[0][0][0], 0.0);
         assert_eq!(mix_matrix[0][4][0], 0.0);
@@ -998,31 +1000,31 @@ mod tests {
         // towards point 0, reaching it on the last slot of the half.
         let half = &output[1][0];
         assert!((half[0] - 0.0).abs() < 1e-6);
-        assert!((half[BAND_1] - 0.2001953125).abs() < 1e-6);
-        assert!((half[13] - 0.2001953125).abs() < 1e-6);
-        assert!((half[BAND_2] - 0.400390625).abs() < 1e-6);
-        assert!((half[63] - 0.400390625).abs() < 1e-6);
+        assert!((half[BAND_1] - COARSE_STEP).abs() < 1e-6);
+        assert!((half[13] - COARSE_STEP).abs() < 1e-6);
+        assert!((half[BAND_2] - 2.0 * COARSE_STEP).abs() < 1e-6);
+        assert!((half[63] - 2.0 * COARSE_STEP).abs() < 1e-6);
 
         // Midway through the second half: half of the way from point 0 to
         // point 1, band by band.
         let between = &output[2][0];
-        assert!((between[0] - 0.2001953125).abs() < 1e-6);
-        assert!((between[BAND_1] - 0.400390625).abs() < 1e-6);
-        assert!((between[BAND_2] - 0.6005859375).abs() < 1e-6);
+        assert!((between[0] - COARSE_STEP).abs() < 1e-6);
+        assert!((between[BAND_1] - 2.0 * COARSE_STEP).abs() < 1e-6);
+        assert!((between[BAND_2] - 3.0 * COARSE_STEP).abs() < 1e-6);
 
         // And the frame ends on point 1 itself, expanded the same way.
         let end = &output[3][0];
-        assert!((end[0] - 0.400390625).abs() < 1e-6);
-        assert!((end[BAND_1] - 0.6005859375).abs() < 1e-6);
-        assert!((end[13] - 0.6005859375).abs() < 1e-6);
-        assert!((end[BAND_2] - 0.80078125).abs() < 1e-6);
-        assert!((end[63] - 0.80078125).abs() < 1e-6);
+        assert!((end[0] - 2.0 * COARSE_STEP).abs() < 1e-6);
+        assert!((end[BAND_1] - 3.0 * COARSE_STEP).abs() < 1e-6);
+        assert!((end[13] - 3.0 * COARSE_STEP).abs() < 1e-6);
+        assert!((end[BAND_2] - 4.0 * COARSE_STEP).abs() < 1e-6);
+        assert!((end[63] - 4.0 * COARSE_STEP).abs() < 1e-6);
 
         // The matrix carried into the next frame is the last point, expanded -
         // not the raw parameter array, which would zero the top end again on
         // the very next frame's first half.
-        assert!((prev_matrix[0][BAND_2] - 0.80078125).abs() < 1e-6);
-        assert!((prev_matrix[0][63] - 0.80078125).abs() < 1e-6);
+        assert!((prev_matrix[0][BAND_2] - 4.0 * COARSE_STEP).abs() < 1e-6);
+        assert!((prev_matrix[0][63] - 4.0 * COARSE_STEP).abs() < 1e-6);
     }
 
     /// The parameters arrive one per parameter band; the reconstruction needs
@@ -1069,10 +1071,10 @@ mod tests {
         // parameter array - zero - and the object lost its whole top end.
         let switched = &output[3][0];
         assert!((switched[0] - 0.0).abs() < 1e-6);
-        assert!((switched[3] - 0.2001953125).abs() < 1e-6);
-        assert!((switched[13] - 0.2001953125).abs() < 1e-6);
-        assert!((switched[14] - 0.400390625).abs() < 1e-6);
-        assert!((switched[63] - 0.400390625).abs() < 1e-6);
+        assert!((switched[3] - COARSE_STEP).abs() < 1e-6);
+        assert!((switched[13] - COARSE_STEP).abs() < 1e-6);
+        assert!((switched[14] - 2.0 * COARSE_STEP).abs() < 1e-6);
+        assert!((switched[63] - 2.0 * COARSE_STEP).abs() < 1e-6);
     }
 
     #[test]
@@ -1114,16 +1116,12 @@ mod tests {
         assert!(output[0][0].iter().all(|value| *value == 1.0));
         assert!(output[1][0].iter().all(|value| *value == 0.0));
         assert!(output[2][0].iter().all(|value| *value == 0.0));
-        assert!(
-            output[3][0]
-                .iter()
-                .all(|value| (*value - 0.2001953125).abs() < 1e-6)
-        );
-        assert!(
-            prev_matrix[0]
-                .iter()
-                .all(|value| (*value - 0.2001953125).abs() < 1e-6)
-        );
+        assert!(output[3][0]
+            .iter()
+            .all(|value| (*value - COARSE_STEP).abs() < 1e-6));
+        assert!(prev_matrix[0]
+            .iter()
+            .all(|value| (*value - COARSE_STEP).abs() < 1e-6));
     }
 
     #[test]
