@@ -99,8 +99,11 @@ pub fn hd_speaker_to_speaker(index: usize) -> Option<SpeakerLabels> {
 
 /// Map a DTS:X spatial-extension channel to its OAMD speaker.
 ///
-/// `TopFrontCenter` (the D0 profile's first feed) has no OAMD equivalent and is
-/// dropped, so a D0 bed exports as 7.1.4 rather than 7.1.5.
+/// `TopFrontCenter` has no OAMD equivalent and is dropped. No presentation
+/// puts a feed there any more — D0's centre-height feed is now the object it
+/// declares itself to be, and reaches the export with a position — so the arm
+/// stands for a layout that names the speaker some other way, not for a feed
+/// this exporter silently loses.
 pub fn spatial_channel_to_speaker(channel: SpatialChannel) -> Option<SpeakerLabels> {
     Some(match channel {
         SpatialChannel::TopFrontLeft => SpeakerLabels::Lfh,
@@ -645,28 +648,36 @@ mod tests {
         );
     }
 
-    /// D0 carries a top-front-centre feed that OAMD cannot name, so the bed
-    /// comes out as 7.1.4 rather than 7.1.5.
+    /// D0's first feed is the object its record declares, so the bed comes
+    /// out as 7.1.4 and the feed is exported as an object with a position.
+    /// It used to be presented as a fixed top-front-centre channel, which
+    /// OAMD cannot name: the bed came out the same size and the feed was
+    /// dropped outright, after its fold had already been taken out of the
+    /// bed.
     #[test]
-    fn d0_drops_top_front_centre() {
+    fn d0_first_feed_is_an_object() {
         let layout = DtsLayout::from_hd(
             &[0, 1, 2, 3, 4, 5, 7, 8],
-            Some(XPresentation::FixedD0),
+            Some(XPresentation::ObjectD0),
             None,
             false,
         );
         assert_eq!(
-            XPresentation::FixedD0.feed_count(),
+            XPresentation::ObjectD0.feed_count(),
             5,
             "D0 carries five feeds"
         );
         assert_eq!(
             layout.bed.len(),
             8 + 4,
-            "only four of the five reach the bed: top-front-centre has no OAMD speaker"
+            "the four heights join the bed; the object does not"
         );
         assert_eq!(layout.bed.len(), layout.bed_sources.len());
-        assert!(layout.objects.is_empty());
+        assert_eq!(
+            layout.object_sources,
+            vec![0],
+            "feed 0 is exported as an object, not dropped"
+        );
     }
 
     #[test]
