@@ -26,7 +26,15 @@ pub const SCHEMA: u32 = 1;
 /// 1: `TrueHD`, `EAC3-JOC`, `DTS:X-7.1.4`, `DTS:X-7.1.5`, `DTS:X-7.1.4+2`,
 /// `DTS:X-7.1.4+3`, `DTS:X-7.1.4+4`, `DTS:X-7.1.4+5`, `DTS:X-5.1+1`,
 /// `Auro-3D-9.1`, `Auro-3D-10.1`, `Auro-3D-11.1`, `Auro-3D-13.1`, `Auro-3D`.
-pub const TAXONOMY_VERSION: u32 = 1;
+///
+/// 2: `DTS:X-7.1.5` becomes `DTS:X-7.1.4+1`. The five-feed D0 presentation's
+/// first feed is an object at the position its record declares, not a fixed
+/// centre-height channel; the same presentation also now reads two further
+/// record grammars, so streams that reported no spatial metadata at all can
+/// start reporting this label. A consumer holding the old label should map it
+/// onto the new one and re-probe, since the feed count did not change but its
+/// meaning did.
+pub const TAXONOMY_VERSION: u32 = 2;
 
 /// The versions alone, for `harletty taxonomy`.
 #[derive(Debug, Serialize)]

@@ -22,9 +22,13 @@
 //! identities were established against a finite corpus by comparing the
 //! decoded audio with the private metadata (see the repository's
 //! `docs/private-metadata-probe.md`): the last four feeds are the fixed
-//! heights named by the type-3 rows, the first feeds are the declared objects,
-//! and D0's single object also declares the centre-height speaker as its
-//! fixed alternative. The object-only variant on a 5.1 bed carries one
+//! heights named by the type-3 rows, and the first feeds are the declared
+//! objects. Every feed a record declares is presented at the position that
+//! record states, D0's single object included: the centre-height speaker it
+//! may name in its auxiliary section is an *alternative* for a layout that
+//! has one, carried on the object as
+//! [`crate::SourceRole::Object::centre_height_alternative`], not a position
+//! to impose. The object-only variant on a 5.1 bed carries one
 //! declared object and no height quartet at all. A three-channel first set
 //! under the D0 marker carries the single declared object as its three
 //! components at the compatible bed's C, L and R, then the height quartet.
@@ -56,10 +60,16 @@ pub enum XPresentation {
     /// Standard DTS:X: four full-coded height waveforms folded into the 7.1
     /// bed. The stable stereo pairs are front-height L/R then rear-height L/R.
     Height,
-    /// Five-feed alternate profile: one object whose record declares the
-    /// centre-height speaker as its fixed alternative, presented as that fixed
-    /// channel, then the four fixed heights.
-    FixedD0,
+    /// Five-feed alternate profile: one object, then the four fixed heights.
+    ///
+    /// Three forms of it are known, differing in the record grammar, the
+    /// object's declared position and the height fold: the classic streams
+    /// put the object above the centre and name the centre-height speaker as
+    /// an alternative, while two IMAX-labelled streams put it at the centre
+    /// speaker at ear level and name no alternative. The position is read,
+    /// never assumed. Not to be confused with [`Self::ObjectsD0`], which is
+    /// the seven-feed component form of the same marker.
+    ObjectD0,
     /// Six-feed alternate profile: two objects, then the four fixed heights.
     ObjectsD1,
     /// Eight-feed alternate profile: four objects, then the four fixed
@@ -79,14 +89,6 @@ pub enum XPresentation {
 }
 
 const HEIGHT_CHANNELS: [SpatialChannel; 4] = [
-    SpatialChannel::TopFrontLeft,
-    SpatialChannel::TopFrontRight,
-    SpatialChannel::TopBackLeft,
-    SpatialChannel::TopBackRight,
-];
-
-const D0_CHANNELS: [SpatialChannel; 5] = [
-    SpatialChannel::TopFrontCenter,
     SpatialChannel::TopFrontLeft,
     SpatialChannel::TopFrontRight,
     SpatialChannel::TopBackLeft,
@@ -122,7 +124,7 @@ impl XPresentation {
             return None;
         }
         [
-            Self::FixedD0,
+            Self::ObjectD0,
             Self::ObjectsD1,
             Self::ObjectsD3,
             Self::ObjectsD4,
@@ -137,7 +139,7 @@ impl XPresentation {
     pub fn feed_count(self) -> usize {
         match self {
             Self::Height => 4,
-            Self::FixedD0 => 5,
+            Self::ObjectD0 => 5,
             Self::ObjectsD1 => 6,
             Self::ObjectsD3 => 8,
             Self::ObjectsD4 => 9,
@@ -160,11 +162,11 @@ impl XPresentation {
     pub fn fixed_channels(self) -> &'static [SpatialChannel] {
         match self {
             Self::Height
+            | Self::ObjectD0
             | Self::ObjectsD1
             | Self::ObjectsD3
             | Self::ObjectsD4
             | Self::ObjectsD0 => &HEIGHT_CHANNELS,
-            Self::FixedD0 => &D0_CHANNELS,
             Self::ObjectOnly => &[],
         }
     }
@@ -210,7 +212,7 @@ mod tests {
     #[test]
     fn detects_each_alternate_profile() {
         for (n, expected) in [
-            (5usize, XPresentation::FixedD0),
+            (5usize, XPresentation::ObjectD0),
             (6, XPresentation::ObjectsD1),
             (8, XPresentation::ObjectsD3),
             (9, XPresentation::ObjectsD4),
@@ -262,7 +264,7 @@ mod tests {
     fn feeds_split_into_objects_then_fixed_channels() {
         for (presentation, objects, fixed) in [
             (XPresentation::Height, 0..0, 0..4),
-            (XPresentation::FixedD0, 0..0, 0..5),
+            (XPresentation::ObjectD0, 0..1, 1..5),
             (XPresentation::ObjectsD1, 0..2, 2..6),
             (XPresentation::ObjectsD3, 0..4, 4..8),
             (XPresentation::ObjectsD0, 0..3, 3..7),
@@ -285,8 +287,9 @@ mod tests {
             "alternate heights are the standard quartet"
         );
         assert_eq!(
-            XPresentation::FixedD0.fixed_channels()[0],
-            SpatialChannel::TopFrontCenter
+            XPresentation::ObjectD0.fixed_channels(),
+            &HEIGHT_CHANNELS,
+            "D0's quartet is the standard one; its first feed is an object"
         );
     }
 }

@@ -962,14 +962,38 @@ fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<(usi
         modes[record] = mode;
     }
     for record in 0..count {
-        // Mode 0 carries a four-bit option field and no reference rows; the
-        // field's meaning is not established, only its exact consumption.
+        // Record options. Neither field's meaning is established, only its
+        // exact consumption and the values the corpus shows.
+        //
+        // Mode 0 carries four bits and no reference rows: 1 on the short D1
+        // form, 5 on one IMAX stream.
+        //
+        // Mode 1 carries three bits, zero on every classic stream. One IMAX
+        // stream instead sets the leading bit and carries four bits more. The
+        // widened form cannot be read unconditionally: the classic three-bit
+        // zero is followed by the position options, whose leading bits would
+        // then be swallowed. Both readings are pinned to their observed
+        // leading values so an unseen third form is reported, not guessed at.
         if modes[record] == 0 {
-            b.expect(4, 1, "mode-0 record options")?;
+            match b.read(4)? {
+                1 | 5 => {}
+                _ => return Err(XMetadataError::Unsupported("mode-0 record options")),
+            }
         } else {
-            b.expect(3, 0, "type-241 record options")?;
+            match b.read(3)? {
+                0 => {}
+                4 => {
+                    b.expect(4, 0b1010, "type-241 wide record options")?;
+                }
+                _ => return Err(XMetadataError::Unsupported("type-241 record options")),
+            }
         }
-        b.expect(7, 0x20, "type-241 position options")?;
+        // 0x20 on every stream but one, which sets one further bit without
+        // adding a field: the element still ends exactly on its CRC boundary.
+        match b.read(7)? {
+            0x20 | 0x24 => {}
+            _ => return Err(XMetadataError::Unsupported("type-241 position options")),
+        }
         b.expect(1, 1, "type-241 gain present")?;
         b.expect(1, 1, "type-241 position flag")?;
         b.expect(2, 0, "type-241 position mode")?;
@@ -1233,6 +1257,33 @@ pub(crate) mod fixtures {
         /// `(reference mask, gain code)`; `None` when the row is absent.
         pub row: Option<(u32, u32)>,
         pub centre_height: bool,
+        /// Mode 1 only: write the seven-bit options field one IMAX stream
+        /// carries instead of the classic three-bit zero.
+        pub wide_options: bool,
+        /// Mode 0 only: the four-bit options value. 1 on the short D1 form,
+        /// 5 on one IMAX stream.
+        pub mode0_options: u32,
+        /// The seven-bit position options. 0x20 everywhere but one IMAX
+        /// stream, which carries 0x24 without adding a field.
+        pub position_options: u32,
+    }
+
+    impl Default for ObjectRecord {
+        /// The classic record: mode 1, at the centre, distance 1, no row.
+        fn default() -> Self {
+            Self {
+                mode: 1,
+                index: 0,
+                distance: 63,
+                azimuth: 120,
+                elevation: 60,
+                row: None,
+                centre_height: false,
+                wide_options: false,
+                mode0_options: 1,
+                position_options: 0x20,
+            }
+        }
     }
 
     /// An alternate prefix (type 241 + type 3, CRC-delimited) followed by
@@ -1246,6 +1297,19 @@ pub(crate) mod fixtures {
         alternate_payload_with(records, height_rows, false)
     }
 
+    /// As [`alternate_payload`], with one gain code per height-row column.
+    pub(crate) fn alternate_payload_rows(
+        records: &[ObjectRecord],
+        height_rows: [HeightRow; 4],
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        type241_bits(&mut w, records);
+        w.align();
+        let mut prefix = w.bytes();
+        prefix.extend_from_slice(&type3_bytes_rows(height_rows, false));
+        wrap_prefix(prefix)
+    }
+
     /// `explicit_type3_mask` writes the type-3 reference mask explicitly
     /// instead of inheriting it, a form the corpus never uses.
     pub(crate) fn alternate_payload_with(
@@ -1254,6 +1318,15 @@ pub(crate) mod fixtures {
         explicit_type3_mask: bool,
     ) -> Vec<u8> {
         let mut w = BitWriter::new();
+        type241_bits(&mut w, records);
+        w.align();
+        let mut prefix = w.bytes();
+        prefix.extend_from_slice(&type3_bytes(height_rows, explicit_type3_mask));
+        wrap_prefix(prefix)
+    }
+
+    /// The type-241 element for `records`.
+    fn type241_bits(w: &mut BitWriter, records: &[ObjectRecord]) {
         // The profile byte (0xd0/0xd1/0xd3) is the header fields below with
         // the declaration count in its low nibble, not a separate field.
         w.push(0xf1, 8)
@@ -1281,11 +1354,13 @@ pub(crate) mod fixtures {
         }
         for record in records {
             if record.mode == 0 {
-                w.push(1, 4);
+                w.push(record.mode0_options, 4);
+            } else if record.wide_options {
+                w.push(4, 3).push(0b1010, 4);
             } else {
                 w.push(0, 3);
             }
-            w.push(0x20, 7)
+            w.push(record.position_options, 7)
                 .push(1, 1)
                 .push(1, 1)
                 .push(0, 2)
@@ -1325,19 +1400,44 @@ pub(crate) mod fixtures {
                 }
             }
         }
-        w.align();
-        let mut prefix = w.bytes();
-        prefix.extend_from_slice(&type3_bytes(height_rows, explicit_type3_mask));
+    }
+
+    /// The envelope CRC over `prefix`, then the outer control suffix and a
+    /// few bytes, as `x_payload` carries them.
+    fn wrap_prefix(prefix: Vec<u8>) -> Vec<u8> {
         let mut payload = crc_appended(prefix);
         payload.extend_from_slice(&XLL_X_ALT_OUTER_SUFFIX);
         payload.extend_from_slice(&[0xb2, 0, 0, 0, 0, 0, 0, 0]);
         payload
     }
 
+    /// One type-3 height row as explicit `(full-layout column, gain code)`
+    /// pairs in ascending column order, for a fold the single-code form
+    /// cannot express. A height's own column takes unity whatever is given,
+    /// as the element does.
+    pub(crate) type HeightRow<'a> = &'a [(usize, u32)];
+
     /// The type-3 element over the 7.1 full layout: `height_rows[i]` is
     /// `(full-layout mask, bed gain code)` for height row `i`; its height
     /// column is set at unity.
     fn type3_bytes(height_rows: [(u32, u32); 4], explicit_type3_mask: bool) -> Vec<u8> {
+        let expand = |(mask, code): (u32, u32)| -> Vec<(usize, u32)> {
+            (0..MAX_FULL_COLUMNS)
+                .filter(|column| mask & (1 << column) != 0)
+                .map(|column| (column, code))
+                .collect()
+        };
+        let rows = height_rows.map(expand);
+        type3_bytes_rows(
+            [&rows[0], &rows[1], &rows[2], &rows[3]],
+            explicit_type3_mask,
+        )
+    }
+
+    /// The type-3 element with one gain code per column, so a row can fold a
+    /// height into several bed channels at different gains — which one IMAX
+    /// stream does and no other stream known here does.
+    fn type3_bytes_rows(height_rows: [HeightRow; 4], explicit_type3_mask: bool) -> Vec<u8> {
         let mut w = BitWriter::new();
         layout_header_bits(&mut w, 3, FULL_MASK_7_1, explicit_type3_mask);
         w.push(2, 5)
@@ -1345,18 +1445,65 @@ pub(crate) mod fixtures {
             .push(1, 1)
             .push(0, 1)
             .push(TYPE3_CONTROL, 12);
-        for (mask, code) in height_rows {
+        let (columns, column_count) = full_columns(FULL_MASK_7_1).unwrap();
+        for row in height_rows {
+            let mask = row
+                .iter()
+                .fold(0u32, |mask, (column, _)| mask | 1 << column);
             w.push(mask, 12);
-            let (columns, column_count) = full_columns(FULL_MASK_7_1).unwrap();
             for (column, entry) in columns.iter().enumerate().take(column_count) {
-                if mask & (1 << column) != 0 {
-                    w.push(if entry.is_err() { UNITY_CODE } else { code }, 6);
-                }
+                let Some((_, code)) = row.iter().find(|(c, _)| *c == column) else {
+                    continue;
+                };
+                w.push(if entry.is_err() { UNITY_CODE } else { *code }, 6);
             }
         }
         w.align();
         w.bytes()
     }
+
+    /// The smallest (silent) frame's extension payload from the IMAX stream
+    /// whose mode-1 record widens its options field to seven bits. Its
+    /// object sits at the centre speaker at ear level, folded there at
+    /// unity, and it declares no centre-height alternative.
+    pub(crate) const D0_WIDE_OPTIONS_PAYLOAD: [u8; 112] = [
+        0xf1, 0x40, 0x00, 0xd0, 0x30, 0x28, 0x4b, 0x00, 0xe1, 0x00, 0x25, 0x20, 0xcf, 0x7f, 0x78,
+        0x78, 0x80, 0x7d, 0x00, 0x03, 0x00, 0x08, 0x81, 0xf4, 0xe2, 0x1a, 0xc4, 0x04, 0x7f, 0x40,
+        0x25, 0xbf, 0xa0, 0x49, 0xbf, 0xa8, 0x81, 0xbf, 0xb1, 0x01, 0xbf, 0xa0, 0x6c, 0x30, 0x03,
+        0x34, 0x38, 0x8c, 0x4f, 0x00, 0xb2, 0x6c, 0x06, 0x08, 0x00, 0x49, 0x44, 0x01, 0xc3, 0x7b,
+        0xe0, 0x00, 0x00, 0x6a, 0x81, 0x08, 0x00, 0x94, 0xa6, 0x00, 0x00, 0x00, 0x00, 0x02, 0x34,
+        0x38, 0x8c, 0x4f, 0x00, 0xc2, 0xc6, 0x03, 0x05, 0x38, 0x00, 0xc6, 0x93, 0x03, 0xcf, 0xef,
+        0x7c, 0x02, 0x9c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xcf, 0xc4, 0x04, 0x00,
+        0xd1, 0xcb, 0x80, 0x00, 0x40, 0x00, 0x00,
+    ];
+
+    /// The smallest (silent) frame's extension payload from the IMAX stream
+    /// declared in mode 0. Same object position, no fold row for it, and
+    /// height rows that fold each height into TWO bed columns.
+    pub(crate) const D0_MODE_ZERO_PAYLOAD: [u8; 112] = [
+        0xf1, 0x40, 0x00, 0xd0, 0x30, 0x28, 0x4b, 0x00, 0xe0, 0x00, 0x15, 0x26, 0x7b, 0xfb, 0xc3,
+        0xc0, 0x03, 0x00, 0x08, 0x81, 0xf4, 0xe2, 0x1a, 0xc4, 0x04, 0x7f, 0x40, 0xa5, 0xe7, 0xb3,
+        0x05, 0x27, 0x9e, 0xcc, 0x88, 0x53, 0x79, 0xec, 0x42, 0x4d, 0xe7, 0xa0, 0xd8, 0x71, 0x03,
+        0x34, 0x38, 0x8c, 0x4f, 0x00, 0xb2, 0x6c, 0x06, 0x08, 0x00, 0x49, 0x44, 0x01, 0xc3, 0x7b,
+        0xe0, 0x00, 0x00, 0x6a, 0x81, 0x08, 0x00, 0x94, 0xa6, 0x00, 0x00, 0x00, 0x00, 0x02, 0x34,
+        0x38, 0x8c, 0x4f, 0x00, 0xc2, 0xc6, 0x03, 0x05, 0x38, 0x00, 0xc6, 0x93, 0x03, 0xcf, 0xef,
+        0x7c, 0x02, 0x9c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xcf, 0xc4, 0x04, 0x00,
+        0xd1, 0xcb, 0x80, 0x00, 0x40, 0x00, 0x00,
+    ];
+
+    /// The CRC-protected prefix of both five-feed IMAX forms. (The classic
+    /// D0's is 48: it carries an auxiliary section and a three-column fold.)
+    pub(crate) const IMAX_D0_PREFIX_LEN: usize = 44;
+
+    /// The mode-0 IMAX stream's height rows, as `(full-layout column, gain
+    /// code)`: each height at code 60 into its own bed column and code 38
+    /// into the front/back mirror, plus its own height column at unity.
+    pub(crate) const HEIGHT_ROWS_CROSSED: [HeightRow<'static>; 4] = [
+        &[(1, 60), (4, UNITY_CODE), (6, 38)],
+        &[(2, 60), (5, UNITY_CODE), (7, 38)],
+        &[(1, 38), (6, 60), (10, UNITY_CODE)],
+        &[(2, 38), (7, 60), (11, UNITY_CODE)],
+    ];
 
     /// One component position as `(distance, azimuth, elevation)` codes.
     pub(crate) type ComponentPosition = (u32, u32, u32);
@@ -1647,6 +1794,7 @@ mod tests {
                 elevation: 79,
                 row: Some((1 << 4 | 1 << 5, 21)),
                 centre_height: false,
+                ..ObjectRecord::default()
             },
             ObjectRecord {
                 mode: 1,
@@ -1656,6 +1804,7 @@ mod tests {
                 elevation: 78,
                 row: Some((1 << 5, 61)),
                 centre_height: false,
+                ..ObjectRecord::default()
             },
             ObjectRecord {
                 mode: 1,
@@ -1665,6 +1814,7 @@ mod tests {
                 elevation: 60,
                 row: None,
                 centre_height: false,
+                ..ObjectRecord::default()
             },
             ObjectRecord {
                 mode: 1,
@@ -1674,6 +1824,7 @@ mod tests {
                 elevation: 60,
                 row: Some((1 << 5, 61)),
                 centre_height: false,
+                ..ObjectRecord::default()
             },
         ]
     }
@@ -1772,6 +1923,7 @@ mod tests {
                 elevation: 68,
                 row: None,
                 centre_height: false,
+                ..ObjectRecord::default()
             },
             ObjectRecord {
                 mode: 0,
@@ -1781,6 +1933,7 @@ mod tests {
                 elevation: 68,
                 row: None,
                 centre_height: false,
+                ..ObjectRecord::default()
             },
         ];
         let payload = alternate_payload(&records, HEIGHT_ROWS_55);
@@ -1816,6 +1969,7 @@ mod tests {
             elevation: 77,
             row: Some((1 << 0 | 1 << 1 | 1 << 2, 46)),
             centre_height: true,
+            ..ObjectRecord::default()
         }];
         let rows = [
             (1 << 1 | 1 << 4, 61),
@@ -1892,6 +2046,164 @@ mod tests {
 
         // The corpus frame itself reads the same way.
         let corpus = XMetadata::parse(&D0_THREE_COMPONENT_PAYLOAD, 7).expect("corpus frame");
+        assert_eq!(corpus, metadata);
+    }
+
+    /// The IMAX five-feed form whose mode-1 record widens its options field
+    /// to seven bits. Everything else about the record is classic, and the
+    /// object it declares sits at the centre speaker at ear level — not
+    /// above it, where the classic streams put theirs.
+    #[test]
+    fn wide_options_form_reads_an_object_at_the_centre_speaker() {
+        let payload = alternate_payload(
+            &[ObjectRecord {
+                wide_options: true,
+                row: Some((1 << 0, UNITY_CODE)),
+                ..ObjectRecord::default()
+            }],
+            HEIGHT_ROWS_55,
+        );
+        assert_eq!(
+            &payload[..IMAX_D0_PREFIX_LEN],
+            &D0_WIDE_OPTIONS_PAYLOAD[..IMAX_D0_PREFIX_LEN],
+            "the fixture reproduces the corpus prefix, CRC included"
+        );
+        let metadata = XMetadata::parse(&payload, 5).expect("wide-options metadata");
+        assert_eq!(metadata.source_count(), 5);
+
+        let object = metadata.source(0).unwrap();
+        let SourceRole::Object {
+            position,
+            centre_height_alternative,
+        } = object.role
+        else {
+            panic!("feed 0 is the declared object");
+        };
+        assert!(!centre_height_alternative, "no auxiliary section");
+        assert_eq!(position.azimuth_half_degrees, 0);
+        assert_eq!(position.elevation_half_degrees, 0, "ear level");
+        assert_eq!(position.distance_64ths, 64);
+        let mut expected = [0.0; 8];
+        expected[0] = 1.0;
+        assert_eq!(object.fold, BedFold::Known(expected));
+
+        for (feed, speaker) in (1..5).zip(STANDARD_HEIGHTS) {
+            assert_eq!(
+                metadata.source(feed).unwrap().role,
+                SourceRole::Height(speaker)
+            );
+        }
+        let plan = FoldPlan::from_metadata(&metadata);
+        assert!((0..5).all(|feed| plan.source_is_known(feed)));
+
+        // The corpus frame itself reads the same way.
+        let corpus = XMetadata::parse(&D0_WIDE_OPTIONS_PAYLOAD, 5).expect("corpus frame");
+        assert_eq!(corpus, metadata);
+    }
+
+    /// The classic three-bit reading must survive the widened one: a stream
+    /// carrying the classic zero is not the widened form with a different
+    /// value, and reading seven bits there would swallow the position
+    /// options that follow.
+    #[test]
+    fn the_classic_three_bit_options_field_still_reads() {
+        let classic = alternate_payload(
+            &[ObjectRecord {
+                elevation: 77,
+                row: Some((1 << 0, UNITY_CODE)),
+                ..ObjectRecord::default()
+            }],
+            HEIGHT_ROWS_55,
+        );
+        let metadata = XMetadata::parse(&classic, 5).expect("classic record");
+        let SourceRole::Object { position, .. } = metadata.source(0).unwrap().role else {
+            panic!("feed 0 is the declared object");
+        };
+        assert_eq!(position.elevation_half_degrees, 51, "25.5 degrees up");
+
+        // The two forms differ by four bits, so the elements differ in length.
+        let wide = alternate_payload(
+            &[ObjectRecord {
+                elevation: 77,
+                wide_options: true,
+                row: Some((1 << 0, UNITY_CODE)),
+                ..ObjectRecord::default()
+            }],
+            HEIGHT_ROWS_55,
+        );
+        assert_ne!(classic, wide);
+        assert!(XMetadata::parse(&wide, 5).is_ok());
+
+        // An options value neither form accounts for is reported, not
+        // guessed at. Mode 0 is where the fixture can express one.
+        for options in [0u32, 2, 3, 15] {
+            let payload = alternate_payload(
+                &[ObjectRecord {
+                    mode: 0,
+                    mode0_options: options,
+                    ..ObjectRecord::default()
+                }],
+                HEIGHT_ROWS_55,
+            );
+            assert_eq!(
+                XMetadata::parse(&payload, 5),
+                Err(XMetadataError::Unsupported("mode-0 record options")),
+                "mode-0 options {options}"
+            );
+        }
+    }
+
+    /// The IMAX five-feed form declared in mode 0: no fold row for its
+    /// object, an options value of 5 where the short D1 form carries 1, one
+    /// further bit set in the position options, and height rows that fold
+    /// each height into TWO bed columns at different gains.
+    #[test]
+    fn mode_zero_form_folds_each_height_into_two_bed_columns() {
+        let payload = alternate_payload_rows(
+            &[ObjectRecord {
+                mode: 0,
+                mode0_options: 5,
+                position_options: 0x24,
+                ..ObjectRecord::default()
+            }],
+            HEIGHT_ROWS_CROSSED,
+        );
+        assert_eq!(
+            &payload[..IMAX_D0_PREFIX_LEN],
+            &D0_MODE_ZERO_PAYLOAD[..IMAX_D0_PREFIX_LEN],
+            "the fixture reproduces the corpus prefix, CRC included"
+        );
+        let metadata = XMetadata::parse(&payload, 5).expect("mode-0 metadata");
+
+        let object = metadata.source(0).unwrap();
+        let SourceRole::Object { position, .. } = object.role else {
+            panic!("feed 0 is the declared object");
+        };
+        assert_eq!(position.azimuth_half_degrees, 0);
+        assert_eq!(position.elevation_half_degrees, 0, "ear level");
+        assert_eq!(
+            object.fold,
+            BedFold::Unknown,
+            "a mode-0 record carries no reference row"
+        );
+
+        let code60 = gain_code_linear(60).unwrap();
+        let code38 = gain_code_linear(38).unwrap();
+        for (feed, own, mirror) in [(1usize, 1usize, 4usize), (2, 2, 5), (3, 4, 1), (4, 5, 2)] {
+            let BedFold::Known(columns) = metadata.source(feed).unwrap().fold else {
+                panic!("height {feed} states its fold");
+            };
+            assert_eq!(columns[own], code60, "feed {feed} into its own column");
+            assert_eq!(columns[mirror], code38, "feed {feed} into the mirror");
+            assert_eq!(columns.iter().filter(|&&gain| gain != 0.0).count(), 2);
+        }
+
+        let plan = FoldPlan::from_metadata(&metadata);
+        assert!(!plan.source_is_known(0), "the object's fold is withheld");
+        assert!((1..5).all(|feed| plan.source_is_known(feed)));
+
+        // The corpus frame itself reads the same way.
+        let corpus = XMetadata::parse(&D0_MODE_ZERO_PAYLOAD, 5).expect("corpus frame");
         assert_eq!(corpus, metadata);
     }
 
@@ -2015,6 +2327,7 @@ mod tests {
             elevation: 77,
             row: Some((1 << 0 | 1 << 1 | 1 << 2, 46)),
             centre_height: false,
+            ..ObjectRecord::default()
         };
         let payload = object_only_payload(&record);
         let metadata = XMetadata::parse(&payload, 1).expect("object-only metadata");

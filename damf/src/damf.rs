@@ -131,10 +131,12 @@ pub enum SourceCodec {
     #[serde(rename = "DTS:X-7.1.4")]
     DtsX714,
     /// Five-feed presentation (D0): 7.1 bed, four fixed heights and one
-    /// object whose record also declares the centre-height speaker, so it is
-    /// presented as that fixed channel.
-    #[serde(rename = "DTS:X-7.1.5")]
-    DtsX715,
+    /// object, at the position its record declares. (Formerly labelled
+    /// `DTS:X-7.1.5`, when that object was presented as a fixed
+    /// centre-height channel regardless of where it said it was; Atmos
+    /// Ranker maps that label onto this one.)
+    #[serde(rename = "DTS:X-7.1.4+1")]
+    DtsX714Plus1,
     /// Six-feed presentation (D1): 7.1 bed, four fixed heights and two
     /// objects. (Formerly labelled `DTS:X-9.1.4` when the two objects were
     /// taken for wide channels; Atmos Ranker maps that label onto this one.)
@@ -179,7 +181,7 @@ impl SourceCodec {
         SourceCodec::TrueHD,
         SourceCodec::Eac3Joc,
         SourceCodec::DtsX714,
-        SourceCodec::DtsX715,
+        SourceCodec::DtsX714Plus1,
         SourceCodec::DtsX714Plus2,
         SourceCodec::DtsX714Plus4,
         SourceCodec::DtsX714Plus5,
@@ -201,7 +203,7 @@ impl SourceCodec {
             SourceCodec::TrueHD => "TrueHD",
             SourceCodec::Eac3Joc => "EAC3-JOC",
             SourceCodec::DtsX714 => "DTS:X-7.1.4",
-            SourceCodec::DtsX715 => "DTS:X-7.1.5",
+            SourceCodec::DtsX714Plus1 => "DTS:X-7.1.4+1",
             SourceCodec::DtsX714Plus2 => "DTS:X-7.1.4+2",
             SourceCodec::DtsX714Plus4 => "DTS:X-7.1.4+4",
             SourceCodec::DtsX714Plus5 => "DTS:X-7.1.4+5",

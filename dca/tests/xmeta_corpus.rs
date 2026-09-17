@@ -2,7 +2,8 @@
 //! Corpus-gated checks of the private-metadata reader against real streams.
 //!
 //! Inputs come from the `HARLETTY_DTSX_STANDARD_CORPUS`, `HARLETTY_D0_CORPUS`,
-//! `HARLETTY_D1_CORPUS`, `HARLETTY_D3_CORPUS`, `HARLETTY_ALT_51_CORPUS` and
+//! `HARLETTY_D0_WIDE_CORPUS`, `HARLETTY_D0_MODE0_CORPUS`, `HARLETTY_D1_CORPUS`,
+//! `HARLETTY_D3_CORPUS`, `HARLETTY_ALT_51_CORPUS` and
 //! `HARLETTY_ALT_LCR_CORPUS` environment variables; each test self-skips,
 //! loudly, when its input is absent. A green run without the
 //! corpus therefore proves nothing about the reader; run these locally.
@@ -151,30 +152,140 @@ fn standard_matrix_parses_on_every_frame() {
     );
 }
 
+/// The classic five-feed D0: heights at unity, and an object above the centre
+/// that also names the centre-height speaker as an alternative. Its position
+/// and that alternative agree, which is why presenting it as a fixed
+/// top-front-centre channel went unnoticed for so long; two other streams
+/// under the same marker do not agree, so the position is what is read.
 #[test]
-fn d0_folds_heights_at_unity_and_declares_a_centre_height_object() {
+fn classic_d0_folds_heights_at_unity_and_names_a_centre_height_alternative() {
     let Some(bytes) = corpus("HARLETTY_D0_CORPUS") else {
         eprintln!("skipping: HARLETTY_D0_CORPUS is not set");
         return;
     };
     let survey = survey(&bytes);
-    assert_eq!(survey.presentation, XPresentation::FixedD0);
+    assert_eq!(survey.presentation, XPresentation::ObjectD0);
+    assert_eq!(survey.presentation.object_feeds(), 0..1);
     assert_eq!(
         height_fold_columns(&survey.metadata, survey.presentation),
         vec![(1, 1.0), (2, 1.0), (4, 1.0), (5, 1.0)]
     );
     let object = survey.metadata.source(0).unwrap();
-    assert!(matches!(
-        object.role,
-        SourceRole::Object {
-            centre_height_alternative: true,
-            ..
-        }
-    ));
+    let SourceRole::Object {
+        position,
+        centre_height_alternative,
+    } = object.role
+    else {
+        panic!("feed 0 is the declared object");
+    };
+    assert!(
+        centre_height_alternative,
+        "classic D0 names the alternative"
+    );
+    assert_eq!(position.azimuth_half_degrees, 0);
+    assert_eq!(position.elevation_half_degrees, 51, "25.5 degrees up");
     assert!(matches!(object.fold, BedFold::Known(_)));
     let plan = FoldPlan::from_metadata(&survey.metadata);
     assert!((0..5).all(|feed| plan.source_is_known(feed)));
-    eprintln!("D0: {} frames", survey.frames);
+    eprintln!("classic D0: {} frames", survey.frames);
+}
+
+/// A D0 whose mode-1 record widens its options field from three bits to
+/// seven. Its object sits at the centre speaker at ear level, not above it,
+/// and it names no centre-height alternative: the same marker, a different
+/// place. Its heights fold at 0.707, where the classic form uses unity.
+#[test]
+fn wide_options_d0_puts_its_object_at_the_centre_speaker() {
+    let Some(bytes) = corpus("HARLETTY_D0_WIDE_CORPUS") else {
+        eprintln!("skipping: HARLETTY_D0_WIDE_CORPUS is not set");
+        return;
+    };
+    let survey = survey(&bytes);
+    assert_eq!(survey.presentation, XPresentation::ObjectD0);
+    assert_eq!(
+        height_fold_columns(&survey.metadata, survey.presentation),
+        vec![(1, Q55), (2, Q55), (4, Q55), (5, Q55)]
+    );
+    let object = survey.metadata.source(0).unwrap();
+    let SourceRole::Object {
+        position,
+        centre_height_alternative,
+    } = object.role
+    else {
+        panic!("feed 0 is the declared object");
+    };
+    assert!(!centre_height_alternative, "no auxiliary section here");
+    assert_eq!(position.azimuth_half_degrees, 0);
+    assert_eq!(position.elevation_half_degrees, 0, "ear level");
+    assert_eq!(position.distance(), 1.0);
+    let BedFold::Known(columns) = object.fold else {
+        panic!("the object states its fold");
+    };
+    assert_eq!(columns[0], 1.0, "unity into the centre bed channel");
+    assert_eq!(columns.iter().filter(|&&gain| gain != 0.0).count(), 1);
+    let plan = FoldPlan::from_metadata(&survey.metadata);
+    assert!((0..5).all(|feed| plan.source_is_known(feed)));
+    eprintln!("wide-options D0: {} frames", survey.frames);
+}
+
+/// A D0 declared in mode 0: its object states the same centre position but
+/// no fold row, and its heights fold across TWO bed columns each — 0.944
+/// into their own, 0.266 into the front/back mirror — where every other
+/// stream known here folds a height into one column.
+#[test]
+fn mode_zero_d0_folds_its_heights_across_two_columns() {
+    let Some(bytes) = corpus("HARLETTY_D0_MODE0_CORPUS") else {
+        eprintln!("skipping: HARLETTY_D0_MODE0_CORPUS is not set");
+        return;
+    };
+    let survey = survey(&bytes);
+    assert_eq!(survey.presentation, XPresentation::ObjectD0);
+    let object = survey.metadata.source(0).unwrap();
+    let SourceRole::Object {
+        position,
+        centre_height_alternative,
+    } = object.role
+    else {
+        panic!("feed 0 is the declared object");
+    };
+    assert!(!centre_height_alternative);
+    assert_eq!(position.azimuth_half_degrees, 0);
+    assert_eq!(position.elevation_half_degrees, 0, "ear level");
+    assert!(
+        matches!(object.fold, BedFold::Unknown),
+        "a mode-0 record carries no reference row"
+    );
+
+    // Heights, in feed order: front-left, front-right, back-left, back-right.
+    // Columns 1 and 2 are the bed's L and R, 4 and 5 its Lb and Rb.
+    let folds: Vec<Vec<(usize, f32)>> = (1..5)
+        .map(|feed| match survey.metadata.source(feed).unwrap().fold {
+            BedFold::Known(columns) => columns
+                .iter()
+                .enumerate()
+                .filter(|(_, gain)| **gain != 0.0)
+                .map(|(column, gain)| (column, *gain))
+                .collect(),
+            BedFold::Unknown => panic!("height fold must be known"),
+        })
+        .collect();
+    for (feed, columns) in folds.iter().enumerate() {
+        assert_eq!(columns.len(), 2, "height {feed} folds into two columns");
+    }
+    let near = |gain: f32, want: f32| (gain - want).abs() < 1e-3;
+    assert_eq!(folds[0][0].0, 1);
+    assert_eq!(folds[0][1].0, 4);
+    assert_eq!(folds[2][0].0, 1);
+    assert_eq!(folds[2][1].0, 4);
+    assert!(near(folds[0][0].1, 0.944) && near(folds[0][1].1, 0.266));
+    assert!(near(folds[2][0].1, 0.266) && near(folds[2][1].1, 0.944));
+    assert_eq!(folds[1], vec![(2, folds[0][0].1), (5, folds[0][1].1)]);
+    assert_eq!(folds[3], vec![(2, folds[2][0].1), (5, folds[2][1].1)]);
+
+    let plan = FoldPlan::from_metadata(&survey.metadata);
+    assert!(!plan.source_is_known(0), "the object's fold is withheld");
+    assert!((1..5).all(|feed| plan.source_is_known(feed)));
+    eprintln!("mode-0 D0: {} frames", survey.frames);
 }
 
 #[test]

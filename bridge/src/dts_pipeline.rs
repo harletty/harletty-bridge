@@ -1037,8 +1037,14 @@ mod tests {
         assert!(again.metadata.is_empty());
     }
 
+    /// D0's single feed is the object its record declares, unfolded out of the
+    /// bed and played at the position it states — here 25.5 degrees above the
+    /// centre, with the centre-height speaker named only as an alternative.
+    /// It used to be presented as a fixed top-front-centre channel whatever
+    /// the record said, which two other streams under the same marker
+    /// contradict.
     #[test]
-    fn d0_presents_its_object_as_a_fixed_channel_and_unfolds_it() {
+    fn d0_plays_its_object_at_the_declared_position_and_unfolds_it() {
         let extension: Vec<Vec<f32>> = (0..5)
             .map(|index| vec![0.01 * (index + 1) as f32, -0.01 * (index + 1) as f32])
             .collect();
@@ -1086,9 +1092,8 @@ mod tests {
         let mut state = state_with(XMetadata::from_sources(&sources));
         let (frame, emitted) = build(&hd, &mut state);
 
-        assert!(!emitted, "the D0 object is presented as a fixed channel");
-        assert_eq!(state.locked, Some(XPresentation::FixedD0));
-        assert!(frame.metadata.is_empty());
+        assert!(emitted, "the D0 object is announced to the engine");
+        assert_eq!(state.locked, Some(XPresentation::ObjectD0));
         assert_eq!(frame.channel_count, 13);
         assert_eq!(
             frame.channel_labels.as_slice(),
@@ -1101,11 +1106,11 @@ mod tests {
                 RChannelLabel::LFE,
                 RChannelLabel::Lb,
                 RChannelLabel::Rb,
-                RChannelLabel::Tfc,
                 RChannelLabel::Tfl,
                 RChannelLabel::Tfr,
                 RChannelLabel::Tbl,
                 RChannelLabel::Tbr,
+                RChannelLabel::Object,
             ]
         );
         for sample in 0..SAMPLE_COUNT {
@@ -1116,10 +1121,30 @@ mod tests {
             assert_pcm_close(row[3], hd.samples[3].as_ref().unwrap()[sample]);
             assert_pcm_close(row[6], dry[3][sample]);
             assert_pcm_close(row[7], dry[4][sample]);
-            for source in 0..5 {
-                assert_pcm_close(row[8 + source], hd.x_samples[source][sample]);
+            // The four heights, then the object last.
+            for (slot, feed) in (1..5).chain(0..1).enumerate() {
+                assert_pcm_close(row[8 + slot], hd.x_samples[feed][sample]);
             }
         }
+
+        assert_eq!(frame.metadata.len(), 1);
+        let metadata = &frame.metadata[0];
+        assert_eq!(metadata.object_channels.len(), 1);
+        assert_eq!(
+            metadata.object_channels[0].channel, 12,
+            "the object is the last channel"
+        );
+        assert_eq!(metadata.events.len(), 1);
+        let event = &metadata.events[0];
+        assert!(event.has_pos);
+        let SourceRole::Object { position, .. } = sources[0].role else {
+            panic!("feed 0 is the declared object")
+        };
+        assert_eq!(event.pos, position.to_adm_cartesian());
+        assert!(
+            event.pos[2] > 0.0 && event.pos[0].abs() < 1e-6,
+            "above the centre, not off to a side"
+        );
     }
 
     #[test]

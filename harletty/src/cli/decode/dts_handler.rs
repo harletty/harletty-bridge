@@ -119,7 +119,7 @@ pub(crate) fn presentation_label(presentation: XPresentation) -> &'static str {
 fn source_codec_for(presentation: XPresentation) -> SourceCodec {
     match presentation {
         XPresentation::Height => SourceCodec::DtsX714,
-        XPresentation::FixedD0 => SourceCodec::DtsX715,
+        XPresentation::ObjectD0 => SourceCodec::DtsX714Plus1,
         XPresentation::ObjectsD1 => SourceCodec::DtsX714Plus2,
         XPresentation::ObjectsD3 => SourceCodec::DtsX714Plus4,
         XPresentation::ObjectsD4 => SourceCodec::DtsX714Plus5,
