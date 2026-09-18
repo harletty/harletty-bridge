@@ -44,6 +44,9 @@ pub(crate) struct Eac3DiagStats {
     pub(crate) dependent_pair_channel_beds: u64,
     /// Dependents whose channels could not be overlaid onto the core.
     pub(crate) dependent_merge_failures: u64,
+    /// Presentations whose JOC configuration declares a downmix the merged bed
+    /// is not: a 5-channel configuration reached with dependents overlaid.
+    pub(crate) joc_downmix_config_mismatch: u64,
     /// Standalone AC-3 cores (plain AC-3, no dependent) emitted as 5.1 beds.
     pub(crate) standalone_ac3_core_beds: u64,
     pub(crate) short_packet_silence_frames: u64,

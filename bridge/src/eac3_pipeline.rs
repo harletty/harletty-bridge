@@ -172,10 +172,14 @@ pub(crate) fn resolve_eac3_presentation(
     dependents: &[Vec<u8>],
 ) -> Result<RDecodedFrame, String> {
     let mut bed = core;
+    let mut merged_any = false;
     for dependent in dependents {
         emit_eac3_frame_diagnostic(bridge, dependent);
         match merge_eac3_core_with_dependent(bridge, &bed, dependent) {
-            Some(merged) => bed = merged,
+            Some(merged) => {
+                bed = merged;
+                merged_any = true;
+            }
             None => {
                 // The channels stay as the core had them rather than failing the
                 // presentation, but silently is how this used to hide a
@@ -200,6 +204,36 @@ pub(crate) fn resolve_eac3_presentation(
         bridge.eac3_total_samples += sample_count as u64;
         bridge.eac3_diag_stats.dependent_pair_channel_beds += 1;
         bridge.perf.maybe_report(bridge.eac3_frame_count);
+        return Ok(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge));
+    }
+
+    // The reconstruction is only valid against the downmix the encoder wrote
+    // its matrices for, and Table 47 ties that to `joc_dmx_config_idx`:
+    // configurations 0 and 3 declare a 5-channel downmix, which is the
+    // independent substream on its own. A bed with a dependent overlaid is a
+    // different signal — the 7.1 extension replaces the folded Ls/Rs with the
+    // discrete ones — so feeding it to a 5-channel configuration would place
+    // and level every surround-derived object against channels the encoder
+    // never saw. Every JOC stream measured that carries a dependent declares a
+    // 7-channel configuration, so this guards an assumption rather than a live
+    // code path; if it ever fires, saying so beats reconstructing silently.
+    if let Some(joc) = dep_info.first_joc_payload()
+        && merged_any
+        && joc.channel_count == 5
+    {
+        let message = format!(
+            "E-AC3 JOC declares a {}-channel downmix (joc_dmx_config_idx {}) but the bed carries an overlaid dependent",
+            joc.channel_count, joc.downmix_config
+        );
+        if bridge.strict {
+            return Err(message);
+        }
+        bridge_diag_log(log::Level::Warn, &message);
+        bridge.eac3_diag_stats.joc_downmix_config_mismatch += 1;
+        bridge.eac3_diag_stats.last_dependent_pair_error = Some(message);
+        bridge.eac3_object_decoder.note_non_joc_presentation();
+        let sample_count = bed.samples_per_channel();
+        bridge.eac3_total_samples += sample_count as u64;
         return Ok(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge));
     }
 
