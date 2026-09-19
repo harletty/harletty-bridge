@@ -10,15 +10,24 @@ use super::qmf::{QMF_SUBBANDS, QmfSubbands, QuadratureMirrorFilterBank};
 use super::syncframe::ParseError;
 use crate::BedChannel;
 
-const JOC_INPUT_ORDER: [BedChannel; 7] = [
+/// The five downmix channels every JOC configuration starts with, in the order
+/// clause 6.3.5.2 table 53 indexes them by `joc_channel_idx`. The LFE is
+/// bypassed rather than processed - table 47's note says so - and takes no
+/// slot.
+const JOC_INPUT_BASE: [BedChannel; 5] = [
     BedChannel::FrontLeft,
     BedChannel::FrontRight,
     BedChannel::Center,
     BedChannel::SurroundLeft,
     BedChannel::SurroundRight,
-    BedChannel::RearLeft,
-    BedChannel::RearRight,
 ];
+
+/// The pair the 7.X downmix adds: `joc_dmx_config_idx` 1.
+const JOC_INPUT_BACK_PAIR: [BedChannel; 2] = [BedChannel::RearLeft, BedChannel::RearRight];
+
+/// The pair the two "5.X + 2" downmixes add: `joc_dmx_config_idx` 2 and 4.
+const JOC_INPUT_TOP_FRONT_PAIR: [BedChannel; 2] =
+    [BedChannel::TopFrontLeft, BedChannel::TopFrontRight];
 
 const JOC_PARAMETER_BAND_BOUNDARIES: [&[u8]; 8] = [
     &[0],
@@ -94,15 +103,12 @@ impl JocObjectDecoderState {
         joc: &JocPayload,
         objects: &mut Vec<Vec<f32>>,
     ) -> Result<(), ParseError> {
-        if joc.channel_count > JOC_INPUT_ORDER.len() {
-            return Err(ParseError::UnsupportedFeature("joc-channel-count"));
-        }
         let samples = core.samples_per_channel();
         if samples == 0 || !samples.is_multiple_of(QMF_SUBBANDS) {
             return Err(ParseError::InvalidHeader("joc-frame-samples"));
         }
 
-        let input_indices = map_input_channel_indices(core, joc.channel_count)?;
+        let input_indices = map_input_channel_indices(core, joc.downmix_config, joc.channel_count)?;
         let timeslots = samples / QMF_SUBBANDS;
         self.reconfigure(joc.channel_count, joc.object_count);
         self.build_frame_matrices(joc, timeslots)?;
@@ -354,34 +360,48 @@ fn zero_timeslot_matrices(output: &mut TimeslotMatrices) {
     }
 }
 
+/// The bed channels the reconstruction reads, in `joc_channel_idx` order.
+///
+/// Clause 6.3.2.2 table 47 gives every `joc_dmx_config_idx` its own downmix.
+/// L, R, C, Ls and Rs are the same in all of them; only the pair a
+/// seven-channel downmix adds moves, and which pair that is the configuration
+/// alone says - the back pair for 7.X, the top front pair for the two
+/// "5.X + 2". The 90 degree phase shift that names configurations 3 and 4 is a
+/// property of the downmix the encoder made, carried in the coefficients this
+/// decoder is handed; TS 103 420 asks the decoder for nothing further, so 3
+/// reads as 0 does and 4 as 2 does.
+///
+/// A channel the configuration declares and the bed does not carry is an
+/// error, not something to substitute for. The 5.1 downmix of a 7.1 bed has
+/// Ls = Ls + Lb, so handing that one array to both the Ls and the Lb input is
+/// not an approximation of the missing channel: it applies two coefficients
+/// that meant different things to the same signal, and doubles what the
+/// surrounds contribute to every object.
 fn map_input_channel_indices(
     core: &CorePcmFrame,
+    downmix_config: u8,
     channel_count: usize,
 ) -> Result<Vec<usize>, ParseError> {
-    let mut indices = Vec::with_capacity(channel_count);
-    for channel in &JOC_INPUT_ORDER[..channel_count] {
-        let index = resolve_joc_input_channel_index(core, *channel)
-            .ok_or(ParseError::UnsupportedFeature("joc-input-layout"))?;
-        indices.push(index);
+    let extension: &[BedChannel] = match downmix_config {
+        0 | 3 => &[],
+        1 => &JOC_INPUT_BACK_PAIR,
+        2 | 4 => &JOC_INPUT_TOP_FRONT_PAIR,
+        _ => return Err(ParseError::UnsupportedFeature("joc_dmx_config_idx")),
+    };
+    if channel_count > JOC_INPUT_BASE.len() + extension.len() {
+        return Err(ParseError::UnsupportedFeature("joc-channel-count"));
     }
-    Ok(indices)
-}
-
-fn resolve_joc_input_channel_index(core: &CorePcmFrame, channel: BedChannel) -> Option<usize> {
-    core.fullband_channel_order
+    JOC_INPUT_BASE
         .iter()
-        .position(|candidate| *candidate == channel)
-        .or_else(|| match channel {
-            BedChannel::RearLeft => core
-                .fullband_channel_order
+        .chain(extension)
+        .take(channel_count)
+        .map(|channel| {
+            core.fullband_channel_order
                 .iter()
-                .position(|candidate| *candidate == BedChannel::SurroundLeft),
-            BedChannel::RearRight => core
-                .fullband_channel_order
-                .iter()
-                .position(|candidate| *candidate == BedChannel::SurroundRight),
-            _ => None,
+                .position(|candidate| candidate == channel)
+                .ok_or(ParseError::UnsupportedFeature("joc-input-layout"))
         })
+        .collect()
 }
 
 /// The dequantization step of clause 6.6.4 Pseudocode 5, which scales a
@@ -673,13 +693,75 @@ mod tests {
             lfe_channel: Some(vec![0.0; 64]),
         };
 
-        let indices = map_input_channel_indices(&frame, 5).expect("indices");
+        let indices = map_input_channel_indices(&frame, 0, 5).expect("indices");
         assert_eq!(indices, vec![0, 2, 1, 3, 4]);
     }
 
+    /// A bed carrying every position a seven-channel downmix can name, so the
+    /// only thing that decides which two the reconstruction reads is the
+    /// configuration.
+    fn seven_channel_bed() -> CorePcmFrame {
+        CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![
+                BedChannel::FrontLeft,
+                BedChannel::Center,
+                BedChannel::FrontRight,
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::RearLeft,
+                BedChannel::RearRight,
+                BedChannel::TopFrontLeft,
+                BedChannel::TopFrontRight,
+            ],
+            fullband_channels: vec![vec![0.0; 64]; 9],
+            lfe_channel: Some(vec![0.0; 64]),
+        }
+    }
+
+    /// Table 47 gives configuration 1 the back pair as its sixth and seventh
+    /// downmix channels, and configurations 2 and 4 the top front pair. The bed
+    /// below carries both, so a mapper that reads the configuration lands on
+    /// different channels for each and one that ignores it cannot.
     #[test]
-    fn five_channel_surround_core_can_feed_rear_joc_inputs() {
-        let frame = CorePcmFrame {
+    fn the_downmix_configuration_chooses_the_seventh_and_eighth_inputs() {
+        let frame = seven_channel_bed();
+
+        assert_eq!(
+            map_input_channel_indices(&frame, 1, 7).expect("7.X maps"),
+            vec![0, 2, 1, 3, 4, 5, 6],
+            "configuration 1 is 7.X: its extension pair is Lb/Rb"
+        );
+        for config in [2, 4] {
+            assert_eq!(
+                map_input_channel_indices(&frame, config, 7).expect("5.X + 2 maps"),
+                vec![0, 2, 1, 3, 4, 7, 8],
+                "configuration {config} is 5.X + 2: its extension pair is Tfl/Tfr"
+            );
+        }
+    }
+
+    /// Configurations 3 and 4 differ from 0 and 2 by a 90 degree phase shift in
+    /// the downmix the encoder made, which TS 103 420 gives the decoder nothing
+    /// to do about, so they read the same channels.
+    #[test]
+    fn the_phase_shifted_configurations_read_the_channels_they_mirror() {
+        let frame = seven_channel_bed();
+        assert_eq!(
+            map_input_channel_indices(&frame, 3, 5).expect("mirrors 0"),
+            map_input_channel_indices(&frame, 0, 5).expect("mirrors 0"),
+        );
+        assert_eq!(
+            map_input_channel_indices(&frame, 4, 7).expect("mirrors 2"),
+            map_input_channel_indices(&frame, 2, 7).expect("mirrors 2"),
+        );
+    }
+
+    /// A bed that cannot supply a declared downmix channel is an error, not a
+    /// reason to hand the reconstruction the nearest channel twice.
+    #[test]
+    fn a_bed_missing_a_declared_downmix_channel_is_rejected() {
+        let five_one = CorePcmFrame {
             sample_rate: 48_000,
             fullband_channel_order: vec![
                 BedChannel::FrontLeft,
@@ -691,9 +773,47 @@ mod tests {
             fullband_channels: vec![vec![0.0; 64]; 5],
             lfe_channel: Some(vec![0.0; 64]),
         };
+        assert!(
+            map_input_channel_indices(&five_one, 1, 7).is_err(),
+            "5.1 cannot stand in for the back pair configuration 1 declares"
+        );
 
-        let indices = map_input_channel_indices(&frame, 7).expect("indices");
-        assert_eq!(indices, vec![0, 1, 2, 3, 4, 3, 4]);
+        // And the reverse: a bed with the back pair but no height cannot serve
+        // the configurations whose extension is Tfl/Tfr, which is exactly what
+        // a mapper hard-wired to the back pair would let through.
+        let seven_one = CorePcmFrame {
+            fullband_channel_order: vec![
+                BedChannel::FrontLeft,
+                BedChannel::FrontRight,
+                BedChannel::Center,
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::RearLeft,
+                BedChannel::RearRight,
+            ],
+            fullband_channels: vec![vec![0.0; 64]; 7],
+            ..five_one
+        };
+        for config in [2, 4] {
+            assert!(
+                map_input_channel_indices(&seven_one, config, 7).is_err(),
+                "configuration {config} reads Tfl/Tfr, which this bed does not carry"
+            );
+        }
+        assert!(
+            map_input_channel_indices(&seven_one, 1, 7).is_ok(),
+            "the same bed does satisfy configuration 1"
+        );
+    }
+
+    /// Five-channel configurations have no extension pair to take a sixth and
+    /// seventh input from, whatever the bed carries.
+    #[test]
+    fn a_five_channel_configuration_cannot_declare_seven_inputs() {
+        let frame = seven_channel_bed();
+        for config in [0, 3] {
+            assert!(map_input_channel_indices(&frame, config, 7).is_err());
+        }
     }
 
     /// Clause 6.6.2 Pseudocode 2 as this decoder reads it, worked through by

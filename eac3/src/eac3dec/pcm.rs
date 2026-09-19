@@ -56,7 +56,16 @@ impl CorePcmFrame {
 /// Speaker positions a dependent-substream `chanmap` carries, in coded-channel
 /// order (MSB→LSB; pair bits emit left then right). Only the bits that map to a
 /// concrete bed position are emitted — enough for the common 5.1/7.1 channel
-/// extensions (e.g. 0x1A00 = Ls, Rs, Lrs/Rrs).
+/// extensions (e.g. 0x1A00 = Ls, Rs, Lrs/Rrs) and for the height pairs a
+/// 5.1.2 or 5.1.4 bed is carried as.
+///
+/// The bit numbering is TS 102 366 table E.1.4's, where bit 0 is the most
+/// significant of the sixteen — so its bit 11, the Vhl/Vhr pair, is `1 << 4`
+/// here. Vhl/Vhr are the front height speakers, the Tfl/Tfr that JOC downmix
+/// configurations 2 and 4 name as their sixth and seventh inputs; without them
+/// no bed can satisfy those configurations. Its bits 8 and 12, Ts and Vhc, have
+/// no [`BedChannel`] to land on and are left out, which the caller's
+/// count check turns into a declined merge rather than a misplaced channel.
 pub fn dependent_chanmap_positions(chanmap: u16) -> Vec<BedChannel> {
     use BedChannel::*;
     const TABLE: &[(u16, &[BedChannel])] = &[
@@ -68,6 +77,8 @@ pub fn dependent_chanmap_positions(chanmap: u16) -> Vec<BedChannel> {
         (1 << 9, &[RearLeft, RearRight]), // Lrs/Rrs (back surrounds)
         (1 << 8, &[RearCenter]),          // Cs
         (1 << 5, &[WideLeft, WideRight]), // Lw/Rw
+        (1 << 4, &[TopFrontLeft, TopFrontRight]), // Vhl/Vhr (front height)
+        (1 << 2, &[TopSurroundLeft, TopSurroundRight]), // Lts/Rts
     ];
     let mut out = Vec::new();
     for &(bit, chans) in TABLE {
@@ -79,34 +90,66 @@ pub fn dependent_chanmap_positions(chanmap: u16) -> Vec<BedChannel> {
 }
 
 /// Merge a decoded core (5.1) with its dependent E-AC-3 substream — the discrete
-/// surround/back channels of a 7.1 extension — into one bed, placing the
-/// dependent's channels by its `chanmap`. Returns `None` (caller falls back to
-/// the core alone) when the dependent can't be decoded or doesn't line up.
+/// surround/back channels of a 7.1 extension, or the height layer above it —
+/// into one bed. Returns `None` (caller falls back to the core alone) when the
+/// dependent can't be decoded or doesn't line up.
+///
+/// TS 102 366 clause E.2.8.2 gives the dependent's channels two ways of naming
+/// themselves and the same meaning either way: a channel the core also carries
+/// is overwritten by the dependent's, and one it does not extends the bed.
+/// `chanmape == 1` names them with the custom map; `chanmape == 0` leaves it to
+/// the dependent's own `acmod` and `lfeon`, which is the layout the decoder has
+/// already derived for it, so that case reads the order off the decoded frame
+/// rather than declining the merge. It is a narrower case than it sounds —
+/// `acmod` reaches no further than 3/2, so a map-less dependent can only
+/// replace base channels, never add a back or height pair — but replacing them
+/// is exactly what it is for, and ignoring it left the reconstruction reading
+/// core channels the dependent had already superseded.
 pub fn merge_core_with_dependent(
     dependent_decoder: &mut PcmDecoder,
     core: &CorePcmFrame,
     dependent_frame: &[u8],
 ) -> Option<CorePcmFrame> {
     let dep = dependent_decoder.push_access_unit(dependent_frame).ok()?;
-    let positions = dependent_chanmap_positions(dep.info.dependent_channel_map?);
-    let dep_pcm = dep.pcm;
-    if positions.len() != dep_pcm.fullband_channels.len()
-        || dep_pcm.samples_per_channel() != core.samples_per_channel()
+    overlay_dependent_on_core(core, &dep.pcm, dep.info.dependent_channel_map)
+}
+
+/// Overlay a decoded dependent substream onto the core it belongs to.
+///
+/// Split out from [`merge_core_with_dependent`] because this is the whole of
+/// clause E.2.8.2's rule and none of the bitstream: given the dependent's
+/// decoded channels and how it named them, the result follows. A dependent
+/// whose `chanmap` names a different number of channels than it decoded, or
+/// whose block length disagrees with the core's, is declined.
+///
+/// The LFE follows the same replace-or-keep rule, and clause E.2.8.2 says so in
+/// as many words: a dependent that carries one replaces the core's.
+fn overlay_dependent_on_core(
+    core: &CorePcmFrame,
+    dependent: &CorePcmFrame,
+    chanmap: Option<u16>,
+) -> Option<CorePcmFrame> {
+    let positions = match chanmap {
+        Some(chanmap) => dependent_chanmap_positions(chanmap),
+        None => dependent.fullband_channel_order.clone(),
+    };
+    if positions.len() != dependent.fullband_channels.len()
+        || dependent.samples_per_channel() != core.samples_per_channel()
     {
         return None;
     }
 
     // Start from the core's fullband channels, then overlay the dependent's:
     // replace a position the core also carried (discrete side surrounds) or
-    // append a new one (the back pair).
+    // append a new one (the back pair, or the height layer).
     let mut order: Vec<BedChannel> = core.fullband_channel_order.clone();
     let mut chans: Vec<Vec<f32>> = core.fullband_channels.clone();
     for (i, &pos) in positions.iter().enumerate() {
         match order.iter().position(|&b| b == pos) {
-            Some(idx) => chans[idx] = dep_pcm.fullband_channels[i].clone(),
+            Some(idx) => chans[idx] = dependent.fullband_channels[i].clone(),
             None => {
                 order.push(pos);
-                chans.push(dep_pcm.fullband_channels[i].clone());
+                chans.push(dependent.fullband_channels[i].clone());
             }
         }
     }
@@ -115,7 +158,10 @@ pub fn merge_core_with_dependent(
         sample_rate: core.sample_rate,
         fullband_channel_order: order,
         fullband_channels: chans,
-        lfe_channel: core.lfe_channel.clone(),
+        lfe_channel: dependent
+            .lfe_channel
+            .clone()
+            .or_else(|| core.lfe_channel.clone()),
     })
 }
 
@@ -341,7 +387,44 @@ pub struct ObjectPcmDecoder {
     metadata_state: MetadataParseState,
     core_delay: CoreAlignmentDelay,
     joc_input_core: Option<CorePcmFrame>,
+    /// `joc_sequence_counter` of the last JOC frame reconstructed, or `None`
+    /// while the decoder is cold. See [`continues_joc_sequence`].
+    joc_sequence: Option<u16>,
     debug_log_level: log::Level,
+}
+
+/// Whether a JOC frame carrying `sequence_counter` continues the frame that
+/// carried `previous`.
+///
+/// Clause 6.3.3.3 gives the counter one job: "The frame sequence counter is
+/// used for splice detection in the decoder." It increments by one per frame up
+/// to 1 023 and then restarts at 1, and "the value 0 indicates the first frame
+/// in the bitstream or the first frame after a splice". So the successor of the
+/// last counter seen is the only value that means one continuous programme, and
+/// everything else - a zero, a repeat, a gap forwards, a jump backwards - means
+/// the frames either side of this one were never adjacent, whatever the decoder
+/// is still holding from before.
+///
+/// Note that 1 023 is followed by 1 rather than 0: the wrap skips the value the
+/// clause reserves for a splice, so a stream that has been running for six hours
+/// is not mistaken for one that has just been cut.
+fn continues_joc_sequence(previous: Option<u16>, sequence_counter: u16) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    if sequence_counter == 0 {
+        return false;
+    }
+    let expected = if previous == 1023 { 1 } else { previous + 1 };
+    sequence_counter == expected
+}
+
+/// The JOC payload of an access unit, if it carries one.
+fn find_joc_payload(info: &AccessUnitInfo) -> Option<JocPayload> {
+    info.payloads().find_map(|payload| match &payload.parsed {
+        ParsedEmdfPayloadData::Joc(joc) => Some(joc.clone()),
+        _ => None,
+    })
 }
 
 /// Holds the core PCM back by [`JOC_LATENCY_SAMPLES`] so that everything in an
@@ -471,6 +554,7 @@ impl Default for ObjectPcmDecoder {
             metadata_state: MetadataParseState::default(),
             core_delay: CoreAlignmentDelay::default(),
             joc_input_core: None,
+            joc_sequence: None,
             debug_log_level: log::Level::Debug,
         }
     }
@@ -497,6 +581,75 @@ impl ObjectPcmDecoder {
         self.metadata_state.reset();
         self.core_delay.reset();
         self.joc_input_core = None;
+        self.joc_sequence = None;
+    }
+
+    /// Tell the decoder that a complete presentation carried no JOC.
+    ///
+    /// The sequence counter cannot see this. It increments once per JOC frame,
+    /// so a programme that stops carrying JOC and later resumes can come back
+    /// with the successor of the counter this decoder last saw, and read as
+    /// continuous - while the reconstruction slept through an entire interval
+    /// and its filter banks still hold the audio from before the gap.
+    ///
+    /// Only the caller knows where a presentation ends, which is why this is
+    /// asked for rather than inferred: a single access unit without JOC is
+    /// routinely the independent half of a pair whose dependent carries it, and
+    /// resetting on that would cold-start every frame of a healthy 7.1-core
+    /// stream. Call this once a presentation has been *resolved* as carrying no
+    /// JOC - a standalone core emitted, or a pair completed with neither half
+    /// carrying a payload - and never on a half-seen one.
+    ///
+    /// A caller that never calls it keeps the previous behaviour exactly.
+    pub fn note_non_joc_presentation(&mut self) {
+        self.reset_decode_state();
+    }
+
+    /// Take the JOC payload to reconstruct from, cold-starting first when its
+    /// sequence counter says this frame does not follow the last one decoded.
+    ///
+    /// The counter only becomes readable once the frame has been parsed, and
+    /// that parse has already advanced the OAMD and auxiliary syntax state it
+    /// inherited from whatever was playing before the cut. So a splice is not
+    /// finished by clearing the audio history: the frame that exposed it has to
+    /// be read again from cleared state, or the first frame of the new
+    /// programme is still interpreted against the last frame of the old one.
+    /// That second parse costs nothing on a continuous stream, which is every
+    /// frame but the one after a cut.
+    fn joc_payload_for_reconstruction(
+        &mut self,
+        access_unit: &[u8],
+        info: AccessUnitInfo,
+        joc: JocPayload,
+    ) -> Result<(AccessUnitInfo, JocPayload), ParseError> {
+        let (info, joc) = if continues_joc_sequence(self.joc_sequence, joc.sequence_counter) {
+            (info, joc)
+        } else {
+            // A cold decoder starting on its first frame is not a splice, and
+            // the level this logs at is the caller's `set_debug_log_level` -
+            // `Warn` or `Error` for the bridge - so announcing every ordinary
+            // start would put a false fault in the player's log. Only a counter
+            // that broke a run it was part of is worth a line.
+            if let Some(previous) = self.joc_sequence {
+                log::log!(
+                    target: "starmine_ad::eac3dec::pcm",
+                    self.debug_log_level,
+                    "joc-splice previous={previous} counter={} - cold starting",
+                    joc.sequence_counter,
+                );
+            }
+            self.reset_decode_state();
+            let info = inspect_access_unit_with_metadata_state(
+                access_unit,
+                &mut self.metadata_state,
+                Some(&mut self.aux_state),
+            )?;
+            let joc =
+                find_joc_payload(&info).ok_or(ParseError::InvalidHeader("joc-sequence-reparse"))?;
+            (info, joc)
+        };
+        self.joc_sequence = Some(joc.sequence_counter);
+        Ok((info, joc))
     }
 
     /// Number of access units accepted since the last reset.
@@ -596,13 +749,10 @@ impl ObjectPcmDecoder {
             });
         }
 
-        let joc = info.payloads().find_map(|payload| match &payload.parsed {
-            ParsedEmdfPayloadData::Joc(joc) => Some(joc.clone()),
-            _ => None,
-        });
-        let Some(joc) = joc else {
+        let Some(joc) = find_joc_payload(&info) else {
             return Ok(None);
         };
+        let (info, joc) = self.joc_payload_for_reconstruction(access_unit, info, joc)?;
 
         let joc_input_core =
             decode_core_pcm_frame_with_state(access_unit, &info, &mut self.core_state)?;
@@ -678,13 +828,10 @@ impl ObjectPcmDecoder {
             });
         }
 
-        let joc = info.payloads().find_map(|payload| match &payload.parsed {
-            ParsedEmdfPayloadData::Joc(joc) => Some(joc.clone()),
-            _ => None,
-        });
-        let Some(joc) = joc else {
+        let Some(joc) = find_joc_payload(&info) else {
             return Ok(None);
         };
+        let (info, joc) = self.joc_payload_for_reconstruction(access_unit, info, joc)?;
 
         self.reset_history_if_reconfigured(&joc_input_core);
         let object_channels = self.joc_state.decode_frame(&joc_input_core, &joc)?;
@@ -721,6 +868,41 @@ impl ObjectPcmDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clause 6.3.3.3's counter, case by case.
+    ///
+    /// The successor of the last counter seen is the only value that continues
+    /// a programme. A cold decoder continues nothing, whatever it is handed;
+    /// zero is the clause's own splice marker and never continues, not even
+    /// from 1 023; and the wrap runs 1 023 to 1, so the one value that would
+    /// otherwise look like a wrap is the one that means a cut.
+    #[test]
+    fn joc_sequence_counter_continues_only_on_the_successor() {
+        for (previous, counter, expected, what) in [
+            (None, 0, false, "cold decoder, splice marker"),
+            (None, 37, false, "cold decoder, mid-stream counter"),
+            (
+                Some(0),
+                1,
+                true,
+                "first frame after a splice, then its successor",
+            ),
+            (Some(41), 42, true, "ordinary successor"),
+            (Some(1022), 1023, true, "successor up to the maximum"),
+            (Some(1023), 1, true, "the wrap skips zero"),
+            (Some(1023), 0, false, "zero is a splice even at the wrap"),
+            (Some(41), 0, false, "splice marker"),
+            (Some(41), 43, false, "a frame is missing"),
+            (Some(41), 41, false, "the same frame twice"),
+            (Some(900), 12, false, "jump backwards"),
+        ] {
+            assert_eq!(
+                continues_joc_sequence(previous, counter),
+                expected,
+                "{previous:?} -> {counter} ({what})"
+            );
+        }
+    }
 
     /// A ramp is the easiest signal to read a delay off: sample `n` carries the
     /// value `n`, so wherever the ramp starts is the delay.
@@ -867,6 +1049,72 @@ mod tests {
         assert!(at_44k.fullband_channels[0].iter().all(|&s| s == 0.0));
     }
 
+    /// A presentation the object decoder sat out breaks the run, even though
+    /// the counter cannot see it.
+    ///
+    /// The counter increments per JOC frame, so a programme that stops carrying
+    /// JOC and resumes can come back with the successor of the last value seen
+    /// and read as continuous - while the filter banks still hold the audio
+    /// from before the gap. The caller reports the gap, and reporting it has to
+    /// leave the decoder as cold as a fresh one: warm banks here would put the
+    /// old programme's 577 samples under the first frame of the new one, and a
+    /// retained counter would let the frame after that continue from it.
+    #[test]
+    fn a_reported_non_joc_presentation_cold_starts_the_reconstruction() {
+        use super::super::metadata::{JocObject, JocObjectData};
+
+        let core = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![BedChannel::FrontLeft, BedChannel::FrontRight],
+            fullband_channels: vec![vec![0.5; 64], vec![-0.5; 64]],
+            lfe_channel: Some(vec![0.25; 64]),
+        };
+        let joc = JocPayload {
+            downmix_config: 0,
+            channel_count: 2,
+            object_count: 1,
+            gain: 1.0,
+            sequence_counter: 41,
+            objects: vec![JocObject {
+                active: true,
+                bands_index: Some(0),
+                bands: 1,
+                sparse_coded: false,
+                quantization_table: Some(0),
+                steep_slope: false,
+                data_points: 1,
+                timeslot_offsets: Vec::new(),
+                data: Some(JocObjectData::Dense {
+                    matrices: vec![vec![vec![1], vec![1]]],
+                }),
+            }],
+        };
+
+        let mut decoder = ObjectPcmDecoder::new();
+        decoder
+            .joc_state
+            .decode_frame(&core, &joc)
+            .expect("a frame to warm the banks");
+        decoder.core_delay.delayed(&core);
+        decoder.joc_sequence = Some(joc.sequence_counter);
+        assert!(
+            !decoder.joc_state.is_cold(),
+            "the reconstruction should be holding history after a frame",
+        );
+
+        decoder.note_non_joc_presentation();
+
+        assert!(
+            decoder.joc_state.is_cold(),
+            "a reported no-JOC presentation left the filter banks warm",
+        );
+        assert!(
+            decoder.joc_sequence.is_none(),
+            "a reported no-JOC presentation left the counter behind, so counter 42 \
+             would still read as continuing counter 41 across the gap",
+        );
+    }
+
     /// The delay's tails and the reconstruction's filter banks are two halves
     /// of the same history, and the objects are reconstructed before the delay
     /// ever sees the frame. If only the tails cold-start, the frame that
@@ -938,5 +1186,180 @@ mod tests {
                 BedChannel::RearRight,
             ]
         );
+    }
+
+    /// Table E.1.4 bit 11 is the Vhl/Vhr pair and bit 13 the Lts/Rts pair - the
+    /// two height pairs, and the only route by which a bed can carry the
+    /// Tfl/Tfr that JOC downmix configurations 2 and 4 read.
+    ///
+    /// The order of the emitted positions is the order of the enabled bits, not
+    /// the order the table is written in, so this asserts a chanmap that mixes
+    /// a height pair in among the surrounds rather than one bit at a time.
+    ///
+    /// Both maps below are ones a single dependent can actually carry. `acmod`
+    /// reaches 3/2 at most, so five full-band channels is the ceiling for one
+    /// substream and a map naming six positions describes no frame that can
+    /// exist — a 5.1.4 bed is two dependents, one pair each, not one map.
+    #[test]
+    fn chanmap_carries_the_height_pairs() {
+        // Ls, Rs and the front height pair: a 5.1.2 extension in one
+        // four-channel dependent (acmod 2/2).
+        assert_eq!(
+            dependent_chanmap_positions(0x1810),
+            vec![
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::TopFrontLeft,
+                BedChannel::TopFrontRight,
+            ]
+        );
+        // Both height pairs and nothing else: the top layer of a 5.1.4 bed,
+        // again four channels in one dependent.
+        assert_eq!(
+            dependent_chanmap_positions(0x0014),
+            vec![
+                BedChannel::TopFrontLeft,
+                BedChannel::TopFrontRight,
+                BedChannel::TopSurroundLeft,
+                BedChannel::TopSurroundRight,
+            ]
+        );
+    }
+
+    /// Build a bed whose every channel is a constant, so which array ended up
+    /// where is readable from one sample.
+    fn bed(order: &[BedChannel], values: &[f32], lfe: Option<f32>) -> CorePcmFrame {
+        CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: order.to_vec(),
+            fullband_channels: values.iter().map(|v| vec![*v; 256]).collect(),
+            lfe_channel: lfe.map(|v| vec![v; 256]),
+        }
+    }
+
+    fn first_samples(frame: &CorePcmFrame) -> Vec<f32> {
+        frame.fullband_channels.iter().map(|c| c[0]).collect()
+    }
+
+    const FIVE_ONE: [BedChannel; 5] = [
+        BedChannel::FrontLeft,
+        BedChannel::Center,
+        BedChannel::FrontRight,
+        BedChannel::SurroundLeft,
+        BedChannel::SurroundRight,
+    ];
+
+    /// A dependent with no custom channel map is not a dependent with no
+    /// channels.
+    ///
+    /// Clause E.2.8.2: with `chanmape` at 0 the dependent's own `acmod` and
+    /// `lfeon` identify what it carries, and those channels overwrite the
+    /// core's. Declining the merge instead — which is what reading the map as
+    /// mandatory did — left the reconstruction running on core channels the
+    /// dependent had already superseded.
+    #[test]
+    fn a_dependent_without_a_custom_map_replaces_by_its_own_channel_order() {
+        let core = bed(&FIVE_ONE, &[1.0, 2.0, 3.0, 4.0, 5.0], Some(9.0));
+        // acmod 3/0, as the decoder derived it for the dependent: L, C, R.
+        let dependent = bed(
+            &[
+                BedChannel::FrontLeft,
+                BedChannel::Center,
+                BedChannel::FrontRight,
+            ],
+            &[-1.0, -2.0, -3.0],
+            None,
+        );
+
+        let merged = overlay_dependent_on_core(&core, &dependent, None)
+            .expect("a map-less dependent must still merge");
+        assert_eq!(
+            merged.fullband_channel_order.as_slice(),
+            FIVE_ONE.as_slice(),
+            "replacing channels the core already has must not extend the bed"
+        );
+        assert_eq!(
+            first_samples(&merged),
+            vec![-1.0, -2.0, -3.0, 4.0, 5.0],
+            "the three channels it carries must overwrite the core's, and only those"
+        );
+    }
+
+    /// Clause E.2.8.2 names the LFE specifically: a dependent that carries one
+    /// replaces the core's. Keeping the core's unconditionally is what this
+    /// used to do.
+    #[test]
+    fn a_dependent_lfe_replaces_the_core_lfe() {
+        let core = bed(&FIVE_ONE, &[1.0; 5], Some(9.0));
+        let with_lfe = bed(&[BedChannel::Center], &[-2.0], Some(-9.0));
+        let merged = overlay_dependent_on_core(&core, &with_lfe, None).expect("merges");
+        assert_eq!(
+            merged.lfe_channel.as_ref().map(|c| c[0]),
+            Some(-9.0),
+            "the dependent's LFE must replace the core's"
+        );
+
+        // And a dependent with none leaves the core's alone.
+        let without_lfe = bed(&[BedChannel::Center], &[-2.0], None);
+        let merged = overlay_dependent_on_core(&core, &without_lfe, None).expect("merges");
+        assert_eq!(
+            merged.lfe_channel.as_ref().map(|c| c[0]),
+            Some(9.0),
+            "a dependent carrying no LFE must not take the core's away"
+        );
+    }
+
+    /// The custom map still wins where there is one, and a position the core
+    /// does not carry extends the bed rather than replacing something.
+    #[test]
+    fn a_custom_map_places_channels_the_core_does_not_carry() {
+        let core = bed(&FIVE_ONE, &[1.0, 2.0, 3.0, 4.0, 5.0], Some(9.0));
+        // 0x1810: Ls, Rs, then the front height pair.
+        let dependent = bed(
+            &[
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::TopFrontLeft,
+                BedChannel::TopFrontRight,
+            ],
+            &[-4.0, -5.0, -6.0, -7.0],
+            None,
+        );
+
+        let merged =
+            overlay_dependent_on_core(&core, &dependent, Some(0x1810)).expect("5.1.2 must merge");
+        assert_eq!(
+            merged.fullband_channel_order,
+            vec![
+                BedChannel::FrontLeft,
+                BedChannel::Center,
+                BedChannel::FrontRight,
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::TopFrontLeft,
+                BedChannel::TopFrontRight,
+            ],
+            "the height pair must extend the bed, giving the seven channels \
+             downmix configurations 2 and 4 read"
+        );
+        assert_eq!(
+            first_samples(&merged),
+            vec![1.0, 2.0, 3.0, -4.0, -5.0, -6.0, -7.0]
+        );
+    }
+
+    /// The map is authoritative when present: one naming a different number of
+    /// channels than the dependent decoded is a mismatch, not something to
+    /// merge halfway.
+    #[test]
+    fn a_map_that_does_not_match_the_decoded_channels_is_declined() {
+        let core = bed(&FIVE_ONE, &[1.0; 5], Some(9.0));
+        let dependent = bed(
+            &[BedChannel::SurroundLeft, BedChannel::SurroundRight],
+            &[-1.0, -2.0],
+            None,
+        );
+        // 0x1810 names four positions; the dependent decoded two.
+        assert!(overlay_dependent_on_core(&core, &dependent, Some(0x1810)).is_none());
     }
 }

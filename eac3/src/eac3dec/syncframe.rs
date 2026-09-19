@@ -16,7 +16,7 @@ use super::allocation::{
 use super::bitstream::BitReader;
 use super::imdct::ImdctState;
 use super::metadata::{
-    MetadataParseState, ParsedEmdfPayloadData, parse_emdf_payload_body_with_state,
+    JocPayload, MetadataParseState, ParsedEmdfPayloadData, parse_emdf_payload_body_with_state,
 };
 use super::pcm::CorePcmFrame;
 use crate::BedChannel;
@@ -415,6 +415,18 @@ impl AccessUnitInfo {
         self.payloads()
             .filter(|payload| payload.info.payload_id == 14)
             .count()
+    }
+
+    /// First JOC payload parsed out of this access unit, if any.
+    ///
+    /// The payload is decoded during inspection, so callers that only need the
+    /// header it declares — the downmix configuration, the object count — can
+    /// read it here instead of parsing the access unit again.
+    pub fn first_joc_payload(&self) -> Option<&JocPayload> {
+        self.payloads().find_map(|payload| match &payload.parsed {
+            ParsedEmdfPayloadData::Joc(joc) => Some(joc),
+            _ => None,
+        })
     }
 
     /// Number of OAMD payloads present in this access unit.
