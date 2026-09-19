@@ -26,7 +26,7 @@ bridge-perf = ["truehd/perf"]
 bridge_api = { version = "0.3.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
 spdif = { version = "0.1.0", path = "../../Omniphony/omniphony-renderer/spdif" }
 sys = { version = "0.1.0", path = "../../Omniphony/omniphony-renderer/sys" }
-truehd = { version = "0.7.1" }
+truehd = { version = "0.7.2" }
 eac3 = { version = "0.7.4", path = "../eac3" }
 dca = { version = "0.7.4", path = "../dca" }
 auro = { version = "0.7.4", path = "../auro" }

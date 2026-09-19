@@ -251,9 +251,14 @@ mod tests {
     }
 
     fn run(bytes: &[u8]) -> Run {
+        run_in_chunks(bytes, bytes.len().max(1))
+    }
+
+    /// Pushes `bytes` to the extractor `chunk_len` bytes at a time and drains it
+    /// after every push, the way the file and pipe readers do.
+    fn run_in_chunks(bytes: &[u8], chunk_len: usize) -> Run {
         let (tx, rx) = mpsc::channel();
         let mut extractor = Extractor::default();
-        extractor.push_bytes(bytes);
 
         let mut parser = Parser::default();
         let mut decoder = Decoder::default();
@@ -282,7 +287,10 @@ mod tests {
             gap_samples: &mut gap_samples,
         };
 
-        process_frames(&mut ctx).expect("processing must not abort in non-strict mode");
+        for chunk in bytes.chunks(chunk_len) {
+            ctx.extractor.push_bytes(chunk);
+            process_frames(&mut ctx).expect("processing must not abort in non-strict mode");
+        }
         drop(tx);
 
         Run {
@@ -300,6 +308,28 @@ mod tests {
         assert_eq!(run.access_units.len(), 8);
         assert_eq!(run.total_samples, 320);
         assert_eq!(run.gap_access_units, 0, "nothing to recover from");
+    }
+
+    /// A pipe hands `decode -` whatever it has, which can be a few bytes at a
+    /// time, and the extractor must lock on all the same. With truehd 0.7.1 it
+    /// never did: a failed resync scan kept only four trailing bytes, so a sync
+    /// word arriving in pieces of 23 bytes or fewer settled below the index the
+    /// scan starts at and was never found again — a valid stream pushed a byte
+    /// at a time extracted nothing at all. Fixed in truehd 0.7.2
+    /// (truehdd/truehdd#33); this pins the fix for the CLI and the realtime
+    /// bridge alike, which drain the same extractor.
+    #[test]
+    fn a_stream_pushed_a_byte_at_a_time_extracts_every_access_unit() {
+        let whole = run(&stream(4));
+        let trickled = run_in_chunks(&stream(4), 1);
+
+        assert_eq!(
+            trickled.access_units.len(),
+            whole.access_units.len(),
+            "the extractor lost access units it was fed piecemeal"
+        );
+        assert_eq!(trickled.total_samples, whole.total_samples);
+        assert_eq!(trickled.gap_access_units, 0, "nothing to recover from");
     }
 
     /// An access unit we cannot decode has to leave silence behind, not
