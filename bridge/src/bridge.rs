@@ -1,7 +1,7 @@
 use abi_stable::std_types::{RSlice, RStr, RString, RVec};
 use bridge_api::{
-    FormatBridge, RCoordinateFormat, RInputTransport, RPushResult, RVbapCartesianDefaults,
-    RVbapTableMode,
+    FormatBridge, RChannelPose, RCoordinateFormat, RInputTransport, RPushResult,
+    RVbapCartesianDefaults, RVbapTableMode,
 };
 use eac3::{CorePcmFrame, Extractor as Eac3RawExtractor, ObjectPcmDecoder, PcmDecoder};
 use std::collections::VecDeque;
@@ -826,6 +826,17 @@ impl FormatBridge for AtmosBridge {
         RCoordinateFormat::Cartesian
     }
 
+    fn fixed_channel_poses(&self) -> RVec<RChannelPose> {
+        // Auro-3D is the one format here that states an angle for its
+        // channels (an unfolded carrier declares its whole layout). Every
+        // other presentation names speakers the renderer already places.
+        if self.dts_active {
+            self.dts_auro.declared_poses()
+        } else {
+            RVec::new()
+        }
+    }
+
     fn vbap_cartesian_defaults(&self) -> RVbapCartesianDefaults {
         // Balanced default grid size for runtime cartesian VBAP table
         // generation. The axis sizes mirror the OAMD position quantisation
@@ -998,22 +1009,49 @@ mod raw_transport_tests {
             assert!(result.error_message.is_empty(), "{}", result.error_message);
             frames.extend(result.frames.into_iter());
         }
-        assert!(bridge.dts_auro.is_unfolding(), "the carrier was not confirmed");
+        assert!(
+            bridge.dts_auro.is_unfolding(),
+            "the carrier was not confirmed"
+        );
         assert!(!bridge.has_objects(), "Auro is fixed channels, not objects");
         // Every frame that came out is the unfolded layout: the carrier was
         // held back until the verdict, never emitted as 7.1.
         let channels = frames[0].channel_count;
-        assert!(channels > 8, "expected more than the carrier's channels, got {channels}");
+        assert!(
+            channels > 8,
+            "expected more than the carrier's channels, got {channels}"
+        );
         assert!(frames.iter().all(|f| f.channel_count == channels));
         let labels = &frames[0].channel_labels;
         assert!(
-            labels.contains(&bridge_api::RChannelLabel::Tfl)
-                && labels.contains(&bridge_api::RChannelLabel::Tbr)
+            labels.contains(&bridge_api::RChannelLabel::Lh)
+                && labels.contains(&bridge_api::RChannelLabel::Rhs),
+            "the height layer is the height tier, not the top one: {labels:?}"
+        );
+        // The bridge declares where Auro puts every one of them.
+        let poses = bridge.fixed_channel_poses();
+        let lhs = poses
+            .iter()
+            .find(|p| p.label == bridge_api::RChannelLabel::Lhs)
+            .expect("Lhs is declared");
+        assert_eq!((lhs.azimuth_deg, lhs.elevation_deg), (-110.0, 30.0));
+        assert!(
+            poses.iter().all(|p| labels.contains(&p.label)),
+            "declared poses name only channels of the frame"
         );
         // Output is one block behind input, and no more.
         let emitted: u64 = frames.iter().map(|f| u64::from(f.sample_count)).sum();
-        assert!(bridge.total_samples - emitted <= 4096, "{} held back", bridge.total_samples - emitted);
-        eprintln!("{} frames, {} channels, {emitted}/{} samples out", frames.len(), channels, bridge.total_samples);
+        assert!(
+            bridge.total_samples - emitted <= 4096,
+            "{} held back",
+            bridge.total_samples - emitted
+        );
+        eprintln!(
+            "{} frames, {} channels, {emitted}/{} samples out",
+            frames.len(),
+            channels,
+            bridge.total_samples
+        );
     }
 
     #[test]
