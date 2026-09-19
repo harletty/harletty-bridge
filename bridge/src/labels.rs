@@ -120,10 +120,16 @@ pub(crate) fn oamd_speaker_to_label(speaker_index: usize) -> RChannelLabel {
     }
 }
 
-/// Map an Auro stream to the renderer's channel label. Auro's height layer
-/// sits at about 30 degrees of elevation rather than overhead, and its
-/// centre height and top have no closer labels than the top-front-centre
-/// and top-centre ones; the renderer's channel mode places them.
+/// Map an Auro stream to the renderer's channel label.
+///
+/// The floor is the shared 7.1 set. The height layer is the renderer's
+/// height tier — `Lh`/`Rh`/`Ch`/`Lhs`/`Rhs`, 30° over the floor speaker of
+/// the same name — not the top tier, whose labels mean the ceiling corners;
+/// the Top is the single overhead `Tc`. Where each of them sits is declared
+/// alongside ([`crate::auro_pipeline::auro_pose`]), so the renderer places
+/// the layer at Auro's own angles whatever its room ratio is. Stream 15, the
+/// second top of the `_2T` layouts, has no public position and stays
+/// unlabelled.
 pub(crate) fn auro_stream_to_r(stream: auro::StreamId) -> RChannelLabel {
     match stream.0 {
         0 => RChannelLabel::L,
@@ -135,12 +141,12 @@ pub(crate) fn auro_stream_to_r(stream: auro::StreamId) -> RChannelLabel {
         6 => RChannelLabel::Cb,
         7 => RChannelLabel::Lb,
         8 => RChannelLabel::Rb,
-        9 => RChannelLabel::Tfl,
-        10 => RChannelLabel::Tfr,
-        11 => RChannelLabel::Tfc,
+        9 => RChannelLabel::Lh,
+        10 => RChannelLabel::Rh,
+        11 => RChannelLabel::Ch,
         12 => RChannelLabel::Tc,
-        13 => RChannelLabel::Tbl,
-        14 => RChannelLabel::Tbr,
+        13 => RChannelLabel::Lhs,
+        14 => RChannelLabel::Rhs,
         _ => RChannelLabel::Unknown,
     }
 }
