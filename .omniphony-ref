@@ -1,0 +1,3 @@
+# The Omniphony side of this pull request (mgth/Omniphony#546, bridge_api 0.4).
+# CI builds against this ref instead of main. Remove before merging.
+feat/channel-poses
