@@ -13,6 +13,16 @@ name: CI
 # `cargo test` covers both artifacts since the root became a virtual
 # workspace, including the truehdd CLI's golden-file regression
 # (truehdd/tests/golden.rs).
+#
+# The bridge builds against a checkout of Omniphony (path dependencies on
+# `../Omniphony`), normally its `main`. A pull request whose Omniphony side
+# is not merged yet can name the ref to build against in a file
+# `.omniphony-ref` at the repository root — one line, a branch, tag or SHA
+# of mgth/Omniphony — and its CI runs against that instead. The file is for
+# pull requests only: remove it before merging, once the Omniphony side is
+# on `main`. A push to `main` that still carries one fails on purpose,
+# because `main` would then be tested against something `main` is not
+# built with.
 
 on:
   push:
@@ -31,10 +41,33 @@ jobs:
         with:
           path: harletty-bridge
 
+      # `main` unless the branch names another ref in `.omniphony-ref` (see
+      # the header). Blank lines and `#` comments in the file are ignored;
+      # the first remaining line is the ref.
+      - name: Resolve the Omniphony ref
+        id: omniphony
+        shell: bash
+        run: |
+          ref=main
+          if [ -f harletty-bridge/.omniphony-ref ]; then
+            ref=$(grep -v -E '^\s*(#|$)' harletty-bridge/.omniphony-ref | head -n 1 | tr -d '[:space:]')
+            if [ -z "$ref" ]; then
+              echo "::error file=.omniphony-ref::.omniphony-ref is present but names no ref"
+              exit 1
+            fi
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "::error file=.omniphony-ref::.omniphony-ref (${ref}) is only for pull requests; remove it before merging"
+              exit 1
+            fi
+            echo "::notice file=.omniphony-ref::building against mgth/Omniphony@${ref} (remove the file before merging)"
+          fi
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout Omniphony (path dependencies)
         uses: actions/checkout@v4
         with:
           repository: mgth/Omniphony
+          ref: ${{ steps.omniphony.outputs.ref }}
           path: Omniphony
 
       - name: Install Rust toolchain
