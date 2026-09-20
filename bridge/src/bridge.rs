@@ -838,14 +838,36 @@ impl FormatBridge for AtmosBridge {
     }
 
     fn fixed_channel_poses(&self) -> RVec<RChannelPose> {
-        // Auro-3D is the one format here that states an angle for its
-        // channels (an unfolded carrier declares its whole layout). Every
-        // other presentation names speakers the renderer already places.
+        // Two formats here state an angle for their channels: an unfolded
+        // Auro-3D carrier declares its whole layout from Auro's setup table,
+        // and DTS declares its lower layer from the ETSI loudspeaker table.
+        // Dolby's bed is defined in its room cube, not by angles, and
+        // declares nothing: the renderer's room model is its model.
         if self.dts_active {
-            self.dts_auro.declared_poses()
+            if self.dts_auro.is_unfolding() {
+                self.dts_auro.declared_poses()
+            } else {
+                crate::labels::dts_declared_poses()
+            }
         } else {
             RVec::new()
         }
+    }
+
+    fn source_family(&self) -> RString {
+        // The renderer's placement policy is chosen per family
+        // (`renderer::placement`): Dolby's codecs share the room-cube bed,
+        // DTS its ITU angles, and an unfolded Auro-3D carrier is its own
+        // family with its own default (a sphere).
+        RString::from(if self.dts_active {
+            if self.dts_auro.is_unfolding() {
+                "auro"
+            } else {
+                "dts"
+            }
+        } else {
+            "dolby"
+        })
     }
 
     fn vbap_cartesian_defaults(&self) -> RVbapCartesianDefaults {
@@ -1052,6 +1074,32 @@ mod raw_transport_tests {
         assert_eq!(bridge.forced_raw_codec, Some(RawCodec::Dts));
     }
 
+    /// The family follows the codec path the last packet took: Dolby until
+    /// a DTS packet, DTS until an Auro carrier is confirmed. Before any
+    /// packet the bridge is a Dolby bridge, which is also what an older host
+    /// that never asks would assume.
+    #[test]
+    fn source_family_follows_the_active_codec() {
+        let mut bridge = AtmosBridge::new(false);
+        assert_eq!(bridge.source_family().as_str(), "dolby");
+        assert!(
+            bridge.fixed_channel_poses().is_empty(),
+            "Dolby declares no angles"
+        );
+        bridge.dts_active = true;
+        assert_eq!(bridge.source_family().as_str(), "dts");
+        let poses = bridge.fixed_channel_poses();
+        assert!(
+            poses
+                .iter()
+                .any(|p| p.label == bridge_api::RChannelLabel::Ls && p.azimuth_deg == -110.0),
+            "DTS declares its ETSI angles"
+        );
+        bridge.dts_active = false;
+        bridge.eac3_active = true;
+        assert_eq!(bridge.source_family().as_str(), "dolby");
+    }
+
     // End-to-end: feed a raw DTS core stream through the FormatBridge and check
     // it emits 5.1 bed frames with the expected channel labels. Skips when the
     // (uncommitted) corpus is absent.
@@ -1074,6 +1122,7 @@ mod raw_transport_tests {
             "the carrier was not confirmed"
         );
         assert!(!bridge.has_objects(), "Auro is fixed channels, not objects");
+        assert_eq!(bridge.source_family().as_str(), "auro");
         // Every frame that came out is the unfolded layout: the carrier was
         // held back until the verdict, never emitted as 7.1.
         let channels = frames[0].channel_count;

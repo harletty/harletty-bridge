@@ -128,7 +128,6 @@ impl DtsAuroState {
         *self = Self::default();
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_unfolding(&self) -> bool {
         matches!(self.phase, Phase::Unfolding { .. })
     }
