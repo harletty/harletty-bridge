@@ -23,7 +23,7 @@ bridge-perf = ["truehd/perf"]
 # `bridge/../../Omniphony` is the workflow symlink locally and the second
 # checkout in CI.
 [dependencies]
-bridge_api = { version = "0.3.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
+bridge_api = { version = "0.4.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
 spdif = { version = "0.1.0", path = "../../Omniphony/omniphony-renderer/spdif" }
 sys = { version = "0.1.0", path = "../../Omniphony/omniphony-renderer/sys" }
 truehd = { version = "0.7.2" }
