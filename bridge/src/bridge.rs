@@ -1,7 +1,7 @@
 use abi_stable::std_types::{RSlice, RStr, RString, RVec};
 use bridge_api::{
-    FormatBridge, RCoordinateFormat, RInputTransport, RPushResult, RVbapCartesianDefaults,
-    RVbapTableMode,
+    FormatBridge, RChannelPose, RCoordinateFormat, RInputTransport, RPushResult,
+    RVbapCartesianDefaults, RVbapTableMode,
 };
 use eac3::{CorePcmFrame, Extractor as Eac3RawExtractor, ObjectPcmDecoder, PcmDecoder};
 #[cfg(feature = "bridge-perf")]
@@ -14,9 +14,9 @@ use crate::ac3_native::NativeAc3Decoder;
 use crate::auro_pipeline::DtsAuroState;
 use crate::dts_pipeline::{DtsFoldConfig, DtsXState};
 use crate::eac3_pipeline::{
-    diagnose_eac3_frame, eac3_frame_can_carry_dependents, eac3_frame_carries_joc,
-    eac3_frame_carries_self_contained_joc, is_dependent_eac3_frame, is_legacy_ac3_frame,
-    is_temporary_eac3_silence_frame, process_eac3_frame,
+    build_legacy_ac3_core_failure_silence, diagnose_eac3_frame, eac3_frame_can_carry_dependents,
+    eac3_frame_carries_joc, eac3_frame_carries_self_contained_joc, is_dependent_eac3_frame,
+    is_legacy_ac3_frame, is_temporary_eac3_silence_frame, process_eac3_frame,
 };
 use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::PcmStats;
@@ -517,7 +517,7 @@ impl AtmosBridge {
             return Err(());
         }
 
-        if is_legacy_ac3_frame(frame) {
+        let decode_result = if is_legacy_ac3_frame(frame) {
             match self.ac3_decoder.decode_frame(frame) {
                 Ok(core) => {
                     diagnose_eac3_frame(self, frame);
@@ -532,6 +532,7 @@ impl AtmosBridge {
                     return Ok(());
                 }
                 Err(err) => {
+                    diagnose_eac3_frame(self, frame);
                     self.eac3_diag_stats.ac3_core_decode_failures += 1;
                     self.eac3_diag_stats.last_ac3_core_decode_error = Some(err.clone());
                     bridge_diag_log(
@@ -541,23 +542,32 @@ impl AtmosBridge {
                             self.eac3_frame_count, err
                         ),
                     );
+                    // Stand in one frame of silence for the core and stop here.
+                    // This used to fall through to the E-AC-3 decoders, which
+                    // can only reject an AC-3 syncframe ("not-eac3") and then
+                    // substituted silence labelled in WAV order (L R C LFE Ls
+                    // Rs) — a different channel list from the decoded frames
+                    // (fullband order, LFE last), so the renderer replanned
+                    // its bed on every dropped frame and Studio reordered its
+                    // virtual speakers. The silence now carries the labels
+                    // the core decoder would have produced for this header.
+                    build_legacy_ac3_core_failure_silence(self, frame)
+                        .ok_or_else(|| format!("AC-3 core decode error: {err}"))
                 }
             }
-        }
-
-        // A plain independent core might be the first half of a group, and
-        // nothing in it says whether a dependent follows. Hold it until the next
-        // access unit answers that. A converted-AC-3 frame is excluded: ETSI
-        // allows it no dependents, so buffering it would add latency for a
-        // partner that cannot arrive. An independent whose own JOC payload
-        // declares a downmix wider than the frame carries is the opposite case -
-        // its extension pair, the back channels or the top front ones, is in a
-        // dependent, and emitting the frame alone would reconstruct from a bed
-        // two channels short of its own header - so that one is held too.
-        let might_be_half_a_presentation =
-            eac3_frame_can_carry_dependents(frame) && !eac3_frame_carries_self_contained_joc(frame);
-
-        let decode_result = if might_be_half_a_presentation {
+        } else if eac3_frame_can_carry_dependents(frame)
+            && !eac3_frame_carries_self_contained_joc(frame)
+        {
+            // A plain independent core might be the first half of a group, and
+            // nothing in it says whether a dependent follows. Hold it until the
+            // next access unit answers that. A converted-AC-3 frame is excluded:
+            // ETSI allows it no dependents, so buffering it would add latency
+            // for a partner that cannot arrive. An independent whose own JOC
+            // payload declares a downmix wider than the frame carries is the
+            // opposite case - its extension pair, the back channels or the top
+            // front ones, is in a dependent, and emitting the frame alone would
+            // reconstruct from a bed two channels short of its own header - so
+            // that one is held too.
             match self.eac3_pcm_decoder.push_access_unit(frame) {
                 Ok(push) => {
                     diagnose_eac3_frame(self, frame);
@@ -942,6 +952,39 @@ impl FormatBridge for AtmosBridge {
         RCoordinateFormat::Cartesian
     }
 
+    fn fixed_channel_poses(&self) -> RVec<RChannelPose> {
+        // Two formats here state an angle for their channels: an unfolded
+        // Auro-3D carrier declares its whole layout from Auro's setup table,
+        // and DTS declares its lower layer from the ETSI loudspeaker table.
+        // Dolby's bed is defined in its room cube, not by angles, and
+        // declares nothing: the renderer's room model is its model.
+        if self.dts_active {
+            if self.dts_auro.is_unfolding() {
+                self.dts_auro.declared_poses()
+            } else {
+                crate::labels::dts_declared_poses()
+            }
+        } else {
+            RVec::new()
+        }
+    }
+
+    fn source_family(&self) -> RString {
+        // The renderer's placement policy is chosen per family
+        // (`renderer::placement`): Dolby's codecs share the room-cube bed,
+        // DTS its ITU angles, and an unfolded Auro-3D carrier is its own
+        // family with its own default (a sphere).
+        RString::from(if self.dts_active {
+            if self.dts_auro.is_unfolding() {
+                "auro"
+            } else {
+                "dts"
+            }
+        } else {
+            "dolby"
+        })
+    }
+
     fn vbap_cartesian_defaults(&self) -> RVbapCartesianDefaults {
         // Balanced default grid size for runtime cartesian VBAP table
         // generation. The axis sizes mirror the OAMD position quantisation
@@ -1001,6 +1044,7 @@ impl FormatBridge for AtmosBridge {
 #[cfg(test)]
 mod raw_transport_tests {
     use super::*;
+    use bridge_api::RChannelLabel;
     use std::io::Read;
 
     fn read_prefix(path: &str, bytes: u64) -> Option<Vec<u8>> {
@@ -1013,6 +1057,54 @@ mod raw_transport_tests {
     fn corpus_path(variable: &str) -> Option<String> {
         let path = std::env::var(variable).ok()?;
         std::path::Path::new(&path).is_file().then_some(path)
+    }
+
+    #[test]
+    fn failed_legacy_ac3_core_becomes_silence_in_decoder_channel_order() {
+        // 44.1 kHz frmsizecod=29 header (1672-byte frame) handed over two
+        // bytes short: the core decoder rejects it, and the access unit must
+        // still advance the stream by one frame of silence whose channel list
+        // is the one decoded frames carry (fullband order, then LFE) — not a
+        // second, differently ordered list that would make the renderer
+        // replan the bed twice around every dropped frame.
+        let mut frame = vec![0u8; 1670];
+        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1]);
+        let mut bridge = AtmosBridge::new(false);
+        let mut result = RPushResult {
+            frames: RVec::new(),
+            error_message: RString::new(),
+            did_reset: false,
+        };
+        let mut temporary_silence_pushed = false;
+
+        bridge
+            .process_eac3_access_unit(&frame, &mut result, &mut temporary_silence_pushed)
+            .expect("a failed core is not a pipeline error");
+
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(!result.did_reset);
+        assert_eq!(bridge.eac3_diag_stats.ac3_core_decode_failures, 1);
+        assert_eq!(bridge.eac3_diag_stats.legacy_ac3_frames, 1);
+        assert_eq!(bridge.eac3_total_samples, 1536);
+        assert_eq!(result.frames.len(), 1);
+        let silence = &result.frames[0];
+        assert_eq!(silence.sampling_frequency, 44_100);
+        assert_eq!(silence.sample_count, 1536);
+        assert_eq!(silence.channel_count, 6);
+        assert_eq!(
+            silence.channel_labels.as_slice(),
+            &[
+                RChannelLabel::L,
+                RChannelLabel::C,
+                RChannelLabel::R,
+                RChannelLabel::Ls,
+                RChannelLabel::Rs,
+                RChannelLabel::LFE,
+            ]
+        );
+        assert_eq!(silence.pcm.len(), 1536 * 6);
+        assert!(silence.pcm.iter().all(|sample| *sample == 0));
+        assert!(silence.metadata.is_empty());
     }
 
     #[test]
@@ -1097,6 +1189,32 @@ mod raw_transport_tests {
         assert_eq!(bridge.forced_raw_codec, Some(RawCodec::Dts));
     }
 
+    /// The family follows the codec path the last packet took: Dolby until
+    /// a DTS packet, DTS until an Auro carrier is confirmed. Before any
+    /// packet the bridge is a Dolby bridge, which is also what an older host
+    /// that never asks would assume.
+    #[test]
+    fn source_family_follows_the_active_codec() {
+        let mut bridge = AtmosBridge::new(false);
+        assert_eq!(bridge.source_family().as_str(), "dolby");
+        assert!(
+            bridge.fixed_channel_poses().is_empty(),
+            "Dolby declares no angles"
+        );
+        bridge.dts_active = true;
+        assert_eq!(bridge.source_family().as_str(), "dts");
+        let poses = bridge.fixed_channel_poses();
+        assert!(
+            poses
+                .iter()
+                .any(|p| p.label == bridge_api::RChannelLabel::Ls && p.azimuth_deg == -110.0),
+            "DTS declares its ETSI angles"
+        );
+        bridge.dts_active = false;
+        bridge.eac3_active = true;
+        assert_eq!(bridge.source_family().as_str(), "dolby");
+    }
+
     // End-to-end: feed a raw DTS core stream through the FormatBridge and check
     // it emits 5.1 bed frames with the expected channel labels. Skips when the
     // (uncommitted) corpus is absent.
@@ -1114,22 +1232,50 @@ mod raw_transport_tests {
             assert!(result.error_message.is_empty(), "{}", result.error_message);
             frames.extend(result.frames.into_iter());
         }
-        assert!(bridge.dts_auro.is_unfolding(), "the carrier was not confirmed");
+        assert!(
+            bridge.dts_auro.is_unfolding(),
+            "the carrier was not confirmed"
+        );
         assert!(!bridge.has_objects(), "Auro is fixed channels, not objects");
+        assert_eq!(bridge.source_family().as_str(), "auro");
         // Every frame that came out is the unfolded layout: the carrier was
         // held back until the verdict, never emitted as 7.1.
         let channels = frames[0].channel_count;
-        assert!(channels > 8, "expected more than the carrier's channels, got {channels}");
+        assert!(
+            channels > 8,
+            "expected more than the carrier's channels, got {channels}"
+        );
         assert!(frames.iter().all(|f| f.channel_count == channels));
         let labels = &frames[0].channel_labels;
         assert!(
-            labels.contains(&bridge_api::RChannelLabel::Tfl)
-                && labels.contains(&bridge_api::RChannelLabel::Tbr)
+            labels.contains(&bridge_api::RChannelLabel::Lh)
+                && labels.contains(&bridge_api::RChannelLabel::Rhs),
+            "the height layer is the height tier, not the top one: {labels:?}"
+        );
+        // The bridge declares where Auro puts every one of them.
+        let poses = bridge.fixed_channel_poses();
+        let lhs = poses
+            .iter()
+            .find(|p| p.label == bridge_api::RChannelLabel::Lhs)
+            .expect("Lhs is declared");
+        assert_eq!((lhs.azimuth_deg, lhs.elevation_deg), (-110.0, 30.0));
+        assert!(
+            poses.iter().all(|p| labels.contains(&p.label)),
+            "declared poses name only channels of the frame"
         );
         // Output is one block behind input, and no more.
         let emitted: u64 = frames.iter().map(|f| u64::from(f.sample_count)).sum();
-        assert!(bridge.total_samples - emitted <= 4096, "{} held back", bridge.total_samples - emitted);
-        eprintln!("{} frames, {} channels, {emitted}/{} samples out", frames.len(), channels, bridge.total_samples);
+        assert!(
+            bridge.total_samples - emitted <= 4096,
+            "{} held back",
+            bridge.total_samples - emitted
+        );
+        eprintln!(
+            "{} frames, {} channels, {emitted}/{} samples out",
+            frames.len(),
+            channels,
+            bridge.total_samples
+        );
     }
 
     #[test]

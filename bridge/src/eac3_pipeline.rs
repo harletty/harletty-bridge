@@ -18,27 +18,6 @@ use crate::metadata::build_eac3_metadata_frame;
 const LEGACY_AC3_SAMPLE_COUNT: u32 = 1536;
 const LEGACY_AC3_CHANNEL_COUNT: u32 = 6;
 const AC3_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
-const AC3_FRAME_SIZE_WORDS: [[usize; 3]; 19] = [
-    [64, 69, 96],
-    [80, 87, 120],
-    [96, 104, 144],
-    [112, 121, 168],
-    [128, 139, 192],
-    [160, 174, 240],
-    [192, 208, 288],
-    [224, 243, 336],
-    [256, 278, 384],
-    [320, 348, 480],
-    [384, 417, 576],
-    [448, 487, 672],
-    [512, 557, 768],
-    [640, 696, 960],
-    [768, 835, 1152],
-    [896, 975, 1344],
-    [1024, 1114, 1536],
-    [1152, 1253, 1728],
-    [1280, 1393, 1920],
-];
 const EAC3_BLOCKS: [u32; 4] = [1, 2, 3, 6];
 const EAC3_SAMPLE_RATES: [u32; 3] = [48_000, 44_100, 32_000];
 
@@ -85,26 +64,36 @@ pub(crate) fn process_eac3_frame(
             let diag = eac3_frame_reject_diag(frame);
             let err_str = format!("{e}");
             if err_str == "not-eac3" {
-                if let Some(sample_rate) = legacy_ac3_sample_rate(frame) {
+                if let Some(silence) = build_legacy_ac3_core_failure_silence(bridge, frame) {
+                    return Ok(silence);
+                }
+            }
+            if err_str == "unsupported-feature:non-independent-core-pcm" {
+                if let (Some((sample_rate, sample_count)), Some(labels)) =
+                    (eac3_frame_timing(frame), eac3_header_bed_labels(frame))
+                {
+                    maybe_dump_reject_frame(frame, "unsupported");
                     return Ok(build_silence_frame(
                         sample_rate,
-                        LEGACY_AC3_SAMPLE_COUNT,
+                        sample_count,
+                        labels,
                         bridge,
                     ));
                 }
             }
-            if err_str == "unsupported-feature:non-independent-core-pcm" {
-                if let Some((sample_rate, sample_count)) = eac3_frame_timing(frame) {
-                    maybe_dump_reject_frame(frame, "unsupported");
-                    return Ok(build_silence_frame(sample_rate, sample_count, bridge));
-                }
-            }
             if err_str == "short-packet" {
                 maybe_dump_short_packet_frame(frame);
-                if let Some((sample_rate, sample_count)) = eac3_frame_timing(frame) {
+                if let (Some((sample_rate, sample_count)), Some(labels)) =
+                    (eac3_frame_timing(frame), eac3_header_bed_labels(frame))
+                {
                     maybe_dump_reject_frame(frame, "shortpkt");
                     bridge.eac3_diag_stats.short_packet_silence_frames += 1;
-                    return Ok(build_silence_frame(sample_rate, sample_count, bridge));
+                    return Ok(build_silence_frame(
+                        sample_rate,
+                        sample_count,
+                        labels,
+                        bridge,
+                    ));
                 }
             }
             maybe_dump_reject_frame(frame, "parseerr");
@@ -485,10 +474,6 @@ fn frame_bsid(frame: &[u8]) -> Option<u8> {
     frame.get(byte_index).map(|byte| (byte >> bit_shift) & 0x1F)
 }
 
-fn legacy_ac3_sample_rate(frame: &[u8]) -> Option<u32> {
-    legacy_ac3_info(frame).map(|info| info.sample_rate)
-}
-
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(test), allow(dead_code))]
 struct LegacyAc3Info {
@@ -540,11 +525,9 @@ fn legacy_ac3_info(frame: &[u8]) -> Option<LegacyAc3Info> {
 }
 
 fn ac3_frame_size_from_fscod_frmsizecod(fscod: u8, frmsizecod: u8) -> Option<usize> {
-    let bitrate_index = usize::from(frmsizecod >> 1);
-    if fscod > 2 || bitrate_index >= AC3_FRAME_SIZE_WORDS.len() {
-        return None;
-    }
-    Some(AC3_FRAME_SIZE_WORDS[bitrate_index][usize::from(fscod)] * 2)
+    // Shared with the raw extractor and the decoder: one table, and the
+    // 44.1 kHz odd-`frmsizecod` padding word the local copy used to omit.
+    eac3::legacy_ac3_frame_size(fscod, frmsizecod)
 }
 
 fn read_bits(data: &[u8], bit_offset: usize, bit_count: usize) -> Option<u32> {
@@ -583,29 +566,75 @@ fn eac3_frame_timing(frame: &[u8]) -> Option<(u32, u32)> {
     Some((sample_rate, blocks * 256))
 }
 
+/// The channel list the core decoder emits for an AC-3 / E-AC-3 `acmod` +
+/// `lfeon`: fullband channels in bitstream order, then LFE — exactly what
+/// [`build_eac3_channel_bed_frame`] and [`build_eac3_frame_from_core`] label a
+/// decoded frame with. Silence substituted for a frame that could not be
+/// decoded has to carry this same list: the renderer keys its bed plan on the
+/// ordered labels, so any other order replans the bed twice around every
+/// dropped frame (audible, and Studio reorders its virtual speakers).
+fn bed_labels_for_channel_mode(channel_mode: u8, lfe_on: bool) -> RVec<RChannelLabel> {
+    let order = eac3::fullband_channel_order(channel_mode).unwrap_or(&[
+        BedChannel::FrontLeft,
+        BedChannel::Center,
+        BedChannel::FrontRight,
+        BedChannel::SurroundLeft,
+        BedChannel::SurroundRight,
+    ]);
+    let mut labels = RVec::with_capacity(order.len() + usize::from(lfe_on));
+    labels.extend(order.iter().map(|bed| bed_channel_to_r(*bed)));
+    if lfe_on {
+        labels.push(RChannelLabel::LFE);
+    }
+    labels
+}
+
+/// Channel list for silence standing in for an E-AC-3 access unit, read from
+/// its header (`acmod` + `lfeon` share byte 4 with `fscod`/`numblkscod`).
+fn eac3_header_bed_labels(frame: &[u8]) -> Option<RVec<RChannelLabel>> {
+    if frame.len() < 5 || frame_bsid(frame)? < 11 {
+        return None;
+    }
+    Some(bed_labels_for_channel_mode(
+        (frame[4] >> 1) & 0x07,
+        frame[4] & 0x01 != 0,
+    ))
+}
+
+/// One frame of silence in place of a legacy AC-3 core the native decoder
+/// rejected. The header is intact even when the body is not (the failures seen
+/// in the field are bit-reader exhaustion late in the frame), so the channel
+/// list is derived from it and matches the decoded neighbours. Returns `None`
+/// only when the header itself does not parse as legacy AC-3.
+pub(crate) fn build_legacy_ac3_core_failure_silence(
+    bridge: &mut AtmosBridge,
+    frame: &[u8],
+) -> Option<RDecodedFrame> {
+    let info = legacy_ac3_info(frame)?;
+    Some(build_silence_frame(
+        info.sample_rate,
+        LEGACY_AC3_SAMPLE_COUNT,
+        bed_labels_for_channel_mode(info.channel_mode, info.lfe_on),
+        bridge,
+    ))
+}
+
 fn build_silence_frame(
     sample_rate: u32,
     sample_count: u32,
+    channel_labels: RVec<RChannelLabel>,
     bridge: &mut AtmosBridge,
 ) -> RDecodedFrame {
     let sample_count_usize = sample_count as usize;
-    let channel_count = LEGACY_AC3_CHANNEL_COUNT as usize;
+    let channel_count = channel_labels.len();
     bridge.eac3_total_samples += sample_count as u64;
 
     RDecodedFrame {
         sampling_frequency: sample_rate,
         sample_count,
-        channel_count: LEGACY_AC3_CHANNEL_COUNT,
+        channel_count: channel_count as u32,
         pcm: vec![0; sample_count_usize * channel_count].into(),
-        channel_labels: vec![
-            RChannelLabel::L,
-            RChannelLabel::R,
-            RChannelLabel::C,
-            RChannelLabel::LFE,
-            RChannelLabel::Ls,
-            RChannelLabel::Rs,
-        ]
-        .into(),
+        channel_labels,
         metadata: RVec::new(),
         drc_gain: 1.0,
         drc_ramp_duration: 0,
@@ -1339,15 +1368,17 @@ mod tests {
         assert_eq!(decoded.sampling_frequency, 48_000);
         assert_eq!(decoded.sample_count, LEGACY_AC3_SAMPLE_COUNT);
         assert_eq!(decoded.channel_count, LEGACY_AC3_CHANNEL_COUNT);
+        // Same channel list as a decoded 3/2 + LFE core: fullband order, LFE
+        // last — not WAV order, which would replan the renderer's bed.
         assert_eq!(
             decoded.channel_labels.as_slice(),
             &[
                 RChannelLabel::L,
-                RChannelLabel::R,
                 RChannelLabel::C,
-                RChannelLabel::LFE,
+                RChannelLabel::R,
                 RChannelLabel::Ls,
                 RChannelLabel::Rs,
+                RChannelLabel::LFE,
             ]
         );
         assert_eq!(
@@ -1370,6 +1401,73 @@ mod tests {
         assert_eq!(info.channel_mode, 7);
         assert_eq!(info.channels, 6);
         assert!(info.lfe_on);
+    }
+
+    #[test]
+    fn legacy_ac3_info_sizes_44_1_khz_odd_frmsizecod_frames() {
+        // 44.1 kHz / 384 kbps alternates 1670 / 1672 bytes (frmsizecod 28 /
+        // 29); the odd size carries the padding word.
+        let mut frame = vec![0u8; 1672];
+        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1]);
+        let info = legacy_ac3_info(&frame).expect("legacy AC-3 info");
+        assert_eq!(info.sample_rate, 44_100);
+        assert_eq!(info.frame_size, 1672);
+        assert_eq!(info.channels, 6);
+
+        frame[4] = 0x5C;
+        assert_eq!(legacy_ac3_info(&frame).unwrap().frame_size, 1670);
+    }
+
+    #[test]
+    fn silence_labels_match_the_decoded_core_for_every_channel_mode() {
+        let mut bridge = AtmosBridge::new(false);
+        for channel_mode in 0u8..=7 {
+            for lfe_on in [false, true] {
+                let order = eac3::fullband_channel_order(channel_mode).unwrap();
+                let core = CorePcmFrame {
+                    sample_rate: 44_100,
+                    fullband_channel_order: order.to_vec(),
+                    fullband_channels: vec![vec![0.0]; order.len()],
+                    lfe_channel: lfe_on.then(|| vec![0.0]),
+                };
+                let decoded = build_eac3_channel_bed_frame(&core, None, &mut bridge);
+                let silence = bed_labels_for_channel_mode(channel_mode, lfe_on);
+                assert_eq!(
+                    silence.as_slice(),
+                    decoded.channel_labels.as_slice(),
+                    "acmod {channel_mode} lfe {lfe_on}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_ac3_core_failure_silence_follows_the_header() {
+        let mut bridge = AtmosBridge::new(false);
+        // 44.1 kHz, acmod=2 (2/0) without LFE, bsid=8: byte 6 = 0b010_00_0_0…
+        // (acmod, dsurmod, lfeon).
+        let mut frame = vec![0u8; 1672];
+        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0x40]);
+
+        let silence =
+            build_legacy_ac3_core_failure_silence(&mut bridge, &frame).expect("legacy AC-3 header");
+
+        assert_eq!(silence.sampling_frequency, 44_100);
+        assert_eq!(silence.sample_count, LEGACY_AC3_SAMPLE_COUNT);
+        assert_eq!(silence.channel_count, 2);
+        assert_eq!(
+            silence.channel_labels.as_slice(),
+            &[RChannelLabel::L, RChannelLabel::R]
+        );
+        assert_eq!(silence.pcm.len(), LEGACY_AC3_SAMPLE_COUNT as usize * 2);
+        assert!(silence.pcm.iter().all(|sample| *sample == 0));
+        assert_eq!(
+            bridge.eac3_total_samples,
+            u64::from(LEGACY_AC3_SAMPLE_COUNT)
+        );
+        // Not a legacy AC-3 header (E-AC-3 bsid=16): nothing to stand in for.
+        frame[5] = 0x80;
+        assert!(build_legacy_ac3_core_failure_silence(&mut bridge, &frame).is_none());
     }
 
     #[test]

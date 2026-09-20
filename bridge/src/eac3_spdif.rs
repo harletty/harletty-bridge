@@ -75,37 +75,10 @@ fn ac3_frame_size_from_header(data: &[u8]) -> Option<usize> {
         return None;
     };
 
-    let fscod = header >> 6;
-    let frmsizecod = header & 0x3F;
-    let bitrate_index = usize::from(frmsizecod >> 1);
-    if fscod > 2 || bitrate_index >= AC3_FRAME_SIZE_WORDS.len() {
-        return None;
-    }
-
-    Some(AC3_FRAME_SIZE_WORDS[bitrate_index][usize::from(fscod)] * 2)
+    // One sizing function for every legacy AC-3 framing site: it carries the
+    // 44.1 kHz odd-`frmsizecod` padding word this table used to omit.
+    eac3::legacy_ac3_frame_size(header >> 6, header & 0x3F)
 }
-
-const AC3_FRAME_SIZE_WORDS: [[usize; 3]; 19] = [
-    [64, 69, 96],
-    [80, 87, 120],
-    [96, 104, 144],
-    [112, 121, 168],
-    [128, 139, 192],
-    [160, 174, 240],
-    [192, 208, 288],
-    [224, 243, 336],
-    [256, 278, 384],
-    [320, 348, 480],
-    [384, 417, 576],
-    [448, 487, 672],
-    [512, 557, 768],
-    [640, 696, 960],
-    [768, 835, 1152],
-    [896, 975, 1344],
-    [1024, 1114, 1536],
-    [1152, 1253, 1728],
-    [1280, 1393, 1920],
-];
 
 #[derive(Debug)]
 enum ParserState {
@@ -621,6 +594,29 @@ mod tests {
         let result = stream.next_frame().unwrap();
         assert_eq!(result, Some(frame));
         assert_eq!(stream.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn ac3_frame_size_includes_the_44_1_khz_padding_word() {
+        // 44.1 kHz / 384 kbps: frmsizecod 28 → 1670 bytes, 29 → 1672 bytes,
+        // in both byte orders the burst can arrive in.
+        assert_eq!(
+            ac3_frame_size_from_header(&[0x0B, 0x77, 0x00, 0x00, 0x5C, 0x40]),
+            Some(1670)
+        );
+        assert_eq!(
+            ac3_frame_size_from_header(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40]),
+            Some(1672)
+        );
+        assert_eq!(
+            ac3_frame_size_from_header(&[0x77, 0x0B, 0x00, 0x00, 0x40, 0x5D]),
+            Some(1672)
+        );
+        // 48 kHz is unaffected.
+        assert_eq!(
+            ac3_frame_size_from_header(&[0x0B, 0x77, 0x00, 0x00, 0x1D, 0x40]),
+            Some(1536)
+        );
     }
 
     #[test]

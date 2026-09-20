@@ -19,7 +19,7 @@
 
 use abi_stable::std_types::RVec;
 use auro::{Detector, StreamId, Unfolder};
-use bridge_api::{RChannelLabel, RDecodedFrame};
+use bridge_api::{RChannelLabel, RChannelPose, RDecodedFrame};
 
 use crate::labels::auro_stream_to_r;
 
@@ -30,6 +30,42 @@ const NO_BLOCK_LIMIT: usize = 2 * auro::block::MAX_BLOCK;
 /// Samples to hold back while blocks validate but the layout has not
 /// latched yet.
 const HOLD_LIMIT: usize = 4 * auro::block::MAX_BLOCK;
+
+/// Where Auro-3D puts one of its speakers, as azimuth and elevation in
+/// degrees, for the bridge's channel declaration.
+///
+/// Auro is a layout before it is a codec: it states an angle for every
+/// speaker and asks for them all "equidistant from the main listening
+/// position" — a sphere, where the renderer's own defaults are the corners
+/// of a room. The values are the nominal column of Table 3, "Normative
+/// Speaker Positions", of the AURO-3D Home Theater Setup Guidelines v12
+/// (2024-05-16): L/R ±30°, C 0°, Ls/Rs ±110°, Lb/Rb ±150°, the height layer
+/// over each of them at 30° of elevation, the Top straight overhead. A
+/// 7.1-based layout uses the same rows.
+///
+/// `None` for the LFE, which the guidelines send wherever the room measures
+/// best rather than to an angle, and for the centre surround of the old
+/// 12.1 layouts, for which no Auro paper states one. Both then take the
+/// renderer's own default for their label.
+pub(crate) fn auro_pose(label: RChannelLabel) -> Option<(f32, f32)> {
+    use RChannelLabel::*;
+    Some(match label {
+        L => (-30.0, 0.0),
+        R => (30.0, 0.0),
+        C => (0.0, 0.0),
+        Ls => (-110.0, 0.0),
+        Rs => (110.0, 0.0),
+        Lb => (-150.0, 0.0),
+        Rb => (150.0, 0.0),
+        Lh => (-30.0, 30.0),
+        Rh => (30.0, 30.0),
+        Ch => (0.0, 30.0),
+        Lhs => (-110.0, 30.0),
+        Rhs => (110.0, 30.0),
+        Tc => (0.0, 90.0),
+        _ => return None,
+    })
+}
 
 /// The bed stream a DCA speaker index plays as.
 fn speaker_stream(speaker: usize) -> StreamId {
@@ -92,9 +128,29 @@ impl DtsAuroState {
         *self = Self::default();
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_unfolding(&self) -> bool {
         matches!(self.phase, Phase::Unfolding { .. })
+    }
+
+    /// Where Auro puts each channel of the unfolded layout
+    /// ([`auro_pose`]), in the layout's channel order, for
+    /// `FormatBridge::fixed_channel_poses`. Empty until the carrier is
+    /// confirmed, and after it was ruled out. Built on demand: the host
+    /// asks once per label change, not per frame.
+    pub(crate) fn declared_poses(&self) -> RVec<RChannelPose> {
+        match &self.phase {
+            Phase::Unfolding { labels, .. } => labels
+                .iter()
+                .filter_map(|&label| {
+                    auro_pose(label).map(|(azimuth_deg, elevation_deg)| RChannelPose {
+                        label,
+                        azimuth_deg,
+                        elevation_deg,
+                    })
+                })
+                .collect(),
+            _ => RVec::new(),
+        }
     }
 
     /// One built DTS-HD frame, whose first `speakers.len()` channels are the
@@ -423,13 +479,26 @@ mod tests {
                 RChannelLabel::R,
                 RChannelLabel::Ls,
                 RChannelLabel::Rs,
-                RChannelLabel::Tfl,
-                RChannelLabel::Tfr,
-                RChannelLabel::Tbl,
-                RChannelLabel::Tbr,
+                RChannelLabel::Lh,
+                RChannelLabel::Rh,
+                RChannelLabel::Lhs,
+                RChannelLabel::Rhs,
             ]
         );
-        // Sample 100: the L carrier announced HL, so L is silent and Tfl
+        // Every unfolded channel is declared at Auro's angle, in label order:
+        // the height layer over the floor speaker beneath it, at 30°.
+        let poses = state.declared_poses();
+        let pose = |label: RChannelLabel| {
+            poses
+                .iter()
+                .find(|p| p.label == label)
+                .map(|p| (p.azimuth_deg, p.elevation_deg))
+        };
+        assert_eq!(poses.len(), 8);
+        assert_eq!(pose(RChannelLabel::Ls), Some((-110.0, 0.0)));
+        assert_eq!(pose(RChannelLabel::Lh), Some((-30.0, 30.0)));
+        assert_eq!(pose(RChannelLabel::Rhs), Some((110.0, 30.0)));
+        // Sample 100: the L carrier announced HL, so L is silent and Lh
         // carries the carrier with its borrowed bits cleared; R plays as R.
         let f = &out[0];
         let row = |s: usize| &f.pcm[s * 8..(s + 1) * 8];

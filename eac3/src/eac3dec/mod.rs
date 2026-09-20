@@ -22,5 +22,6 @@ pub use pcm::{
 };
 pub use syncframe::{
     AccessUnitInfo, AudioFrameInfo, AuxParseStatus, BlockDrcInfo, EmdfBlockInfo, EmdfPayloadInfo,
-    EmdfSource, FrameType, ParseError, PayloadInfo, SkipFieldInfo, inspect_access_unit,
+    EmdfSource, FrameType, ParseError, PayloadInfo, SkipFieldInfo, fullband_channel_order,
+    inspect_access_unit,
 };
