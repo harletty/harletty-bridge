@@ -12,11 +12,11 @@ pub use eac3dec::{
     OamdObjectElement, OamdPayload, ObjectPcmDecoder, ObjectPcmFrame, ObjectPcmPushResult,
     ParseError as AccessUnitParseError, ParsedEmdfPayloadData, ParsedEmdfPayloadKind, PayloadInfo,
     PcmDecoder, PcmPushResult, PushResult, SkipFieldInfo, dependent_chanmap_positions,
-    inspect_access_unit, merge_core_with_dependent,
+    fullband_channel_order, inspect_access_unit, merge_core_with_dependent,
 };
 pub use extract::{ExtractError, Extractor, Frame};
 pub use parser::{
     ChannelMode, FrameInfo, ParseError as HeaderParseError, SYNCWORD, SampleRateCode, StreamType,
-    parse_header, parse_legacy_ac3_header,
+    legacy_ac3_frame_size, parse_header, parse_legacy_ac3_header,
 };
 pub use types::{BedChannel, ObjectAnchor, Vec3};

@@ -15,8 +15,9 @@ use crate::ac3_native::NativeAc3Decoder;
 use crate::auro_pipeline::DtsAuroState;
 use crate::dts_pipeline::{DtsFoldConfig, DtsXState};
 use crate::eac3_pipeline::{
-    diagnose_eac3_frame, is_dependent_eac3_frame, is_legacy_ac3_frame,
-    is_temporary_eac3_silence_frame, process_eac3_dependent_frame_with_core, process_eac3_frame,
+    build_legacy_ac3_core_failure_silence, diagnose_eac3_frame, is_dependent_eac3_frame,
+    is_legacy_ac3_frame, is_temporary_eac3_silence_frame, process_eac3_dependent_frame_with_core,
+    process_eac3_frame,
 };
 use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::PcmStats;
@@ -416,7 +417,7 @@ impl AtmosBridge {
         if !is_dependent_eac3_frame(frame) {
             self.flush_pending_standalone_ac3_cores(result);
         }
-        if is_legacy_ac3_frame(frame) {
+        let decode_result = if is_legacy_ac3_frame(frame) {
             match self.ac3_decoder.decode_frame(frame) {
                 Ok(core) => {
                     diagnose_eac3_frame(self, frame);
@@ -428,6 +429,7 @@ impl AtmosBridge {
                     return Ok(());
                 }
                 Err(err) => {
+                    diagnose_eac3_frame(self, frame);
                     self.eac3_diag_stats.ac3_core_decode_failures += 1;
                     self.eac3_diag_stats.last_ac3_core_decode_error = Some(err.clone());
                     bridge_diag_log(
@@ -437,11 +439,20 @@ impl AtmosBridge {
                             self.eac3_frame_count, err
                         ),
                     );
+                    // Stand in one frame of silence for the core and stop here.
+                    // This used to fall through to the E-AC-3 decoders, which
+                    // can only reject an AC-3 syncframe ("not-eac3") and then
+                    // substituted silence labelled in WAV order (L R C LFE Ls
+                    // Rs) — a different channel list from the decoded frames
+                    // (fullband order, LFE last), so the renderer replanned
+                    // its bed on every dropped frame and Studio reordered its
+                    // virtual speakers. The silence now carries the labels
+                    // the core decoder would have produced for this header.
+                    build_legacy_ac3_core_failure_silence(self, frame)
+                        .ok_or_else(|| format!("AC-3 core decode error: {err}"))
                 }
             }
-        }
-
-        let decode_result = if is_dependent_eac3_frame(frame) {
+        } else if is_dependent_eac3_frame(frame) {
             // A dependent is normally paired with its core immediately, so the
             // queue holds at most one entry. It only grows when cores keep
             // failing to decode; bound it so a corrupt stream cannot grow it
@@ -896,6 +907,7 @@ impl FormatBridge for AtmosBridge {
 #[cfg(test)]
 mod raw_transport_tests {
     use super::*;
+    use bridge_api::RChannelLabel;
     use std::io::Read;
 
     fn read_prefix(path: &str, bytes: u64) -> Option<Vec<u8>> {
@@ -908,6 +920,54 @@ mod raw_transport_tests {
     fn corpus_path(variable: &str) -> Option<String> {
         let path = std::env::var(variable).ok()?;
         std::path::Path::new(&path).is_file().then_some(path)
+    }
+
+    #[test]
+    fn failed_legacy_ac3_core_becomes_silence_in_decoder_channel_order() {
+        // 44.1 kHz frmsizecod=29 header (1672-byte frame) handed over two
+        // bytes short: the core decoder rejects it, and the access unit must
+        // still advance the stream by one frame of silence whose channel list
+        // is the one decoded frames carry (fullband order, then LFE) — not a
+        // second, differently ordered list that would make the renderer
+        // replan the bed twice around every dropped frame.
+        let mut frame = vec![0u8; 1670];
+        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1]);
+        let mut bridge = AtmosBridge::new(false);
+        let mut result = RPushResult {
+            frames: RVec::new(),
+            error_message: RString::new(),
+            did_reset: false,
+        };
+        let mut temporary_silence_pushed = false;
+
+        bridge
+            .process_eac3_access_unit(&frame, &mut result, &mut temporary_silence_pushed)
+            .expect("a failed core is not a pipeline error");
+
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(!result.did_reset);
+        assert_eq!(bridge.eac3_diag_stats.ac3_core_decode_failures, 1);
+        assert_eq!(bridge.eac3_diag_stats.legacy_ac3_frames, 1);
+        assert_eq!(bridge.eac3_total_samples, 1536);
+        assert_eq!(result.frames.len(), 1);
+        let silence = &result.frames[0];
+        assert_eq!(silence.sampling_frequency, 44_100);
+        assert_eq!(silence.sample_count, 1536);
+        assert_eq!(silence.channel_count, 6);
+        assert_eq!(
+            silence.channel_labels.as_slice(),
+            &[
+                RChannelLabel::L,
+                RChannelLabel::C,
+                RChannelLabel::R,
+                RChannelLabel::Ls,
+                RChannelLabel::Rs,
+                RChannelLabel::LFE,
+            ]
+        );
+        assert_eq!(silence.pcm.len(), 1536 * 6);
+        assert!(silence.pcm.iter().all(|sample| *sample == 0));
+        assert!(silence.metadata.is_empty());
     }
 
     #[test]
