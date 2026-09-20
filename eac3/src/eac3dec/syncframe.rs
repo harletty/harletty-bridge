@@ -16,7 +16,7 @@ use super::allocation::{
 use super::bitstream::BitReader;
 use super::imdct::ImdctState;
 use super::metadata::{
-    MetadataParseState, ParsedEmdfPayloadData, parse_emdf_payload_body_with_state,
+    JocPayload, MetadataParseState, ParsedEmdfPayloadData, parse_emdf_payload_body_with_state,
 };
 use super::pcm::CorePcmFrame;
 use crate::BedChannel;
@@ -26,27 +26,6 @@ use thiserror::Error;
 const EAC3_BLOCKS: [u8; 4] = [1, 2, 3, 6];
 const AC3_SAMPLE_RATES: [u32; 3] = [48_000, 44_100, 32_000];
 const AC3_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
-const AC3_FRAME_SIZE_WORDS: [[usize; 3]; 19] = [
-    [64, 69, 96],
-    [80, 87, 120],
-    [96, 104, 144],
-    [112, 121, 168],
-    [128, 139, 192],
-    [160, 174, 240],
-    [192, 208, 288],
-    [224, 243, 336],
-    [256, 278, 384],
-    [320, 348, 480],
-    [384, 417, 576],
-    [448, 487, 672],
-    [512, 557, 768],
-    [640, 696, 960],
-    [768, 835, 1152],
-    [896, 975, 1344],
-    [1024, 1114, 1536],
-    [1152, 1253, 1728],
-    [1280, 1393, 1920],
-];
 const DEF_CPL_BNDSTRC: [bool; 18] = [
     false, false, false, false, false, false, false, false, true, false, true, true, false, true,
     true, true, true, true,
@@ -415,6 +394,18 @@ impl AccessUnitInfo {
         self.payloads()
             .filter(|payload| payload.info.payload_id == 14)
             .count()
+    }
+
+    /// First JOC payload parsed out of this access unit, if any.
+    ///
+    /// The payload is decoded during inspection, so callers that only need the
+    /// header it declares — the downmix configuration, the object count — can
+    /// read it here instead of parsing the access unit again.
+    pub fn first_joc_payload(&self) -> Option<&JocPayload> {
+        self.payloads().find_map(|payload| match &payload.parsed {
+            ParsedEmdfPayloadData::Joc(joc) => Some(joc),
+            _ => None,
+        })
     }
 
     /// Number of OAMD payloads present in this access unit.
@@ -1240,12 +1231,11 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
     })
 }
 
+/// Frame size of a legacy AC-3 syncframe; one table for the whole crate (the
+/// raw extractor frames with it too), see [`crate::parser::legacy_ac3_frame_size`].
 fn legacy_ac3_frame_size(fscod: u8, frmsizecod: u8) -> Result<usize, ParseError> {
-    let bitrate_index = usize::from(frmsizecod >> 1);
-    if fscod > 2 || bitrate_index >= AC3_FRAME_SIZE_WORDS.len() {
-        return Err(ParseError::InvalidHeader("frame-size"));
-    }
-    Ok(AC3_FRAME_SIZE_WORDS[bitrate_index][usize::from(fscod)] * 2)
+    crate::parser::legacy_ac3_frame_size(fscod, frmsizecod)
+        .ok_or(ParseError::InvalidHeader("frame-size"))
 }
 
 fn legacy_ac3_volume_control(
@@ -3355,7 +3345,11 @@ fn prepare_lfe_channel_storage(channel: &mut Option<Vec<f32>>, enabled: bool, sa
     }
 }
 
-fn fullband_channel_order(channel_mode: u8) -> Result<&'static [BedChannel], ParseError> {
+/// Bitstream order of the fullband channels for an AC-3 / E-AC-3 `acmod`
+/// (ATSC A/52 Table 5.8). This is the order `CorePcmFrame::fullband_channel_order`
+/// reports, so a host that has to fabricate a frame for one it could not decode
+/// (silence substitution) can label it exactly like the decoded neighbours.
+pub fn fullband_channel_order(channel_mode: u8) -> Result<&'static [BedChannel], ParseError> {
     match channel_mode {
         0 => Ok(&[BedChannel::Center, BedChannel::Center]),
         1 => Ok(&[BedChannel::Center]),
@@ -4126,8 +4120,34 @@ mod tests {
     use super::{
         AccessUnitInfo, AudioFrameInfo, BlockSyntaxState, CoreDecodeState, EmdfSource, ExpStrategy,
         FrameType, ParseError, apply_spx_extension, decode_block_core_pcm, inspect_access_unit,
+        inspect_legacy_ac3_access_unit,
     };
     use crate::BedChannel;
+
+    #[test]
+    fn legacy_ac3_inspect_sizes_44_1_khz_odd_frmsizecod_frames() {
+        // 44.1 kHz, 384 kbps, frmsizecod=29: 836 words = 1672 bytes, not the
+        // 1670 of the even neighbour. bsid=8, acmod=7 (3/2) with LFE.
+        let mut frame = vec![0u8; 1672];
+        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1]);
+
+        let info = inspect_legacy_ac3_access_unit(&frame).expect("legacy AC-3 header");
+        assert_eq!(info.frame_type, FrameType::LegacyAc3);
+        assert_eq!(info.sample_rate, 44_100);
+        assert_eq!(info.frame_size, 1672);
+        assert_eq!(info.channels, 6);
+        assert!(info.lfe_on);
+
+        // The two-bytes-short slice the old sizing produced is now rejected up
+        // front instead of being decoded with its tail missing.
+        assert!(matches!(
+            inspect_legacy_ac3_access_unit(&frame[..1670]),
+            Err(ParseError::TruncatedFrame {
+                expected: 1672,
+                available: 1670,
+            })
+        ));
+    }
 
     fn push_bits(bits: &mut Vec<bool>, value: u32, width: usize) {
         for bit in (0..width).rev() {

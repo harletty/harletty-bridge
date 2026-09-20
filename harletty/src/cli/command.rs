@@ -51,6 +51,10 @@ pub enum Commands {
 
     /// Print stream information
     Info(InfoArgs),
+
+    /// Print, as JSON, the version of the label taxonomy `info --json` and
+    /// `decode` emit, and the binary's version.
+    Taxonomy,
 }
 
 #[derive(Debug, Args)]
@@ -67,6 +71,14 @@ pub struct DecodeArgs {
     #[arg(long, value_enum, default_value_t = AudioFormat::Caf)]
     pub format: AudioFormat,
 
+    /// Write the audio as one mono 24-bit WAV per channel, `<PREFIX>_<n>.wav`
+    /// with n from 0 in the order of the interleaved file (a master set's bed,
+    /// then its objects), instead of one interleaved file. The `.atmos` and
+    /// `.atmos.metadata` files are written as usual; the header still names
+    /// the interleaved audio file, which is not written.
+    #[arg(long, value_name = "PREFIX")]
+    pub mono_prefix: Option<PathBuf>,
+
     /// Disable audio file output (metadata files are still generated when available).
     #[arg(long)]
     pub no_audio: bool,
@@ -79,9 +91,17 @@ pub struct DecodeArgs {
     #[arg(long)]
     pub no_estimate_progress: bool,
 
-    /// Enable bed conformance for Atmos content
+    /// Keep the bed to what an Atmos bed can hold. TrueHD: declare a 7.1.2
+    /// bed. DTS:X and Auro-3D: the corner heights and wides leave the bed for
+    /// static objects at their speaker positions.
     #[arg(long)]
     pub bed_conform: bool,
+
+    /// Keep a DTS:X waveform whose bed fold the stream does not state in the
+    /// bed, muted on its own channel, instead of estimating its fold from
+    /// the bed and playing it at its position.
+    #[arg(long)]
+    pub no_fold_estimate: bool,
 
     /// Specify warp mode when not present in metadata
     #[arg(long, value_enum)]
@@ -93,6 +113,38 @@ pub struct InfoArgs {
     /// Input TrueHD bitstream.
     #[arg(value_name = "INPUT")]
     pub input: PathBuf,
+
+    /// Print every matrix the stream declares, as it is declared or changed.
+    #[arg(long)]
+    pub matrices: bool,
+
+    /// Print each block's channel parameters: which channels say anything, and what.
+    #[arg(long)]
+    pub params: bool,
+
+    /// Print every prediction filter as it is restated, taps scaled to real numbers.
+    #[arg(long)]
+    pub filters: bool,
+
+    /// Total the block-level coding choices over the stream, per substream.
+    #[arg(long)]
+    pub stats: bool,
+
+    /// Stop after this many access units.
+    #[arg(long, value_name = "N")]
+    pub units: Option<usize>,
+
+    /// Print one JSON object instead of the report: codec, bed, the spatial
+    /// presentation as `decode` labels it, and the taxonomy version those
+    /// labels belong to. See docs/harletty-cli.md, "Machine-readable info".
+    #[arg(long)]
+    pub json: bool,
+
+    /// Stop after about this many seconds of audio, whatever the codec. The
+    /// DTS report already stops on its own within twenty seconds; TrueHD
+    /// and E-AC-3 otherwise read the whole input.
+    #[arg(long, value_name = "SECONDS")]
+    pub max_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

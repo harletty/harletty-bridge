@@ -13,6 +13,19 @@ use std::arch::aarch64::{
 pub(crate) const QMF_SUBBANDS: usize = 64;
 const QMF_DOUBLE_LENGTH: usize = QMF_SUBBANDS * 2;
 const QMF_COEFFS_LEN: usize = 640;
+
+/// How far behind its input this bank puts its output, in samples.
+///
+/// Measured, not derived: an impulse handed to [`QuadratureMirrorFilterBank::process_forward`]
+/// and passed straight on to [`QuadratureMirrorFilterBank::process_inverse`] comes back out
+/// exactly this many samples later, and `reconstruction_delay_matches_the_impulse_round_trip`
+/// pins it there. The 640-tap prototype advancing `QMF_SUBBANDS` samples a slot accounts for 576
+/// of it; the last sample belongs to this bank's own indexing convention, which is why the number
+/// is nailed down by a round trip rather than written out as a formula and trusted.
+///
+/// Anything mixed with QMF-reconstructed audio has to be held back by this much to stay on the
+/// same clock. See `JOC_LATENCY_SAMPLES`.
+pub(crate) const QMF_RECONSTRUCTION_DELAY: usize = QMF_COEFFS_LEN - QMF_SUBBANDS + 1;
 const QMF_FORWARD_RING_LEN: usize = QMF_COEFFS_LEN;
 const QMF_FORWARD_STORAGE_LEN: usize = QMF_FORWARD_RING_LEN * 2;
 const QMF_INVERSE_RING_LEN: usize = QMF_COEFFS_LEN * 2;
@@ -669,6 +682,50 @@ mod tests {
             reference.process_inverse(&input, &mut reference_output);
             assert_output_close(&actual_output, &reference_output);
         }
+    }
+
+    /// [`QMF_RECONSTRUCTION_DELAY`] is what the rest of the decoder aligns
+    /// against, so it is checked against the bank itself rather than against a
+    /// second copy of the same arithmetic: feed one impulse in and find where it
+    /// comes out.
+    #[test]
+    fn reconstruction_delay_matches_the_impulse_round_trip() {
+        const TOLERANCE: f32 = 1e-4;
+        let mut forward = QuadratureMirrorFilterBank::new();
+        let mut inverse = QuadratureMirrorFilterBank::new();
+        let timeslots = (QMF_RECONSTRUCTION_DELAY * 2).div_ceil(QMF_SUBBANDS);
+        let mut reconstructed = vec![0.0f32; timeslots * QMF_SUBBANDS];
+
+        for timeslot in 0..timeslots {
+            let mut block = [0.0f32; QMF_SUBBANDS];
+            if timeslot == 0 {
+                block[0] = 1.0;
+            }
+            let subbands = forward.process_forward(&block);
+            let offset = timeslot * QMF_SUBBANDS;
+            inverse.process_inverse(&subbands, &mut reconstructed[offset..offset + QMF_SUBBANDS]);
+        }
+
+        let peak = reconstructed
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.abs().total_cmp(&right.abs()))
+            .map(|(index, _)| index)
+            .expect("a reconstructed impulse");
+        assert_eq!(
+            peak, QMF_RECONSTRUCTION_DELAY,
+            "the cascade delays by {peak} samples, not {QMF_RECONSTRUCTION_DELAY}",
+        );
+        // Unity gain, and the neighbouring samples nowhere near it - otherwise
+        // the peak index would be an accident of which side of a smeared
+        // response happened to be larger.
+        assert!(
+            (reconstructed[peak] - 1.0).abs() <= TOLERANCE,
+            "impulse came back at {} rather than unity",
+            reconstructed[peak],
+        );
+        assert!(reconstructed[peak - 1].abs() <= TOLERANCE);
+        assert!(reconstructed[peak + 1].abs() <= TOLERANCE);
     }
 
     fn next_block(seed: &mut u32) -> [f32; QMF_SUBBANDS] {

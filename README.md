@@ -17,9 +17,9 @@ config where it is. That's the whole job.
 > **Looking for the command-line converter instead?** This repo also
 > ships **`harletty`** — a fork of
 > [`truehdd`](https://github.com/truehdd/truehdd) by
-> [Rainbaby](https://github.com/truehdd), extended with E-AC-3 JOC and
-> DTS input — which turns those bitstreams into Dolby Atmos master files
-> on disk. That one you *do* run yourself; see
+> [Rainbaby](https://github.com/truehdd), extended with E-AC-3 JOC, DTS
+> and Auro-3D input — which turns those bitstreams into Dolby Atmos
+> master files on disk. That one you *do* run yourself; see
 > **[docs/harletty-cli.md](docs/harletty-cli.md)** for the command
 > reference and the provenance in detail.
 
@@ -226,7 +226,9 @@ unix and `target\release\harletty_bridge.dll` on Windows. Point
 by [Rainbaby](https://github.com/truehdd)** — 85% of the shared-lineage
 code is byte-identical to upstream, including the whole DAMF master-set
 writer and the CAF/Wave64 writers. What was added here is E-AC-3 JOC and
-DTS/DTS:X input, the latter exported as ADM.
+DTS/DTS:X input, the latter exported as ADM, and the unfolding of
+Auro-3D carriers (a DTS-HD MA track whose low bits hold a folded 9.1 to
+13.1 layout) into their bed and height layer.
 
 It turns those bitstreams into Dolby Atmos master files (`.atmos`,
 `.atmos.metadata`, plus CAF/WAV audio), reading a file or stdin, so it
@@ -270,6 +272,7 @@ truehdd-macros/      # proc macros used by the CAF writer and `info`
 truehd/              # TrueHD decoder crate (vendored, Apache-2.0)
 eac3/                # E-AC-3 (JOC) decoder crate
 dca/                 # DTS (core / DTS-HD MA / XLL) decoder crate
+auro/                # Auro-Codec side channel: detection and unfold
 docs/                # protocol notes (IEC61937, OAMD shape, …)
 EAC3_PATCH_NOTES.md  # upstream patches to the E-AC-3 decoder
 OBJECT_SIZE_NOTES.md # notes on OAMD object_size handling
@@ -296,8 +299,8 @@ Concretely, what is Rainbaby's:
   `info` report and `truehdd-macros/` are all upstream work.
 
 What is ours: the `bridge_api` ABI wrapper and the OAMD plumbing the
-renderer needs; the `eac3` and `dca` crates; the E-AC-3 JOC and DTS/DTS:X
-routing in the CLI; and decoder robustness fixes. Upstream is Apache-2.0,
+renderer needs; the `eac3`, `dca` and `auro` crates; the E-AC-3 JOC,
+DTS/DTS:X and Auro-3D routing in the CLI; and decoder robustness fixes. Upstream is Apache-2.0,
 as is this repo.
 
 So: huge thanks to Rainbaby and the `truehdd` project. **If any of this
@@ -306,5 +309,22 @@ That is where the hard part was done.
 
 ## License
 
-Apache-2.0. The vendored TrueHD decoder under `truehd/` ships its own
-upstream `LICENSE` and remains © its original author.
+The sources in this repository are **Apache-2.0**. The two things it builds
+are not distributable under the same terms, so they are worth separating:
+
+- **`harletty`, the CLI** — Apache-2.0. It depends only on this workspace and
+  on crates.io (`truehd` and `truehdd-macros` are Apache-2.0 too), so the
+  binary carries no copyleft.
+- **`libharletty_bridge.so` / `.dll`, the decoder bridge** —
+  **GPL-3.0-or-later**. It links `bridge_api`, `spdif` and `sys` from
+  [Omniphony](https://github.com/mgth/Omniphony), which are GPL-3.0-or-later,
+  and the resulting library is a combined work. Apache-2.0 code may be
+  combined into a GPLv3 work, so there is no licence conflict — but what you
+  receive is governed by the GPL, and linking it into a proprietary program is
+  not permitted. Source for both halves is public.
+
+Note that this is one-way: Apache-2.0 is incompatible with GPLv2 because of
+its patent clause, so anything built on `truehd` can be GPLv3 but never GPLv2.
+
+The TrueHD decoder itself is the `truehd` crate from crates.io (Apache-2.0),
+© its original author; it used to be vendored here and no longer is.

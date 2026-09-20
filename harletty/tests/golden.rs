@@ -105,17 +105,56 @@ fn joc_master_set_matches_golden() {
     // hash pins one target rather than the algorithm. Decoding this same
     // fixture with the same source:
     //
-    //     x86_64-unknown-linux-gnu     769f8b6a…   (the committed hash)
-    //     aarch64-unknown-linux-musl   b3d1a6b9…   (NEON QMF path)
+    //     x86_64-unknown-linux-gnu     c301c8ba…   (the committed hash)
+    //     aarch64-unknown-linux-musl   —           (NEON QMF path, differs)
     //
     // Both are correct decodes. Asserting the hash off x86_64 would report a
     // failure that is not a regression, so it is scoped rather than dropped —
     // on x86_64 it stays a byte-exact tripwire, which is what it is good at.
+    // The aarch64 value moved with the last rebase below and was not
+    // recomputed; nothing asserts it, so it is left unstated rather than stale.
     //
-    // Rebased twice: once when `float_to_i24` stopped scaling by 2^23 - 1 and
-    // truncating (1.6% of samples moved one count away from zero, no sign
-    // flips, max delta 1), and once when the QMF scalar fallbacks stopped
-    // accumulating into a single sum.
+    // Rebased six times: once when `float_to_i24` stopped scaling by
+    // 2^23 - 1 and truncating (1.6% of samples moved one count away from zero,
+    // no sign flips, max delta 1), once when the QMF scalar fallbacks stopped
+    // accumulating into a single sum, once when the JOC parameter bands started
+    // being expanded onto the subbands they cover on every path, once when
+    // the core was delayed to meet the objects it is written beside
+    // (`JOC_LATENCY_SAMPLES`) — the bed channels of every JOC frame shift 577
+    // samples later — and once when the two short transforms stopped reading
+    // the flat coefficient array at the long transform's stride. This fixture
+    // carries exactly one short block: frame 31 of its 47 sets `blkswe`, and
+    // its last block, block 5, switches the front-left channel. That one block
+    // moves 785 of 72 192 samples, 1.1%, every one of them inside the five
+    // consecutive 256-sample blocks running from it to four blocks into frame
+    // 32 - the block after a short block reads back the delay it left behind,
+    // so the damage outlives the block that caused it. Two of the twenty-one
+    // master-set channels carry it; the other nineteen, and every other frame,
+    // are bit-identical. Neither is anywhere near full scale there, 0,021 and
+    // 0,015 of it at most, and the change is small: 785 samples on channel 6
+    // (samples 49 064 to 50 348) and 510 on channel 0 (49 474 to 49 984), by
+    // at most 40 496 counts of 2^23, 0,0048 full scale, with 60 sign flips on
+    // each; the clip's peak, 0,470 full scale, does not move. And once when the
+    // JOC dequantization step became clause 6.6.4's exact 820/4096 rather than
+    // 0,2. That can be more than a 0,098 % correction: the dense chain wraps in
+    // floating point against a `max` that is itself a multiple of the step,
+    // and 820/4096 is 205/1024, so every product is exact in f32 and the wrap
+    // lands where the integer arithmetic puts it, whereas 0,2 is not
+    // representable in binary and its rounding can drift a chain across that
+    // boundary - a band belonging near the top of the quantizer comes back
+    // near the bottom, the whole 19,2 range wrong. Not here, though: this
+    // fixture's dense coefficients all sit on the fine quantizer ten steps
+    // above zero, a gain of 1,0 that becomes 1,001, and no chain in it lands
+    // on the boundary, so what moves is the 0,098 % alone. One of the
+    // twenty-one channels carries it: channel 6 moves 22 892 of its 72 192
+    // samples, 31,7 %, in 142 runs between 1,017 s and 1,504 s, by at most
+    // 3 853 counts of 2^23 (0,00046 full scale, -67 dBFS) and with no sign
+    // flips; the peak sits on that channel and moves with it, 0,470330 to
+    // 0,470770. These figures were measured on the decoded CAF, 24-bit
+    // big-endian signed, after each merge; the ones this note carried before
+    // for the last two rebases - near-full-scale channels, thousands of sign
+    // flips, a peak of 0,99997 - did not describe this file. The last four
+    // change the audio on purpose; that is what they are for.
     #[cfg(target_arch = "x86_64")]
     {
         let produced_audio = sha256_of(&audio_path);

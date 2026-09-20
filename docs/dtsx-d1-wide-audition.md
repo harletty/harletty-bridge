@@ -1,5 +1,16 @@
 # Alternate-profile experimental presentations
 
+> **Superseded (2026-09).** The D0/D1 presentations and folds described
+> below were inferred from the audio alone. The stream's private metadata,
+> read since `dca::XMetadata`, states the feed identities and fold gains
+> directly, and the audio confirms them: the last four feeds of every
+> alternate profile are the fixed heights (folded at unity in D0, at
+> -3.01 dB in D1/D3), D1's first two feeds are objects rather than wide
+> channels, and D0's first feed is an object that also declares the
+> centre-height speaker. Both hosts now build their presentation from that
+> metadata; see `private-metadata-probe.md`. This note is kept as the record
+> of the earlier inference and its measurements.
+
 This note records the evidence and reproduction steps for the experimental D0
 height and D1 wide-channel presentations. They are research, not normative
 format claims. Harletty now selects the standard four-source or inferred

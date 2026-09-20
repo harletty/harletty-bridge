@@ -116,24 +116,106 @@ pub enum SourceCodec {
     // DTS:X, one label per spatial presentation.
     //
     // These strings are not free choices. Atmos Ranker classifies DTS:X tracks
-    // at scan time by looking for the D0/D1/D3 syncwords in the elementary
-    // stream, and stores the result under exactly these names; its
+    // at scan time by looking for the alternate-profile syncwords in the
+    // elementary stream, and stores the result under exactly these names; its
     // `canonical_codec` maps them to themselves. Emitting anything else here —
     // a generic "DTS-X", say — would leave the same physical codec stored under
     // two different strings depending on whether it was scanned or decoded,
     // which is precisely what that function exists to prevent.
+    //
+    // The scanner's syncword list is not visible from this repository, so the
+    // agreement is an expectation held here rather than a thing checked here.
+    // A label that decodes but never ranks is the shape that disagreement
+    // takes, and the profile added most recently is where to look for it.
     /// Standard DTS:X: 7.1 bed plus four height feeds.
     #[serde(rename = "DTS:X-7.1.4")]
     DtsX714,
-    /// Experimental five-feed presentation (D0).
-    #[serde(rename = "DTS:X-7.1.5")]
-    DtsX715,
-    /// Experimental six-feed presentation (D1): four heights plus wides.
-    #[serde(rename = "DTS:X-9.1.4")]
-    DtsX914,
-    /// Experimental eight-feed object presentation (D3).
-    #[serde(rename = "DTS:X-7.1+8")]
-    DtsX71Plus8,
+    /// Five-feed presentation (D0): 7.1 bed, four fixed heights and one
+    /// object, at the position its record declares. (Formerly labelled
+    /// `DTS:X-7.1.5`, when that object was presented as a fixed
+    /// centre-height channel regardless of where it said it was; Atmos
+    /// Ranker maps that label onto this one.)
+    #[serde(rename = "DTS:X-7.1.4+1")]
+    DtsX714Plus1,
+    /// Six-feed presentation (D1): 7.1 bed, four fixed heights and two
+    /// objects. (Formerly labelled `DTS:X-9.1.4` when the two objects were
+    /// taken for wide channels; Atmos Ranker maps that label onto this one.)
+    #[serde(rename = "DTS:X-7.1.4+2")]
+    DtsX714Plus2,
+    /// Eight-feed presentation (D3): 7.1 bed, four fixed heights and four
+    /// objects. (Formerly `DTS:X-7.1+8`, when the height quartet was counted
+    /// among the objects; mapped likewise.)
+    #[serde(rename = "DTS:X-7.1.4+4")]
+    DtsX714Plus4,
+    /// Nine-feed presentation (D4): 7.1 bed, four fixed heights and five
+    /// objects.
+    #[serde(rename = "DTS:X-7.1.4+5")]
+    DtsX714Plus5,
+    /// Seven-feed presentation (the D0 marker over a three-channel first
+    /// set): 7.1 bed, four fixed heights and the single declared object as
+    /// three components at the bed's C, L and R positions.
+    #[serde(rename = "DTS:X-7.1.4+3")]
+    DtsX714Plus3,
+    /// Object-only presentation on a 5.1 bed: one object waveform, no height
+    /// quartet (the D0 marker with a 5.1 reference layout).
+    #[serde(rename = "DTS:X-5.1+1")]
+    DtsX51Plus1,
+    // Auro-3D, by the channel count of the layout the carrier unfolds to:
+    // bed plus heights plus top. Layouts with no common name fall back to
+    // the bare label.
+    #[serde(rename = "Auro-3D-9.1")]
+    Auro3d91,
+    #[serde(rename = "Auro-3D-10.1")]
+    Auro3d101,
+    #[serde(rename = "Auro-3D-11.1")]
+    Auro3d111,
+    #[serde(rename = "Auro-3D-13.1")]
+    Auro3d131,
+    #[serde(rename = "Auro-3D")]
+    Auro3d,
+}
+
+impl SourceCodec {
+    /// Every label, for the taxonomy checks.
+    pub const ALL: [SourceCodec; 14] = [
+        SourceCodec::TrueHD,
+        SourceCodec::Eac3Joc,
+        SourceCodec::DtsX714,
+        SourceCodec::DtsX714Plus1,
+        SourceCodec::DtsX714Plus2,
+        SourceCodec::DtsX714Plus4,
+        SourceCodec::DtsX714Plus5,
+        SourceCodec::DtsX714Plus3,
+        SourceCodec::DtsX51Plus1,
+        SourceCodec::Auro3d91,
+        SourceCodec::Auro3d101,
+        SourceCodec::Auro3d111,
+        SourceCodec::Auro3d131,
+        SourceCodec::Auro3d,
+    ];
+
+    /// The string this codec is written as: the `sourceCodec` of the DAMF
+    /// header, and the label `harletty info --json` reports. The same
+    /// strings as the serde names above, kept in step by a test, so a
+    /// caller can hold the label without serialising a header.
+    pub fn label(self) -> &'static str {
+        match self {
+            SourceCodec::TrueHD => "TrueHD",
+            SourceCodec::Eac3Joc => "EAC3-JOC",
+            SourceCodec::DtsX714 => "DTS:X-7.1.4",
+            SourceCodec::DtsX714Plus1 => "DTS:X-7.1.4+1",
+            SourceCodec::DtsX714Plus2 => "DTS:X-7.1.4+2",
+            SourceCodec::DtsX714Plus4 => "DTS:X-7.1.4+4",
+            SourceCodec::DtsX714Plus5 => "DTS:X-7.1.4+5",
+            SourceCodec::DtsX714Plus3 => "DTS:X-7.1.4+3",
+            SourceCodec::DtsX51Plus1 => "DTS:X-5.1+1",
+            SourceCodec::Auro3d91 => "Auro-3D-9.1",
+            SourceCodec::Auro3d101 => "Auro-3D-10.1",
+            SourceCodec::Auro3d111 => "Auro-3D-11.1",
+            SourceCodec::Auro3d131 => "Auro-3D-13.1",
+            SourceCodec::Auro3d => "Auro-3D",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -527,6 +609,13 @@ impl Configuration {
             Vec::new()
         };
 
+        // Dynamic objects take the IDs 10, 11, … in the order they appear,
+        // matching the `objects:` list of the header. Counting them as they
+        // come, rather than subtracting the bed size from the index, keeps
+        // the IDs right whether or not the bed objects precede them in
+        // `object_data`: a TrueHD payload lists the bed first, a payload
+        // synthesised for a DTS:X or Auro-3D track lists no bed at all.
+        let mut dynamic_rank = 0usize;
         for i in 0..object_count {
             let object_data = &object_element.object_data[i][0];
             let id = if object_data.b_object_in_bed_or_isf {
@@ -540,7 +629,8 @@ impl Configuration {
                     _ => index + 120,
                 }
             } else {
-                i + 10 - bed_index_vec.len()
+                dynamic_rank += 1;
+                dynamic_rank + 9
             };
 
             let mut event: Event = Event::with_id(id as u32);
@@ -893,6 +983,21 @@ fn unquote(scalar: &str) -> String {
 /// `CreationTool { name: env!("CARGO_PKG_NAME"), version: env!("CARGO_PKG_VERSION") }`,
 /// so pinning a fixture here checks that whatever the caller declares reaches
 /// `creationTool` verbatim.
+#[test]
+fn source_codec_labels_are_the_serde_names() {
+    for codec in SourceCodec::ALL {
+        let written = serde_yaml_ng::to_string(&codec).unwrap();
+        assert_eq!(written.trim(), codec.label(), "{codec:?}");
+    }
+    let distinct: std::collections::BTreeSet<&str> =
+        SourceCodec::ALL.iter().map(|codec| codec.label()).collect();
+    assert_eq!(
+        distinct.len(),
+        SourceCodec::ALL.len(),
+        "labels are distinct"
+    );
+}
+
 #[cfg(test)]
 const TEST_TOOL: CreationTool = CreationTool {
     name: "harletty",
@@ -1035,8 +1140,7 @@ presentations:
       - ID: 23
       - ID: 24
 "#,
-        TEST_TOOL.name,
-        TEST_TOOL.version
+        TEST_TOOL.name, TEST_TOOL.version
     );
 
     let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();

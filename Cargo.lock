@@ -137,6 +137,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "auro"
+version = "0.8.0"
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -168,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "bridge_api"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "abi_stable",
 ]
@@ -332,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "damf"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_yaml_ng",
@@ -411,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "dca"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "log",
  "rustfft",
@@ -467,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "eac3"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "log",
  "rustfft",
@@ -566,9 +570,10 @@ dependencies = [
 
 [[package]]
 name = "harletty"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "anyhow",
+ "auro",
  "chrono",
  "clap",
  "damf",
@@ -589,10 +594,11 @@ dependencies = [
 
 [[package]]
 name = "harletty-bridge"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "abi_stable",
  "anyhow",
+ "auro",
  "bridge_api",
  "dca",
  "eac3",
@@ -1218,9 +1224,9 @@ dependencies = [
 
 [[package]]
 name = "truehd"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71781f17f77b87b23b2ae7d442e476b801d77e8fc3e342d80eba83ca3de470d7"
+checksum = "3670e5f6df01d8518e225c37ada5c9e41fa5d98fb414ef1eed051e71c885da16"
 dependencies = [
  "anyhow",
  "bitstream-io",

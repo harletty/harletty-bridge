@@ -4,10 +4,18 @@
 // routes each frame to either the DTS-HD MA lossless decoder (5.1/7.1, when an
 // EXSS substream follows the core) or the plain DTS core decoder (5.1). Every
 // decoded core channel is emitted as a bed channel, placed at its canonical
-// speaker by the renderer. XLL-X's standard four-source profile is mapped to
-// the four 7.1.4 height positions after undoing its -3 dB contribution to the
-// backward-compatible 7.1 bed. Alternate decoded profiles use their current
-// experimental presentations automatically.
+// speaker by the renderer.
+//
+// DTS:X extension waveforms are presented the way the stream describes them
+// (`dca::XPresentation` + `dca::XMetadata`): fixed heights as labeled
+// channels, objects as object channels with transmitted positions. Every
+// waveform was also mixed into the backward-compatible bed by the encoder, at
+// gains the stream's private metadata states; that contribution is removed
+// from the bed before the waveform is emitted at its own position, so nothing
+// plays twice. A waveform whose fold is not stated (an object record without
+// reference rows) has its fold estimated from the audio (`dca::FoldEstimator`)
+// and is treated the same; with estimation off it stays in the bed and its
+// own channel is silent.
 
 use abi_stable::std_types::{RString, RVec};
 use bridge_api::RPushResult;
@@ -15,7 +23,8 @@ use bridge_api::{
     RChannelLabel, RDecodedFrame, REvent, RMetadataFrame, RNameUpdate, RObjectChannel,
 };
 use dca::{
-    CorePcmFrame, HdError, HdFrame, XPresentation, exss_has_xll, exss_substream_size, parse_header,
+    CorePcmFrame, FoldEstimator, FoldPlan, HdError, HdFrame, MAX_SOURCES, SourceRole,
+    SphericalPosition, XMetadata, XPresentation, exss_has_xll, exss_substream_size, parse_header,
 };
 use serde::Deserialize;
 
@@ -26,26 +35,18 @@ use crate::metadata::declare_object_channels;
 
 const CORE_SYNC: [u8; 4] = 0x7FFE_8001u32.to_be_bytes();
 const SUBSTREAM_SYNC: [u8; 4] = 0x6458_2025u32.to_be_bytes();
-// Exact Q15 -3 dB coefficient used by the DTS downmix table. The regular 7.1
-// presentation contains this contribution from each corresponding height feed.
-#[cfg(test)]
-const XLL_X_HEIGHT_DOWNMIX_GAIN: f32 = 23_170.0 / 32_768.0;
+/// Object ids start past the legacy bed-id range.
+const OBJECT_ID_BASE: u32 = 10;
+/// Re-emit unchanged object positions at this rate so monitoring clients
+/// whose stream-idle timeout is shorter than a second keep the objects
+/// alive, while staying far below the per-audio-frame rate that could
+/// overwhelm Studio.
+const HEARTBEAT_HZ: u64 = 2;
 
-// Research-only D0 partial-unfold coefficients. The source-to-speaker
-// associations are repeatable across the two measured programmes, but these
-// gains are conservative presentation choices, not decoded metadata or a proven
-// profile-exact matrix. In particular, the partial subtraction deliberately
-// preserves some programme material authored in both the lower and top feeds.
-#[cfg(test)]
-const D0_TFC_CENTER_DOWNMIX_GAIN: f32 = 0.5;
-#[cfg(test)]
-const ALTERNATE_CORNER_HEIGHT_PARTIAL_UNFOLD_GAIN: f32 = 1.0 / std::f32::consts::SQRT_2;
-
-// Research-only D1 compatibility-fold estimates, measured on strict,
-// well-conditioned full-programme matrices in the D1 corpus. These are
-// intentionally isolated from the lossless decoder. They are not claimed to be
-// a normative/profile-exact matrix yet.
-
+/// Fallback fold for a standard-profile frame whose type-2 matrix could not
+/// be read: the four height feeds at one configured gain. Every stream in
+/// the corpus states code 55 (Q15 23170/32768, -3.01 dB), which is also the
+/// bundled default; a local `dts-fold.yaml` overrides it.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct FoldRoute {
     pub target: String,
@@ -63,6 +64,15 @@ pub(crate) struct FoldSource {
 pub(crate) struct DtsFoldConfig {
     #[serde(default)]
     pub sources: Vec<FoldSource>,
+    /// Estimate the fold of a waveform the stream does not state one for,
+    /// from the bed's own audio, so the waveform plays at its position and
+    /// leaves the bed. Off, such a waveform stays in the bed and is muted.
+    #[serde(default = "default_true")]
+    pub estimate_unknown: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for DtsFoldConfig {
@@ -93,16 +103,61 @@ impl DtsFoldConfig {
             })
             .map_or(0.0, |route| 10.0_f32.powf(route.gain_db / 20.0))
     }
-}
-// The D0/D1 channel identities and the D3 inferred object positions moved to
-// `dca::spatial`, which documents their (research-only) provenance. Both this
-// pipeline and the offline ADM exporter read them from there.
-const D3_OBJECT_SOURCE_INDICES: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 
-enum FoldSources<'a> {
-    None,
-    One(&'a [f32], f32),
-    Two(&'a [f32], f32, &'a [f32], f32),
+    /// The standard-profile fallback plan: TFL→L, TFR→R, TBL→Lb, TBR→Rb.
+    fn standard_fallback(&self) -> FoldPlan {
+        FoldPlan::standard_heights(self.gain("L", "TFL"))
+    }
+}
+
+/// Per-stream DTS:X extension state. Cleared with the pipeline.
+#[derive(Default)]
+pub(crate) struct DtsXState {
+    /// Presentation latched from the first frame with usable extension
+    /// waveforms. A later frame whose waveforms are missing or invalid keeps
+    /// this channel shape (composite bed + silent extension channels) instead
+    /// of renegotiating, and no content is lost: the folded contribution stays
+    /// in the bed for that frame.
+    pub(crate) locked: Option<XPresentation>,
+    /// The most recent metadata that parsed. A frame whose own metadata does
+    /// not parse reuses it, so a transient failure neither clicks nor changes
+    /// which waveforms play.
+    pub(crate) last_metadata: Option<XMetadata>,
+    /// Position last announced per object feed, for sparse events.
+    emitted_positions: [Option<SphericalPosition>; MAX_SOURCES],
+    /// Running fold estimates for the waveforms whose fold is not stated.
+    estimator: FoldEstimator,
+    /// Whether the estimation has been announced for this stream.
+    estimation_noted: bool,
+    parse_failures: u64,
+    feed_dropouts: u64,
+}
+
+impl DtsXState {
+    fn note_parse_failure(&mut self, error: dca::XMetadataError) {
+        self.parse_failures += 1;
+        if self.parse_failures == 1 || self.parse_failures.is_power_of_two() {
+            log::warn!(
+                "dts: extension metadata unreadable ({error:?}, {} frames so far); {}",
+                self.parse_failures,
+                if self.last_metadata.is_some() {
+                    "reusing the last readable frame"
+                } else {
+                    "keeping the bed as authored and muting the extension channels"
+                }
+            );
+        }
+    }
+
+    fn note_feed_dropout(&mut self, reason: &str) {
+        self.feed_dropouts += 1;
+        if self.feed_dropouts == 1 || self.feed_dropouts.is_power_of_two() {
+            log::warn!(
+                "dts: extension waveforms unavailable ({reason}, {} frames so far); emitting silent extension channels",
+                self.feed_dropouts
+            );
+        }
+    }
 }
 
 /// Demux and decode all complete DTS frames buffered in `bridge.dts_buf`.
@@ -150,13 +205,25 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                         let n = hd_samples(&hd);
                         if let Some((frame, emitted_objects)) = build_hd_frame_with_extensions(
                             &hd,
-                            &mut bridge.dts_height_locked,
+                            &mut bridge.dts_x,
                             &bridge.dts_fold_config,
                             bridge.total_samples,
                             &mut bridge.declared_object_channels,
                         ) {
                             bridge.dts_objects_active = emitted_objects;
-                            result.frames.push(frame);
+                            // The Auro side channel lives in the low bits of
+                            // the lossless integers, read off the decoder's
+                            // integer tap. The stage decides whether the
+                            // frame goes out as it is or unfolded.
+                            let active: Vec<usize> = (0..hd.samples.len())
+                                .filter(|&s| hd.samples[s].is_some())
+                                .collect();
+                            bridge.dts_auro.route(
+                                frame,
+                                &active,
+                                bridge.dts_hd_decoder.lossless_samples(),
+                                &mut result.frames,
+                            );
                         }
                         bridge.total_samples += n as u64;
                         bridge.dts_frame_count += 1;
@@ -181,6 +248,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 match bridge.dts_decoder.push_access_unit(&rest[..fs]) {
                     Ok(push) => {
                         bridge.dts_objects_active = false;
+                        bridge.dts_auro.not_a_carrier(&mut result.frames);
                         result.frames.push(build_core_frame(&push.pcm));
                         bridge.total_samples += push.pcm.samples_per_channel() as u64;
                         bridge.dts_frame_count += 1;
@@ -203,6 +271,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 Ok(push) => {
                     let frame = build_core_frame(&push.pcm);
                     bridge.dts_objects_active = false;
+                    bridge.dts_auro.not_a_carrier(&mut result.frames);
                     bridge.total_samples += push.pcm.samples_per_channel() as u64;
                     bridge.dts_frame_count += 1;
                     result.frames.push(frame);
@@ -235,29 +304,8 @@ fn hd_samples(hd: &HdFrame) -> usize {
     hd.bed_sample_count()
 }
 
-/// ABI labels for a presentation's extension feeds, in feed order.
-///
-/// The feed->position tables themselves live in `dca::spatial` so the offline
-/// ADM exporter reads the same ones; this only projects them onto the ABI.
-fn spatial_labels(presentation: XPresentation) -> impl Iterator<Item = RChannelLabel> {
-    presentation
-        .channels()
-        .iter()
-        .copied()
-        .map(dca_spatial_channel_to_r)
-}
-
-/// Static position of D3 object feed `source`. Research-only defaults; see
-/// `dca::spatial` for their provenance.
-fn d3_object_position(source: usize) -> [f64; 3] {
-    XPresentation::ObjectsD3
-        .object_positions()
-        .and_then(|positions| positions.get(source).copied())
-        .unwrap_or([0.0; 3])
-}
-
 /// DCA speaker index -> renderer channel label, for the DTS-HD bed.
-fn speaker_to_label(spkr: usize) -> RChannelLabel {
+pub(crate) fn speaker_to_label(spkr: usize) -> RChannelLabel {
     match spkr {
         0 => RChannelLabel::C,
         1 => RChannelLabel::L,
@@ -272,19 +320,37 @@ fn speaker_to_label(spkr: usize) -> RChannelLabel {
     }
 }
 
-/// Build a frame from decoded DTS-HD per-speaker PCM. The normal path remains
-/// fixed-channel only. Decoded alternate profiles use the current experimental
-/// presentation: inferred fixed channels for D0/D1 and unchanged named objects
-/// at inferred static positions for D3.
-///
-/// `height_locked` latches once a valid XLL-X quartet has been emitted: from
-/// then on a frame with a missing/invalid quartet keeps the 12-channel shape
-/// (composite bed + silent heights) instead of collapsing to 8 channels, so
-/// the host never renegotiates mid-stream and no content is lost (the folded
-/// height contribution stays in the bed for that frame).
+/// The fold plan for this frame: its own metadata when readable, otherwise
+/// the last readable metadata, otherwise the profile's fallback.
+fn resolve_plan(
+    hd: &HdFrame,
+    presentation: XPresentation,
+    state: &mut DtsXState,
+    fold_config: &DtsFoldConfig,
+) -> FoldPlan {
+    match XMetadata::parse(&hd.x_payload, presentation.feed_count()) {
+        Ok(metadata) => {
+            state.last_metadata = Some(metadata);
+            FoldPlan::from_metadata(&metadata)
+        }
+        Err(error) => {
+            state.note_parse_failure(error);
+            match (&state.last_metadata, presentation) {
+                (Some(metadata), _) => FoldPlan::from_metadata(metadata),
+                (None, XPresentation::Height) => fold_config.standard_fallback(),
+                (None, _) => FoldPlan::all_unknown(presentation.feed_count()),
+            }
+        }
+    }
+}
+
+/// Build a frame from decoded DTS-HD per-speaker PCM: the bed with every
+/// stated extension contribution removed, then the fixed extension channels,
+/// then the object channels. Returns the frame and whether it carries object
+/// channels (the live `has_objects` fact).
 fn build_hd_frame_with_extensions(
     hd: &HdFrame,
-    height_locked: &mut bool,
+    state: &mut DtsXState,
     fold_config: &DtsFoldConfig,
     sample_pos: u64,
     declared_object_channels: &mut Option<RVec<RObjectChannel>>,
@@ -310,163 +376,66 @@ fn build_hd_frame_with_extensions(
         bed.push(channel.as_slice());
     }
 
-    // The XLL-X channel set carries four full-coded waveforms but no
-    // one-to-one speaker mask. Treat its stable stereo pairs as front-height
-    // L/R followed by rear-height L/R. Keep the mapping isolated here so it
-    // can be replaced without touching the lossless decoder if later metadata
-    // proves otherwise.
-    let height_samples: Option<&[Vec<f32>; 4]> =
-        hd.x_samples
-            .as_slice()
-            .try_into()
-            .ok()
-            .filter(|channels: &&[Vec<f32>; 4]| {
-                channels.iter().all(|channel| channel.len() == sample_count)
-            });
-    if height_samples.is_none() && hd.x_present && *height_locked {
-        let err = hd.x_decode_error.unwrap_or("no quartet");
-        log::warn!("dts: XLL-X quartet unavailable ({err}); emitting silent heights");
-    }
-
-    let emit_heights = height_samples.is_some() || *height_locked;
-    let height_count = if emit_heights {
-        XPresentation::Height.feed_count()
-    } else {
-        0
-    };
-    let alternate_samples = hd
-        .x_imax
-        .then_some(hd.x_samples.as_slice())
-        .filter(|channels| matches!(channels.len(), 5 | 6 | 8))
-        .filter(|channels| channels.iter().all(|channel| channel.len() == sample_count));
-    let d0_fixed_samples = alternate_samples
-        .filter(|channels| channels.len() == 5)
-        .map(|channels| {
-            [
-                &channels[0][..],
-                &channels[1][..],
-                &channels[2][..],
-                &channels[3][..],
-                &channels[4][..],
-            ]
-        });
-    let d1_fixed_samples = alternate_samples
-        .filter(|channels| channels.len() == 6)
-        .map(|channels| {
-            [
-                &channels[0][..],
-                &channels[1][..],
-                &channels[2][..],
-                &channels[3][..],
-                &channels[4][..],
-                &channels[5][..],
-            ]
-        });
-    let object_source_indices: &[usize] = match alternate_samples.map(<[Vec<f32>]>::len) {
-        Some(8) => &D3_OBJECT_SOURCE_INDICES,
-        _ => &[],
-    };
-    let d0_fixed_count = d0_fixed_samples.map_or(0, |_| XPresentation::FixedD0.feed_count());
-    let d1_fixed_count = d1_fixed_samples.map_or(0, |_| XPresentation::FixedD1.feed_count());
-    let object_count = object_source_indices.len();
-    let channel_count =
-        active.len() + height_count + d0_fixed_count + d1_fixed_count + object_count;
-
-    // Per-channel source and coefficient for the unfold, hoisted out of the
-    // sample loop (no per-sample speaker/profile branching). The D0 choices
-    // below are conservative research settings, not a normative matrix.
-    let fold_sources: Vec<FoldSources<'_>> = active
-        .iter()
-        .map(|&spkr| {
-            if let Some(heights) = height_samples {
-                let height_idx = match spkr {
-                    1 => 0usize,
-                    2 => 1,
-                    7 => 2,
-                    8 => 3,
-                    _ => return FoldSources::None,
-                };
-                return FoldSources::One(
-                    heights[height_idx].as_slice(),
-                    match spkr {
-                        1 => fold_config.gain("L", "TFL"),
-                        2 => fold_config.gain("R", "TFR"),
-                        7 => fold_config.gain("Lb", "TBL"),
-                        8 => fold_config.gain("Rb", "TBR"),
-                        _ => 0.0,
-                    },
+    // A presentation is detected only when every extension waveform is
+    // present at the bed length; otherwise the latched one keeps the shape.
+    let detected = XPresentation::detect(hd);
+    let presentation = match (detected, state.locked) {
+        (Some(detected), _) => {
+            if state.locked.is_some_and(|locked| locked != detected) {
+                log::warn!(
+                    "dts: extension presentation changed {:?} -> {detected:?}; channel shape changes",
+                    state.locked
                 );
+                state.estimator.reset();
             }
-            if let Some(fixed) = d0_fixed_samples {
-                return match spkr {
-                    0 => FoldSources::One(fixed[0], fold_config.gain("C", "X0")),
-                    1 => FoldSources::One(fixed[1], fold_config.gain("L", "X1")),
-                    2 => FoldSources::One(fixed[2], fold_config.gain("R", "X2")),
-                    7 => FoldSources::One(fixed[3], fold_config.gain("Lb", "X3")),
-                    8 => FoldSources::One(fixed[4], fold_config.gain("Rb", "X4")),
-                    _ => FoldSources::None,
-                };
+            state.locked = Some(detected);
+            detected
+        }
+        (None, Some(locked)) => {
+            if hd.x_present || hd.x_imax {
+                state.note_feed_dropout(hd.x_decode_error.unwrap_or("no usable waveform set"));
             }
-            if let Some(fixed) = d1_fixed_samples {
-                return match spkr {
-                    1 => FoldSources::Two(
-                        fixed[0],
-                        fold_config.gain("L", "X0"),
-                        fixed[2],
-                        fold_config.gain("L", "X2"),
-                    ),
-                    2 => FoldSources::Two(
-                        fixed[1],
-                        fold_config.gain("R", "X1"),
-                        fixed[3],
-                        fold_config.gain("R", "X3"),
-                    ),
-                    3 => FoldSources::One(fixed[2], fold_config.gain("Ls", "X2")),
-                    4 => FoldSources::One(fixed[3], fold_config.gain("Rs", "X3")),
-                    7 => FoldSources::One(fixed[4], fold_config.gain("Lb", "X4")),
-                    8 => FoldSources::One(fixed[5], fold_config.gain("Rb", "X5")),
-                    _ => FoldSources::None,
-                };
-            }
-            FoldSources::None
-        })
-        .collect();
+            locked
+        }
+        (None, None) => return Some((bed_only_frame(hd, &active, &bed, sample_count), false)),
+    };
+    let feeds: &[Vec<f32>] = if detected.is_some() {
+        hd.x_samples.as_slice()
+    } else {
+        &[]
+    };
+    let mut plan = if detected.is_some() {
+        resolve_plan(hd, presentation, state, fold_config)
+    } else {
+        FoldPlan::all_unknown(presentation.feed_count())
+    };
+    if detected.is_some() && fold_config.estimate_unknown && plan.has_unknown() {
+        if !state.estimation_noted {
+            state.estimation_noted = true;
+            log::info!(
+                "dts: {:?} carries waveform(s) without a stated bed fold; estimating their fold from the bed",
+                presentation
+            );
+        }
+        state.estimator.refine(&mut plan, &hd.samples, feeds);
+    }
+    let metadata = detected.and(state.last_metadata);
+
+    let fixed_feeds = presentation.fixed_feeds();
+    let object_feeds = presentation.object_feeds();
+    let channel_count = active.len() + presentation.feed_count();
 
     let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * channel_count);
     for s in 0..sample_count {
-        for (channel, fold) in bed.iter().zip(fold_sources.iter()) {
-            let sample = match *fold {
-                FoldSources::None => channel[s],
-                FoldSources::One(source, gain) => channel[s] - source[s] * gain,
-                FoldSources::Two(first, first_gain, second, second_gain) => {
-                    channel[s] - first[s] * first_gain - second[s] * second_gain
-                }
+        for (channel, &spkr) in bed.iter().zip(&active) {
+            pcm.push(float_to_pcm_i32(plan.clean(spkr, channel[s], s, feeds)));
+        }
+        for feed in fixed_feeds.clone().chain(object_feeds.clone()) {
+            let sample = match feeds.get(feed) {
+                Some(waveform) if plan.source_is_known(feed) => waveform[s],
+                _ => 0.0,
             };
             pcm.push(float_to_pcm_i32(sample));
-        }
-        if let Some(height_samples) = height_samples {
-            for channel in height_samples.iter() {
-                pcm.push(float_to_pcm_i32(channel[s]));
-            }
-        } else {
-            for _ in 0..height_count {
-                pcm.push(0);
-            }
-        }
-        if let Some(fixed) = d0_fixed_samples {
-            for channel in fixed {
-                pcm.push(float_to_pcm_i32(channel[s]));
-            }
-        }
-        if let Some(fixed) = d1_fixed_samples {
-            for channel in fixed {
-                pcm.push(float_to_pcm_i32(channel[s]));
-            }
-        }
-        if let Some(alternate) = alternate_samples {
-            for &source in object_source_indices {
-                pcm.push(float_to_pcm_i32(alternate[source][s]));
-            }
         }
     }
 
@@ -474,21 +443,25 @@ fn build_hd_frame_with_extensions(
     for &spkr in &active {
         channel_labels.push(speaker_to_label(spkr));
     }
-    channel_labels.extend(spatial_labels(XPresentation::Height).take(height_count));
-    channel_labels.extend(spatial_labels(XPresentation::FixedD0).take(d0_fixed_count));
-    channel_labels.extend(spatial_labels(XPresentation::FixedD1).take(d1_fixed_count));
-    channel_labels.extend(std::iter::repeat_n(RChannelLabel::Object, object_count));
+    channel_labels.extend(
+        presentation
+            .fixed_channels()
+            .iter()
+            .map(|&channel| dca_spatial_channel_to_r(channel)),
+    );
+    channel_labels.extend(std::iter::repeat_n(
+        RChannelLabel::Object,
+        object_feeds.len(),
+    ));
 
-    if height_samples.is_some() {
-        *height_locked = true;
-    }
-
-    let metadata = build_d3_metadata(
-        object_source_indices,
-        active.len() + height_count + d0_fixed_count + d1_fixed_count,
+    let metadata = build_object_metadata(
+        presentation,
+        metadata.as_ref(),
+        active.len() + fixed_feeds.len(),
         sample_pos,
         hd.sample_rate,
         sample_count,
+        state,
         declared_object_channels,
     );
 
@@ -505,85 +478,132 @@ fn build_hd_frame_with_extensions(
             dialogue_level: None.into(),
             is_new_segment: false,
         },
-        object_count > 0,
+        !object_feeds.is_empty(),
     ))
 }
 
-fn build_d3_metadata(
-    object_source_indices: &[usize],
+/// A frame with no extension presentation: the lossless bed as decoded.
+fn bed_only_frame(
+    hd: &HdFrame,
+    active: &[usize],
+    bed: &[&[f32]],
+    sample_count: usize,
+) -> RDecodedFrame {
+    let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * active.len());
+    for s in 0..sample_count {
+        for channel in bed {
+            pcm.push(float_to_pcm_i32(channel[s]));
+        }
+    }
+    let channel_labels: RVec<RChannelLabel> =
+        active.iter().map(|&spkr| speaker_to_label(spkr)).collect();
+    RDecodedFrame {
+        sampling_frequency: hd.sample_rate,
+        sample_count: sample_count as u32,
+        channel_count: active.len() as u32,
+        pcm,
+        channel_labels,
+        metadata: RVec::new(),
+        drc_gain: 1.0,
+        drc_ramp_duration: 0,
+        dialogue_level: None.into(),
+        is_new_segment: false,
+    }
+}
+
+/// Object channel declaration and position events for a presentation with
+/// objects. Declarations are sparse (re-emitted on change); positions are
+/// emitted when they change, when the declaration changes, and on the
+/// heartbeat. A fixed presentation emits nothing.
+#[allow(clippy::too_many_arguments)]
+fn build_object_metadata(
+    presentation: XPresentation,
+    metadata: Option<&XMetadata>,
     first_object_channel: usize,
     sample_pos: u64,
     sample_rate: u32,
     sample_count: usize,
+    state: &mut DtsXState,
     declared_object_channels: &mut Option<RVec<RObjectChannel>>,
 ) -> RVec<RMetadataFrame> {
-    const HEARTBEAT_HZ: u64 = 2;
-
-    let object_count = object_source_indices.len();
-    if object_count == 0 {
+    let object_feeds = presentation.object_feeds();
+    if object_feeds.is_empty() {
         return RVec::new();
     }
 
-    let declaration_unchanged = declared_object_channels.as_deref().is_some_and(|channels| {
-        channels.len() == object_count
-            && channels.iter().zip(object_source_indices).enumerate().all(
-                |(index, (channel, source))| {
-                    channel.id == (10 + source) as u32
-                        && channel.channel == (first_object_channel + index) as u32
-                },
-            )
-    });
-    // Keep static presentations alive in monitoring clients whose stream-idle
-    // timeout is shorter than one second, while staying far below the former
-    // per-audio-frame metadata rate that could overwhelm Studio.
-    let heartbeat_period = (sample_rate as u64) / HEARTBEAT_HZ;
-    let heartbeat_due = heartbeat_period > 0 && sample_pos % heartbeat_period < sample_count as u64;
-    if declaration_unchanged && !heartbeat_due {
-        return RVec::new();
-    }
-    let object_channels = if declaration_unchanged {
-        RVec::new()
-    } else {
-        log::warn!(
-            "dts: EXPERIMENTAL D3 presentation declaring X0..X{} at inferred positions; mapping is not source metadata",
-            object_count - 1,
-        );
-        let current: RVec<RObjectChannel> = object_source_indices
-            .iter()
-            .enumerate()
-            .map(|(index, &source)| RObjectChannel {
-                id: (10 + source) as u32,
-                channel: (first_object_channel + index) as u32,
-            })
-            .collect();
-        declare_object_channels(declared_object_channels, current)
-    };
-
-    let events: RVec<REvent> = object_source_indices
-        .iter()
-        .map(|&source| REvent {
-            id: (10 + source) as u32,
-            sample_pos,
-            has_pos: true,
-            pos: d3_object_position(source),
-            gain_db: 0,
-            size: [0.0; 3],
-            ramp_duration: 0,
+    let current: RVec<RObjectChannel> = object_feeds
+        .clone()
+        .enumerate()
+        .map(|(index, feed)| RObjectChannel {
+            id: OBJECT_ID_BASE + feed as u32,
+            channel: (first_object_channel + index) as u32,
         })
         .collect();
-    let name_updates = if declaration_unchanged {
-        RVec::new()
+    let declaration_unchanged = declared_object_channels.as_deref() == Some(current.as_slice());
+    let heartbeat_period = u64::from(sample_rate) / HEARTBEAT_HZ;
+    let heartbeat_due = heartbeat_period > 0 && sample_pos % heartbeat_period < sample_count as u64;
+
+    // The engine broadcasts the objects present in each metadata frame and
+    // clears the others as stale, so a frame must carry every object or none:
+    // emitting only the objects that moved makes the static ones flicker in
+    // monitoring clients.
+    let positions: Vec<(usize, SphericalPosition)> = object_feeds
+        .clone()
+        .filter_map(|feed| {
+            match metadata
+                .and_then(|metadata| metadata.source(feed))
+                .map(|source| source.role)
+            {
+                Some(SourceRole::Object { position, .. }) => Some((feed, position)),
+                _ => None,
+            }
+        })
+        .collect();
+    let moved = positions
+        .iter()
+        .any(|&(feed, position)| state.emitted_positions[feed] != Some(position));
+    let mut events: RVec<REvent> = RVec::new();
+    if moved || !declaration_unchanged || heartbeat_due {
+        for &(feed, position) in &positions {
+            state.emitted_positions[feed] = Some(position);
+            events.push(REvent {
+                id: OBJECT_ID_BASE + feed as u32,
+                sample_pos,
+                has_pos: true,
+                pos: position.to_adm_cartesian(),
+                gain_db: 0,
+                size: [0.0; 3],
+                ramp_duration: 0,
+            });
+        }
+    }
+    if declaration_unchanged && events.is_empty() {
+        return RVec::new();
+    }
+
+    let (object_channels, name_updates) = if declaration_unchanged {
+        (RVec::new(), RVec::new())
     } else {
-        object_source_indices
-            .iter()
-            .map(|&source| RNameUpdate {
-                id: (10 + source) as u32,
-                name: RString::from(format!("X{source}")),
+        log::info!(
+            "dts: {presentation:?} declares object channels for extension waveforms {}..{}",
+            object_feeds.start,
+            object_feeds.end
+        );
+        let names = object_feeds
+            .clone()
+            .map(|feed| RNameUpdate {
+                id: OBJECT_ID_BASE + feed as u32,
+                name: RString::from(format!("X{feed}")),
             })
-            .collect()
+            .collect();
+        (
+            declare_object_channels(declared_object_channels, current),
+            names,
+        )
     };
-    let mut metadata = RVec::with_capacity(1);
-    metadata.push(RMetadataFrame {
+
+    let mut frames = RVec::with_capacity(1);
+    frames.push(RMetadataFrame {
         events,
         object_channels,
         channel_gains: RVec::new(),
@@ -591,13 +611,7 @@ fn build_d3_metadata(
         sample_pos,
         ramp_duration: 0,
     });
-    metadata
-}
-
-#[cfg(test)]
-fn build_hd_frame(hd: &HdFrame, height_locked: &mut bool) -> Option<RDecodedFrame> {
-    build_hd_frame_with_extensions(hd, height_locked, &DtsFoldConfig::default(), 0, &mut None)
-        .map(|(frame, _)| frame)
+    frames
 }
 
 /// Build a bed frame from a plain DTS core PCM frame (DCA primary order + LFE).
@@ -639,49 +653,127 @@ fn build_core_frame(core: &CorePcmFrame) -> RDecodedFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dca::{BedFold, SourceMetadata, SpatialChannel, gain_code_linear};
 
     const SAMPLE_COUNT: usize = 2;
+    const Q55: f32 = 23170.0 / 32768.0;
 
     fn hd_frame(samples: Vec<Option<Vec<f32>>>, x_samples: Vec<Vec<f32>>) -> HdFrame {
         HdFrame {
             sample_rate: 48_000,
-            output_mask: 0,
-            samples,
             x_present: !x_samples.is_empty(),
-            x_imax: false,
-            x_payload: Vec::new(),
-            x_payload_offset: 0,
-            x_samples,
             x_pcm_bit_res: 24,
-            x_bits_consumed: 0,
-            x_decode_error: None,
-            x_header_tail_bits: 0,
             xll_frame_segments: 1,
             xll_segment_samples: SAMPLE_COUNT,
-            xll_segment_size_bits: 0,
-            xll_band_crc_present: 0,
-            xll_scalable_lsbs: false,
-            exss_descriptor_tail: Vec::new(),
-            exss_descriptor_tail_bits: 0,
-            x_descriptor_offset: None,
-            x_descriptor_size: None,
-            x_descriptor_navigation_used: false,
+            samples,
+            x_samples,
+            ..HdFrame::default()
         }
     }
 
     fn assert_pcm_close(actual: i32, expected: f32) {
         let expected = float_to_pcm_i32(expected);
         assert!(
-            // YAML dB values are converted back to linear amplitude; allow
-            // the bounded float32/PCM quantisation difference.
+            // Allow the bounded float32/PCM quantisation difference.
             actual.abs_diff(expected) <= 64,
             "actual={actual}, expected={expected}"
         );
     }
 
+    fn height(channel: SpatialChannel, column: usize, gain: f32) -> SourceMetadata {
+        let mut columns = [0.0; 8];
+        columns[column] = gain;
+        SourceMetadata {
+            role: SourceRole::Height(channel),
+            fold: BedFold::Known(columns),
+        }
+    }
+
+    fn object(azimuth: i16, elevation: i16, fold: BedFold) -> SourceMetadata {
+        SourceMetadata {
+            role: SourceRole::Object {
+                position: SphericalPosition {
+                    azimuth_half_degrees: azimuth,
+                    elevation_half_degrees: elevation,
+                    distance_64ths: 64,
+                },
+                centre_height_alternative: false,
+            },
+            fold,
+        }
+    }
+
+    /// The four fixed heights folded into L, R, Lb, Rb at `gain`.
+    fn heights(gain: f32) -> [SourceMetadata; 4] {
+        [
+            height(SpatialChannel::TopFrontLeft, 1, gain),
+            height(SpatialChannel::TopFrontRight, 2, gain),
+            height(SpatialChannel::TopBackLeft, 4, gain),
+            height(SpatialChannel::TopBackRight, 5, gain),
+        ]
+    }
+
+    fn state_with(metadata: Option<XMetadata>) -> DtsXState {
+        DtsXState {
+            last_metadata: metadata,
+            ..DtsXState::default()
+        }
+    }
+
+    fn build(hd: &HdFrame, state: &mut DtsXState) -> (RDecodedFrame, bool) {
+        let mut declared = None;
+        build_hd_frame_with_extensions(hd, state, &DtsFoldConfig::default(), 0, &mut declared)
+            .expect("valid frame")
+    }
+
+    fn build_without_estimation(hd: &HdFrame, state: &mut DtsXState) -> (RDecodedFrame, bool) {
+        let mut declared = None;
+        let config = DtsFoldConfig {
+            estimate_unknown: false,
+            ..DtsFoldConfig::default()
+        };
+        build_hd_frame_with_extensions(hd, state, &config, 0, &mut declared).expect("valid frame")
+    }
+
+    /// Deterministic pseudo-noise in [-1, 1] (splitmix64).
+    fn noise(seed: u64, length: usize) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..length)
+            .map(|_| {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                ((z >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn folded(dry: &[f32], sources: &[(&[f32], f32)]) -> Vec<f32> {
+        dry.iter()
+            .enumerate()
+            .map(|(s, &value)| {
+                value
+                    + sources
+                        .iter()
+                        .map(|(source, gain)| source[s] * gain)
+                        .sum::<f32>()
+            })
+            .collect()
+    }
+
+    fn full_bed() -> Vec<Option<Vec<f32>>> {
+        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
+        for idx in [0usize, 1, 2, 3, 4, 5, 7, 8] {
+            samples[idx] = Some(vec![0.01 * idx as f32, -0.01 * idx as f32]);
+        }
+        samples
+    }
+
     #[test]
-    fn xll_x_heights_are_removed_from_the_compatible_bed() {
-        let heights = [
+    fn standard_heights_are_removed_from_the_bed_with_the_stated_gain() {
+        let heights_pcm = [
             vec![0.40, -0.20],
             vec![-0.30, 0.10],
             vec![0.20, -0.40],
@@ -693,46 +785,18 @@ mod tests {
             vec![0.09, -0.10],
             vec![-0.11, 0.12],
         ];
-        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
-        samples[0] = Some(vec![0.01, -0.01]);
-        samples[1] = Some(
-            dry[0]
-                .iter()
-                .zip(&heights[0])
-                .map(|(&bed, &height)| bed + height * XLL_X_HEIGHT_DOWNMIX_GAIN)
-                .collect(),
-        );
-        samples[2] = Some(
-            dry[1]
-                .iter()
-                .zip(&heights[1])
-                .map(|(&bed, &height)| bed + height * XLL_X_HEIGHT_DOWNMIX_GAIN)
-                .collect(),
-        );
-        samples[3] = Some(vec![0.02, -0.02]);
-        samples[4] = Some(vec![0.03, -0.03]);
-        samples[5] = Some(vec![0.04, -0.04]);
-        samples[7] = Some(
-            dry[2]
-                .iter()
-                .zip(&heights[2])
-                .map(|(&bed, &height)| bed + height * XLL_X_HEIGHT_DOWNMIX_GAIN)
-                .collect(),
-        );
-        samples[8] = Some(
-            dry[3]
-                .iter()
-                .zip(&heights[3])
-                .map(|(&bed, &height)| bed + height * XLL_X_HEIGHT_DOWNMIX_GAIN)
-                .collect(),
-        );
+        // The stream states unity here, unlike the bundled -3 dB fallback.
+        let mut samples = full_bed();
+        samples[1] = Some(folded(&dry[0], &[(&heights_pcm[0], 1.0)]));
+        samples[2] = Some(folded(&dry[1], &[(&heights_pcm[1], 1.0)]));
+        samples[7] = Some(folded(&dry[2], &[(&heights_pcm[2], 1.0)]));
+        samples[8] = Some(folded(&dry[3], &[(&heights_pcm[3], 1.0)]));
+        let hd = hd_frame(samples, heights_pcm.to_vec());
 
-        let hd = hd_frame(samples, heights.into());
-        let mut locked = false;
-        let frame = build_hd_frame(&hd, &mut locked).expect("valid frame");
-        assert!(locked, "a valid quartet must latch the height lock");
-
-        assert_eq!(frame.sample_count, SAMPLE_COUNT as u32);
+        let mut state = state_with(XMetadata::from_sources(&heights(1.0)));
+        let (frame, emitted) = build(&hd, &mut state);
+        assert!(!emitted, "a fixed presentation carries no objects");
+        assert_eq!(state.locked, Some(XPresentation::Height));
         assert_eq!(frame.channel_count, 12);
         assert_eq!(
             frame.channel_labels.as_slice(),
@@ -755,7 +819,6 @@ mod tests {
             frame.metadata.is_empty(),
             "a fixed presentation must not fabricate metadata"
         );
-
         for sample in 0..SAMPLE_COUNT {
             let row = &frame.pcm[sample * 12..(sample + 1) * 12];
             assert_pcm_close(row[1], dry[0][sample]);
@@ -769,24 +832,33 @@ mod tests {
     }
 
     #[test]
-    fn invalid_xll_x_quartet_keeps_the_compatible_bed_unchanged() {
+    fn unreadable_standard_metadata_falls_back_to_the_configured_gain() {
+        let left_height = vec![0.40, -0.20];
+        let dry = vec![0.05, -0.06];
+        let mut samples = full_bed();
+        samples[1] = Some(folded(&dry, &[(&left_height, Q55)]));
+        let hd = hd_frame(samples, vec![left_height; 4]);
+
+        let mut state = DtsXState::default();
+        let (frame, _) = build(&hd, &mut state);
+        assert_eq!(frame.channel_count, 12);
+        assert_eq!(state.parse_failures, 1);
+        for sample in 0..SAMPLE_COUNT {
+            assert_pcm_close(frame.pcm[sample * 12 + 1], dry[sample]);
+        }
+    }
+
+    #[test]
+    fn invalid_quartet_keeps_the_compatible_bed_unchanged() {
         let composite_left = vec![0.25, -0.25];
-        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
-        samples[0] = Some(vec![0.0; SAMPLE_COUNT]);
+        let mut samples = full_bed();
         samples[1] = Some(composite_left.clone());
-        samples[2] = Some(vec![0.0; SAMPLE_COUNT]);
-        samples[3] = Some(vec![0.0; SAMPLE_COUNT]);
-        samples[4] = Some(vec![0.0; SAMPLE_COUNT]);
-        samples[5] = Some(vec![0.0; SAMPLE_COUNT]);
-        samples[7] = Some(vec![0.0; SAMPLE_COUNT]);
-        samples[8] = Some(vec![0.0; SAMPLE_COUNT]);
         let hd = hd_frame(samples, vec![vec![0.5; SAMPLE_COUNT]; 3]);
 
         // Not locked yet: an invalid quartet keeps the plain 8-channel bed.
-        let mut locked = false;
-        let frame = build_hd_frame(&hd, &mut locked).expect("valid frame");
-        assert!(!locked, "an invalid quartet must not latch the lock");
-
+        let mut state = DtsXState::default();
+        let (frame, _) = build(&hd, &mut state);
+        assert_eq!(state.locked, None, "an invalid quartet must not latch");
         assert_eq!(frame.channel_count, 8);
         assert!(frame.metadata.is_empty());
         for sample in 0..SAMPLE_COUNT {
@@ -798,23 +870,22 @@ mod tests {
     }
 
     #[test]
-    fn locked_stream_keeps_shape_with_silent_heights_on_quartet_dropout() {
+    fn locked_stream_keeps_shape_with_silent_feeds_on_dropout() {
         let composite_left = vec![0.25, -0.25];
-        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
-        for idx in [0usize, 2, 3, 4, 5, 7, 8] {
-            samples[idx] = Some(vec![0.0; SAMPLE_COUNT]);
-        }
+        let mut samples = full_bed();
         samples[1] = Some(composite_left.clone());
         // Invalid quartet (3 channels) after a previous frame locked heights.
         let hd = hd_frame(samples, vec![vec![0.5; SAMPLE_COUNT]; 3]);
 
-        let mut locked = true;
-        let frame = build_hd_frame(&hd, &mut locked).expect("valid frame");
+        let mut state = state_with(XMetadata::from_sources(&heights(Q55)));
+        state.locked = Some(XPresentation::Height);
+        let (frame, _) = build(&hd, &mut state);
 
-        // Stable 12-channel shape: composite bed (no unfold without a
-        // quartet) + silent height channels — the host never renegotiates.
+        // Stable 12-channel shape: composite bed (nothing to subtract without
+        // a quartet) + silent height channels — the host never renegotiates.
         assert_eq!(frame.channel_count, 12);
         assert!(frame.metadata.is_empty());
+        assert_eq!(state.feed_dropouts, 1);
         for sample in 0..SAMPLE_COUNT {
             let row = &frame.pcm[sample * 12..(sample + 1) * 12];
             assert_eq!(row[1], float_to_pcm_i32(composite_left[sample]));
@@ -823,23 +894,49 @@ mod tests {
     }
 
     #[test]
-    fn d3_emits_named_objects_without_unfolding_the_bed() {
-        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
-        samples[0] = Some(vec![0.10, -0.10]);
-        samples[1] = Some(vec![0.20, -0.20]);
-        samples[2] = Some(vec![0.30, -0.30]);
+    fn d3_unfolds_objects_and_heights_and_positions_the_objects() {
         let extension: Vec<Vec<f32>> = (0..8)
-            .map(|index| vec![0.01 * (index + 1) as f32; SAMPLE_COUNT])
+            .map(|index| vec![0.01 * (index + 1) as f32, -0.02 * (index + 1) as f32])
             .collect();
+        let code21 = gain_code_linear(21).unwrap();
+        let dry_lb = vec![0.10, -0.10];
+        let dry_l = vec![0.20, -0.20];
+        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
+        samples[0] = Some(vec![0.30, -0.30]);
+        // L carries TFL (feed 4) at -3 dB; Lb carries objects 0 (unity), 1
+        // (code 21) and TBL (feed 6) at -3 dB.
+        samples[1] = Some(folded(&dry_l, &[(&extension[4], Q55)]));
+        samples[7] = Some(folded(
+            &dry_lb,
+            &[
+                (&extension[0], 1.0),
+                (&extension[1], code21),
+                (&extension[6], Q55),
+            ],
+        ));
         let mut hd = hd_frame(samples, extension);
         hd.x_present = false;
         hd.x_imax = true;
 
-        let mut locked = false;
+        let mut columns0 = [0.0; 8];
+        columns0[4] = 1.0;
+        let mut columns1 = [0.0; 8];
+        columns1[4] = code21;
+        let sources = [
+            object(-291, 57, BedFold::Known(columns0)),
+            object(291, 54, BedFold::Known(columns1)),
+            object(-300, 0, BedFold::Known([0.0; 8])),
+            object(300, 0, BedFold::Known([0.0; 8])),
+            heights(Q55)[0],
+            heights(Q55)[1],
+            heights(Q55)[2],
+            heights(Q55)[3],
+        ];
+        let mut state = state_with(XMetadata::from_sources(&sources));
         let mut declared = None;
         let (frame, emitted) = build_hd_frame_with_extensions(
             &hd,
-            &mut locked,
+            &mut state,
             &DtsFoldConfig::default(),
             48_000,
             &mut declared,
@@ -847,54 +944,112 @@ mod tests {
         .expect("valid D3 frame");
 
         assert!(emitted);
-        assert!(!locked);
-        assert_eq!(frame.channel_count, 11);
+        assert_eq!(state.locked, Some(XPresentation::ObjectsD3));
+        assert_eq!(frame.channel_count, 3 + 8);
         assert_eq!(
-            &frame.channel_labels[..3],
-            &[RChannelLabel::C, RChannelLabel::L, RChannelLabel::R]
-        );
-        assert!(
-            frame.channel_labels[3..]
-                .iter()
-                .all(|&label| label == RChannelLabel::Object)
+            frame.channel_labels.as_slice(),
+            &[
+                RChannelLabel::C,
+                RChannelLabel::L,
+                RChannelLabel::Lb,
+                RChannelLabel::Tfl,
+                RChannelLabel::Tfr,
+                RChannelLabel::Tbl,
+                RChannelLabel::Tbr,
+                RChannelLabel::Object,
+                RChannelLabel::Object,
+                RChannelLabel::Object,
+                RChannelLabel::Object,
+            ]
         );
         for sample in 0..SAMPLE_COUNT {
             let row = &frame.pcm[sample * 11..(sample + 1) * 11];
-            for bed in 0..3 {
-                assert_pcm_close(row[bed], hd.samples[bed].as_ref().unwrap()[sample]);
-            }
-            for source in 0..8 {
-                assert_pcm_close(row[3 + source], hd.x_samples[source][sample]);
+            assert_pcm_close(row[0], 0.30 * if sample == 0 { 1.0 } else { -1.0 });
+            assert_pcm_close(row[1], dry_l[sample]);
+            assert_pcm_close(row[2], dry_lb[sample]);
+            for (slot, feed) in (4..8).chain(0..4).enumerate() {
+                assert_pcm_close(row[3 + slot], hd.x_samples[feed][sample]);
             }
         }
 
         assert_eq!(frame.metadata.len(), 1);
         let metadata = &frame.metadata[0];
         assert_eq!(metadata.sample_pos, 48_000);
-        assert_eq!(metadata.events.len(), 8);
-        assert_eq!(metadata.object_channels.len(), 8);
-        assert_eq!(metadata.name_updates.len(), 8);
-        for source in 0..8 {
-            assert_eq!(metadata.object_channels[source].id, (10 + source) as u32);
+        assert_eq!(metadata.events.len(), 4);
+        assert_eq!(metadata.object_channels.len(), 4);
+        assert_eq!(metadata.name_updates.len(), 4);
+        for feed in 0..4 {
+            assert_eq!(metadata.object_channels[feed].id, 10 + feed as u32);
+            assert_eq!(metadata.object_channels[feed].channel, (7 + feed) as u32);
             assert_eq!(
-                metadata.object_channels[source].channel,
-                (3 + source) as u32
+                metadata.name_updates[feed].name.as_str(),
+                format!("X{feed}")
             );
-            assert_eq!(metadata.name_updates[source].id, (10 + source) as u32);
-            assert_eq!(
-                metadata.name_updates[source].name.as_str(),
-                format!("X{source}")
-            );
-            assert_eq!(metadata.events[source].id, (10 + source) as u32);
-            assert_eq!(
-                metadata.events[source].pos,
-                d3_object_position(source)
-            );
+            let event = &metadata.events[feed];
+            assert_eq!(event.id, 10 + feed as u32);
+            assert!(event.has_pos);
+            let SourceRole::Object { position, .. } = sources[feed].role else {
+                panic!()
+            };
+            assert_eq!(event.pos, position.to_adm_cartesian());
         }
+        // Rear-left object: negative x, negative y, raised.
+        assert!(metadata.events[0].pos[0] < 0.0 && metadata.events[0].pos[1] < 0.0);
+        assert!(metadata.events[0].pos[2] > 0.0);
+
+        // One object moves: every object is announced again, so the engine's
+        // per-frame object list keeps its size and nothing flickers.
+        let mut moved = sources;
+        moved[2] = object(-280, 20, BedFold::Known([0.0; 8]));
+        state.last_metadata = XMetadata::from_sources(&moved);
+        let mut moved_hd = hd_frame(hd.samples.clone(), hd.x_samples.clone());
+        moved_hd.x_present = false;
+        moved_hd.x_imax = true;
+        let (frame_moved, _) = build_hd_frame_with_extensions(
+            &moved_hd,
+            &mut state,
+            &DtsFoldConfig::default(),
+            48_000 + 1024,
+            &mut declared,
+        )
+        .expect("valid D3 frame");
+        assert_eq!(frame_moved.metadata.len(), 1);
+        assert_eq!(
+            frame_moved.metadata[0].events.len(),
+            4,
+            "all objects, not only the mover"
+        );
+        assert!(
+            frame_moved.metadata[0].object_channels.is_empty(),
+            "declaration unchanged"
+        );
+
+        // Same positions again: the declaration is cached and no event is due
+        // between heartbeats.
+        let (again, _) = build_hd_frame_with_extensions(
+            &hd,
+            &mut state,
+            &DtsFoldConfig::default(),
+            48_000 + 512,
+            &mut declared,
+        )
+        .expect("valid D3 frame");
+        assert!(again.metadata.is_empty());
     }
 
+    /// D0's single feed is the object its record declares, unfolded out of the
+    /// bed and played at the position it states — here 25.5 degrees above the
+    /// centre, with the centre-height speaker named only as an alternative.
+    /// It used to be presented as a fixed top-front-centre channel whatever
+    /// the record said, which two other streams under the same marker
+    /// contradict.
     #[test]
-    fn d0_emits_fixed_7_1_5_with_partial_unfold() {
+    fn d0_plays_its_object_at_the_declared_position_and_unfolds_it() {
+        let extension: Vec<Vec<f32>> = (0..5)
+            .map(|index| vec![0.01 * (index + 1) as f32, -0.01 * (index + 1) as f32])
+            .collect();
+        let code58 = gain_code_linear(58).unwrap();
+        let code46 = gain_code_linear(46).unwrap();
         let dry = [
             vec![0.10, -0.10],
             vec![0.20, -0.20],
@@ -902,73 +1057,43 @@ mod tests {
             vec![0.40, -0.40],
             vec![0.50, -0.50],
         ];
-        let extension: Vec<Vec<f32>> = (0..5)
-            .map(|index| vec![0.01 * (index + 1) as f32; SAMPLE_COUNT])
-            .collect();
-        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
-        samples[0] = Some(
-            dry[0]
-                .iter()
-                .zip(&extension[0])
-                .map(|(&bed, &top)| bed + top * D0_TFC_CENTER_DOWNMIX_GAIN)
-                .collect(),
-        );
-        samples[1] = Some(
-            dry[1]
-                .iter()
-                .zip(&extension[1])
-                .map(|(&bed, &top)| bed + top * ALTERNATE_CORNER_HEIGHT_PARTIAL_UNFOLD_GAIN)
-                .collect(),
-        );
-        samples[2] = Some(
-            dry[2]
-                .iter()
-                .zip(&extension[2])
-                .map(|(&bed, &top)| bed + top * ALTERNATE_CORNER_HEIGHT_PARTIAL_UNFOLD_GAIN)
-                .collect(),
-        );
-        samples[3] = Some(vec![0.60, -0.60]);
-        samples[4] = Some(vec![0.70, -0.70]);
-        samples[5] = Some(vec![0.80, -0.80]);
-        samples[7] = Some(
-            dry[3]
-                .iter()
-                .zip(&extension[3])
-                .map(|(&bed, &top)| bed + top * ALTERNATE_CORNER_HEIGHT_PARTIAL_UNFOLD_GAIN)
-                .collect(),
-        );
-        samples[8] = Some(
-            dry[4]
-                .iter()
-                .zip(&extension[4])
-                .map(|(&bed, &top)| bed + top * ALTERNATE_CORNER_HEIGHT_PARTIAL_UNFOLD_GAIN)
-                .collect(),
-        );
+        let mut samples = full_bed();
+        samples[0] = Some(folded(&dry[0], &[(&extension[0], code58)]));
+        samples[1] = Some(folded(
+            &dry[1],
+            &[(&extension[0], code46), (&extension[1], 1.0)],
+        ));
+        samples[2] = Some(folded(
+            &dry[2],
+            &[(&extension[0], code46), (&extension[2], 1.0)],
+        ));
+        samples[7] = Some(folded(&dry[3], &[(&extension[3], 1.0)]));
+        samples[8] = Some(folded(&dry[4], &[(&extension[4], 1.0)]));
         let mut hd = hd_frame(samples, extension);
         hd.x_present = false;
         hd.x_imax = true;
 
-        let mut locked = false;
-        let mut declared = None;
-        let (frame, emitted) = build_hd_frame_with_extensions(
-            &hd,
-            &mut locked,
-            &DtsFoldConfig::default(),
-            100,
-            &mut declared,
-        )
-        .expect("valid D0 frame");
+        let mut columns = [0.0; 8];
+        columns[0] = code58;
+        columns[1] = code46;
+        columns[2] = code46;
+        let mut sources = vec![SourceMetadata {
+            role: SourceRole::Object {
+                position: SphericalPosition {
+                    azimuth_half_degrees: 0,
+                    elevation_half_degrees: 51,
+                    distance_64ths: 64,
+                },
+                centre_height_alternative: true,
+            },
+            fold: BedFold::Known(columns),
+        }];
+        sources.extend(heights(1.0));
+        let mut state = state_with(XMetadata::from_sources(&sources));
+        let (frame, emitted) = build(&hd, &mut state);
 
-        assert!(
-            !emitted,
-            "fixed channels must not set the object stream fact"
-        );
-        assert!(
-            !locked,
-            "alternate fixed channels must not latch standard heights"
-        );
-        assert!(declared.is_none());
-        assert!(frame.metadata.is_empty());
+        assert!(emitted, "the D0 object is announced to the engine");
+        assert_eq!(state.locked, Some(XPresentation::ObjectD0));
         assert_eq!(frame.channel_count, 13);
         assert_eq!(
             frame.channel_labels.as_slice(),
@@ -981,11 +1106,11 @@ mod tests {
                 RChannelLabel::LFE,
                 RChannelLabel::Lb,
                 RChannelLabel::Rb,
-                RChannelLabel::Tfc,
                 RChannelLabel::Tfl,
                 RChannelLabel::Tfr,
                 RChannelLabel::Tbl,
                 RChannelLabel::Tbr,
+                RChannelLabel::Object,
             ]
         );
         for sample in 0..SAMPLE_COUNT {
@@ -994,79 +1119,253 @@ mod tests {
                 assert_pcm_close(row[channel], dry[channel][sample]);
             }
             assert_pcm_close(row[3], hd.samples[3].as_ref().unwrap()[sample]);
-            assert_pcm_close(row[4], hd.samples[4].as_ref().unwrap()[sample]);
-            assert_pcm_close(row[5], hd.samples[5].as_ref().unwrap()[sample]);
             assert_pcm_close(row[6], dry[3][sample]);
             assert_pcm_close(row[7], dry[4][sample]);
-            for source in 0..5 {
-                assert_pcm_close(row[8 + source], hd.x_samples[source][sample]);
+            // The four heights, then the object last.
+            for (slot, feed) in (1..5).chain(0..1).enumerate() {
+                assert_pcm_close(row[8 + slot], hd.x_samples[feed][sample]);
             }
         }
+
+        assert_eq!(frame.metadata.len(), 1);
+        let metadata = &frame.metadata[0];
+        assert_eq!(metadata.object_channels.len(), 1);
+        assert_eq!(
+            metadata.object_channels[0].channel, 12,
+            "the object is the last channel"
+        );
+        assert_eq!(metadata.events.len(), 1);
+        let event = &metadata.events[0];
+        assert!(event.has_pos);
+        let SourceRole::Object { position, .. } = sources[0].role else {
+            panic!("feed 0 is the declared object")
+        };
+        assert_eq!(event.pos, position.to_adm_cartesian());
+        assert!(
+            event.pos[2] > 0.0 && event.pos[0].abs() < 1e-6,
+            "above the centre, not off to a side"
+        );
     }
 
     #[test]
-    fn d1_emits_fixed_wides_and_partial_unfold() {
-        let left_wide = vec![0.20, -0.10];
-        let right_wide = vec![-0.15, 0.25];
-        let dry_l = vec![0.03, -0.04];
-        let dry_r = vec![-0.05, 0.06];
-        let dry_ls = vec![0.07, -0.08];
-        let dry_rs = vec![-0.09, 0.10];
+    fn d1_objects_without_a_stated_fold_are_estimated_out_of_the_bed_and_played() {
+        let n = 2048;
+        let extension: Vec<Vec<f32>> = (0..6).map(|i| noise(100 + i, n)).collect();
+        let dry: Vec<Vec<f32>> = (0..9)
+            .map(|i| noise(200 + i, n).iter().map(|v| v * 0.3).collect())
+            .collect();
         let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
-        samples[0] = Some(vec![0.0; SAMPLE_COUNT]);
-        samples[1] = Some(
-            dry_l
-                .iter()
-                .zip(&left_wide)
-                .map(|(&dry, &wide)| dry + wide * 0.707107)
-                .collect(),
-        );
-        samples[2] = Some(
-            dry_r
-                .iter()
-                .zip(&right_wide)
-                .map(|(&dry, &wide)| dry + wide * 0.707107)
-                .collect(),
-        );
-        samples[3] = Some(
-            dry_ls
-                .iter()
-                .zip(&left_wide)
-                .map(|(&dry, &wide)| dry + wide * 0.707107)
-                .collect(),
-        );
-        samples[4] = Some(
-            dry_rs
-                .iter()
-                .zip(&right_wide)
-                .map(|(&dry, &wide)| dry + wide * 0.707107)
-                .collect(),
-        );
-        let extension = vec![
-            vec![0.01; SAMPLE_COUNT],
-            vec![0.02; SAMPLE_COUNT],
-            left_wide.clone(),
-            right_wide.clone(),
-            vec![0.05; SAMPLE_COUNT],
-            vec![0.06; SAMPLE_COUNT],
+        for idx in [0usize, 2, 3, 5, 7, 8] {
+            samples[idx] = Some(dry[idx].clone());
+        }
+        // L holds object 0 at 0.92 plus TFL (feed 2) at the stated Q55; Rs
+        // holds object 1 at 0.34.
+        samples[1] = Some(folded(
+            &dry[1],
+            &[(&extension[0], 0.9152), (&extension[2], Q55)],
+        ));
+        samples[4] = Some(folded(&dry[4], &[(&extension[1], 0.34)]));
+        let mut hd = hd_frame(samples, extension);
+        hd.xll_segment_samples = n;
+        hd.x_present = false;
+        hd.x_imax = true;
+
+        let mut sources = vec![
+            object(-69, 24, BedFold::Unknown),
+            object(69, 24, BedFold::Unknown),
         ];
+        sources.extend(heights(Q55));
+        let mut state = state_with(XMetadata::from_sources(&sources));
+        let (frame, emitted) = build(&hd, &mut state);
+
+        assert!(emitted);
+        assert_eq!(frame.channel_count, 8 + 6);
+        let mut l_residual = 0.0f64;
+        let mut rs_residual = 0.0f64;
+        for sample in 0..n {
+            let row = &frame.pcm[sample * 14..(sample + 1) * 14];
+            l_residual += f64::from(row[1] as f32 / 8_388_608.0 - dry[1][sample]).powi(2);
+            rs_residual += f64::from(row[4] as f32 / 8_388_608.0 - dry[4][sample]).powi(2);
+            // Both objects now play on their own channels.
+            assert_pcm_close(row[12], hd.x_samples[0][sample]);
+            assert_pcm_close(row[13], hd.x_samples[1][sample]);
+        }
+        // What is left in L and Rs is the dry content: the objects are gone to
+        // within the fit's noise (-30 dB of the dry level at least).
+        let dry_l: f64 = dry[1].iter().map(|v| f64::from(*v).powi(2)).sum();
+        let dry_rs: f64 = dry[4].iter().map(|v| f64::from(*v).powi(2)).sum();
+        assert!(
+            l_residual / dry_l < 5e-3,
+            "L residual {}",
+            l_residual / dry_l
+        );
+        assert!(
+            rs_residual / dry_rs < 5e-3,
+            "Rs residual {}",
+            rs_residual / dry_rs
+        );
+    }
+
+    #[test]
+    fn d1_objects_without_a_stated_fold_stay_in_the_bed_and_are_muted_without_estimation() {
+        let extension: Vec<Vec<f32>> = (0..6)
+            .map(|index| vec![0.01 * (index + 1) as f32, -0.01 * (index + 1) as f32])
+            .collect();
+        let dry_l = vec![0.20, -0.20];
+        let mut samples = full_bed();
+        // L holds the mode-0 object at an unstated gain plus TFL (feed 2).
+        samples[1] = Some(folded(
+            &dry_l,
+            &[(&extension[0], 0.9152), (&extension[2], Q55)],
+        ));
         let mut hd = hd_frame(samples, extension);
         hd.x_present = false;
         hd.x_imax = true;
 
-        let mut locked = false;
-        let mut declared = None;
-        let (frame, emitted) = build_hd_frame_with_extensions(
-            &hd,
-            &mut locked,
-            &DtsFoldConfig::default(),
-            100,
-            &mut declared,
-        )
-        .expect("valid D1 frame");
+        let mut sources = vec![
+            object(-69, 24, BedFold::Unknown),
+            object(69, 24, BedFold::Unknown),
+        ];
+        sources.extend(heights(Q55));
+        let mut state = state_with(XMetadata::from_sources(&sources));
+        let (frame, emitted) = build_without_estimation(&hd, &mut state);
 
-        assert!(!emitted, "D1 sources are fixed channels");
-        assert_eq!(frame.channel_count, 11);
+        assert!(emitted, "D1 declares object channels");
+        assert_eq!(state.locked, Some(XPresentation::ObjectsD1));
+        assert_eq!(frame.channel_count, 8 + 6);
+        assert_eq!(
+            &frame.channel_labels[8..],
+            &[
+                RChannelLabel::Tfl,
+                RChannelLabel::Tfr,
+                RChannelLabel::Tbl,
+                RChannelLabel::Tbr,
+                RChannelLabel::Object,
+                RChannelLabel::Object,
+            ]
+        );
+        for sample in 0..SAMPLE_COUNT {
+            let row = &frame.pcm[sample * 14..(sample + 1) * 14];
+            // Only the height leaves L; the object's share stays.
+            assert_pcm_close(row[1], dry_l[sample] + hd.x_samples[0][sample] * 0.9152);
+            for (slot, feed) in (2..6).enumerate() {
+                assert_pcm_close(row[8 + slot], hd.x_samples[feed][sample]);
+            }
+            assert_eq!(row[12], 0, "an unfoldable object must not play twice");
+            assert_eq!(row[13], 0);
+        }
+        assert_eq!(frame.metadata.len(), 1);
+        assert_eq!(
+            frame.metadata[0].events.len(),
+            2,
+            "positions are still announced"
+        );
+        assert_eq!(frame.metadata[0].object_channels.len(), 2);
+    }
+
+    #[test]
+    fn three_component_d0_form_presents_the_bed_plus_three_objects_and_heights() {
+        let component = vec![0.20, -0.10];
+        let copy: Vec<f32> = component.iter().map(|s| s * 0.365).collect();
+        let heights_pcm: Vec<Vec<f32>> =
+            (0..4).map(|k| noise(7 + k as u64, SAMPLE_COUNT)).collect();
+        let dry_c = vec![0.05, -0.05];
+        let dry_l = vec![0.07, -0.02];
+        let dry_r = vec![-0.03, 0.06];
+        let mut samples = full_bed();
+        samples[0] = Some(folded(&dry_c, &[(&component, 1.0)]));
+        samples[1] = Some(folded(&dry_l, &[(&copy, 1.0), (&heights_pcm[0], Q55)]));
+        samples[2] = Some(folded(&dry_r, &[(&copy, 1.0), (&heights_pcm[1], Q55)]));
+        let mut extension = vec![component.clone(), copy.clone(), copy.clone()];
+        extension.extend(heights_pcm.iter().cloned());
+        let mut hd = hd_frame(samples, extension);
+        hd.x_present = false;
+        hd.x_imax = true;
+
+        let unity = |column: usize| {
+            let mut columns = [0.0; 8];
+            columns[column] = 1.0;
+            BedFold::Known(columns)
+        };
+        let sources = [
+            object(0, 0, unity(0)),
+            object(-60, 0, unity(1)),
+            object(60, 0, unity(2)),
+            heights(Q55)[0],
+            heights(Q55)[1],
+            heights(Q55)[2],
+            heights(Q55)[3],
+        ];
+        let mut state = state_with(XMetadata::from_sources(&sources));
+        let (frame, emitted) = build(&hd, &mut state);
+
+        assert!(emitted, "the components are object channels");
+        assert_eq!(state.locked, Some(XPresentation::ObjectsD0));
+        assert_eq!(frame.channel_count, 8 + 4 + 3);
+        assert_eq!(
+            &frame.channel_labels.as_slice()[8..],
+            &[
+                RChannelLabel::Tfl,
+                RChannelLabel::Tfr,
+                RChannelLabel::Tbl,
+                RChannelLabel::Tbr,
+                RChannelLabel::Object,
+                RChannelLabel::Object,
+                RChannelLabel::Object,
+            ]
+        );
+        for sample in 0..SAMPLE_COUNT {
+            let row = &frame.pcm[sample * 15..(sample + 1) * 15];
+            assert_pcm_close(row[0], dry_c[sample]);
+            assert_pcm_close(row[1], dry_l[sample]);
+            assert_pcm_close(row[2], dry_r[sample]);
+            for (slot, feed) in (3..7).chain(0..3).enumerate() {
+                assert_pcm_close(row[8 + slot], hd.x_samples[feed][sample]);
+            }
+        }
+        assert_eq!(frame.metadata.len(), 1);
+        let metadata = &frame.metadata[0];
+        assert_eq!(metadata.object_channels.len(), 3);
+        assert_eq!(metadata.events.len(), 3);
+        assert_eq!(metadata.events[0].pos[2], 0.0, "ear level");
+        assert!(
+            metadata.events[1].pos[0] < 0.0 && metadata.events[2].pos[0] > 0.0,
+            "the left and right components sit on their sides"
+        );
+    }
+
+    #[test]
+    fn object_only_variant_presents_a_5_1_bed_plus_one_object() {
+        let object_pcm = vec![0.20, -0.10];
+        let dry_c = vec![0.05, -0.05];
+        let dry_l = vec![0.07, -0.02];
+        let code58 = gain_code_linear(58).unwrap();
+        let code46 = gain_code_linear(46).unwrap();
+        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
+        samples[0] = Some(folded(&dry_c, &[(&object_pcm, code58)]));
+        samples[1] = Some(folded(&dry_l, &[(&object_pcm, code46)]));
+        samples[2] = Some(vec![0.03, -0.03]);
+        samples[3] = Some(vec![0.04, -0.04]);
+        samples[4] = Some(vec![0.06, -0.06]);
+        samples[5] = Some(vec![0.08, -0.08]);
+        let mut hd = hd_frame(samples, vec![object_pcm.clone()]);
+        hd.x_present = false;
+        hd.x_imax = true;
+
+        let mut columns = [0.0; 8];
+        columns[0] = code58;
+        columns[1] = code46;
+        columns[2] = code46;
+        let source = object(0, 51, BedFold::Known(columns));
+        let mut state = state_with(XMetadata::from_sources_on(
+            &[source],
+            dca::REFERENCE_MASK_5_1,
+        ));
+        let (frame, emitted) = build(&hd, &mut state);
+
+        assert!(emitted, "the object is an object channel");
+        assert_eq!(state.locked, Some(XPresentation::ObjectOnly));
+        assert_eq!(frame.channel_count, 7);
         assert_eq!(
             frame.channel_labels.as_slice(),
             &[
@@ -1075,33 +1374,50 @@ mod tests {
                 RChannelLabel::R,
                 RChannelLabel::Ls,
                 RChannelLabel::Rs,
-                RChannelLabel::Tfl,
-                RChannelLabel::Tfr,
-                RChannelLabel::Lw,
-                RChannelLabel::Rw,
-                RChannelLabel::Tbl,
-                RChannelLabel::Tbr,
+                RChannelLabel::LFE,
+                RChannelLabel::Object,
             ]
         );
         for sample in 0..SAMPLE_COUNT {
-            let row = &frame.pcm[sample * 11..(sample + 1) * 11];
-            assert_pcm_close(
-                row[1],
-                dry_l[sample]
-                    - hd.x_samples[0][sample] * ALTERNATE_CORNER_HEIGHT_PARTIAL_UNFOLD_GAIN,
-            );
-            assert_pcm_close(
-                row[2],
-                dry_r[sample]
-                    - hd.x_samples[1][sample] * ALTERNATE_CORNER_HEIGHT_PARTIAL_UNFOLD_GAIN,
-            );
-            assert_pcm_close(row[3], dry_ls[sample]);
-            assert_pcm_close(row[4], dry_rs[sample]);
-            for (slot, source) in (0usize..6).enumerate() {
-                assert_pcm_close(row[5 + slot], hd.x_samples[source][sample]);
-            }
+            let row = &frame.pcm[sample * 7..(sample + 1) * 7];
+            assert_pcm_close(row[0], dry_c[sample]);
+            assert_pcm_close(row[1], dry_l[sample]);
+            assert_pcm_close(row[3], hd.samples[3].as_ref().unwrap()[sample]);
+            assert_pcm_close(row[6], object_pcm[sample]);
         }
-        assert!(frame.metadata.is_empty());
+        assert_eq!(frame.metadata.len(), 1);
+        let metadata = &frame.metadata[0];
+        assert_eq!(metadata.object_channels.len(), 1);
+        assert_eq!(metadata.object_channels[0].channel, 6);
+        assert_eq!(metadata.events.len(), 1);
+        assert!(metadata.events[0].pos[2] > 0.0, "the object is raised");
+    }
+
+    #[test]
+    fn alternate_frame_without_any_readable_metadata_mutes_its_feeds() {
+        let extension: Vec<Vec<f32>> = (0..8).map(|_| vec![0.1; SAMPLE_COUNT]).collect();
+        let composite_left = vec![0.25, -0.25];
+        let mut samples = full_bed();
+        samples[1] = Some(composite_left.clone());
+        let mut hd = hd_frame(samples, extension);
+        hd.x_present = false;
+        hd.x_imax = true;
+
+        let mut state = DtsXState::default();
+        let (frame, emitted) = build_without_estimation(&hd, &mut state);
+        assert!(emitted);
+        assert_eq!(frame.channel_count, 16);
+        assert_eq!(state.parse_failures, 1);
+        for sample in 0..SAMPLE_COUNT {
+            let row = &frame.pcm[sample * 16..(sample + 1) * 16];
+            assert_eq!(row[1], float_to_pcm_i32(composite_left[sample]));
+            assert!(row[8..16].iter().all(|&s| s == 0));
+        }
+        assert_eq!(frame.metadata.len(), 1, "channels are still declared");
+        assert!(
+            frame.metadata[0].events.is_empty(),
+            "no positions to announce"
+        );
     }
 
     #[test]
@@ -1110,8 +1426,17 @@ mod tests {
         samples[0] = Some(vec![0.0; SAMPLE_COUNT]);
         samples[1] = Some(vec![0.0; SAMPLE_COUNT + 1]); // corrupt length
         let hd = hd_frame(samples, Vec::new());
-
-        let mut locked = false;
-        assert!(build_hd_frame(&hd, &mut locked).is_none());
+        let mut state = DtsXState::default();
+        let mut declared = None;
+        assert!(
+            build_hd_frame_with_extensions(
+                &hd,
+                &mut state,
+                &DtsFoldConfig::default(),
+                0,
+                &mut declared
+            )
+            .is_none()
+        );
     }
 }

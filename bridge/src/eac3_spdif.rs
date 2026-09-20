@@ -17,6 +17,14 @@ use crate::logging::bridge_external_log;
 /// IEC 61937 data type for E-AC-3.
 const IEC61937_EAC3_DATA_TYPE: u8 = 0x15;
 
+/// IEC 61937 data type for AC-3 (IEC 61937-3).
+///
+/// Legacy AC-3 rides its own burst type and its own 48 kHz carrier, but the
+/// bitstream inside shares the 0x0B77 syncword with E-AC-3 and is already
+/// handled here: `ac3_frame_size_from_header` is tried before the E-AC-3 sizing
+/// on every frame boundary, and the decoder accepts `bsid <= 10`.
+const IEC61937_AC3_DATA_TYPE: u8 = 0x01;
+
 /// E-AC-3 syncword (16-bit big-endian: 0x0B77).
 const EAC3_SYNCWORD: u16 = 0x0B77;
 
@@ -67,37 +75,10 @@ fn ac3_frame_size_from_header(data: &[u8]) -> Option<usize> {
         return None;
     };
 
-    let fscod = header >> 6;
-    let frmsizecod = header & 0x3F;
-    let bitrate_index = usize::from(frmsizecod >> 1);
-    if fscod > 2 || bitrate_index >= AC3_FRAME_SIZE_WORDS.len() {
-        return None;
-    }
-
-    Some(AC3_FRAME_SIZE_WORDS[bitrate_index][usize::from(fscod)] * 2)
+    // One sizing function for every legacy AC-3 framing site: it carries the
+    // 44.1 kHz odd-`frmsizecod` padding word this table used to omit.
+    eac3::legacy_ac3_frame_size(header >> 6, header & 0x3F)
 }
-
-const AC3_FRAME_SIZE_WORDS: [[usize; 3]; 19] = [
-    [64, 69, 96],
-    [80, 87, 120],
-    [96, 104, 144],
-    [112, 121, 168],
-    [128, 139, 192],
-    [160, 174, 240],
-    [192, 208, 288],
-    [224, 243, 336],
-    [256, 278, 384],
-    [320, 348, 480],
-    [384, 417, 576],
-    [448, 487, 672],
-    [512, 557, 768],
-    [640, 696, 960],
-    [768, 835, 1152],
-    [896, 975, 1344],
-    [1024, 1114, 1536],
-    [1152, 1253, 1728],
-    [1280, 1393, 1920],
-];
 
 #[derive(Debug)]
 enum ParserState {
@@ -154,7 +135,7 @@ impl Eac3SpdifStream {
 
     /// Returns `true` if this parser handles the given IEC 61937 data type.
     pub fn accepts_data_type(data_type: u8) -> bool {
-        data_type == IEC61937_EAC3_DATA_TYPE
+        matches!(data_type, IEC61937_EAC3_DATA_TYPE | IEC61937_AC3_DATA_TYPE)
     }
 
     /// Replace the current payload with a new one.
@@ -562,8 +543,13 @@ mod tests {
     #[test]
     fn accepts_expected_data_type() {
         assert!(Eac3SpdifStream::accepts_data_type(0x15));
+        // AC-3 rides burst type 0x01, and its frames are sized and decoded by
+        // this same parser.
+        assert!(Eac3SpdifStream::accepts_data_type(0x01));
+        // TrueHD/MAT stays with the MAT stream.
         assert!(!Eac3SpdifStream::accepts_data_type(0x16));
-        assert!(!Eac3SpdifStream::accepts_data_type(0x01));
+        // DTS types belong to the DTS path.
+        assert!(!Eac3SpdifStream::accepts_data_type(0x0B));
     }
 
     #[test]
@@ -608,6 +594,29 @@ mod tests {
         let result = stream.next_frame().unwrap();
         assert_eq!(result, Some(frame));
         assert_eq!(stream.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn ac3_frame_size_includes_the_44_1_khz_padding_word() {
+        // 44.1 kHz / 384 kbps: frmsizecod 28 → 1670 bytes, 29 → 1672 bytes,
+        // in both byte orders the burst can arrive in.
+        assert_eq!(
+            ac3_frame_size_from_header(&[0x0B, 0x77, 0x00, 0x00, 0x5C, 0x40]),
+            Some(1670)
+        );
+        assert_eq!(
+            ac3_frame_size_from_header(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40]),
+            Some(1672)
+        );
+        assert_eq!(
+            ac3_frame_size_from_header(&[0x77, 0x0B, 0x00, 0x00, 0x40, 0x5D]),
+            Some(1672)
+        );
+        // 48 kHz is unaffected.
+        assert_eq!(
+            ac3_frame_size_from_header(&[0x0B, 0x77, 0x00, 0x00, 0x1D, 0x40]),
+            Some(1536)
+        );
     }
 
     #[test]

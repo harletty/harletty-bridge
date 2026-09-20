@@ -5,13 +5,12 @@
 //! and each consumer owns its own mapping. `dca::spatial` says which extension
 //! waveform sits where; this decides how that becomes a DAMF bed and objects.
 //!
-//! Only the DTS:X D3 presentation produces objects, and their positions are
-//! static (see [`dca::XPresentation::object_positions`]). Every other
-//! presentation is a fixed bed. When per-frame object coordinates are decoded
-//! from the extension blob, they slot into [`DtsLayout::objects`] without any
-//! change to this module's shape.
+//! The D1 and D3 presentations carry objects whose positions come from each
+//! frame's private metadata ([`dca::XMetadata`]); every other feed is a fixed
+//! channel that joins the bed. Which feeds are which is the presentation's
+//! call ([`dca::XPresentation`]), so both hosts agree.
 
-use dca::{BedChannel, SpatialChannel, XPresentation};
+use dca::{BedChannel, SourceRole, SpatialChannel, XMetadata, XPresentation};
 use truehd::structs::oamd::{
     BedAssignment, BlockUpdateInfo, MDUpdateInfo, ObjectAudioMetadataPayload, ObjectBasicInfo,
     ObjectData, ObjectElement, ObjectInfoBlock, ObjectRenderInfo, ProgramAssignment, SpeakerLabels,
@@ -43,8 +42,9 @@ pub struct DtsLayout {
     pub bed: Vec<SpeakerLabels>,
     /// Source of each entry in `bed`, same length and order.
     pub bed_sources: Vec<BedSource>,
-    /// Static object positions in DAMF space: `[x, y, z]`, each `-1.0..=1.0`,
-    /// x left-to-right, y back-to-front, z floor-to-ceiling.
+    /// This frame's object positions in DAMF space: `[x, y, z]`, each
+    /// `-1.0..=1.0`, x left-to-right, y back-to-front, z floor-to-ceiling.
+    /// An object whose position is unavailable sits at the origin.
     pub objects: Vec<[f64; 3]>,
     /// Extension feed index backing each entry in `objects`.
     pub object_sources: Vec<usize>,
@@ -52,7 +52,9 @@ pub struct DtsLayout {
 
 impl DtsLayout {
     /// Sort a `(speaker, source)` set into DAMF bed order and split it.
-    fn from_pairs(mut pairs: Vec<(SpeakerLabels, BedSource)>) -> (Vec<SpeakerLabels>, Vec<BedSource>) {
+    fn from_pairs(
+        mut pairs: Vec<(SpeakerLabels, BedSource)>,
+    ) -> (Vec<SpeakerLabels>, Vec<BedSource>) {
         pairs.sort_by_key(|(speaker, _)| *speaker as u8);
         pairs.into_iter().unzip()
     }
@@ -97,8 +99,11 @@ pub fn hd_speaker_to_speaker(index: usize) -> Option<SpeakerLabels> {
 
 /// Map a DTS:X spatial-extension channel to its OAMD speaker.
 ///
-/// `TopFrontCenter` (the D0 profile's first feed) has no OAMD equivalent and is
-/// dropped, so a D0 bed exports as 7.1.4 rather than 7.1.5.
+/// `TopFrontCenter` has no OAMD equivalent and is dropped. No presentation
+/// puts a feed there any more — D0's centre-height feed is now the object it
+/// declares itself to be, and reaches the export with a position — so the arm
+/// stands for a layout that names the speaker some other way, not for a feed
+/// this exporter silently loses.
 pub fn spatial_channel_to_speaker(channel: SpatialChannel) -> Option<SpeakerLabels> {
     Some(match channel {
         SpatialChannel::TopFrontLeft => SpeakerLabels::Lfh,
@@ -113,7 +118,71 @@ pub fn spatial_channel_to_speaker(channel: SpatialChannel) -> Option<SpeakerLabe
     })
 }
 
+/// Whether an OAMD speaker belongs to the Atmos bed (up to 7.1.2). Anything
+/// else a DTS:X or Auro-3D layout puts in the bed — the four corner heights,
+/// the wides — has no place in a bed an Atmos encoder accepts.
+fn is_atmos_bed_speaker(speaker: SpeakerLabels) -> bool {
+    matches!(
+        speaker,
+        SpeakerLabels::L
+            | SpeakerLabels::R
+            | SpeakerLabels::C
+            | SpeakerLabels::LFE
+            | SpeakerLabels::Lss
+            | SpeakerLabels::Rss
+            | SpeakerLabels::Lrs
+            | SpeakerLabels::Rrs
+            | SpeakerLabels::Lts
+            | SpeakerLabels::Rts
+    )
+}
+
+/// Where a bed speaker sits as a static object, in DAMF space (x right,
+/// y front, z up, each -1..=1): the heights at the ceiling corners, the
+/// wides on the side walls ahead of the listener.
+fn static_speaker_position(speaker: SpeakerLabels) -> [f64; 3] {
+    match speaker {
+        SpeakerLabels::Lfh => [-1.0, 1.0, 1.0],
+        SpeakerLabels::Rfh => [1.0, 1.0, 1.0],
+        SpeakerLabels::Lrh => [-1.0, -1.0, 1.0],
+        SpeakerLabels::Rrh => [1.0, -1.0, 1.0],
+        SpeakerLabels::Lw => [-1.0, 0.5, 0.0],
+        SpeakerLabels::Rw => [1.0, 0.5, 0.0],
+        SpeakerLabels::Lts => [-1.0, 0.0, 1.0],
+        SpeakerLabels::Rts => [1.0, 0.0, 1.0],
+        SpeakerLabels::L => [-1.0, 1.0, 0.0],
+        SpeakerLabels::R => [1.0, 1.0, 0.0],
+        SpeakerLabels::C | SpeakerLabels::LFE | SpeakerLabels::LFE2 => [0.0, 1.0, 0.0],
+        SpeakerLabels::Lss => [-1.0, 0.0, 0.0],
+        SpeakerLabels::Rss => [1.0, 0.0, 0.0],
+        SpeakerLabels::Lrs => [-1.0, -1.0, 0.0],
+        SpeakerLabels::Rrs => [1.0, -1.0, 0.0],
+    }
+}
+
 impl DtsLayout {
+    /// Move every bed speaker an Atmos bed cannot hold out of `pairs` and
+    /// into the objects, as a static object at the speaker's position. The
+    /// object's source is the pair's source index, whichever kind it was.
+    fn conform_bed(
+        pairs: &mut Vec<(SpeakerLabels, BedSource)>,
+        objects: &mut Vec<[f64; 3]>,
+        object_sources: &mut Vec<usize>,
+    ) {
+        let mut kept = Vec::with_capacity(pairs.len());
+        for (speaker, source) in pairs.drain(..) {
+            if is_atmos_bed_speaker(speaker) {
+                kept.push((speaker, source));
+            } else {
+                objects.push(static_speaker_position(speaker));
+                object_sources.push(match source {
+                    BedSource::Speaker(index) | BedSource::Feed(index) => index,
+                });
+            }
+        }
+        *pairs = kept;
+    }
+
     /// Layout of a plain DTS core frame: a bed, no objects.
     ///
     /// The decoder hands back fullband channels then LFE; this reorders them
@@ -140,12 +209,21 @@ impl DtsLayout {
     }
 
     /// Layout of a DTS-HD frame: the lossless bed, extended by whatever spatial
-    /// presentation the frame carries.
+    /// presentation the frame carries, with object positions from `metadata`.
     ///
     /// `active_speakers` are the DCA speaker indices present in the frame, in
     /// ascending order — the same order the realtime pipeline emits channels
     /// in, so the ADM channel order matches the audio it describes.
-    pub fn from_hd(active_speakers: &[usize], presentation: Option<XPresentation>) -> Self {
+    ///
+    /// `conform`: keep only what an Atmos bed can hold (up to 7.1.2) in the
+    /// bed; the corner heights and wides become static objects at their
+    /// speaker positions, so the master set can feed an Atmos encoder.
+    pub fn from_hd(
+        active_speakers: &[usize],
+        presentation: Option<XPresentation>,
+        metadata: Option<&XMetadata>,
+        conform: bool,
+    ) -> Self {
         let mut pairs: Vec<(SpeakerLabels, BedSource)> = active_speakers
             .iter()
             .enumerate()
@@ -157,21 +235,94 @@ impl DtsLayout {
         let mut object_sources = Vec::new();
 
         if let Some(p) = presentation {
-            match p.object_positions() {
-                // Object presentation: the feeds are objects, not bed channels.
-                Some(positions) => {
-                    objects.extend_from_slice(positions);
-                    object_sources.extend(0..positions.len());
-                }
-                // Fixed presentation: the feeds extend the bed.
-                None => pairs.extend(p.channels().iter().enumerate().filter_map(
-                    |(feed, channel)| {
+            // Fixed feeds extend the bed; object feeds become objects.
+            pairs.extend(
+                p.fixed_feeds()
+                    .zip(p.fixed_channels())
+                    .filter_map(|(feed, channel)| {
                         spatial_channel_to_speaker(*channel).map(|s| (s, BedSource::Feed(feed)))
-                    },
-                )),
+                    }),
+            );
+            for feed in p.object_feeds() {
+                let position = metadata
+                    .and_then(|metadata| metadata.source(feed))
+                    .and_then(|source| match source.role {
+                        SourceRole::Object { position, .. } => Some(position.to_adm_cartesian()),
+                        SourceRole::Height(_) => None,
+                    })
+                    .unwrap_or([0.0; 3]);
+                objects.push(position);
+                object_sources.push(feed);
             }
         }
+        if conform {
+            Self::conform_bed(&mut pairs, &mut objects, &mut object_sources);
+        }
 
+        let (bed, bed_sources) = Self::from_pairs(pairs);
+        Self {
+            bed,
+            bed_sources,
+            objects,
+            object_sources,
+        }
+    }
+}
+
+/// Map an Auro stream to its OAMD speaker. The bed and the four corner
+/// heights have names; the centre height and the top do not and become
+/// static objects instead (see [`DtsLayout::from_auro`]).
+pub fn auro_stream_to_speaker(stream: auro::StreamId) -> Option<SpeakerLabels> {
+    Some(match stream.0 {
+        0 => SpeakerLabels::L,
+        1 => SpeakerLabels::R,
+        2 => SpeakerLabels::C,
+        3 => SpeakerLabels::LFE,
+        4 => SpeakerLabels::Lss,
+        5 => SpeakerLabels::Rss,
+        7 => SpeakerLabels::Lrs,
+        8 => SpeakerLabels::Rrs,
+        9 => SpeakerLabels::Lfh,
+        10 => SpeakerLabels::Rfh,
+        13 => SpeakerLabels::Lrh,
+        14 => SpeakerLabels::Rrh,
+        _ => return None,
+    })
+}
+
+/// Where an Auro stream with no OAMD speaker sits, in DAMF space: the
+/// centre height on the front wall at the ceiling, the top overhead.
+pub fn auro_stream_object_position(stream: auro::StreamId) -> Option<[f64; 3]> {
+    Some(match stream.0 {
+        11 => [0.0, 1.0, 1.0],
+        12 => [0.0, 0.0, 1.0],
+        _ => return None,
+    })
+}
+
+impl DtsLayout {
+    /// Layout of an unfolded Auro-3D stream: `streams` in the order the
+    /// unfolder interleaves them. Streams with a speaker name join the bed;
+    /// the centre height and the top become objects at fixed positions;
+    /// anything else (a rear centre) is dropped.
+    ///
+    /// `conform` as in [`DtsLayout::from_hd`]: the corner heights leave the
+    /// bed for static objects too.
+    pub fn from_auro(streams: &[auro::StreamId], conform: bool) -> Self {
+        let mut pairs = Vec::new();
+        let mut objects = Vec::new();
+        let mut object_sources = Vec::new();
+        for (index, stream) in streams.iter().enumerate() {
+            if let Some(speaker) = auro_stream_to_speaker(*stream) {
+                pairs.push((speaker, BedSource::Speaker(index)));
+            } else if let Some(position) = auro_stream_object_position(*stream) {
+                objects.push(position);
+                object_sources.push(index);
+            }
+        }
+        if conform {
+            Self::conform_bed(&mut pairs, &mut objects, &mut object_sources);
+        }
         let (bed, bed_sources) = Self::from_pairs(pairs);
         Self {
             bed,
@@ -274,11 +425,8 @@ mod tests {
         let layout = DtsLayout {
             bed: vec![SpeakerLabels::L, SpeakerLabels::R],
             bed_sources: vec![BedSource::Speaker(0), BedSource::Speaker(1)],
-            objects: XPresentation::ObjectsD3
-                .object_positions()
-                .unwrap()
-                .to_vec(),
-            object_sources: (0..8).collect(),
+            objects: vec![[-0.5, 0.75, 0.25], [0.5, -0.75, 0.0], [0.0, 0.0, 1.0]],
+            object_sources: (0..3).collect(),
         };
         let oamd = convert_dts(&layout);
         let read_back = oamd.get_damf_pos();
@@ -299,6 +447,118 @@ mod tests {
 
     /// Guards the y inversion specifically — a mirrored mapping would still
     /// round-trip if it were applied symmetrically, so pin the encoding too.
+    /// The metadata events must carry the IDs the header declares for the
+    /// objects (10, 11, …), or a DAMF reader cannot pair them with their
+    /// tracks. A synthesised payload lists no bed objects, which once made
+    /// the IDs wrap below zero.
+    #[test]
+    fn event_ids_match_the_declared_objects() {
+        use damf::{Configuration, CreationTool, Data, SourceCodec};
+
+        let layout = DtsLayout {
+            bed: vec![SpeakerLabels::L, SpeakerLabels::R, SpeakerLabels::C],
+            bed_sources: vec![
+                BedSource::Speaker(1),
+                BedSource::Speaker(2),
+                BedSource::Speaker(0),
+            ],
+            objects: vec![[-0.5, 0.75, 0.25], [0.5, -0.75, 0.0], [0.0, 0.0, 1.0]],
+            object_sources: vec![0, 1, 2],
+        };
+        let oamd = convert_dts(&layout);
+        let tool = CreationTool {
+            name: "test",
+            version: "0",
+        };
+        let header = Data::with_oamd_payload(
+            &oamd,
+            std::path::Path::new("test"),
+            SourceCodec::DtsX714Plus4,
+            tool,
+        );
+        // Read the IDs back from the serialised YAML, the form a reader sees.
+        let ids_in = |yaml: &str| -> Vec<u32> {
+            yaml.lines()
+                .filter_map(|line| line.trim().strip_prefix("- ID: "))
+                .filter_map(|id| id.trim().parse().ok())
+                .collect()
+        };
+        let declared: Vec<u32> = ids_in(&header.serialize_damf())
+            .into_iter()
+            .filter(|id| *id >= 10)
+            .collect();
+        assert_eq!(declared, vec![10, 11, 12]);
+
+        let mut events = Configuration::with_oamd_payload(&oamd, 48_000, 0).expect("payload");
+        let ids = ids_in(&events.serialize_events(false));
+        assert_eq!(ids, declared, "events name the declared objects");
+    }
+
+    /// With `conform`, a 7.1.4 DTS:X layout keeps a 7.1 bed and carries the
+    /// four heights as static objects at the ceiling corners, so an Atmos
+    /// encoder can take the master set.
+    #[test]
+    fn conform_moves_the_heights_out_of_the_bed_into_static_objects() {
+        let free = DtsLayout::from_hd(
+            &[0, 1, 2, 3, 4, 5, 7, 8],
+            Some(XPresentation::Height),
+            None,
+            false,
+        );
+        assert_eq!(free.bed.len(), 12);
+        assert!(free.objects.is_empty());
+
+        let layout = DtsLayout::from_hd(
+            &[0, 1, 2, 3, 4, 5, 7, 8],
+            Some(XPresentation::Height),
+            None,
+            true,
+        );
+        assert_eq!(layout.bed.len(), 8, "7.1 stays");
+        assert!(!layout.bed.contains(&SpeakerLabels::Lfh));
+        assert_eq!(layout.objects.len(), 4);
+        assert_eq!(
+            layout.object_sources,
+            vec![0, 1, 2, 3],
+            "the height feeds, in feed order"
+        );
+        assert_eq!(
+            layout.objects[0],
+            [-1.0, 1.0, 1.0],
+            "TFL at the front-left corner"
+        );
+        assert_eq!(
+            layout.objects[3],
+            [1.0, -1.0, 1.0],
+            "TBR at the back-right corner"
+        );
+
+        // Objects declared by the stream come first, then the heights.
+        let d4 = DtsLayout::from_hd(
+            &[0, 1, 2, 3, 4, 5, 7, 8],
+            Some(XPresentation::ObjectsD4),
+            None,
+            true,
+        );
+        assert_eq!(d4.bed.len(), 8);
+        assert_eq!(d4.object_sources, vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(d4.objects[5], [-1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn conform_keeps_an_unfolded_auro_bed_to_seven_one() {
+        let streams: Vec<auro::StreamId> = (0..=14).map(auro::StreamId).collect();
+        let layout = DtsLayout::from_auro(&streams, true);
+        assert_eq!(layout.bed.len(), 8);
+        assert!(layout.bed.iter().all(|s| !matches!(
+            s,
+            SpeakerLabels::Lfh | SpeakerLabels::Rfh | SpeakerLabels::Lrh | SpeakerLabels::Rrh
+        )));
+        // Centre height, top, then the four corner heights.
+        assert_eq!(layout.object_sources, vec![11, 12, 9, 10, 13, 14]);
+        assert_eq!(layout.objects[2], [-1.0, 1.0, 1.0]);
+    }
+
     #[test]
     fn oamd_y_axis_is_inverted_relative_to_damf() {
         let front = damf_pos_to_oamd([0.0, 1.0, 0.0]);
@@ -351,17 +611,19 @@ mod tests {
     fn rear_centre_is_dropped_from_the_bed() {
         assert_eq!(bed_channel_to_speaker(BedChannel::RearCenter), None);
         assert_eq!(hd_speaker_to_speaker(6), None);
-        let layout = DtsLayout::from_core(
-            &[BedChannel::FrontLeft, BedChannel::RearCenter],
-            false,
-        );
+        let layout = DtsLayout::from_core(&[BedChannel::FrontLeft, BedChannel::RearCenter], false);
         assert_eq!(layout.bed, vec![SpeakerLabels::L]);
     }
 
     #[test]
     fn standard_height_extends_the_bed_to_7_1_4() {
         // A full 7.1 lossless bed: every DCA speaker except rear centre.
-        let layout = DtsLayout::from_hd(&[0, 1, 2, 3, 4, 5, 7, 8], Some(XPresentation::Height));
+        let layout = DtsLayout::from_hd(
+            &[0, 1, 2, 3, 4, 5, 7, 8],
+            Some(XPresentation::Height),
+            None,
+            false,
+        );
         assert_eq!(
             layout.bed,
             vec![
@@ -380,44 +642,180 @@ mod tests {
             ],
             "7.1 bed plus the four height feeds, in DAMF order"
         );
-        assert!(layout.objects.is_empty(), "heights are channels, not objects");
+        assert!(
+            layout.objects.is_empty(),
+            "heights are channels, not objects"
+        );
     }
 
-    /// D0 carries a top-front-centre feed that OAMD cannot name, so the bed
-    /// comes out as 7.1.4 rather than 7.1.5.
+    /// D0's first feed is the object its record declares, so the bed comes
+    /// out as 7.1.4 and the feed is exported as an object with a position.
+    /// It used to be presented as a fixed top-front-centre channel, which
+    /// OAMD cannot name: the bed came out the same size and the feed was
+    /// dropped outright, after its fold had already been taken out of the
+    /// bed.
     #[test]
-    fn d0_drops_top_front_centre() {
-        let layout = DtsLayout::from_hd(&[0, 1, 2, 3, 4, 5, 7, 8], Some(XPresentation::FixedD0));
-        assert_eq!(XPresentation::FixedD0.feed_count(), 5, "D0 carries five feeds");
+    fn d0_first_feed_is_an_object() {
+        let layout = DtsLayout::from_hd(
+            &[0, 1, 2, 3, 4, 5, 7, 8],
+            Some(XPresentation::ObjectD0),
+            None,
+            false,
+        );
+        assert_eq!(
+            XPresentation::ObjectD0.feed_count(),
+            5,
+            "D0 carries five feeds"
+        );
         assert_eq!(
             layout.bed.len(),
             8 + 4,
-            "only four of the five reach the bed: top-front-centre has no OAMD speaker"
+            "the four heights join the bed; the object does not"
         );
         assert_eq!(layout.bed.len(), layout.bed_sources.len());
-        assert!(layout.objects.is_empty());
+        assert_eq!(
+            layout.object_sources,
+            vec![0],
+            "feed 0 is exported as an object, not dropped"
+        );
     }
 
     #[test]
-    fn d1_maps_its_wides_into_the_bed() {
-        let layout = DtsLayout::from_hd(&[0, 1, 2, 3, 4, 5, 7, 8], Some(XPresentation::FixedD1));
-        assert!(layout.bed.contains(&SpeakerLabels::Lw));
-        assert!(layout.bed.contains(&SpeakerLabels::Rw));
-        assert!(layout.objects.is_empty());
+    fn three_component_d0_form_is_three_objects_and_four_heights() {
+        let bed_only = DtsLayout::from_hd(&[0, 1, 2, 3, 4, 5, 7, 8], None, None, false);
+        let layout = DtsLayout::from_hd(
+            &[0, 1, 2, 3, 4, 5, 7, 8],
+            Some(XPresentation::ObjectsD0),
+            None,
+            false,
+        );
+        assert_eq!(
+            layout.bed.len(),
+            bed_only.bed.len() + 4,
+            "the four heights join the bed"
+        );
+        assert_eq!(
+            layout.object_sources,
+            vec![0, 1, 2],
+            "the three components are the objects"
+        );
+        let feeds: Vec<_> = layout
+            .bed_sources
+            .iter()
+            .filter_map(|s| match s {
+                BedSource::Feed(feed) => Some(*feed),
+                BedSource::Speaker(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            feeds,
+            vec![3, 4, 5, 6],
+            "heights are feeds 3..7, in bed order"
+        );
     }
 
     #[test]
-    fn d3_becomes_objects_and_leaves_the_bed_alone() {
-        let bed_only = DtsLayout::from_hd(&[0, 1, 2, 3, 4, 5, 7, 8], None);
-        let layout = DtsLayout::from_hd(&[0, 1, 2, 3, 4, 5, 7, 8], Some(XPresentation::ObjectsD3));
-        assert_eq!(layout.bed, bed_only.bed, "D3 feeds must not join the bed");
-        assert_eq!(layout.objects.len(), 8);
+    fn d1_is_two_objects_and_four_heights() {
+        let bed_only = DtsLayout::from_hd(&[0, 1, 2, 3, 4, 5, 7, 8], None, None, false);
+        let layout = DtsLayout::from_hd(
+            &[0, 1, 2, 3, 4, 5, 7, 8],
+            Some(XPresentation::ObjectsD1),
+            None,
+            false,
+        );
+        assert_eq!(
+            layout.bed.len(),
+            bed_only.bed.len() + 4,
+            "the four heights join the bed"
+        );
+        assert!(
+            layout.bed.contains(&SpeakerLabels::Lfh) && layout.bed.contains(&SpeakerLabels::Rrh)
+        );
+        assert!(
+            !layout.bed.contains(&SpeakerLabels::Lw),
+            "D1 has no wide channels"
+        );
+        assert_eq!(
+            layout.object_sources,
+            vec![0, 1],
+            "the first two feeds are the objects"
+        );
+        assert_eq!(
+            layout.objects,
+            vec![[0.0; 3]; 2],
+            "no metadata: objects sit at the origin"
+        );
+        let feeds: Vec<_> = layout
+            .bed_sources
+            .iter()
+            .filter_map(|s| match s {
+                BedSource::Feed(feed) => Some(*feed),
+                BedSource::Speaker(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            feeds,
+            vec![2, 3, 4, 5],
+            "heights are feeds 2..6, in bed order"
+        );
+    }
+
+    #[test]
+    fn d3_is_four_objects_and_four_heights_positioned_by_metadata() {
+        use dca::{BedFold, SourceMetadata, SphericalPosition};
+
+        let object = |azimuth: i16, elevation: i16| SourceMetadata {
+            role: SourceRole::Object {
+                position: SphericalPosition {
+                    azimuth_half_degrees: azimuth,
+                    elevation_half_degrees: elevation,
+                    distance_64ths: 64,
+                },
+                centre_height_alternative: false,
+            },
+            fold: BedFold::Known([0.0; 8]),
+        };
+        let height = |channel: SpatialChannel| SourceMetadata {
+            role: SourceRole::Height(channel),
+            fold: BedFold::Known([0.0; 8]),
+        };
+        let metadata = XMetadata::from_sources(&[
+            object(-291, 57),
+            object(291, 54),
+            object(-300, 0),
+            object(300, 0),
+            height(SpatialChannel::TopFrontLeft),
+            height(SpatialChannel::TopFrontRight),
+            height(SpatialChannel::TopBackLeft),
+            height(SpatialChannel::TopBackRight),
+        ])
+        .unwrap();
+
+        let bed_only = DtsLayout::from_hd(&[0, 1, 2, 3, 4, 5, 7, 8], None, None, false);
+        let layout = DtsLayout::from_hd(
+            &[0, 1, 2, 3, 4, 5, 7, 8],
+            Some(XPresentation::ObjectsD3),
+            Some(&metadata),
+            false,
+        );
+        assert_eq!(layout.bed.len(), bed_only.bed.len() + 4);
+        assert_eq!(layout.object_sources, vec![0, 1, 2, 3]);
+        assert_eq!(layout.objects.len(), 4);
+        // Object 0 is rear-left and raised; object 3 is rear-right at ear level.
+        assert!(
+            layout.objects[0][0] < 0.0 && layout.objects[0][1] < 0.0 && layout.objects[0][2] > 0.0
+        );
+        assert!(layout.objects[3][0] > 0.0 && layout.objects[3][1] < 0.0);
+        assert!(layout.objects[3][2].abs() < 1e-9);
 
         let oamd = convert_dts(&layout);
-        assert_eq!(oamd.program_assignment.num_dynamic_objects, 8);
-        assert_eq!(oamd.object_count, 8);
-        let element = oamd.object_element.expect("D3 must emit an object element");
-        assert_eq!(element.object_data.len(), 8);
+        assert_eq!(oamd.program_assignment.num_dynamic_objects, 4);
+        assert_eq!(oamd.object_count, 4);
+        let element = oamd
+            .object_element
+            .as_ref()
+            .expect("D3 must emit an object element");
+        assert_eq!(element.object_data.len(), 4);
         assert!(
             element
                 .object_data
@@ -425,11 +823,40 @@ mod tests {
                 .all(|blocks| blocks.len() == 1 && !blocks[0].b_object_in_bed_or_isf),
             "each object gets one block and none of them are bed channels"
         );
+        let read_back = oamd.get_damf_pos();
+        for (index, expected) in layout.objects.iter().enumerate() {
+            for axis in 0..3 {
+                assert!((read_back[index][0][axis] - expected[axis]).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn an_unfolded_thirteen_one_is_a_twelve_channel_bed_plus_two_objects() {
+        let streams: Vec<auro::StreamId> = auro::Layout(32703)
+            .streams()
+            .unwrap()
+            .as_slice()
+            .iter()
+            .map(|&id| auro::StreamId(id))
+            .collect();
+        let layout = DtsLayout::from_auro(&streams, false);
+        assert_eq!(layout.bed.len(), 12);
+        assert_eq!(layout.objects.len(), 2);
+        // HC (index 10 in the stream order) then T (index 13).
+        assert_eq!(layout.object_sources, vec![10, 13]);
+        assert_eq!(layout.objects[0], [0.0, 1.0, 1.0]);
+        assert_eq!(layout.objects[1], [0.0, 0.0, 1.0]);
+        // The bed is declared in DAMF order with matching sources.
+        assert_eq!(layout.bed[0], SpeakerLabels::L);
+        assert_eq!(layout.bed_sources[0], BedSource::Speaker(0));
+        assert_eq!(layout.bed[3], SpeakerLabels::LFE);
+        assert_eq!(layout.bed_sources[3], BedSource::Speaker(7));
     }
 
     #[test]
     fn a_frame_with_no_presentation_is_just_its_bed() {
-        let layout = DtsLayout::from_hd(&[1, 2], None);
+        let layout = DtsLayout::from_hd(&[1, 2], None, None, false);
         assert_eq!(layout.bed, vec![SpeakerLabels::L, SpeakerLabels::R]);
         assert!(layout.objects.is_empty());
     }
@@ -486,7 +913,12 @@ mod tests {
     /// sorted in among the speakers, not appended.
     #[test]
     fn height_feeds_sort_into_the_bed_rather_than_trailing_it() {
-        let layout = DtsLayout::from_hd(&[0, 1, 2, 3, 4, 5, 7, 8], Some(XPresentation::Height));
+        let layout = DtsLayout::from_hd(
+            &[0, 1, 2, 3, 4, 5, 7, 8],
+            Some(XPresentation::Height),
+            None,
+            false,
+        );
         assert_eq!(layout.bed.len(), layout.bed_sources.len());
 
         let mut sorted = layout.bed.clone();

@@ -445,15 +445,14 @@ fn extract_events(
 
         let id = (i + 10 - bed_index_vec.len()) as u32;
         let render = &object_data.object_render_info;
-        let (has_pos, pos, size) =
-            match pos_vec.get(i).and_then(|raw_blocks| raw_blocks.first()) {
-                Some(raw) if raw.len() >= 3 => (true, [raw[0], raw[1], raw[2]], render.object_size),
-                Some(_) => (false, [0.0; 3], [0.0; 3]),
-                None => {
-                    missing_damf_pos += 1;
-                    (false, [0.0; 3], [0.0; 3])
-                }
-            };
+        let (has_pos, pos, size) = match pos_vec.get(i).and_then(|raw_blocks| raw_blocks.first()) {
+            Some(raw) if raw.len() >= 3 => (true, [raw[0], raw[1], raw[2]], render.object_size),
+            Some(_) => (false, [0.0; 3], [0.0; 3]),
+            None => {
+                missing_damf_pos += 1;
+                (false, [0.0; 3], [0.0; 3])
+            }
+        };
 
         objects.push((id, i));
         events.push(bridge_api::REvent {

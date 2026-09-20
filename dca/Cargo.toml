@@ -1,6 +1,6 @@
 [package]
 name = "dca"
-version = "0.7.4"
+version = "0.8.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Independent DTS Coherent Acoustics (DCA) bitstream parser and decoder"
@@ -15,3 +15,8 @@ crate-type = ["lib"]
 log = "0.4"
 thiserror = "2.0"
 rustfft = "6.4"
+
+# Keep the offline parser's synthetic corruption tests in the normal CI suite.
+[[example]]
+name = "xll_private_metadata"
+test = true

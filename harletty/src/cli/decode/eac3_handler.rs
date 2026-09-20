@@ -29,6 +29,9 @@ pub struct Eac3DecodeHandler {
     pub final_sample_rate: u32,
     pub final_channel_count: usize,
     pub warp_mode: Option<WarpMode>,
+    /// Write one mono WAV per channel, `<prefix>_<n>.wav`, instead of the
+    /// interleaved audio file.
+    pub mono_prefix: Option<PathBuf>,
     pub warned_experimental: bool,
 }
 
@@ -44,6 +47,7 @@ impl Default for Eac3DecodeHandler {
             final_sample_rate: 48000,
             final_channel_count: 0,
             warp_mode: None,
+            mono_prefix: None,
             warned_experimental: false,
         }
     }
@@ -198,6 +202,14 @@ impl Eac3DecodeHandler {
         let Some(base_path) = base_path else {
             return Ok(());
         };
+        if let Some(prefix) = &self.mono_prefix {
+            log::info!(
+                "Creating {channel_count} mono audio files: {}",
+                super::output::mono_path(prefix, 0).display()
+            );
+            self.audio_writer = Some(AudioWriter::create_mono(prefix, sample_rate, channel_count)?);
+            return Ok(());
+        }
         let (audio_path, _) = create_output_paths(base_path, format, self.has_atmos);
         log::info!("Creating audio file: {}", audio_path.display());
         let writer = match (format, self.has_atmos) {

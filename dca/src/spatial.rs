@@ -1,25 +1,39 @@
 //! Spatial-extension presentations: what the DTS:X extension waveforms in an
-//! [`HdFrame`] mean.
+//! [`HdFrame`] are.
 //!
 //! The lossless decoder recovers the extension channel set as a bag of
-//! waveforms with no one-to-one speaker mask. Deciding that "waveform 2 of a
-//! five-feed alternate profile is top-front-right" is *codec* knowledge, so it
+//! waveforms with no one-to-one speaker mask. Deciding that "waveform 5 of an
+//! eight-feed alternate profile is top-front-right" is *codec* knowledge, so it
 //! lives here rather than in a consumer — the realtime bridge and the offline
 //! ADM/DAMF exporter both need it and must not disagree about it.
 //!
-//! What deliberately does NOT live here: fold/unfold gains and the per-sample
-//! recombination. Those are presentation choices a renderer makes, and the
-//! bridge owns them.
+//! A presentation splits the feeds into **objects**, whose positions and bed
+//! folds come from the frame's private metadata ([`crate::XMetadata`]), and
+//! **fixed channels** at the positions listed here. What deliberately does NOT
+//! live here: the per-sample bed recombination. That is [`crate::FoldPlan`],
+//! built from the metadata and applied by each host.
 //!
 //! Everything below is expressed as plain data. This module has no notion of
 //! any consumer's channel-label ABI.
 //!
 //! # Status
 //!
-//! Only [`XPresentation::Height`] is established. The alternate profiles are
-//! research results from a finite corpus; each carries its provenance in the
-//! docs below. They are exposed so consumers can render *something* coherent,
-//! not because the mapping is confirmed normative.
+//! [`XPresentation::Height`] is established. The alternate profiles' feed
+//! identities were established against a finite corpus by comparing the
+//! decoded audio with the private metadata (see the repository's
+//! `docs/private-metadata-probe.md`): the last four feeds are the fixed
+//! heights named by the type-3 rows, and the first feeds are the declared
+//! objects. Every feed a record declares is presented at the position that
+//! record states, D0's single object included: the centre-height speaker it
+//! may name in its auxiliary section is an *alternative* for a layout that
+//! has one, carried on the object as
+//! [`crate::SourceRole::Object::centre_height_alternative`], not a position
+//! to impose. The object-only variant on a 5.1 bed carries one
+//! declared object and no height quartet at all. A three-channel first set
+//! under the D0 marker carries the single declared object as its three
+//! components at the compatible bed's C, L and R, then the height quartet.
+//! They are exposed as presentations rather than as research defaults, but
+//! no listening sign-off exists yet.
 
 use crate::hd::HdFrame;
 
@@ -46,73 +60,37 @@ pub enum XPresentation {
     /// Standard DTS:X: four full-coded height waveforms folded into the 7.1
     /// bed. The stable stereo pairs are front-height L/R then rear-height L/R.
     Height,
-    /// Experimental five-feed alternate profile. Inferred from two complete
-    /// programmes: the first feed has a stable front-centre signature and the
-    /// remaining four form the established top quartet.
-    FixedD0,
-    /// Experimental six-feed alternate profile. Inferred from a single complete
-    /// programme. The wide fold is strongly measurable, but all six channel
-    /// identities remain experimental pending an independent source.
-    FixedD1,
-    /// Experimental eight-feed alternate profile, presented as named objects at
-    /// static inferred positions. See [`XPresentation::object_positions`].
+    /// Five-feed alternate profile: one object, then the four fixed heights.
+    ///
+    /// Three forms of it are known, differing in the record grammar, the
+    /// object's declared position and the height fold: the classic streams
+    /// put the object above the centre and name the centre-height speaker as
+    /// an alternative, while two IMAX-labelled streams put it at the centre
+    /// speaker at ear level and name no alternative. The position is read,
+    /// never assumed. Not to be confused with [`Self::ObjectsD0`], which is
+    /// the seven-feed component form of the same marker.
+    ObjectD0,
+    /// Six-feed alternate profile: two objects, then the four fixed heights.
+    ObjectsD1,
+    /// Eight-feed alternate profile: four objects, then the four fixed
+    /// heights.
     ObjectsD3,
+    /// Nine-feed alternate profile: five objects, then the four fixed
+    /// heights.
+    ObjectsD4,
+    /// Seven-feed alternate form under the D0 marker: the single declared
+    /// object transmitted as three components, each its contribution to the
+    /// compatible bed at the position it names (C, L and R at ear level),
+    /// then the four fixed heights.
+    ObjectsD0,
+    /// Single-feed alternate profile on a 5.1 bed: one object, no fixed
+    /// heights. Its envelope carries the first channel set only.
+    ObjectOnly,
 }
 
 const HEIGHT_CHANNELS: [SpatialChannel; 4] = [
     SpatialChannel::TopFrontLeft,
     SpatialChannel::TopFrontRight,
-    SpatialChannel::TopBackLeft,
-    SpatialChannel::TopBackRight,
-];
-
-const D0_CHANNELS: [SpatialChannel; 5] = [
-    SpatialChannel::TopFrontCenter,
-    SpatialChannel::TopFrontLeft,
-    SpatialChannel::TopFrontRight,
-    SpatialChannel::TopBackLeft,
-    SpatialChannel::TopBackRight,
-];
-
-const D1_CHANNELS: [SpatialChannel; 6] = [
-    SpatialChannel::TopFrontLeft,
-    SpatialChannel::TopFrontRight,
-    SpatialChannel::WideLeft,
-    SpatialChannel::WideRight,
-    SpatialChannel::TopBackLeft,
-    SpatialChannel::TopBackRight,
-];
-
-/// Research-only D3 default positions, as `[x, y, z]` with x left-to-right,
-/// y back-to-front and z floor-to-ceiling, each in `-1.0..=1.0`.
-///
-/// The corpus supports stable left/right pairing and a recurring rear
-/// association for feeds 6/7. Feeds 2/3 also match the front-elevation group in
-/// the paired fixed-layout control, while 4/5 remain the broad side pair.
-/// Feeds 0/1 are the least stable pair and are placed at the front-wide
-/// positions by elimination. These are presentation defaults, not decoded
-/// coordinates and not a claimed normative speaker map.
-const D3_OBJECT_POSITIONS: [[f64; 3]; 8] = [
-    [-1.0, 0.5, 0.0],  // 0: wide left
-    [1.0, 0.5, 0.0],   // 1: wide right
-    [-1.0, 1.0, 1.0],  // 2: top front left
-    [1.0, 1.0, 1.0],   // 3: top front right
-    [-1.0, 0.0, 1.0],  // 4: top side left
-    [1.0, 0.0, 1.0],   // 5: top side right
-    [-1.0, -1.0, 1.0], // 6: top back left
-    [1.0, -1.0, 1.0],  // 7: top back right
-];
-
-/// The position each D3 feed is nominally associated with, parallel to
-/// [`D3_OBJECT_POSITIONS`]. Advisory only — a consumer that renders D3 as
-/// objects should use the positions, not these labels.
-const D3_CHANNEL_HINTS: [SpatialChannel; 8] = [
-    SpatialChannel::WideLeft,
-    SpatialChannel::WideRight,
-    SpatialChannel::TopFrontLeft,
-    SpatialChannel::TopFrontRight,
-    SpatialChannel::TopSideLeft,
-    SpatialChannel::TopSideRight,
     SpatialChannel::TopBackLeft,
     SpatialChannel::TopBackRight,
 ];
@@ -145,45 +123,57 @@ impl XPresentation {
         if !frame.x_imax {
             return None;
         }
-        match frame.x_samples.len() {
-            n if n == D0_CHANNELS.len() && feeds_are(n) => Some(Self::FixedD0),
-            n if n == D1_CHANNELS.len() && feeds_are(n) => Some(Self::FixedD1),
-            n if n == D3_OBJECT_POSITIONS.len() && feeds_are(n) => Some(Self::ObjectsD3),
-            _ => None,
-        }
+        [
+            Self::ObjectD0,
+            Self::ObjectsD1,
+            Self::ObjectsD3,
+            Self::ObjectsD4,
+            Self::ObjectsD0,
+            Self::ObjectOnly,
+        ]
+        .into_iter()
+        .find(|presentation| feeds_are(presentation.feed_count()))
     }
 
     /// Number of extension waveforms this presentation carries.
     pub fn feed_count(self) -> usize {
-        self.channels().len()
-    }
-
-    /// Speaker position of each extension waveform, in feed order.
-    ///
-    /// For [`XPresentation::ObjectsD3`] these are advisory hints; that
-    /// presentation is meant to be rendered as objects via
-    /// [`XPresentation::object_positions`].
-    pub fn channels(self) -> &'static [SpatialChannel] {
         match self {
-            Self::Height => &HEIGHT_CHANNELS,
-            Self::FixedD0 => &D0_CHANNELS,
-            Self::FixedD1 => &D1_CHANNELS,
-            Self::ObjectsD3 => &D3_CHANNEL_HINTS,
+            Self::Height => 4,
+            Self::ObjectD0 => 5,
+            Self::ObjectsD1 => 6,
+            Self::ObjectsD3 => 8,
+            Self::ObjectsD4 => 9,
+            Self::ObjectsD0 => 7,
+            Self::ObjectOnly => 1,
         }
     }
 
-    /// Static positions for a presentation whose feeds are objects rather than
-    /// fixed channels, or `None` for the fixed presentations.
-    pub fn object_positions(self) -> Option<&'static [[f64; 3]]> {
+    /// Feeds presented as objects, positioned by the frame's metadata.
+    pub fn object_feeds(self) -> std::ops::Range<usize> {
+        0..self.feed_count() - self.fixed_channels().len()
+    }
+
+    /// Feeds presented as fixed channels, parallel to [`Self::fixed_channels`].
+    pub fn fixed_feeds(self) -> std::ops::Range<usize> {
+        self.object_feeds().end..self.feed_count()
+    }
+
+    /// Speaker position of each fixed feed, in feed order.
+    pub fn fixed_channels(self) -> &'static [SpatialChannel] {
         match self {
-            Self::ObjectsD3 => Some(&D3_OBJECT_POSITIONS),
-            _ => None,
+            Self::Height
+            | Self::ObjectD0
+            | Self::ObjectsD1
+            | Self::ObjectsD3
+            | Self::ObjectsD4
+            | Self::ObjectsD0 => &HEIGHT_CHANNELS,
+            Self::ObjectOnly => &[],
         }
     }
 
-    /// Whether this presentation's channel identities are inferred research
-    /// results rather than an established mapping. Consumers should say so
-    /// when they surface it to a user.
+    /// Whether this presentation's feed identities rest on corpus evidence
+    /// rather than on the standard profile's established layout. Consumers
+    /// should say so when they surface it to a user.
     pub fn is_experimental(self) -> bool {
         !matches!(self, Self::Height)
     }
@@ -207,11 +197,13 @@ mod tests {
         let f = frame_with(vec![vec![0.0; 512]; 4], false, 512);
         assert_eq!(XPresentation::detect(&f), Some(XPresentation::Height));
         assert!(!XPresentation::Height.is_experimental());
+        assert_eq!(XPresentation::Height.object_feeds(), 0..0);
+        assert_eq!(XPresentation::Height.fixed_feeds(), 0..4);
     }
 
     #[test]
     fn alternate_profiles_need_the_imax_flag() {
-        for n in [5usize, 6, 8] {
+        for n in [5usize, 6, 7, 8] {
             let f = frame_with(vec![vec![0.0; 512]; n], false, 512);
             assert_eq!(XPresentation::detect(&f), None, "{n} feeds without x_imax");
         }
@@ -220,9 +212,12 @@ mod tests {
     #[test]
     fn detects_each_alternate_profile() {
         for (n, expected) in [
-            (5usize, XPresentation::FixedD0),
-            (6, XPresentation::FixedD1),
+            (5usize, XPresentation::ObjectD0),
+            (6, XPresentation::ObjectsD1),
             (8, XPresentation::ObjectsD3),
+            (9, XPresentation::ObjectsD4),
+            (7, XPresentation::ObjectsD0),
+            (1, XPresentation::ObjectOnly),
         ] {
             let f = frame_with(vec![vec![0.0; 512]; n], true, 512);
             assert_eq!(XPresentation::detect(&f), Some(expected));
@@ -247,7 +242,7 @@ mod tests {
         assert_eq!(XPresentation::detect(&frame_with(x, false, 512)), None);
 
         // Feed counts that match no presentation.
-        for n in [0usize, 1, 2, 3, 7, 9] {
+        for n in [0usize, 2, 3, 10, 11] {
             let f = frame_with(vec![vec![0.0; 512]; n], true, 512);
             assert_eq!(XPresentation::detect(&f), None, "{n} feeds");
         }
@@ -263,30 +258,38 @@ mod tests {
         assert_eq!(XPresentation::detect(&f), None);
     }
 
+    /// Objects come first, the fixed heights last, and together they cover
+    /// every feed exactly once.
     #[test]
-    fn only_d3_carries_object_positions() {
-        assert_eq!(XPresentation::Height.object_positions(), None);
-        assert_eq!(XPresentation::FixedD0.object_positions(), None);
-        assert_eq!(XPresentation::FixedD1.object_positions(), None);
-        let d3 = XPresentation::ObjectsD3.object_positions().unwrap();
-        assert_eq!(d3.len(), XPresentation::ObjectsD3.feed_count());
-        // Left feeds sit left of centre, right feeds right of it.
-        for (i, pos) in d3.iter().enumerate() {
-            let expected_sign = if i % 2 == 0 { -1.0 } else { 1.0 };
-            assert_eq!(pos[0].signum(), expected_sign, "feed {i} laterality");
-            assert!(pos.iter().all(|c| (-1.0..=1.0).contains(c)), "feed {i} range");
-        }
-    }
-
-    #[test]
-    fn channel_tables_match_their_feed_counts() {
-        for p in [
-            XPresentation::Height,
-            XPresentation::FixedD0,
-            XPresentation::FixedD1,
-            XPresentation::ObjectsD3,
+    fn feeds_split_into_objects_then_fixed_channels() {
+        for (presentation, objects, fixed) in [
+            (XPresentation::Height, 0..0, 0..4),
+            (XPresentation::ObjectD0, 0..1, 1..5),
+            (XPresentation::ObjectsD1, 0..2, 2..6),
+            (XPresentation::ObjectsD3, 0..4, 4..8),
+            (XPresentation::ObjectsD0, 0..3, 3..7),
+            (XPresentation::ObjectOnly, 0..1, 1..1),
         ] {
-            assert_eq!(p.channels().len(), p.feed_count());
+            assert_eq!(presentation.object_feeds(), objects, "{presentation:?}");
+            assert_eq!(presentation.fixed_feeds(), fixed, "{presentation:?}");
+            assert_eq!(
+                presentation.fixed_channels().len(),
+                presentation.fixed_feeds().len()
+            );
+            assert_eq!(
+                presentation.object_feeds().len() + presentation.fixed_feeds().len(),
+                presentation.feed_count()
+            );
         }
+        assert_eq!(
+            XPresentation::ObjectsD3.fixed_channels(),
+            &HEIGHT_CHANNELS,
+            "alternate heights are the standard quartet"
+        );
+        assert_eq!(
+            XPresentation::ObjectD0.fixed_channels(),
+            &HEIGHT_CHANNELS,
+            "D0's quartet is the standard one; its first feed is an object"
+        );
     }
 }

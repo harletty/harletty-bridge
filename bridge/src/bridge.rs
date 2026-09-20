@@ -1,10 +1,9 @@
 use abi_stable::std_types::{RSlice, RStr, RString, RVec};
 use bridge_api::{
-    FormatBridge, RCoordinateFormat, RInputTransport, RPushResult, RVbapCartesianDefaults,
-    RVbapTableMode,
+    FormatBridge, RChannelPose, RCoordinateFormat, RInputTransport, RPushResult,
+    RVbapCartesianDefaults, RVbapTableMode,
 };
 use eac3::{CorePcmFrame, Extractor as Eac3RawExtractor, ObjectPcmDecoder, PcmDecoder};
-use std::collections::VecDeque;
 #[cfg(feature = "bridge-perf")]
 use std::env;
 #[cfg(feature = "bridge-perf")]
@@ -12,10 +11,12 @@ use std::time::Instant;
 use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, parse::Parser};
 
 use crate::ac3_native::NativeAc3Decoder;
-use crate::dts_pipeline::DtsFoldConfig;
+use crate::auro_pipeline::DtsAuroState;
+use crate::dts_pipeline::{DtsFoldConfig, DtsXState};
 use crate::eac3_pipeline::{
-    diagnose_eac3_frame, is_dependent_eac3_frame, is_legacy_ac3_frame,
-    is_temporary_eac3_silence_frame, process_eac3_dependent_frame_with_core, process_eac3_frame,
+    build_legacy_ac3_core_failure_silence, diagnose_eac3_frame, eac3_frame_can_carry_dependents,
+    eac3_frame_carries_joc, eac3_frame_carries_self_contained_joc, is_dependent_eac3_frame,
+    is_legacy_ac3_frame, is_temporary_eac3_silence_frame, process_eac3_frame,
 };
 use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::PcmStats;
@@ -41,6 +42,11 @@ pub(crate) struct Eac3DiagStats {
     pub(crate) paired_object_frames: u64,
     /// Non-JOC AC-3-core + dependent pairs emitted as plain channel beds.
     pub(crate) dependent_pair_channel_beds: u64,
+    /// Dependents whose channels could not be overlaid onto the core.
+    pub(crate) dependent_merge_failures: u64,
+    /// Presentations whose JOC configuration declares a downmix the merged bed
+    /// is not: a 5-channel configuration reached with dependents overlaid.
+    pub(crate) joc_downmix_config_mismatch: u64,
     /// Standalone AC-3 cores (plain AC-3, no dependent) emitted as 5.1 beds.
     pub(crate) standalone_ac3_core_beds: u64,
     pub(crate) short_packet_silence_frames: u64,
@@ -55,7 +61,6 @@ pub(crate) struct Eac3DiagStats {
 /// partner. In a healthy stream the queue never holds more than one entry;
 /// it only grows while cores fail to decode, so keep a small window and drop
 /// the oldest beyond it.
-const MAX_PENDING_DEPENDENT_FRAMES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum DrcMode {
@@ -79,12 +84,7 @@ pub(crate) enum RawCodec {
 /// specific pattern first: the TrueHD major-sync word `0xF8726FBA` at offset 4,
 /// then the E-AC3/AC-3 sync word `0x0B77` at offset 0 (incl. byte-swapped).
 fn sniff_raw_codec(data: &[u8]) -> Option<RawCodec> {
-    if data.len() >= 8
-        && data[4] == 0xF8
-        && data[5] == 0x72
-        && data[6] == 0x6F
-        && data[7] == 0xBA
-    {
+    if data.len() >= 8 && data[4] == 0xF8 && data[5] == 0x72 && data[6] == 0x6F && data[7] == 0xBA {
         return Some(RawCodec::TrueHd);
     }
     // DTS core (0x7FFE8001) or extension substream (0x64582025) at offset 0.
@@ -117,6 +117,39 @@ fn sniff_raw_codec(data: &[u8]) -> Option<RawCodec> {
 /// transient is a single `Decoder` in a leaf frame. The cost is one pointer
 /// hop per pipeline entry — never per sample — so hot loops are unaffected.
 /// `tests::atmos_bridge_stack_footprint_stays_small` guards the invariant.
+/// A presentation being assembled: the core, and the dependents that have
+/// attached themselves to it so far.
+///
+/// An independent may be followed by up to eight dependents, and the JOC
+/// payload rides in the last of them, so the group is collected rather than
+/// resolved on the first arrival - taking the core away from the second
+/// dependent would orphan it and lose exactly the payload that matters.
+pub(crate) struct PendingEac3Presentation {
+    pub(crate) core: PendingEac3Core,
+    pub(crate) dependents: Vec<Vec<u8>>,
+}
+
+/// ETSI TS 102 366 E.1.3.1.2 allows at most eight dependent substreams behind
+/// one independent. More than that is a malformed group, not a longer one.
+const MAX_EAC3_DEPENDENTS: usize = 8;
+
+/// A presentation's core, held until its dependent arrives or the next
+/// non-dependent access unit ends the presentation without one.
+pub(crate) enum PendingEac3Core {
+    /// A legacy AC-3 core. AC-3 carries no JOC, so this is only ever the
+    /// channel half of a pair. The access unit is kept so a standalone flush
+    /// can recover its DRC and dialnorm.
+    LegacyAc3 {
+        core: CorePcmFrame,
+        access_unit: Vec<u8>,
+    },
+    /// An independent E-AC-3 frame that carried no JOC payload of its own.
+    ///
+    /// Boxed to keep `AtmosBridge` pointer-sized per field, which
+    /// `tests::atmos_bridge_stack_footprint_stays_small` holds it to.
+    Independent(Box<eac3::PcmPushResult>),
+}
+
 pub(crate) struct AtmosBridge {
     // ── TrueHD pipeline ──────────────────────────────────────────────
     pub(crate) mat_stream: MatStream,
@@ -134,12 +167,15 @@ pub(crate) struct AtmosBridge {
     pub(crate) eac3_dependent_pcm_decoder: Box<PcmDecoder>,
     pub(crate) eac3_object_decoder: Box<ObjectPcmDecoder>,
     pub(crate) ac3_decoder: Box<NativeAc3Decoder>,
-    /// Decoded AC-3 cores awaiting either a following E-AC3 dependent (→ paired
-    /// 7.1 bed / object frame) or, if none arrives, a standalone-core flush
-    /// (→ plain 5.1 bed). The `Vec<u8>` keeps the original AC-3 access unit so
-    /// the standalone flush can recover its DRC/dialnorm.
-    pub(crate) pending_ac3_cores: VecDeque<(CorePcmFrame, Vec<u8>)>,
-    pub(crate) pending_dependent_frames: VecDeque<Vec<u8>>,
+    /// The core of a presentation whose dependent has not arrived yet.
+    ///
+    /// A dependent substream belongs to the independent it immediately follows,
+    /// so at most one core is ever outstanding: the next non-dependent access
+    /// unit ends the presentation whether a dependent came or not. Holding it
+    /// as an `Option` rather than a queue is what makes a dependent that
+    /// arrives with nothing in front of it an orphan to drop, instead of one to
+    /// park until some later, unrelated core turns up.
+    pub(crate) pending_eac3_core: Option<PendingEac3Presentation>,
     pub(crate) eac3_frame_count: u64,
     pub(crate) eac3_total_samples: u64,
     /// True when the most recent `push_packet` used the E-AC3 path.
@@ -159,15 +195,19 @@ pub(crate) struct AtmosBridge {
     /// DTS-HD Master Audio lossless (5.1/7.1) decoder.
     pub(crate) dts_hd_decoder: Box<dca::HdDecoder>,
     pub(crate) dts_frame_count: u64,
-    /// Latches once a valid XLL-X height quartet has been emitted: fallback
-    /// frames then keep the 12-channel shape (composite bed + silent heights)
-    /// instead of renegotiating to 8 channels. Cleared with the pipeline.
-    pub(crate) dts_height_locked: bool,
+    /// DTS:X extension state: latched presentation shape, last readable
+    /// metadata, announced object positions. Cleared with the pipeline.
+    pub(crate) dts_x: DtsXState,
     /// True when the most recent `push_packet` used the DTS path.
     pub(crate) dts_active: bool,
     pub(crate) dts_fold_config: DtsFoldConfig,
-    /// Live stream fact: the latest DTS frame carried presented D3 objects.
+    /// Live stream fact: the latest DTS frame emitted object channels. Set
+    /// from what the frame presented rather than from its profile, so every
+    /// object-bearing presentation reaches it by the same route.
     pub(crate) dts_objects_active: bool,
+    /// Auro-3D detection and unfolding over the lossless DTS-HD output.
+    /// Holds the first frames back until the carrier question is settled.
+    pub(crate) dts_auro: DtsAuroState,
     // ── Shared ───────────────────────────────────────────────────────
     pub(crate) presentation: u8,
     pub(crate) strict: bool,
@@ -183,10 +223,12 @@ pub(crate) struct AtmosBridge {
     pub(crate) frame_count: u64,
     /// Last object↔channel declaration emitted (sparse re-emission on change
     /// and after reset). Shared by the TrueHD and E-AC3 metadata paths.
-    pub(crate) declared_object_channels: Option<abi_stable::std_types::RVec<bridge_api::RObjectChannel>>,
+    pub(crate) declared_object_channels:
+        Option<abi_stable::std_types::RVec<bridge_api::RObjectChannel>>,
     /// Fixed-channel labels of the active TrueHD spatial presentation
     /// (bed labels from the OAMD bed assignment, then `Object` fillers).
-    pub(crate) truehd_spatial_labels: Option<abi_stable::std_types::RVec<bridge_api::RChannelLabel>>,
+    pub(crate) truehd_spatial_labels:
+        Option<abi_stable::std_types::RVec<bridge_api::RChannelLabel>>,
     pub(crate) perf: PerfStats,
 }
 
@@ -230,8 +272,7 @@ impl AtmosBridge {
             eac3_dependent_pcm_decoder: eac3_dependent_pcm,
             eac3_object_decoder: eac3_obj,
             ac3_decoder: Box::new(NativeAc3Decoder::default()),
-            pending_ac3_cores: VecDeque::new(),
-            pending_dependent_frames: VecDeque::new(),
+            pending_eac3_core: None,
             eac3_frame_count: 0,
             eac3_total_samples: 0,
             eac3_active: false,
@@ -242,10 +283,11 @@ impl AtmosBridge {
             dts_decoder: Box::new(dca::PcmDecoder::new()),
             dts_hd_decoder: Box::new(dca::HdDecoder::new()),
             dts_frame_count: 0,
-            dts_height_locked: false,
+            dts_x: DtsXState::default(),
             dts_active: false,
             dts_fold_config: DtsFoldConfig::from_env(),
             dts_objects_active: false,
+            dts_auro: DtsAuroState::default(),
             presentation,
             strict,
             total_samples: 0,
@@ -292,8 +334,7 @@ impl AtmosBridge {
         self.eac3_dependent_pcm_decoder.reset();
         self.eac3_object_decoder.reset();
         self.ac3_decoder.reset();
-        self.pending_ac3_cores.clear();
-        self.pending_dependent_frames.clear();
+        self.pending_eac3_core = None;
         self.eac3_frame_count = 0;
         self.eac3_active = false;
 
@@ -302,9 +343,10 @@ impl AtmosBridge {
         self.dts_decoder.reset();
         self.dts_hd_decoder.reset();
         self.dts_frame_count = 0;
-        self.dts_height_locked = false;
+        self.dts_x = DtsXState::default();
         self.dts_active = false;
         self.dts_objects_active = false;
+        self.dts_auro.reset();
         // Re-sniff after reset, but keep any host-declared codec.
         self.raw_codec = None;
 
@@ -323,51 +365,85 @@ impl AtmosBridge {
         self.recovering_until_major_sync = false;
     }
 
-    /// Emit any AC-3 cores buffered without a following E-AC3 dependent as plain
-    /// 5.1 channel beds. Called before processing a non-dependent access unit
-    /// (the buffered core had no partner) so plain AC-3 streams are not silent.
-    fn flush_pending_standalone_ac3_cores(&mut self, result: &mut RPushResult) {
-        while let Some((core, au)) = self.pending_ac3_cores.pop_front() {
-            result
-                .frames
-                .push(crate::eac3_pipeline::build_standalone_ac3_core_frame(
-                    self, &core, &au,
-                ));
+    /// Resolve the pending presentation, applying the pipeline's failure
+    /// policy: strict mode surfaces the error and resets, as every other decode
+    /// failure here does.
+    fn finish_presentation(&mut self, result: &mut RPushResult) -> Result<(), ()> {
+        match self.resolve_pending_presentation(result) {
+            Ok(()) => Ok(()),
+            Err(msg) => {
+                log::warn!("{msg}");
+                self.reset_pipeline();
+                result.did_reset = true;
+                result.error_message = msg.as_str().into();
+                Err(())
+            }
         }
     }
 
-    fn try_decode_pending_eac3_pair(&mut self) -> Option<bridge_api::RDecodedFrame> {
-        // Both queues must have a frame before we commit to popping either —
-        // otherwise an AC-3 core popped here without a partner is silently
-        // dropped when `?` short-circuits the function. On streams that
-        // deliver `[AC-3 core, E-AC-3 dep]` per packet (DD+ JOC with a
-        // backward-compat AC-3 core), the first try_pair after the core was
-        // queued ALWAYS hits the empty dep queue, losing the core. The next
-        // try_pair after the dep is queued then finds no core to pair with.
-        // Net effect: pair_attempts stays at 0 forever and is_spatial never
-        // flips to true.
-        if self.pending_ac3_cores.is_empty() || self.pending_dependent_frames.is_empty() {
-            return None;
+    /// Resolve the presentation in hand into exactly one emitted frame.
+    ///
+    /// Any non-dependent access unit ends the group, because a dependent
+    /// belongs to the unit it immediately follows. The dependents are merged
+    /// onto the core in bitstream order, and the last of them decides what
+    /// comes out: a JOC payload there means objects reconstructed from the
+    /// merged bed, and its absence means the bed itself.
+    ///
+    /// Returns the decode error rather than swallowing it, so strict mode can
+    /// reset the pipeline; the caller decides whether to fall back.
+    fn resolve_pending_presentation(&mut self, result: &mut RPushResult) -> Result<(), String> {
+        let Some(pending) = self.pending_eac3_core.take() else {
+            return Ok(());
+        };
+        let PendingEac3Presentation { core, dependents } = pending;
+
+        // A presentation with no JOC anywhere in it is a gap in object
+        // carriage, and the object decoder cannot see one from the inside: its
+        // sequence counter only advances on frames that carry a payload, so the
+        // next JOC frame would otherwise interpolate away from a matrix
+        // belonging to whatever played before the gap.
+        let joc_dependent = dependents
+            .last()
+            .filter(|dependent| eac3_frame_carries_joc(dependent));
+        if joc_dependent.is_none() {
+            self.eac3_object_decoder.note_non_joc_presentation();
         }
-        let (core, _core_au) = self.pending_ac3_cores.pop_front().unwrap();
-        let dependent = self.pending_dependent_frames.pop_front().unwrap();
+
+        // Nothing attached: the core stands on its own.
+        if dependents.is_empty() {
+            match core {
+                PendingEac3Core::LegacyAc3 { core, access_unit } => {
+                    result
+                        .frames
+                        .push(crate::eac3_pipeline::build_standalone_ac3_core_frame(
+                            self,
+                            &core,
+                            &access_unit,
+                        ));
+                }
+                PendingEac3Core::Independent(push) => {
+                    result
+                        .frames
+                        .push(crate::eac3_pipeline::build_buffered_core_frame(self, &push));
+                }
+            }
+            return Ok(());
+        }
+
         self.eac3_diag_stats.dependent_pair_attempts += 1;
-        match process_eac3_dependent_frame_with_core(self, &dependent, core) {
-            Ok(Some(decoded_frame)) => Some(decoded_frame),
-            Ok(None) => {
-                self.eac3_diag_stats.dependent_pair_no_object += 1;
-                self.eac3_diag_stats.last_dependent_pair_error =
-                    Some("no_object_payload".to_string());
-                None
+        let core_pcm = match core {
+            PendingEac3Core::LegacyAc3 { core, .. } => core,
+            PendingEac3Core::Independent(push) => push.pcm,
+        };
+        match crate::eac3_pipeline::resolve_eac3_presentation(self, core_pcm, &dependents) {
+            Ok(frame) => {
+                result.frames.push(frame);
+                Ok(())
             }
             Err(err) => {
                 self.eac3_diag_stats.dependent_pair_failures += 1;
                 self.eac3_diag_stats.last_dependent_pair_error = Some(err.clone());
-                bridge_diag_log(
-                    log::Level::Warn,
-                    &format!("eac3_dependent_pair_failed error={err}"),
-                );
-                None
+                Err(err)
             }
         }
     }
@@ -403,27 +479,60 @@ impl AtmosBridge {
         temporary_silence_pushed: &mut bool,
     ) -> Result<(), ()> {
         self.eac3_frame_count += 1;
-        // A buffered AC-3 core is only ever paired with an *immediately*
-        // following E-AC3 dependent access unit. If the next access unit is not a
-        // dependent, the buffered core had no partner (plain AC-3, which never
-        // carries dependents) — flush it as a standalone 5.1 bed before handling
-        // this unit, otherwise the core sits queued forever and the track is
-        // silent.
-        if !is_dependent_eac3_frame(frame) {
-            self.flush_pending_standalone_ac3_cores(result);
+        // A dependent substream belongs to the access unit it immediately
+        // follows, so any other kind of unit ends the group in hand.
+        if is_dependent_eac3_frame(frame) {
+            let Some(pending) = self.pending_eac3_core.as_mut() else {
+                // Nothing in front of it: this dependent belongs to nothing. It
+                // used to be parked for some later, unrelated core to claim,
+                // which put one programme's extension channels on another's bed.
+                self.eac3_diag_stats.dependent_frames_dropped += 1;
+                bridge_diag_log(
+                    log::Level::Warn,
+                    "eac3_orphan_dependent no core precedes this dependent access unit",
+                );
+                return Ok(());
+            };
+            if pending.dependents.len() >= MAX_EAC3_DEPENDENTS {
+                // More than the eight ETSI allows behind one independent: the
+                // group is malformed rather than longer, so resolve what is
+                // valid and drop the excess instead of growing without bound.
+                self.eac3_diag_stats.dependent_frames_dropped += 1;
+                bridge_diag_log(
+                    log::Level::Warn,
+                    "eac3_dependent_group_overflow more than eight dependents behind one independent",
+                );
+                return self.finish_presentation(result);
+            }
+            pending.dependents.push(frame.to_vec());
+            // The JOC payload rides in the last dependent, so one that carries
+            // it ends the group with no need to wait for the next access unit.
+            if eac3_frame_carries_joc(frame) {
+                return self.finish_presentation(result);
+            }
+            return Ok(());
         }
-        if is_legacy_ac3_frame(frame) {
+
+        if let Err(()) = self.finish_presentation(result) {
+            return Err(());
+        }
+
+        let decode_result = if is_legacy_ac3_frame(frame) {
             match self.ac3_decoder.decode_frame(frame) {
                 Ok(core) => {
                     diagnose_eac3_frame(self, frame);
                     self.eac3_diag_stats.ac3_core_decoded += 1;
-                    self.pending_ac3_cores.push_back((core, frame.to_vec()));
-                    if let Some(decoded_frame) = self.try_decode_pending_eac3_pair() {
-                        result.frames.push(decoded_frame);
-                    }
+                    self.pending_eac3_core = Some(PendingEac3Presentation {
+                        core: PendingEac3Core::LegacyAc3 {
+                            core,
+                            access_unit: frame.to_vec(),
+                        },
+                        dependents: Vec::new(),
+                    });
                     return Ok(());
                 }
                 Err(err) => {
+                    diagnose_eac3_frame(self, frame);
                     self.eac3_diag_stats.ac3_core_decode_failures += 1;
                     self.eac3_diag_stats.last_ac3_core_decode_error = Some(err.clone());
                     bridge_diag_log(
@@ -433,29 +542,50 @@ impl AtmosBridge {
                             self.eac3_frame_count, err
                         ),
                     );
+                    // Stand in one frame of silence for the core and stop here.
+                    // This used to fall through to the E-AC-3 decoders, which
+                    // can only reject an AC-3 syncframe ("not-eac3") and then
+                    // substituted silence labelled in WAV order (L R C LFE Ls
+                    // Rs) — a different channel list from the decoded frames
+                    // (fullband order, LFE last), so the renderer replanned
+                    // its bed on every dropped frame and Studio reordered its
+                    // virtual speakers. The silence now carries the labels
+                    // the core decoder would have produced for this header.
+                    build_legacy_ac3_core_failure_silence(self, frame)
+                        .ok_or_else(|| format!("AC-3 core decode error: {err}"))
                 }
             }
-        }
-
-        let decode_result = if is_dependent_eac3_frame(frame) {
-            // A dependent is normally paired with its core immediately, so the
-            // queue holds at most one entry. It only grows when cores keep
-            // failing to decode; bound it so a corrupt stream cannot grow it
-            // without limit for the whole playback session.
-            while self.pending_dependent_frames.len() >= MAX_PENDING_DEPENDENT_FRAMES {
-                self.pending_dependent_frames.pop_front();
-                self.eac3_diag_stats.dependent_frames_dropped += 1;
-                bridge_diag_log(
-                    log::Level::Warn,
-                    "eac3_dependent_queue_overflow dropping oldest pending dependent frame",
-                );
-            }
-            self.pending_dependent_frames.push_back(frame.to_vec());
-            match self.try_decode_pending_eac3_pair() {
-                Some(decoded_frame) => Ok(decoded_frame),
-                None => return Ok(()),
+        } else if eac3_frame_can_carry_dependents(frame)
+            && !eac3_frame_carries_self_contained_joc(frame)
+        {
+            // A plain independent core might be the first half of a group, and
+            // nothing in it says whether a dependent follows. Hold it until the
+            // next access unit answers that. A converted-AC-3 frame is excluded:
+            // ETSI allows it no dependents, so buffering it would add latency
+            // for a partner that cannot arrive. An independent whose own JOC
+            // payload declares a downmix wider than the frame carries is the
+            // opposite case - its extension pair, the back channels or the top
+            // front ones, is in a dependent, and emitting the frame alone would
+            // reconstruct from a bed two channels short of its own header - so
+            // that one is held too.
+            match self.eac3_pcm_decoder.push_access_unit(frame) {
+                Ok(push) => {
+                    diagnose_eac3_frame(self, frame);
+                    crate::eac3_pipeline::note_eac3_dialogue_level(self, &push.info);
+                    self.pending_eac3_core = Some(PendingEac3Presentation {
+                        core: PendingEac3Core::Independent(Box::new(push)),
+                        dependents: Vec::new(),
+                    });
+                    return Ok(());
+                }
+                Err(err) => Err(format!("E-AC3 core decode error: {err}")),
             }
         } else {
+            // A JOC payload the frame's own channels satisfy is a complete
+            // presentation - the reconstruction takes the core it arrived with
+            // and wants no dependent - so it is emitted straight away rather
+            // than buffered. That keeps the common 5.1-core Atmos stream free of
+            // the access unit of latency buffering would add.
             process_eac3_frame(self, frame)
         };
 
@@ -489,7 +619,7 @@ impl AtmosBridge {
                 log::warn!("{msg}");
                 self.reset_pipeline();
                 result.did_reset = true;
-                result.error_message = msg.into();
+                result.error_message = msg.as_str().into();
                 Err(())
             }
         }
@@ -663,7 +793,16 @@ impl FormatBridge for AtmosBridge {
                     self.eac3_active = false;
                     self.dts_active = true;
                     let payload = crate::dts_spdif::normalise_payload(data.as_slice());
-                    self.dts_buf.extend_from_slice(&payload);
+                    // Types I/II/III carry the frame directly; type IV wraps it
+                    // in a start code plus a length, and pads the burst past it.
+                    // Fed whole, the pipeline finds no sync word and decodes
+                    // nothing at all.
+                    let payload = if data_type == crate::dts_spdif::DTSHD_DATA_TYPE {
+                        crate::dts_spdif::unwrap_hd_payload(&payload).unwrap_or(&payload)
+                    } else {
+                        &payload
+                    };
+                    self.dts_buf.extend_from_slice(payload);
                     crate::dts_pipeline::drain_dts(self, &mut result);
                     return result;
                 }
@@ -698,10 +837,13 @@ impl FormatBridge for AtmosBridge {
             if self.dts_objects_active {
                 return true;
             }
-            // DTS core and the standard/D0/D1 extension presentations are
-            // labeled fixed channels. Whether they are placed directly or
-            // virtualized remains the renderer's channel-mode decision. D3 is
-            // the only current DTS presentation that declares object channels.
+            // DTS core, and the presentations whose feeds are all fixed - the
+            // standard height quartet and D0's five - are labeled fixed
+            // channels. Whether those are placed directly or virtualized
+            // remains the renderer's channel-mode decision. A presentation
+            // that declares objects labels those feeds as object channels
+            // instead: D1, D3 and D4 over the height quartet, and the
+            // object-only variant for the single one it carries alone.
             return false;
         }
         if self.eac3_active {
@@ -762,7 +904,10 @@ impl FormatBridge for AtmosBridge {
                 };
                 // Force re-resolution against the new codec on the next packet.
                 self.raw_codec = None;
-                log::debug!("atmos-bridge: input_codec set to {:?}", self.forced_raw_codec);
+                log::debug!(
+                    "atmos-bridge: input_codec set to {:?}",
+                    self.forced_raw_codec
+                );
                 true
             }
             #[cfg(feature = "bridge-perf")]
@@ -805,6 +950,39 @@ impl FormatBridge for AtmosBridge {
 
     fn coordinate_format(&self) -> RCoordinateFormat {
         RCoordinateFormat::Cartesian
+    }
+
+    fn fixed_channel_poses(&self) -> RVec<RChannelPose> {
+        // Two formats here state an angle for their channels: an unfolded
+        // Auro-3D carrier declares its whole layout from Auro's setup table,
+        // and DTS declares its lower layer from the ETSI loudspeaker table.
+        // Dolby's bed is defined in its room cube, not by angles, and
+        // declares nothing: the renderer's room model is its model.
+        if self.dts_active {
+            if self.dts_auro.is_unfolding() {
+                self.dts_auro.declared_poses()
+            } else {
+                crate::labels::dts_declared_poses()
+            }
+        } else {
+            RVec::new()
+        }
+    }
+
+    fn source_family(&self) -> RString {
+        // The renderer's placement policy is chosen per family
+        // (`renderer::placement`): Dolby's codecs share the room-cube bed,
+        // DTS its ITU angles, and an unfolded Auro-3D carrier is its own
+        // family with its own default (a sphere).
+        RString::from(if self.dts_active {
+            if self.dts_auro.is_unfolding() {
+                "auro"
+            } else {
+                "dts"
+            }
+        } else {
+            "dolby"
+        })
     }
 
     fn vbap_cartesian_defaults(&self) -> RVbapCartesianDefaults {
@@ -866,6 +1044,7 @@ impl FormatBridge for AtmosBridge {
 #[cfg(test)]
 mod raw_transport_tests {
     use super::*;
+    use bridge_api::RChannelLabel;
     use std::io::Read;
 
     fn read_prefix(path: &str, bytes: u64) -> Option<Vec<u8>> {
@@ -878,6 +1057,54 @@ mod raw_transport_tests {
     fn corpus_path(variable: &str) -> Option<String> {
         let path = std::env::var(variable).ok()?;
         std::path::Path::new(&path).is_file().then_some(path)
+    }
+
+    #[test]
+    fn failed_legacy_ac3_core_becomes_silence_in_decoder_channel_order() {
+        // 44.1 kHz frmsizecod=29 header (1672-byte frame) handed over two
+        // bytes short: the core decoder rejects it, and the access unit must
+        // still advance the stream by one frame of silence whose channel list
+        // is the one decoded frames carry (fullband order, then LFE) — not a
+        // second, differently ordered list that would make the renderer
+        // replan the bed twice around every dropped frame.
+        let mut frame = vec![0u8; 1670];
+        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1]);
+        let mut bridge = AtmosBridge::new(false);
+        let mut result = RPushResult {
+            frames: RVec::new(),
+            error_message: RString::new(),
+            did_reset: false,
+        };
+        let mut temporary_silence_pushed = false;
+
+        bridge
+            .process_eac3_access_unit(&frame, &mut result, &mut temporary_silence_pushed)
+            .expect("a failed core is not a pipeline error");
+
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(!result.did_reset);
+        assert_eq!(bridge.eac3_diag_stats.ac3_core_decode_failures, 1);
+        assert_eq!(bridge.eac3_diag_stats.legacy_ac3_frames, 1);
+        assert_eq!(bridge.eac3_total_samples, 1536);
+        assert_eq!(result.frames.len(), 1);
+        let silence = &result.frames[0];
+        assert_eq!(silence.sampling_frequency, 44_100);
+        assert_eq!(silence.sample_count, 1536);
+        assert_eq!(silence.channel_count, 6);
+        assert_eq!(
+            silence.channel_labels.as_slice(),
+            &[
+                RChannelLabel::L,
+                RChannelLabel::C,
+                RChannelLabel::R,
+                RChannelLabel::Ls,
+                RChannelLabel::Rs,
+                RChannelLabel::LFE,
+            ]
+        );
+        assert_eq!(silence.pcm.len(), 1536 * 6);
+        assert!(silence.pcm.iter().all(|sample| *sample == 0));
+        assert!(silence.metadata.is_empty());
     }
 
     #[test]
@@ -910,7 +1137,10 @@ mod raw_transport_tests {
         let mut bridge = AtmosBridge::new(false);
         bridge.forced_raw_codec = Some(RawCodec::Eac3);
         // Unrecognisable bytes, but the host-declared codec wins.
-        assert_eq!(bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]), RawCodec::Eac3);
+        assert_eq!(
+            bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]),
+            RawCodec::Eac3
+        );
         assert_eq!(bridge.raw_codec, Some(RawCodec::Eac3));
     }
 
@@ -931,7 +1161,10 @@ mod raw_transport_tests {
         let mut bridge = AtmosBridge::new(false);
         // No recognisable sync → treat as TrueHD for this packet but do NOT
         // lock, so a later syncful packet can still pin the codec.
-        assert_eq!(bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]), RawCodec::TrueHd);
+        assert_eq!(
+            bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]),
+            RawCodec::TrueHd
+        );
         assert_eq!(bridge.raw_codec, None);
     }
 
@@ -956,9 +1189,95 @@ mod raw_transport_tests {
         assert_eq!(bridge.forced_raw_codec, Some(RawCodec::Dts));
     }
 
+    /// The family follows the codec path the last packet took: Dolby until
+    /// a DTS packet, DTS until an Auro carrier is confirmed. Before any
+    /// packet the bridge is a Dolby bridge, which is also what an older host
+    /// that never asks would assume.
+    #[test]
+    fn source_family_follows_the_active_codec() {
+        let mut bridge = AtmosBridge::new(false);
+        assert_eq!(bridge.source_family().as_str(), "dolby");
+        assert!(
+            bridge.fixed_channel_poses().is_empty(),
+            "Dolby declares no angles"
+        );
+        bridge.dts_active = true;
+        assert_eq!(bridge.source_family().as_str(), "dts");
+        let poses = bridge.fixed_channel_poses();
+        assert!(
+            poses
+                .iter()
+                .any(|p| p.label == bridge_api::RChannelLabel::Ls && p.azimuth_deg == -110.0),
+            "DTS declares its ETSI angles"
+        );
+        bridge.dts_active = false;
+        bridge.eac3_active = true;
+        assert_eq!(bridge.source_family().as_str(), "dolby");
+    }
+
     // End-to-end: feed a raw DTS core stream through the FormatBridge and check
     // it emits 5.1 bed frames with the expected channel labels. Skips when the
     // (uncommitted) corpus is absent.
+    #[test]
+    fn dts_hd_auro_carrier_unfolds_into_its_layout() {
+        let Some(dts) = corpus_path("HARLETTY_AURO_DTS_CORPUS") else {
+            eprintln!("skipping: HARLETTY_AURO_DTS_CORPUS is not set to a readable file");
+            return;
+        };
+        let bytes = std::fs::read(dts).unwrap();
+        let mut bridge = AtmosBridge::new(false);
+        let mut frames = Vec::new();
+        for chunk in bytes.chunks(16 * 1024) {
+            let result = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+            assert!(result.error_message.is_empty(), "{}", result.error_message);
+            frames.extend(result.frames.into_iter());
+        }
+        assert!(
+            bridge.dts_auro.is_unfolding(),
+            "the carrier was not confirmed"
+        );
+        assert!(!bridge.has_objects(), "Auro is fixed channels, not objects");
+        assert_eq!(bridge.source_family().as_str(), "auro");
+        // Every frame that came out is the unfolded layout: the carrier was
+        // held back until the verdict, never emitted as 7.1.
+        let channels = frames[0].channel_count;
+        assert!(
+            channels > 8,
+            "expected more than the carrier's channels, got {channels}"
+        );
+        assert!(frames.iter().all(|f| f.channel_count == channels));
+        let labels = &frames[0].channel_labels;
+        assert!(
+            labels.contains(&bridge_api::RChannelLabel::Lh)
+                && labels.contains(&bridge_api::RChannelLabel::Rhs),
+            "the height layer is the height tier, not the top one: {labels:?}"
+        );
+        // The bridge declares where Auro puts every one of them.
+        let poses = bridge.fixed_channel_poses();
+        let lhs = poses
+            .iter()
+            .find(|p| p.label == bridge_api::RChannelLabel::Lhs)
+            .expect("Lhs is declared");
+        assert_eq!((lhs.azimuth_deg, lhs.elevation_deg), (-110.0, 30.0));
+        assert!(
+            poses.iter().all(|p| labels.contains(&p.label)),
+            "declared poses name only channels of the frame"
+        );
+        // Output is one block behind input, and no more.
+        let emitted: u64 = frames.iter().map(|f| u64::from(f.sample_count)).sum();
+        assert!(
+            bridge.total_samples - emitted <= 4096,
+            "{} held back",
+            bridge.total_samples - emitted
+        );
+        eprintln!(
+            "{} frames, {} channels, {emitted}/{} samples out",
+            frames.len(),
+            channels,
+            bridge.total_samples
+        );
+    }
+
     #[test]
     fn dts_raw_transport_emits_bed_frames() {
         let Some(dts) = corpus_path("HARLETTY_DTS_CORE_CORPUS") else {
@@ -1013,11 +1332,17 @@ mod raw_transport_tests {
             .find(|f| f.channel_count == 12)
             .expect("expected a 12-channel 7.1.4 frame");
         assert_eq!(f.sampling_frequency, 48_000);
-        assert!(f.metadata.is_empty(), "fixed presentation must carry no metadata");
+        assert!(
+            f.metadata.is_empty(),
+            "fixed presentation must carry no metadata"
+        );
         use bridge_api::RChannelLabel::*;
         let labels: Vec<_> = f.channel_labels.iter().copied().collect();
         // Active speakers ascending (C,L,R,Ls,Rs,LFE,Lsr,Rsr) + the height quartet.
-        assert_eq!(labels, vec![C, L, R, Ls, Rs, LFE, Lb, Rb, Tfl, Tfr, Tbl, Tbr]);
+        assert_eq!(
+            labels,
+            vec![C, L, R, Ls, Rs, LFE, Lb, Rb, Tfl, Tfr, Tbl, Tbr]
+        );
     }
 
     #[test]
@@ -1066,19 +1391,28 @@ mod raw_transport_tests {
         assert!(bridge.configure("input_codec".into(), "dts".into()));
         let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
         assert!(result.error_message.is_empty(), "{}", result.error_message);
-        assert!(!bridge.has_objects(), "D1 must remain fixed-channel");
+        assert!(bridge.has_objects(), "D1 declares its two objects");
 
         let frame = result
             .frames
             .iter()
             .find(|frame| {
-                [Tfl, Tfr, Lw, Rw, Tbl, Tbr]
+                [Tfl, Tfr, Tbl, Tbr]
                     .iter()
                     .all(|label| frame.channel_labels.contains(label))
+                    && frame
+                        .channel_labels
+                        .iter()
+                        .filter(|&&label| label == Object)
+                        .count()
+                        == 2
             })
-            .expect("no experimental fixed D1 declaration");
-        assert!(frame.metadata.is_empty());
-        assert!(!frame.channel_labels.contains(&Object));
+            .expect("no D1 presentation with four heights and two objects");
+        assert_eq!(frame.channel_count, 8 + 6);
+        assert!(
+            !frame.channel_labels.contains(&Lw),
+            "D1 carries no wide channels; its first two feeds are objects"
+        );
 
         let Some(d3_path) = corpus_path("HARLETTY_D3_CORPUS") else {
             eprintln!("skipping: HARLETTY_D3_CORPUS is not set to a readable file");
@@ -1092,10 +1426,7 @@ mod raw_transport_tests {
         assert!(bridge.configure("input_codec".into(), "dts".into()));
         let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
         assert!(result.error_message.is_empty(), "{}", result.error_message);
-        assert!(
-            bridge.has_objects(),
-            "D3 must expose object channels"
-        );
+        assert!(bridge.has_objects(), "D3 must expose object channels");
 
         let frame = result
             .frames
@@ -1106,25 +1437,142 @@ mod raw_transport_tests {
                     .iter()
                     .filter(|&&label| label == Object)
                     .count()
-                    == 8
+                    == 4
                     && frame
                         .metadata
                         .iter()
-                        .any(|metadata| metadata.name_updates.len() == 8)
+                        .any(|metadata| metadata.name_updates.len() == 4)
             })
-            .expect("no experimental D3 object declaration");
+            .expect("no D3 object declaration");
         assert_eq!(frame.channel_count, 16);
+        assert!(
+            [Tfl, Tfr, Tbl, Tbr]
+                .iter()
+                .all(|label| frame.channel_labels.contains(label)),
+            "the last four D3 feeds are the fixed heights"
+        );
         let metadata = frame
             .metadata
             .iter()
-            .find(|metadata| metadata.name_updates.len() == 8)
+            .find(|metadata| metadata.name_updates.len() == 4)
             .expect("no D3 name declaration");
-        for source in 0..8 {
+        for source in 0..4 {
             assert_eq!(
                 metadata.name_updates[source].name.as_str(),
                 format!("X{source}")
             );
         }
+        assert_eq!(
+            metadata.events.len(),
+            4,
+            "every object announces a position"
+        );
+        assert!(metadata.events.iter().all(|event| event.has_pos));
+    }
+}
+
+#[cfg(test)]
+mod dts_object_only_tests {
+    use super::*;
+    use abi_stable::std_types::RSlice;
+    use bridge_api::RInputTransport;
+
+    /// The object-only variant on a 5.1 bed presents six labeled bed channels
+    /// plus one object channel, with a position on the object.
+    #[test]
+    fn object_only_stream_presents_5_1_plus_one_object() {
+        let Some(path) = std::env::var("HARLETTY_ALT_51_CORPUS")
+            .ok()
+            .filter(|p| std::path::Path::new(p).is_file())
+        else {
+            eprintln!("skipping: HARLETTY_ALT_51_CORPUS is not set to a readable file");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read corpus");
+        let bytes = &bytes[..bytes.len().min(4_000_000)];
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("input_codec".into(), "dts".into()));
+        let result = bridge.push_packet(RSlice::from_slice(bytes), RInputTransport::Raw, 0);
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(
+            bridge.has_objects(),
+            "the object-only variant declares its object"
+        );
+        use bridge_api::RChannelLabel::*;
+        let frame = result
+            .frames
+            .iter()
+            .find(|frame| frame.metadata.iter().any(|m| m.name_updates.len() == 1))
+            .expect("no object declaration");
+        assert_eq!(frame.channel_count, 7);
+        assert_eq!(
+            frame.channel_labels.as_slice(),
+            &[C, L, R, Ls, Rs, LFE, Object]
+        );
+        let metadata = frame
+            .metadata
+            .iter()
+            .find(|m| m.name_updates.len() == 1)
+            .unwrap();
+        assert_eq!(metadata.events.len(), 1);
+        assert!(metadata.events[0].has_pos && metadata.events[0].pos[2] > 0.0);
+        assert!(result.frames.len() > 100, "corpus was not exercised");
+    }
+}
+
+#[cfg(test)]
+mod dts_object_motion_tests {
+    use super::*;
+    use abi_stable::std_types::RSlice;
+    use bridge_api::RInputTransport;
+
+    /// A D3 stream with moving objects must produce position events whose
+    /// coordinates change over time: the bridge follows the per-frame
+    /// metadata rather than freezing the first position.
+    #[test]
+    fn d3_object_positions_follow_the_stream() {
+        let Some(path) = std::env::var("HARLETTY_D3_MOTION_CORPUS")
+            .ok()
+            .filter(|p| std::path::Path::new(p).is_file())
+        else {
+            eprintln!("skipping: HARLETTY_D3_MOTION_CORPUS is not set to a readable file");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read corpus");
+        let bytes = &bytes[..bytes.len().min(8_000_000)];
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("input_codec".into(), "dts".into()));
+        let mut positions: std::collections::BTreeMap<u32, Vec<[i64; 3]>> = Default::default();
+        let mut frames = 0usize;
+        for chunk in bytes.chunks(256 * 1024) {
+            let result = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+            assert!(result.error_message.is_empty(), "{}", result.error_message);
+            for frame in result.frames.iter() {
+                frames += 1;
+                for metadata in frame.metadata.iter() {
+                    for event in metadata.events.iter() {
+                        let quantised =
+                            [event.pos[0], event.pos[1], event.pos[2]].map(|v| (v * 1000.0) as i64);
+                        let list = positions.entry(event.id).or_default();
+                        if list.last() != Some(&quantised) {
+                            list.push(quantised);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(frames > 100, "corpus was not exercised ({frames} frames)");
+        assert!(bridge.has_objects());
+        let moving = positions.values().filter(|list| list.len() > 3).count();
+        eprintln!(
+            "frames={frames} objects={} distinct positions per object={:?}",
+            positions.len(),
+            positions.values().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert!(
+            moving >= 2,
+            "at least two objects must change position: {positions:?}"
+        );
     }
 }
 

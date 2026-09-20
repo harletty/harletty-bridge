@@ -6,7 +6,9 @@ const HALF_SAMPLE_RATES: [u32; 3] = [24_000, 22_050, 16_000];
 const BLOCKS_PER_SYNCFRAME: [u8; 4] = [1, 2, 3, 6];
 
 /// Legacy AC-3 (bsid ≤ 10) frame size in 16-bit words, indexed by
-/// `frmsizecod >> 1` then `fscod`. Per ATSC A/52 §5.4.1.4 Table 5.18.
+/// `frmsizecod >> 1` then `fscod`. Per ATSC A/52 §5.4.1.4 Table 5.18 — the
+/// 44.1 kHz column holds the *even* `frmsizecod` size; see
+/// [`legacy_ac3_frame_size`] for the odd one.
 const LEGACY_AC3_FRAME_SIZE_WORDS: [[usize; 3]; 19] = [
     [64, 69, 96],
     [80, 87, 120],
@@ -28,6 +30,26 @@ const LEGACY_AC3_FRAME_SIZE_WORDS: [[usize; 3]; 19] = [
     [1152, 1253, 1728],
     [1280, 1393, 1920],
 ];
+
+/// Size in bytes of a legacy AC-3 (bsid ≤ 10) syncframe from its `fscod` and
+/// `frmsizecod` header fields (ATSC A/52 §5.4.1.4 Table 5.18), or `None` for a
+/// reserved sample-rate code or an out-of-range `frmsizecod`.
+///
+/// 1536 samples at 44.1 kHz do not divide the nominal bit rates into a whole
+/// number of words, so the table alternates between two sizes: an odd
+/// `frmsizecod` carries one extra 16-bit word. Every legacy AC-3 framing site
+/// (raw extractor, decoder, bridge sizing helpers) must go through this one
+/// function — sizing the odd frames two bytes short cut their tail off, which
+/// starved the bit reader on full frames (`ShortPacket`) and made the raw
+/// extractor resync on every frame.
+#[inline]
+pub fn legacy_ac3_frame_size(fscod: u8, frmsizecod: u8) -> Option<usize> {
+    let words = *LEGACY_AC3_FRAME_SIZE_WORDS
+        .get(usize::from(frmsizecod >> 1))?
+        .get(usize::from(fscod))?;
+    let padding_word = usize::from(fscod == 1 && frmsizecod & 1 == 1);
+    Some((words + padding_word) * 2)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
@@ -152,16 +174,12 @@ pub fn parse_legacy_ac3_header(data: &[u8]) -> Result<FrameInfo, ParseError> {
     }
     let fscod = data[4] >> 6;
     let frmsizecod = data[4] & 0x3F;
-    let bitrate_index = usize::from(frmsizecod >> 1);
     let sample_rate = SAMPLE_RATES
         .get(usize::from(fscod))
         .copied()
         .ok_or(ParseError::ReservedSampleRateCode)?;
-    let frame_size = LEGACY_AC3_FRAME_SIZE_WORDS
-        .get(bitrate_index)
-        .and_then(|row| row.get(usize::from(fscod)).copied())
-        .ok_or(ParseError::ReservedSampleRateCode)?
-        * 2;
+    let frame_size =
+        legacy_ac3_frame_size(fscod, frmsizecod).ok_or(ParseError::ReservedSampleRateCode)?;
     Ok(FrameInfo {
         stream_type: StreamType::Independent,
         substream_id: 0,
@@ -324,5 +342,33 @@ mod tests {
         assert_eq!(info.sample_rate, 16_000);
         assert_eq!(info.num_blocks, 6);
         assert_eq!(info.samples, 1536);
+    }
+
+    #[test]
+    fn legacy_ac3_frame_size_adds_the_padding_word_at_44_1_khz() {
+        // 384 kbps: frmsizecod 28/29. 48 kHz and 32 kHz have one size per
+        // bit rate; 44.1 kHz alternates 835 / 836 words.
+        assert_eq!(legacy_ac3_frame_size(0, 28), Some(1536));
+        assert_eq!(legacy_ac3_frame_size(0, 29), Some(1536));
+        assert_eq!(legacy_ac3_frame_size(1, 28), Some(1670));
+        assert_eq!(legacy_ac3_frame_size(1, 29), Some(1672));
+        assert_eq!(legacy_ac3_frame_size(2, 28), Some(2304));
+        assert_eq!(legacy_ac3_frame_size(2, 29), Some(2304));
+        // Reserved sample-rate code / frmsizecod past the table.
+        assert_eq!(legacy_ac3_frame_size(3, 0), None);
+        assert_eq!(legacy_ac3_frame_size(1, 38), None);
+    }
+
+    #[test]
+    fn parses_legacy_ac3_header_at_44_1_khz_odd_frmsizecod() {
+        // fscod=1 (44.1 kHz), frmsizecod=29 → byte 4 = 0x5D; bsid=8 → 0x40.
+        let header = [0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1];
+        let info = parse_legacy_ac3_header(&header).unwrap();
+        assert_eq!(info.sample_rate, 44_100);
+        assert_eq!(info.frame_size, 1672);
+        assert_eq!(info.bitstream_id, 8);
+
+        let even = [0x0B, 0x77, 0x00, 0x00, 0x5C, 0x40, 0xE1];
+        assert_eq!(parse_legacy_ac3_header(&even).unwrap().frame_size, 1670);
     }
 }

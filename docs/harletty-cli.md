@@ -73,6 +73,7 @@ harletty [GLOBAL OPTIONS] <COMMAND>
 
   decode   Decode a stream into audio + Atmos master files
   info     Print stream information and exit
+  taxonomy Print the label taxonomy version as JSON
   help     Print help for a command
 ```
 
@@ -102,7 +103,9 @@ harletty decode [OPTIONS] <INPUT>
 | `--format` | `caf`, `pcm`, `w64` | `caf` | Audio container. **Ignored for Atmos output**, which is always CAF; see [Output files](#output-files). `pcm` is raw 24-bit little-endian, `w64` is Wave64 with a `.wav` extension. |
 | `--no-audio` | flag | off | Skip the audio file; still write `.atmos` and `.atmos.metadata`. Much faster when you only want the object automation. |
 | `--presentation <0-3>` | index | `3` | Which TrueHD presentation to decode. `3` is the 16-channel Atmos presentation; `0`–`2` are the stereo/5.1/7.1 downmixes carried in the same stream. **TrueHD only** — silently ignored for E-AC-3 and DTS, which have no equivalent. |
-| `--bed-conform` | flag | off | Force the Atmos bed to a conformant 7.1.2 layout. |
+| `--bed-conform` | flag | off | Keep the bed to what an Atmos bed can hold. TrueHD: declare a 7.1.2 bed. DTS:X and Auro-3D: the corner heights (and wides) leave the bed for static objects at their speaker positions, so the master set can feed an Atmos encoder. |
+| `--mono-prefix PREFIX` | path | — | Write the audio as one mono 24-bit RIFF WAV per channel, `PREFIX_<n>.wav` with n from 0 in the order of the interleaved file (a master set's bed, then its objects), instead of one interleaved file; `.atmos` and `.atmos.metadata` are written as usual, and the header still names the interleaved file, which is not written. For a front end that would otherwise de-interleave the CAF itself. Not combinable with `--bed-conform` on TrueHD. |
+| `--no-fold-estimate` | flag | off | DTS:X only. A waveform whose bed fold the stream does not state is normally given a fold estimated from the bed's audio, so it plays at its position and leaves the bed. With this flag it stays in the bed and its own channel is muted. |
 | `--warp-mode` | `normal`, `warping`, `prologiciix`, `loro` | *(from stream)* | Downmix warp mode to declare when the metadata does not carry one. |
 | `--no-estimate-progress` | flag | off | Skip the pre-pass that counts frames for the progress bar. Automatic for stdin, which cannot be pre-scanned. |
 
@@ -147,6 +150,59 @@ Channel mode : 5 ch + LFE
 OAMD         : yes
 JOC          : yes
 Frames seen  : 47
+```
+
+DTS (a file or a pipe: `ffmpeg … -c copy -f dts - | harletty info -`),
+read for at most twenty seconds, usually far less:
+
+```
+Codec        : DTS-HD MA
+Channels     : 8
+Sample rate  : 48000 Hz
+Spatial      : DTS:X-7.1.4+5 (ObjectsD4: 5 objects, 4 fixed heights)
+Frames seen  : 33 (0.4 s)
+```
+
+`Spatial` names the presentation the way `decode` labels the master set
+(`DTS:X-7.1.4`, `DTS:X-7.1.4+2`, `Auro-3D-13.1 (7.1_5H_1T carried in
+7.1)`, …), or `none` for a track that carries neither.
+
+#### Machine-readable info
+
+```sh
+harletty info --json [--max-seconds SECONDS] <INPUT>
+harletty taxonomy
+```
+
+`--json` prints one JSON object on one line of stdout instead of the
+report; logs stay on stderr (`--loglevel off` silences them). It is the
+form a catalogue asks for, so that the decoders and the label set live
+here alone. `--max-seconds` stops the read after about that much audio,
+whatever the codec: the DTS report stops on its own within twenty seconds
+(give it at least two, the time a plain track takes to be called plain);
+TrueHD and E-AC-3 otherwise read the whole input. `taxonomy` prints the
+version fields alone, so a caller knows which label set a binary speaks
+before probing anything.
+
+| Field | Meaning |
+|---|---|
+| `schema` | Shape of the object. Bumped only when a field is removed or changes meaning; a field added keeps it. |
+| `harletty`, `build` | Crate version, and the build line (`git describe`, library version, timestamp). |
+| `taxonomy` | The set of strings `spatial.label` can carry. Bumped whenever a label is added or renamed. |
+| `codec` | `TrueHD`, `EAC3`, `DTS` (core only) or `DTS-HD MA`; `null` when no frame was found, with `error` saying why. |
+| `channels`, `sample_rate` | The compatible bed. TrueHD: the highest channel-based presentation. |
+| `spatial` | `null` for a plain track. Otherwise `label` (the `sourceCodec` `decode` writes), `kind` (`atmos`, `joc`, `dtsx`, `auro`), `objects` and `fixed` (waveform counts when the presentation states them), `experimental`, and for DTS:X the decoder's `presentation` name. |
+| `truehd` | `max_presentation`, `atmos`, `substreams`. |
+| `eac3` | `oamd`, `joc`, `spx` (Spectral Extension seen in use within the bound; measured only here, it takes a decode), `bitstream_id`. |
+| `auro` | `carrier` and `original` layouts. |
+| `frames_seen`, `seconds_seen` | How much was read before the report settled or the bound was reached. |
+
+```json
+{"schema":1,"harletty":"0.7.4","build":"…","taxonomy":1,"codec":"DTS-HD MA",
+ "channels":8,"sample_rate":48000,
+ "spatial":{"label":"DTS:X-7.1.4+3","kind":"dtsx","objects":3,"fixed":4,
+            "experimental":true,"presentation":"ObjectsD0"},
+ "frames_seen":1,"seconds_seen":0.0106}
 ```
 
 ## Output files
@@ -238,12 +294,24 @@ of drift.
 
 ## Known limitations
 
-- **DTS:X object positions are not decoded.** Spatial presentations are
-  exported with their channel layout and labels, but objects sit at
-  static positions; the per-frame trajectories live in a proprietary
-  extension block that this decoder does not read. A DTS:X master set is
-  therefore fine for layout inspection and useless for anything that
-  measures movement.
+- **DTS:X objects are positioned from the stream's own metadata**, frame
+  by frame, so an object that moves in the mix moves in the master set;
+  the fixed heights become bed channels. The private metadata is read
+  from corpus evidence rather than a specification, so the alternate
+  profiles (D0, D1, D3, D4, 5.1+1, 7.1.4+3) are reported as experimental. A
+  waveform whose bed fold the stream does not state has that fold
+  estimated from the bed's audio (see `--no-fold-estimate`), so it plays
+  on its own track and leaves the bed.
+- **Auro-3D is unfolded, not decoded bit-exactly.** A DTS-HD MA track
+  that carries an Auro-Codec side channel in its low bits is recognised
+  and unfolded into the layout it was encoded from: a `7.1_5H_1T` carrier
+  becomes a 13.1 master set (bed plus four corner heights, with the centre
+  height and the top as static objects, since OAMD has no names for
+  them). The unfold follows the codec's own arithmetic, whose outputs
+  are "virtually lossless" by design: expect the restored channels to sit
+  about 50 dB below the signal in error, not to match a master bit for
+  bit. The label is `Auro-3D-<count>` (`Auro-3D-13.1`, `-11.1`, `-10.1`,
+  `-9.1`, or `Auro-3D` for other layouts).
 - **ffmpeg cannot open the 6-channel CAF files this writer produces.**
   12-channel files are fine. This predates the rename and is not a
   regression — the reference implementation emits byte-identical headers
