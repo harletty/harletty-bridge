@@ -1,3 +1,0 @@
-# The Omniphony side of this pull request (placement modes, bridge_api 0.4.x).
-# CI builds against this ref instead of main. Remove before merging.
-feat/placement-modes
