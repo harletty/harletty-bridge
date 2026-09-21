@@ -177,6 +177,22 @@ impl XPresentation {
     pub fn is_experimental(self) -> bool {
         !matches!(self, Self::Height)
     }
+
+    /// The layout this presentation is named by — `7.1.4`, `7.1.4+2`,
+    /// `5.1+1`: the bed with its fixed heights, then the objects it
+    /// carries. The DAMF label is `DTS:X-` followed by this, a display
+    /// label `DTS:X ` followed by it.
+    pub fn layout_label(self) -> &'static str {
+        match self {
+            Self::Height => "7.1.4",
+            Self::ObjectD0 => "7.1.4+1",
+            Self::ObjectsD1 => "7.1.4+2",
+            Self::ObjectsD0 => "7.1.4+3",
+            Self::ObjectsD3 => "7.1.4+4",
+            Self::ObjectsD4 => "7.1.4+5",
+            Self::ObjectOnly => "5.1+1",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -199,6 +215,27 @@ mod tests {
         assert!(!XPresentation::Height.is_experimental());
         assert_eq!(XPresentation::Height.object_feeds(), 0..0);
         assert_eq!(XPresentation::Height.fixed_feeds(), 0..4);
+    }
+
+    #[test]
+    fn layout_label_counts_the_feeds() {
+        use XPresentation::*;
+        for p in [
+            Height, ObjectD0, ObjectsD1, ObjectsD3, ObjectsD4, ObjectsD0, ObjectOnly,
+        ] {
+            let label = p.layout_label();
+            let objects = label
+                .split_once('+')
+                .map(|(_, n)| n.parse::<usize>().unwrap())
+                .unwrap_or(0);
+            assert_eq!(objects, p.object_feeds().len(), "{label}");
+            let bed = if p.fixed_channels().is_empty() {
+                "5.1"
+            } else {
+                "7.1.4"
+            };
+            assert!(label.starts_with(bed), "{label}");
+        }
     }
 
     #[test]

@@ -79,6 +79,22 @@ pub(crate) enum RawCodec {
     Dts,
 }
 
+/// Which DTS carrier the frames come in: what the demux found after the
+/// core. Named the way FFmpeg names the profiles, so a host's track
+/// information reads the same on either decoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum DtsProfile {
+    /// A core frame alone (DTS, DTS-ES, DTS 96/24).
+    #[default]
+    Core,
+    /// An extension substream without a lossless asset — DTS-HD High
+    /// Resolution Audio and the other lossy extensions, of which only the
+    /// core is decoded.
+    Hd,
+    /// An extension substream with a lossless asset: DTS-HD Master Audio.
+    Ma,
+}
+
 /// Best-effort codec detection on a raw access unit, used when the host did not
 /// declare the codec via `configure("input_codec", …)`. Checks the most
 /// specific pattern first: the TrueHD major-sync word `0xF8726FBA` at offset 4,
@@ -205,6 +221,8 @@ pub(crate) struct AtmosBridge {
     /// from what the frame presented rather than from its profile, so every
     /// object-bearing presentation reaches it by the same route.
     pub(crate) dts_objects_active: bool,
+    /// The carrier of the latest DTS frame, for the source label.
+    pub(crate) dts_profile: DtsProfile,
     /// Auro-3D detection and unfolding over the lossless DTS-HD output.
     /// Holds the first frames back until the carrier question is settled.
     pub(crate) dts_auro: DtsAuroState,
@@ -287,6 +305,7 @@ impl AtmosBridge {
             dts_active: false,
             dts_fold_config: DtsFoldConfig::from_env(),
             dts_objects_active: false,
+            dts_profile: DtsProfile::default(),
             dts_auro: DtsAuroState::default(),
             presentation,
             strict,
@@ -346,6 +365,7 @@ impl AtmosBridge {
         self.dts_x = DtsXState::default();
         self.dts_active = false;
         self.dts_objects_active = false;
+        self.dts_profile = DtsProfile::default();
         self.dts_auro.reset();
         // Re-sniff after reset, but keep any host-declared codec.
         self.raw_codec = None;
@@ -985,6 +1005,50 @@ impl FormatBridge for AtmosBridge {
         })
     }
 
+    fn source_label(&self) -> RString {
+        // What the host's track information calls the stream: the carrier
+        // the demux found, then the spatial layer actually decoded over it.
+        // Nothing until a frame decoded — before that the codec path is a
+        // guess, and the host has its own.
+        if !self.is_ready() {
+            return RString::new();
+        }
+        let mut label = String::with_capacity(40);
+        if self.dts_active {
+            label.push_str(match self.dts_profile {
+                DtsProfile::Core => "DTS",
+                DtsProfile::Hd => "DTS-HD HRA",
+                DtsProfile::Ma => "DTS-HD MA",
+            });
+            if let Some(layout) = self.dts_auro.unfolded_layout() {
+                label.push_str(" + Auro-3D");
+                if let Some(name) = layout.auro_name() {
+                    label.push(' ');
+                    label.push_str(name);
+                }
+            } else if let Some(presentation) = self.dts_x.locked {
+                label.push_str(" + DTS:X ");
+                label.push_str(presentation.layout_label());
+            }
+        } else if self.eac3_active {
+            let stats = &self.eac3_diag_stats;
+            label.push_str(if stats.total_frames > stats.legacy_ac3_frames {
+                "Dolby Digital Plus"
+            } else {
+                "Dolby Digital"
+            });
+            if stats.joc_frames > 0 {
+                label.push_str(" + Dolby Atmos");
+            }
+        } else {
+            label.push_str("Dolby TrueHD");
+            if self.truehd_spatial_labels.is_some() {
+                label.push_str(" + Dolby Atmos");
+            }
+        }
+        RString::from(label)
+    }
+
     fn vbap_cartesian_defaults(&self) -> RVbapCartesianDefaults {
         // Balanced default grid size for runtime cartesian VBAP table
         // generation. The axis sizes mirror the OAMD position quantisation
@@ -1215,6 +1279,48 @@ mod raw_transport_tests {
         assert_eq!(bridge.source_family().as_str(), "dolby");
     }
 
+    /// The label names the carrier the demux found and the spatial layer
+    /// decoded over it, once a frame decoded; nothing before.
+    #[test]
+    fn source_label_names_the_carrier_and_its_spatial_layer() {
+        let mut bridge = AtmosBridge::new(false);
+        assert_eq!(bridge.source_label().as_str(), "", "nothing before a frame");
+
+        bridge.dts_active = true;
+        bridge.dts_frame_count = 1;
+        assert_eq!(bridge.source_label().as_str(), "DTS");
+        bridge.dts_profile = DtsProfile::Hd;
+        assert_eq!(bridge.source_label().as_str(), "DTS-HD HRA");
+        bridge.dts_profile = DtsProfile::Ma;
+        assert_eq!(bridge.source_label().as_str(), "DTS-HD MA");
+        bridge.dts_x.locked = Some(dca::XPresentation::Height);
+        assert_eq!(bridge.source_label().as_str(), "DTS-HD MA + DTS:X 7.1.4");
+        bridge.dts_x.locked = Some(dca::XPresentation::ObjectsD3);
+        assert_eq!(bridge.source_label().as_str(), "DTS-HD MA + DTS:X 7.1.4+4");
+
+        bridge.dts_active = false;
+        bridge.dts_frame_count = 0;
+        bridge.eac3_active = true;
+        bridge.eac3_frame_count = 1;
+        bridge.eac3_diag_stats.total_frames = 1;
+        bridge.eac3_diag_stats.legacy_ac3_frames = 1;
+        assert_eq!(bridge.source_label().as_str(), "Dolby Digital");
+        bridge.eac3_diag_stats.total_frames = 2;
+        assert_eq!(bridge.source_label().as_str(), "Dolby Digital Plus");
+        bridge.eac3_diag_stats.joc_frames = 1;
+        assert_eq!(
+            bridge.source_label().as_str(),
+            "Dolby Digital Plus + Dolby Atmos"
+        );
+
+        bridge.eac3_active = false;
+        bridge.eac3_frame_count = 0;
+        bridge.frame_count = 1;
+        assert_eq!(bridge.source_label().as_str(), "Dolby TrueHD");
+        bridge.truehd_spatial_labels = Some(RVec::new());
+        assert_eq!(bridge.source_label().as_str(), "Dolby TrueHD + Dolby Atmos");
+    }
+
     // End-to-end: feed a raw DTS core stream through the FormatBridge and check
     // it emits 5.1 bed frames with the expected channel labels. Skips when the
     // (uncommitted) corpus is absent.
@@ -1238,6 +1344,14 @@ mod raw_transport_tests {
         );
         assert!(!bridge.has_objects(), "Auro is fixed channels, not objects");
         assert_eq!(bridge.source_family().as_str(), "auro");
+        assert!(
+            bridge
+                .source_label()
+                .as_str()
+                .starts_with("DTS-HD MA + Auro-3D"),
+            "label {}",
+            bridge.source_label()
+        );
         // Every frame that came out is the unfolded layout: the carrier was
         // held back until the verdict, never emitted as 7.1.
         let channels = frames[0].channel_count;

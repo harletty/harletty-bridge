@@ -649,3 +649,22 @@ impl DtsDecodeHandler {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod presentation_label_tests {
+    use super::presentation_label;
+    use dca::XPresentation;
+
+    /// The DAMF label is the taxonomy prefix over the presentation's own
+    /// layout name, so the ranker's classification and a display label
+    /// built from `layout_label` name the same thing.
+    #[test]
+    fn damf_label_is_the_layout_label_under_the_taxonomy_prefix() {
+        use XPresentation::*;
+        for p in [
+            Height, ObjectD0, ObjectsD1, ObjectsD3, ObjectsD4, ObjectsD0, ObjectOnly,
+        ] {
+            assert_eq!(presentation_label(p), format!("DTS:X-{}", p.layout_label()));
+        }
+    }
+}

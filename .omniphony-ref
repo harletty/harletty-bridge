@@ -1,0 +1,3 @@
+# CI builds this pull request against this Omniphony ref (mgth/Omniphony#560,
+# the bridge_api that adds FormatBridge::source_label). Remove before merging.
+feat/source-label
