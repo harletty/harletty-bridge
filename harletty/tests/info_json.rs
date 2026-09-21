@@ -162,3 +162,82 @@ fn a_truehd_corpus_reports_its_presentations_within_the_bound() {
         "stops at the bound: {seconds}"
     );
 }
+
+/// A settings file in the test's own temporary directory, so the machine's
+/// own configuration — which may hold a real key — plays no part.
+fn config(name: &str, body: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    std::fs::write(&path, body).expect("write the settings file");
+    path
+}
+
+#[test]
+fn a_stream_read_without_a_key_reports_an_unchecked_signature() {
+    let Some(path) = corpus("HARLETTY_TRUEHD_CORPUS") else {
+        eprintln!("skipping: HARLETTY_TRUEHD_CORPUS is not set");
+        return;
+    };
+    let empty = config("no-key.yaml", "# no key here\n");
+    let report = harletty(&[
+        "--config",
+        empty.to_str().unwrap(),
+        "info",
+        "--json",
+        "--max-seconds",
+        "2",
+        &path,
+    ]);
+    assert_eq!(report["signature"]["state"], "unchecked");
+    assert_eq!(report["signature"]["units"], 0);
+    assert_eq!(report["signature"]["checked"], 0);
+
+    // And the same with a key configured but the check turned off.
+    let keyed = config(
+        "dummy-key.yaml",
+        &format!("evolution_key: \"{}\"\n", "00".repeat(32)),
+    );
+    let skipped = harletty(&[
+        "--config",
+        keyed.to_str().unwrap(),
+        "info",
+        "--json",
+        "--max-seconds",
+        "2",
+        "--no-signature",
+        &path,
+    ]);
+    assert_eq!(skipped["signature"]["state"], "unchecked");
+}
+
+/// A key that did not sign the stream must not verify it: whatever the
+/// corpus carries, every protection word in it is refused. A corpus that
+/// carries none says so instead, which is the other half of the contract.
+#[test]
+fn a_key_that_signed_nothing_verifies_nothing() {
+    let Some(path) = corpus("HARLETTY_TRUEHD_CORPUS") else {
+        eprintln!("skipping: HARLETTY_TRUEHD_CORPUS is not set");
+        return;
+    };
+    let wrong = config(
+        "wrong-key.yaml",
+        &format!("evolution_key: \"{}\"\n", "5a".repeat(32)),
+    );
+    let report = harletty(&[
+        "--config",
+        wrong.to_str().unwrap(),
+        "info",
+        "--json",
+        "--max-seconds",
+        "2",
+        &path,
+    ]);
+    let signature = &report["signature"];
+    assert!(signature["units"].as_u64().unwrap() > 0, "{signature}");
+    assert_eq!(signature["verified"], 0, "{signature}");
+    if signature["checked"].as_u64().unwrap() > 0 {
+        assert_eq!(signature["state"], "mismatch", "{signature}");
+        assert_eq!(signature["mismatched"], signature["checked"], "{signature}");
+    } else {
+        assert_eq!(signature["state"], "unsigned", "{signature}");
+    }
+}

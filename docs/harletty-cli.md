@@ -195,6 +195,7 @@ before probing anything.
 | `truehd` | `max_presentation`, `atmos`, `substreams`. |
 | `eac3` | `oamd`, `joc`, `spx` (Spectral Extension seen in use within the bound; measured only here, it takes a decode), `bitstream_id`. |
 | `auro` | `carrier` and `original` layouts. |
+| `signature` | TrueHD only, and only when this machine has a key: see "Checking a stream's signature". `state` is `verified`, `mismatch`, `unsigned` or `unchecked`; `units`, `frames`, `checked`, `verified` and `mismatched` are the counts behind it. |
 | `frames_seen`, `seconds_seen` | How much was read before the report settled or the bound was reached. |
 
 ```json
@@ -204,6 +205,45 @@ before probing anything.
             "experimental":true,"presentation":"ObjectsD0"},
  "frames_seen":1,"seconds_seen":0.0106}
 ```
+
+#### Checking a stream's signature
+
+```sh
+harletty [--config PATH] info [--no-signature] <INPUT>
+```
+
+A TrueHD stream's object metadata travels in Evolution frames, and each
+frame closes with a protection word: the leading byte of a keyed digest
+over the access unit that carries it. Given the key, `info` recomputes
+every one of them and says whether they check out — in the report's
+`Signature` line and in `--json`'s `signature` object:
+
+| `state` | What it means |
+|---|---|
+| `verified` | Every word read is the digest the key produces: the stream came out of an encoder holding that key and has not been re-encoded since. |
+| `mismatch` | At least one is not: something was rewritten after signing, or another key signed it. |
+| `unsigned` | Access units were read and none carried a word. Whatever wrote the stream did not sign it; a remux does not strip one. |
+| `unchecked` | No key on this machine, or `--no-signature`. Not a verdict on the stream. |
+
+The key is not part of this repository, which neither distributes one nor
+helps anyone obtain one. It is read from a local settings file — the
+path given by `--config`, else `$HARLETTY_CONFIG`, else
+`$XDG_CONFIG_HOME/harletty/config.yaml` or `~/.config/harletty/config.yaml`,
+and failing all of those the same two paths under `harlettizer/`, since the
+encoder there reads the same key from the same field:
+
+```yaml
+# ~/.config/harletty/config.yaml — local to this machine, mode 600.
+evolution_key: "0001…"   # hexadecimal
+```
+
+Two bounds on what a verdict is worth. Each digest covers only the access
+unit carrying the frame, and about one access unit in forty carries one, so
+`verified` speaks for the metadata and the encoder that wrote it, not for
+every sample. And the counts are over what was read: with `--max-seconds`
+the verdict is about the head of the stream. Checking also means parsing
+every access unit rather than the first few — about seven times what a
+whole-file report costs otherwise — which `--no-signature` turns off.
 
 ## Output files
 

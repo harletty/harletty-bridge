@@ -77,6 +77,11 @@ pub struct InfoReport {
     pub eac3: Option<Eac3Facts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auro: Option<AuroFacts>,
+    /// Whether the stream's metadata is signed by the key this machine
+    /// holds. Absent for a codec whose signature this binary cannot check,
+    /// which today is every codec but TrueHD.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
     /// Frames read before the report settled or the bound was reached.
     pub frames_seen: u64,
     /// Audio those frames cover.
@@ -122,6 +127,41 @@ pub struct Eac3Facts {
     pub bitstream_id: u8,
 }
 
+/// The Evolution protection word, as the frames read report it.
+///
+/// `state` is the verdict a caller displays:
+///
+/// - `verified`: every word read is the digest the key produces, so the
+///   metadata and the audio under it are the encoder's, unaltered;
+/// - `mismatch`: at least one is not, so something was rewritten after
+///   signing, or another key signed it;
+/// - `unsigned`: access units were read and none carried a word at all;
+/// - `unchecked`: no key on this machine, so nothing was asked. Not a
+///   verdict on the stream.
+///
+/// The counts are over the frames read, which `--max-seconds` bounds: a
+/// verdict is about the head of the stream when the read was bounded.
+///
+/// Each digest covers the access unit carrying it, and about one access unit
+/// in forty carries one, so `verified` says the stream came from an encoder
+/// holding the key and was not re-encoded since — not that every sample is
+/// accounted for.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Signature {
+    pub state: &'static str,
+    /// Access units parsed.
+    pub units: u64,
+    /// Of those, the ones carrying an Evolution frame, which is where the
+    /// object metadata and the word that signs it live.
+    pub frames: u64,
+    /// Of those, the ones carrying a protection word.
+    pub checked: u64,
+    /// Of those, the ones whose word is the digest of the key.
+    pub verified: u64,
+    /// Of those, the ones whose word is not.
+    pub mismatched: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AuroFacts {
     /// The layout the lossless bed presents (`7.1`, `5.1`).
@@ -146,6 +186,7 @@ impl InfoReport {
             truehd: None,
             eac3: None,
             auro: None,
+            signature: None,
             frames_seen: 0,
             seconds_seen: 0.0,
         }

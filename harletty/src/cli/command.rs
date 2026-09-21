@@ -39,6 +39,13 @@ pub struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = crate::codec_probe::Codec::Auto)]
     pub codec: crate::codec_probe::Codec,
 
+    /// Local settings file, holding what belongs to this machine rather than
+    /// to the input: today the key a stream's Evolution protection word is
+    /// signed with. Defaults to `~/.config/harletty/config.yaml`; see
+    /// `crate::settings`.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
     /// Choose an operation to perform.
     #[command(subcommand)]
     pub command: Commands,
@@ -145,6 +152,13 @@ pub struct InfoArgs {
     /// and E-AC-3 otherwise read the whole input.
     #[arg(long, value_name = "SECONDS")]
     pub max_seconds: Option<f64>,
+
+    /// Do not check the stream's signature even when a key is configured.
+    /// Checking one means parsing every access unit rather than the first
+    /// few, which is most of what a bounded report costs; the report then
+    /// says `unchecked`.
+    #[arg(long)]
+    pub no_signature: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
