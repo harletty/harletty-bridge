@@ -21,7 +21,10 @@ path = "src/main.rs"
 # invariant (no damf/clap/indicatif reachable from harletty-bridge).
 [dependencies]
 truehdd-macros = "0.1.1"
-truehd = { version = "0.7.2" }
+# `evo-protection`: the keyed digest an Evolution frame's protection word
+# holds. It brings in `hmac` and `sha2`; the key itself is local to the
+# machine and is never part of this repository.
+truehd = { version = "0.7.2", features = ["evo-protection"] }
 eac3 = { version = "0.8.0", path = "../eac3" }
 dca = { version = "0.8.0", path = "../dca" }
 auro = { version = "0.8.0", path = "../auro" }

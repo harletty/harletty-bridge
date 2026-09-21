@@ -23,6 +23,8 @@ mod codec_probe;
 mod dts_to_oamd;
 mod eac3_to_oamd;
 mod input;
+mod settings;
+mod signature;
 pub(crate) mod timestamp;
 
 /// Identifies this binary in the `creationTool` field of every master set it
