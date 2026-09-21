@@ -25,14 +25,25 @@ pub fn cmd_info(args: &InfoArgs, cli: &Cli, multi: Option<&MultiProgress>) -> Re
         // Keeps reading the same handle: the input may be a pipe.
         return super::dts_info::cmd_info_dts(&mut probe_reader, prefix, args);
     }
-    drop(probe_reader);
-
-    if codec == Codec::Eac3 {
-        return cmd_info_eac3(args);
-    }
 
     if args.matrices || args.params || args.filters || args.stats {
+        drop(probe_reader);
         return super::inspect::run(args, cli);
+    }
+
+    // The report reads the input from its first byte. The probe already
+    // took up to eight kilobytes of it: a file is simply opened again, but a
+    // pipe cannot be, and a short head piped in — a catalogue probe sends a
+    // few hundred bytes of TrueHD — would otherwise be gone entirely.
+    let reader = if probe_reader.is_pipe() {
+        probe_reader.replaying(prefix)
+    } else {
+        drop(probe_reader);
+        InputReader::new(&args.input)?
+    };
+
+    if codec == Codec::Eac3 {
+        return cmd_info_eac3(args, reader);
     }
 
     log::info!("Analyzing TrueHD stream: {}", args.input.display());
@@ -49,14 +60,8 @@ pub fn cmd_info(args: &InfoArgs, cli: &Cli, multi: Option<&MultiProgress>) -> Re
             .map(|key| Verifier::new(key, settings.from.as_deref()))
     };
 
-    let analysis_result = analyze_stream(
-        &args.input,
-        cli,
-        multi,
-        args.json,
-        args.max_seconds,
-        verifier,
-    )?;
+    let analysis_result =
+        analyze_stream(reader, cli, multi, args.json, args.max_seconds, verifier)?;
 
     if args.json {
         return truehd_report(analysis_result.as_ref()).print();
@@ -76,10 +81,9 @@ pub fn cmd_info(args: &InfoArgs, cli: &Cli, multi: Option<&MultiProgress>) -> Re
     Ok(())
 }
 
-fn cmd_info_eac3(args: &InfoArgs) -> Result<()> {
+fn cmd_info_eac3(args: &InfoArgs, mut reader: InputReader) -> Result<()> {
     log::info!("Analyzing EAC3 stream: {}", args.input.display());
 
-    let mut reader = InputReader::new(&args.input)?;
     let mut extractor = eac3::Extractor::default();
     // Spectral Extension shows only in a decoded frame; the text report
     // never paid for that decode and still does not.
@@ -261,14 +265,13 @@ fn truehd_report(analysis: Option<&AnalysisResultTuple>) -> InfoReport {
 /// about that much audio past the major sync. `quiet` keeps the running
 /// report off stdout, for a caller that wants the JSON alone.
 fn analyze_stream(
-    input_path: &std::path::Path,
+    mut input_reader: InputReader,
     cli: &Cli,
     multi: Option<&MultiProgress>,
     quiet: bool,
     max_seconds: Option<f64>,
     verifier: Option<Verifier>,
 ) -> Result<Option<AnalysisResultTuple>> {
-    let mut input_reader = InputReader::new(input_path)?;
     let mut extractor = Extractor::default();
     let mut parser = Parser::default();
 
@@ -556,8 +559,8 @@ fn describe(signature: &Outcome) -> String {
         .unwrap_or_default();
     match signature.state() {
         State::Unchecked => "not checked: no key configured, see `--config`".to_string(),
-        State::Unsigned if tally.frames == 0 => format!(
-            "none: no Evolution frame in {} access unit(s), so there is nothing to sign",
+        State::Absent => format!(
+            "absent: no Evolution frame in {} access unit(s), so there is nothing to sign",
             tally.units
         ),
         State::Unsigned => format!(

@@ -237,7 +237,69 @@ fn a_key_that_signed_nothing_verifies_nothing() {
     if signature["checked"].as_u64().unwrap() > 0 {
         assert_eq!(signature["state"], "mismatch", "{signature}");
         assert_eq!(signature["mismatched"], signature["checked"], "{signature}");
-    } else {
+    } else if signature["frames"].as_u64().unwrap() > 0 {
         assert_eq!(signature["state"], "unsigned", "{signature}");
+    } else {
+        assert_eq!(signature["state"], "absent", "{signature}");
     }
+}
+
+/// `harletty info --json -` with `input` on stdin, the way a catalogue sends
+/// the head of a stream it copied out of a container.
+fn harletty_piped(args: &[&str], input: &[u8]) -> Value {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_harletty"))
+        .args(["--loglevel", "off"])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run harletty");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let bytes = input.to_vec();
+    // The decoder may stop reading before the input ends; the write then
+    // fails harmlessly.
+    let feeder = std::thread::spawn(move || {
+        let _ = stdin.write_all(&bytes);
+    });
+    let output = child.wait_with_output().expect("wait for harletty");
+    let _ = feeder.join();
+    assert!(
+        output.status.success(),
+        "harletty {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("one JSON object on stdout")
+}
+
+/// A pipe cannot be reopened at its first byte the way a file can, so the
+/// bytes the codec probe read have to be read again: the same stream piped in
+/// reports what it reports from a file, first frames included.
+#[test]
+fn a_piped_stream_reads_like_the_same_file() {
+    let path = fixture("joc_atmos_1s.eac3");
+    let from_file = harletty(&["info", "--json", path.to_str().unwrap()]);
+    let piped = harletty_piped(&["info", "--json", "-"], &std::fs::read(&path).unwrap());
+    assert_eq!(piped["codec"], "EAC3");
+    assert_eq!(piped["frames_seen"], from_file["frames_seen"]);
+    assert_eq!(piped["spatial"], from_file["spatial"]);
+}
+
+/// A TrueHD head shorter than the codec probe's own read — a catalogue
+/// sends a few hundred bytes — is the whole of what arrives, and still has
+/// to be read as TrueHD.
+#[test]
+fn a_short_truehd_head_piped_in_is_still_truehd() {
+    let Some(path) = corpus("HARLETTY_TRUEHD_CORPUS") else {
+        eprintln!("skipping: HARLETTY_TRUEHD_CORPUS is not set");
+        return;
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let head = &bytes[..bytes.len().min(4096)];
+    let report = harletty_piped(&["info", "--json", "--max-seconds", "4", "-"], head);
+    assert_eq!(report["codec"], "TrueHD", "{report}");
+    assert!(report["frames_seen"].as_u64().unwrap() > 0, "{report}");
 }
