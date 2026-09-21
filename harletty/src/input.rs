@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Cursor, Read};
 use std::path::Path;
 
 use anyhow::Result;
@@ -37,6 +37,17 @@ impl InputReader {
     /// Check if this is pipe input
     pub fn is_pipe(&self) -> bool {
         self.is_pipe
+    }
+
+    /// The same input with `prefix` read again before the rest of it: what a
+    /// probe of a pipe has to hand back, since a pipe cannot be reopened at
+    /// its first byte the way a file can.
+    pub fn replaying(mut self, prefix: Vec<u8>) -> Self {
+        if !prefix.is_empty() {
+            let rest = std::mem::replace(&mut self.reader, Box::new(io::empty()));
+            self.reader = Box::new(Cursor::new(prefix).chain(rest));
+        }
+        self
     }
 
     /// Read all remaining data for non-streaming use cases

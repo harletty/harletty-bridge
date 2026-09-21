@@ -135,7 +135,10 @@ pub struct Eac3Facts {
 ///   metadata and the audio under it are the encoder's, unaltered;
 /// - `mismatch`: at least one is not, so something was rewritten after
 ///   signing, or another key signed it;
-/// - `unsigned`: access units were read and none carried a word at all;
+/// - `unsigned`: Evolution frames were read and none carried a word;
+/// - `absent`: no Evolution frame was read — a stream without object
+///   metadata, or a read too short to reach the first one — so there was
+///   nothing to sign;
 /// - `unchecked`: no key on this machine, so nothing was asked. Not a
 ///   verdict on the stream.
 ///

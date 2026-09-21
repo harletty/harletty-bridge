@@ -41,7 +41,11 @@ use truehd::structs::evolution::EvoProtectionStatus;
 pub enum State {
     /// No key on this machine, so the question was not asked.
     Unchecked,
-    /// Access units were read, none carried a protection word.
+    /// No Evolution frame in what was read: a stream without object
+    /// metadata, or a read too short to reach its first frame. There is
+    /// nothing to sign, so this says nothing about how the stream was made.
+    Absent,
+    /// Evolution frames were read, and none carried a protection word.
     Unsigned,
     /// Every protection word read is the digest the key produces.
     Verified,
@@ -54,6 +58,7 @@ impl State {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unchecked => "unchecked",
+            Self::Absent => "absent",
             Self::Unsigned => "unsigned",
             Self::Verified => "verified",
             Self::Mismatch => "mismatch",
@@ -83,8 +88,10 @@ impl Tally {
             State::Mismatch
         } else if self.checked > 0 {
             State::Verified
-        } else {
+        } else if self.frames > 0 {
             State::Unsigned
+        } else {
+            State::Absent
         }
     }
 }
@@ -199,6 +206,19 @@ mod tests {
             ..Tally::default()
         };
         assert_eq!(tally.state(), State::Unsigned);
+    }
+
+    /// A plain 7.1 stream, or a read that stopped before the first frame:
+    /// nothing carried metadata, so nothing could have been signed, and
+    /// calling it unsigned would accuse a stream of something it never had.
+    #[test]
+    fn a_stream_without_frames_is_absent_not_unsigned() {
+        let tally = Tally {
+            units: 8,
+            ..Tally::default()
+        };
+        assert_eq!(tally.state(), State::Absent);
+        assert_eq!(tally.state().as_str(), "absent");
     }
 
     #[test]
