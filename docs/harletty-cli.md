@@ -195,7 +195,7 @@ before probing anything.
 | `truehd` | `max_presentation`, `atmos`, `substreams`. |
 | `eac3` | `oamd`, `joc`, `spx` (Spectral Extension seen in use within the bound; measured only here, it takes a decode), `bitstream_id`. |
 | `auro` | `carrier` and `original` layouts. |
-| `signature` | TrueHD only, and only when this machine has a key: see "Checking a stream's signature". `state` is `verified`, `mismatch`, `unsigned`, `absent` or `unchecked`; `units`, `frames`, `checked`, `verified` and `mismatched` are the counts behind it. |
+| `signature` | TrueHD only, and only when this machine has a key: see "Checking a stream's signature". `state` is `verified`, `mismatch`, `unsigned`, `absent` or `unchecked`; `units`, `frames`, `checked`, `verified`, `mismatched`, `sync_checked` and `sync_verified` are the counts behind it. |
 | `frames_seen`, `seconds_seen` | How much was read before the report settled or the bound was reached. |
 
 ```json
@@ -220,8 +220,8 @@ every one of them and says whether they check out — in the report's
 
 | `state` | What it means |
 |---|---|
-| `verified` | Every word read is the digest the key produces: the stream came out of an encoder holding that key and has not been re-encoded since. |
-| `mismatch` | At least one is not: something was rewritten after signing, or another key signed it. |
+| `verified` | No word failed in a unit without a major sync, and at least one word is the digest the key produces: the stream came out of an encoder holding that key and has not been re-encoded since. |
+| `mismatch` | A word in a unit without a major sync is not the key's digest: something was rewritten after signing, or another key signed it. |
 | `unsigned` | Evolution frames were read and none carried a word. Whatever wrote the stream did not sign it; a remux does not strip one. |
 | `absent` | No Evolution frame was read: a stream without object metadata, or a read too short to reach the first one — they come about one access unit in forty. Nothing could have been signed. |
 | `unchecked` | No key on this machine, or `--no-signature`. Not a verdict on the stream. |
@@ -237,6 +237,17 @@ encoder there reads the same key from the same field:
 # ~/.config/harletty/config.yaml — local to this machine, mode 600.
 evolution_key: "0001…"   # hexadecimal
 ```
+
+Words carried in an access unit that also carries a major sync are counted
+apart (`sync_checked`, `sync_verified`) and a failure among them does not
+decide the verdict. Measured across a library of commercial discs: every
+word in a unit without a major sync verified, in every title, while the
+words in major-sync units verified in some titles and failed in others — all
+of them in one, a few in another. Whether a tool rewrote those headers after
+encoding or the digest covers them differently is not established; either
+way, such a failure next to thousands of units that verify is no evidence of
+a re-encode. A match in a major-sync unit still counts, since no digest can
+be produced without the key.
 
 Two bounds on what a verdict is worth. Each digest covers only the access
 unit carrying the frame, and about one access unit in forty carries one, so

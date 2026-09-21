@@ -131,10 +131,12 @@ pub struct Eac3Facts {
 ///
 /// `state` is the verdict a caller displays:
 ///
-/// - `verified`: every word read is the digest the key produces, so the
-///   metadata and the audio under it are the encoder's, unaltered;
-/// - `mismatch`: at least one is not, so something was rewritten after
-///   signing, or another key signed it;
+/// - `verified`: no word in a unit without a major sync failed and at least
+///   one word is the digest the key produces, so the metadata and the audio
+///   under it are the encoder's, unaltered;
+/// - `mismatch`: a word in a unit without a major sync is not the key's
+///   digest, so something was rewritten after signing, or another key
+///   signed it;
 /// - `unsigned`: Evolution frames were read and none carried a word;
 /// - `absent`: no Evolution frame was read — a stream without object
 ///   metadata, or a read too short to reach the first one — so there was
@@ -157,12 +159,18 @@ pub struct Signature {
     /// Of those, the ones carrying an Evolution frame, which is where the
     /// object metadata and the word that signs it live.
     pub frames: u64,
-    /// Of those, the ones carrying a protection word.
+    /// Of those, in units without a major sync, the ones carrying a
+    /// protection word: the words the verdict rests on.
     pub checked: u64,
     /// Of those, the ones whose word is the digest of the key.
     pub verified: u64,
     /// Of those, the ones whose word is not.
     pub mismatched: u64,
+    /// Words in units that also carry a major sync, reported apart: on some
+    /// commercial discs they fail while every other unit verifies, so a
+    /// failure there does not decide the verdict. A match there counts.
+    pub sync_checked: u64,
+    pub sync_verified: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
