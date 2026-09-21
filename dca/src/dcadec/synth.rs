@@ -494,7 +494,10 @@ impl SynthState {
     /// Synthesize PCM for all primary channels + LFE of the decoded core frame.
     /// Returns `(fullband_channels, lfe)` as f32 in [-1, 1], in DCA primary
     /// channel order (caller maps to bed labels via `core::primary_bed_layout`).
-    pub(crate) fn synthesize(&mut self, dec: &mut CoreDecoder) -> (Vec<Vec<f32>>, Option<Vec<f32>>) {
+    pub(crate) fn synthesize(
+        &mut self,
+        dec: &mut CoreDecoder,
+    ) -> (Vec<Vec<f32>>, Option<Vec<f32>>) {
         let nch = dec.nchannels();
         let npcmblocks = dec.npcmblocks();
         let nsamples = npcmblocks * 32;
@@ -547,6 +550,9 @@ impl SynthState {
 pub(crate) struct CoreOutput {
     /// `samples[spkr]` = Some(int32 24-bit PCM) for active speakers.
     pub(crate) samples: Vec<Option<Vec<i32>>>,
+    /// The bare extension set's channels, in set order: waveforms with no
+    /// speaker of their own (a lossy carrier's DTS:X heights).
+    pub(crate) extension: Vec<Vec<i32>>,
     pub(crate) npcmsamples: usize,
     pub(crate) output_rate: u32,
     pub(crate) ch_mask: u32,
@@ -584,6 +590,7 @@ impl SynthState {
         };
 
         let mut samples: Vec<Option<Vec<i32>>> = (0..DCA_SPEAKER_COUNT).map(|_| None).collect();
+        let mut extension: Vec<Vec<i32>> = Vec::with_capacity(dec.extension_channels().len());
 
         for ch in 0..nch {
             let mut subs: [&[i32]; DCA_SUBBANDS] = [&[]; DCA_SUBBANDS];
@@ -613,7 +620,10 @@ impl SynthState {
                     dst[j * 32..j * 32 + 32].copy_from_slice(&out);
                 }
             }
-            samples[dec.primary_speaker(ch)] = Some(dst);
+            match dec.speaker_for(ch) {
+                Some(spkr) => samples[spkr] = Some(dst),
+                None => extension.push(dst),
+            }
         }
 
         if dec.lfe_present() == 2 {
@@ -630,8 +640,13 @@ impl SynthState {
             samples[DCA_SPEAKER_LFE1] = Some(lfe);
         }
 
+        // An XXCH encoder's fold of its channels into the core comes out
+        // here, after every channel is synthesized (`ff_dca_core_filter_fixed`).
+        dec.undo_xxch_dmix(&mut samples);
+
         CoreOutput {
             samples,
+            extension,
             npcmsamples: nsamples,
             output_rate: if x96_synth {
                 dec.sample_rate() * 2

@@ -43,7 +43,7 @@ fn corpus(variable: &str) -> Option<String> {
 fn taxonomy_reports_its_versions() {
     let versions = harletty(&["taxonomy"]);
     assert_eq!(versions["schema"], 1);
-    assert_eq!(versions["taxonomy"], 2);
+    assert_eq!(versions["taxonomy"], 3);
     assert_eq!(versions["harletty"], env!("CARGO_PKG_VERSION"));
     assert!(versions["build"].as_str().is_some_and(|s| !s.is_empty()));
 }
@@ -53,7 +53,7 @@ fn the_joc_fixture_reports_its_presentation_and_stops_at_the_bound() {
     let path = fixture("joc_atmos_1s.eac3");
     let report = harletty(&["info", "--json", path.to_str().unwrap()]);
     assert_eq!(report["schema"], 1);
-    assert_eq!(report["taxonomy"], 2);
+    assert_eq!(report["taxonomy"], 3);
     assert_eq!(report["codec"], "EAC3");
     assert_eq!(report["channels"], 6);
     assert_eq!(report["sample_rate"], 48_000);

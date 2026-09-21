@@ -1418,6 +1418,48 @@ mod raw_transport_tests {
         assert_eq!(labels, vec![C, L, R, Ls, Rs, LFE]);
     }
 
+    // End-to-end lossy carrier (DTS-HD HRA + DTS:X): the core + XXCH bed and
+    // the height quartet come out as the same fixed 7.1.4 shape as a
+    // lossless carrier's, named for what it is.
+    #[test]
+    fn lossy_carrier_raw_transport_emits_labeled_7_1_4_channels() {
+        let Some(dump) = corpus_path("HARLETTY_LOSSY_X_CORPUS") else {
+            eprintln!("skipping: HARLETTY_LOSSY_X_CORPUS is not set to a readable file");
+            return;
+        };
+        let bytes = std::fs::read(dump).unwrap();
+        let chunk = &bytes[..bytes.len().min(2_000_000)];
+        let mut bridge = AtmosBridge::new(false);
+        bridge.configure("input_codec".into(), "dts".into());
+        let result = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(!result.frames.is_empty(), "no HD frames decoded");
+        assert!(!bridge.has_objects());
+        assert_eq!(bridge.dts_profile, DtsProfile::Hd);
+        assert_eq!(bridge.source_family().as_str(), "dts");
+        assert_eq!(bridge.source_label().as_str(), "DTS-HD HRA + DTS:X 7.1.4");
+        let f = result
+            .frames
+            .iter()
+            .find(|f| f.channel_count == 12)
+            .expect("expected a 12-channel 7.1.4 frame");
+        assert_eq!(f.sampling_frequency, 48_000);
+        use bridge_api::RChannelLabel::*;
+        let labels: Vec<_> = f.channel_labels.iter().copied().collect();
+        assert_eq!(
+            labels,
+            vec![C, L, R, Ls, Rs, LFE, Lb, Rb, Tfl, Tfr, Tbl, Tbr]
+        );
+        // Every frame after the lock has the full shape: the extension
+        // decodes on every frame, no dropout.
+        let first = result
+            .frames
+            .iter()
+            .position(|f| f.channel_count == 12)
+            .unwrap();
+        assert!(result.frames[first..].iter().all(|f| f.channel_count == 12));
+    }
+
     // End-to-end DTS-HD MA: feed the raw 7.1 dump and check it emits 8-channel
     // lossless bed frames. Skips when the (uncommitted) dump is absent.
     #[test]

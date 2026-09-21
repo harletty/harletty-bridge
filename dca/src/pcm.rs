@@ -24,7 +24,7 @@ impl From<CoreError> for DecodeError {
     fn from(e: CoreError) -> Self {
         match e {
             CoreError::Bitstream => DecodeError::Bitstream,
-            CoreError::Invalid(s) => DecodeError::Invalid(s),
+            CoreError::Invalid(s) | CoreError::Unsupported(s) => DecodeError::Invalid(s),
         }
     }
 }

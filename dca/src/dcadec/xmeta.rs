@@ -140,7 +140,7 @@ const STANDARD_HEIGHTS: [SpatialChannel; 4] = [
     SpatialChannel::TopBackLeft,
     SpatialChannel::TopBackRight,
 ];
-const FIXED_HEIGHT_COUNT: usize = 4;
+pub(crate) const FIXED_HEIGHT_COUNT: usize = 4;
 /// Unread type-3 control word; every corpus stream carries this value.
 const TYPE3_CONTROL: u32 = 0x3fa;
 const UNITY_CODE: u32 = 61;
@@ -723,11 +723,18 @@ fn parse_standard(payload: &[u8], source_count: usize) -> R<XMetadata> {
     }
     b.expect(5, 2, "matrix header field")?;
     b.expect(6, 0, "matrix header value")?;
-    b.expect(1, 1, "matrix mode")?;
+    // Set on a lossless carrier (XLL-X), clear on a lossy one (the
+    // extension after an XXCH asset), which also states no level in its
+    // layout header, carries two reserved bits before its rows and one
+    // trailing byte after them. Its rows read the same.
+    let lossless_form = b.read(1)? != 0;
     b.expect(1, 0, "optional matrix parameters")?;
     b.expect(1, 1, "inline matrix flag")?;
     b.expect(6, UNITY_CODE, "matrix scale")?;
     b.expect(1, 0, "additional scales")?;
+    if !lossless_form {
+        b.expect(2, 0, "lossy matrix reserved")?;
+    }
     let mut sources = [None; MAX_SOURCES];
     for (feed, &height) in STANDARD_HEIGHTS.iter().enumerate() {
         let mask = b.read(REFERENCE_CHANNELS)?;
@@ -741,6 +748,11 @@ fn parse_standard(payload: &[u8], source_count: usize) -> R<XMetadata> {
         });
     }
     b.align("matrix padding")?;
+    if !lossless_form {
+        // Meaning unknown (0x54 across the corpus); it follows the rows, so
+        // it cannot change what they said, and the CRC still covers it.
+        b.read(8)?;
+    }
     let protected = b.pos / 8 + 2;
     let bytes = payload.get(..protected).ok_or(XMetadataError::Truncated)?;
     if crc16_ccitt(bytes) != 0 {
@@ -774,9 +786,11 @@ fn layout_header(b: &mut Bits<'_>, kind: u32, inherited: u32) -> R<(u32, u32)> {
         b.expect(4, 0, "implicit reference field")?;
         inherited
     };
-    b.expect(1, 1, "level field present")?;
-    b.expect(6, UNITY_CODE, "level code")?;
-    b.expect(1, 0, "additional level")?;
+    // A lossless carrier states a unity level here; a lossy one none.
+    if b.read(1)? != 0 {
+        b.expect(6, UNITY_CODE, "level code")?;
+        b.expect(1, 0, "additional level")?;
+    }
     let width = 4 * (b.read(3)? as usize + 1);
     let output_mask = b.read(width)?;
     if output_mask & reference_mask != reference_mask {
@@ -1671,6 +1685,44 @@ mod tests {
     use super::*;
 
     const Q55: f32 = 23170.0 / 32768.0;
+
+    /// The type-2 matrix a lossy carrier's extension opens with reads the
+    /// same fold as the lossless profile's: the four fixed heights into
+    /// L, R, Lsr and Rsr at 0.707. Its envelope differs (no level field,
+    /// matrix form flag clear, two reserved bits, a trailing byte).
+    #[test]
+    fn lossy_carrier_wrapper_states_the_standard_fold() {
+        let lossless: [u8; 22] = [
+            0x02, 0x00, 0x08, 0x50, 0x28, 0x4b, 0xfa, 0x71, 0x0d, 0x62, 0x02, 0xfa, 0x02, 0xdc,
+            0x13, 0x71, 0x0d, 0xc8, 0x37, 0x3c, 0xf1, 0x02,
+        ];
+        let lossy: [u8; 22] = [
+            0x02, 0x00, 0x08, 0x50, 0x28, 0x4b, 0x38, 0x86, 0xb1, 0x00, 0x7d, 0x00, 0x5b, 0x82,
+            0x6e, 0x21, 0xb9, 0x06, 0xe0, 0x54, 0x8f, 0x00,
+        ];
+        let from_lossless = XMetadata::parse(&lossless, 4).expect("lossless wrapper");
+        let from_lossy = XMetadata::parse(&lossy, 4).expect("lossy wrapper");
+        assert_eq!(from_lossless, from_lossy);
+        assert_eq!(from_lossy.source_count(), 4);
+        for (feed, (height, column)) in STANDARD_HEIGHTS.iter().zip([1usize, 2, 4, 5]).enumerate() {
+            let source = from_lossy.source(feed).expect("height source");
+            assert_eq!(source.role, SourceRole::Height(*height));
+            let BedFold::Known(row) = source.fold else {
+                panic!("feed {feed}: fold not stated");
+            };
+            for (c, &gain) in row.iter().enumerate() {
+                let expected = if c == column { Q55 } else { 0.0 };
+                assert!(
+                    (gain - expected).abs() < 1e-6,
+                    "feed {feed} column {c}: {gain}"
+                );
+            }
+        }
+        // A corrupted trailer fails the CRC, as any other byte would.
+        let mut damaged = lossy;
+        damaged[19] ^= 0x01;
+        assert!(XMetadata::parse(&damaged, 4).is_err());
+    }
 
     #[test]
     fn gain_codes_follow_the_downmix_table_at_the_verified_points() {

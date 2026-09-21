@@ -15,8 +15,8 @@ use super::dts_handler::DtsFrameMessage;
 use crate::input::InputReader;
 use anyhow::Result;
 use dca::{
-    HdDecoder, HdError, PcmDecoder, XMetadata, XPresentation, exss_has_xll, exss_substream_size,
-    parse_header,
+    ExssKind, HdDecoder, HdError, PcmDecoder, XMetadata, XPresentation, exss_kind,
+    exss_substream_size, parse_header,
 };
 use indicatif::ProgressBar;
 use std::path::PathBuf;
@@ -127,9 +127,11 @@ fn drain_frames(
             }
             frame_size = core_size + exss_size;
             let candidate = &rest[core_size..core_size + exss_size];
-            // No XLL asset means nothing lossless to reconstruct; fall back to
-            // the core, which every such stream still carries.
-            if exss_has_xll(candidate) {
+            // Nothing beyond the core to reconstruct (an XBR-only lossy
+            // extension) means the core, which every such stream still
+            // carries; a lossless asset or a lossy carrier's channel sets go
+            // through the HD decoder.
+            if exss_kind(candidate) != ExssKind::Core {
                 exss = Some(candidate);
             }
         }
@@ -206,6 +208,17 @@ fn decode_one(
                     .lossless_samples()
                     .map(|(speaker, samples)| (speaker, samples.to_vec()))
                     .collect();
+                if lossless.is_empty() {
+                    // A lossy carrier: no side channel to read, the frame
+                    // goes out as it is.
+                    auro.not_a_carrier(tx);
+                    let _ = tx.send(Ok(DtsFrameMessage::Hd {
+                        frame: Box::new(frame),
+                        presentation,
+                        metadata,
+                    }));
+                    return Ok(());
+                }
                 auro.frame(
                     Box::new(frame),
                     presentation,

@@ -189,7 +189,7 @@ before probing anything.
 | `schema` | Shape of the object. Bumped only when a field is removed or changes meaning; a field added keeps it. |
 | `harletty`, `build` | Crate version, and the build line (`git describe`, library version, timestamp). |
 | `taxonomy` | The set of strings `spatial.label` can carry. Bumped whenever a label is added or renamed. |
-| `codec` | `TrueHD`, `EAC3`, `DTS` (core only) or `DTS-HD MA`; `null` when no frame was found, with `error` saying why. |
+| `codec` | `TrueHD`, `EAC3`, `DTS` (core only), `DTS-HD HRA` (core + XXCH, with its DTS:X extension when it carries one) or `DTS-HD MA`; `null` when no frame was found, with `error` saying why. |
 | `channels`, `sample_rate` | The compatible bed. TrueHD: the highest channel-based presentation. |
 | `spatial` | `null` for a plain track. Otherwise `label` (the `sourceCodec` `decode` writes), `kind` (`atmos`, `joc`, `dtsx`, `auro`), `objects` and `fixed` (waveform counts when the presentation states them), `experimental`, and for DTS:X the decoder's `presentation` name. |
 | `truehd` | `max_presentation`, `atmos`, `substreams`. |

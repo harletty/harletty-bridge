@@ -1,16 +1,86 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// High-level DTS-HD Master Audio decode: ties the core (residual base), EXSS
-// parser, and XLL lossless decoder together to produce the lossless 5.1/7.1
-// bed. One DTS-HD frame = a core access unit + the following EXSS substream.
+// High-level DTS-HD decode. One DTS-HD frame = a core access unit + the
+// following EXSS substream. Two carriers come out of it:
+//
+// - DTS-HD Master Audio: the core (residual base), the EXSS parser and the
+//   XLL lossless decoder together produce the lossless 5.1/7.1 bed, and the
+//   XLL-X extension its DTS:X waveforms.
+// - A lossy carrier (DTS-HD High Resolution Audio): the core plus the XXCH
+//   component produce the 7.1 bed, and the DTS:X extension that follows the
+//   asset — a bare channel set in the core syntax — its four height feeds.
+//   Both are decoded by the core decoder.
 
-use crate::dcadec::core::CoreDecoder;
+use crate::dcadec::core::{CoreDecoder, CoreError};
 use crate::dcadec::exss::ExssParser;
 use crate::dcadec::synth::SynthState;
-use crate::dcadec::xll::{XllDecoder, XllError};
-use crate::parser::{parse_header, ParseError};
+use crate::dcadec::xll::{DCA_SYNCWORD_XLL_X, XllDecoder, XllError, crc16_ccitt};
+use crate::dcadec::xmeta::FIXED_HEIGHT_COUNT;
+use crate::parser::{ParseError, parse_header};
 
 const PCM_SCALE: f32 = 8_388_608.0; // 2^23
+
+/// The bytes of a lossy carrier's DTS:X extension before its channel set:
+/// the 22-byte wrapper the metadata reader parses (the fold matrix and its
+/// CRC16), four bytes constant across the corpus, a CRC16-protected
+/// navigation (two constant bytes, then the size of everything after it —
+/// the set and the substream's padding), and one constant byte.
+const LOSSY_EXTENSION_WRAPPER: usize = 22;
+const LOSSY_EXTENSION_SET_OFFSET: usize = 33;
+const LOSSY_EXTENSION_CONSTANT: [u8; 4] = [0x75, 0x9a, 0x19, 0x08];
+const LOSSY_EXTENSION_NAVIGATION_HEAD: [u8; 2] = [0x00, 0x40];
+const LOSSY_EXTENSION_SET_MARKER: u8 = 0x02;
+
+/// The bare channel set inside a lossy carrier's DTS:X extension `blob`
+/// (marker included), once the container around it reads as expected.
+fn lossy_extension_set(blob: &[u8]) -> Result<&[u8], &'static str> {
+    let nav = blob
+        .get(LOSSY_EXTENSION_WRAPPER..LOSSY_EXTENSION_SET_OFFSET)
+        .ok_or("short lossy extension")?;
+    if nav[..4] != LOSSY_EXTENSION_CONSTANT
+        || nav[4..6] != LOSSY_EXTENSION_NAVIGATION_HEAD
+        || nav[10] != LOSSY_EXTENSION_SET_MARKER
+    {
+        return Err("lossy extension container");
+    }
+    if crc16_ccitt(&nav[4..10]) != 0 {
+        return Err("lossy extension navigation crc");
+    }
+    let size = u16::from_be_bytes([nav[6], nav[7]]) as usize;
+    if size != blob.len() - LOSSY_EXTENSION_SET_OFFSET {
+        return Err("lossy extension size");
+    }
+    Ok(&blob[LOSSY_EXTENSION_SET_OFFSET..])
+}
+
+fn core_error_kind(error: &CoreError) -> &'static str {
+    match error {
+        CoreError::Bitstream => "bitstream",
+        CoreError::Invalid(kind) | CoreError::Unsupported(kind) => kind,
+    }
+}
+
+/// What an EXSS substream carries for [`HdDecoder`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExssKind {
+    /// An XLL asset: DTS-HD Master Audio, decoded losslessly.
+    Lossless,
+    /// No XLL, but an XXCH component and/or a DTS:X extension after the
+    /// asset: a lossy carrier the decoder reconstructs beyond the core.
+    Lossy,
+    /// Nothing the decoder reads beyond the core (XBR-only HRA, or an
+    /// unparseable substream): callers decode the DTS core alone.
+    Core,
+}
+
+/// Classify the EXSS at `data` (which must begin at the 0x64582025 syncword).
+pub fn exss_kind(data: &[u8]) -> ExssKind {
+    match ExssParser::parse(data) {
+        Ok(p) if p.has_xll() => ExssKind::Lossless,
+        Ok(p) if p.has_xxch() || p.extension_after_asset(data).is_some() => ExssKind::Lossy,
+        _ => ExssKind::Core,
+    }
+}
 
 #[derive(Debug)]
 pub enum HdError {
@@ -28,7 +98,8 @@ impl From<ParseError> for HdError {
     }
 }
 
-/// One decoded DTS-HD frame: lossless PCM indexed by DCA speaker, plus the
+/// One decoded DTS-HD frame: PCM indexed by DCA speaker (lossless for a
+/// Master Audio carrier, core + XXCH for a lossy one), plus the
 /// active-speaker mask.
 #[derive(Default)]
 pub struct HdFrame {
@@ -36,6 +107,12 @@ pub struct HdFrame {
     pub output_mask: u32,
     /// `samples[spkr]` = Some(f32 PCM in [-1, 1]) for active speakers.
     pub samples: Vec<Option<Vec<f32>>>,
+    /// Whether `samples` are the lossless reconstruction of a Master Audio
+    /// carrier (false: a lossy carrier's core + XXCH).
+    pub lossless: bool,
+    /// Why a lossy carrier's XXCH channels are missing from `samples` this
+    /// frame (the bed then is the core alone), if they are.
+    pub xxch_decode_error: Option<&'static str>,
     /// DTS:X end-of-frame extension present (`0x02000850`).
     pub x_present: bool,
     /// DTS:X IMAX variant present.
@@ -151,8 +228,11 @@ impl HdDecoder {
             .decode_frame(&info, core_au)
             .map_err(|_| HdError::Core)?;
 
-        // 2) EXSS → locate XLL asset.
+        // 2) EXSS → locate the XLL asset, or take the lossy route without one.
         let mut exssp = ExssParser::parse(exss).map_err(|_| HdError::Exss)?;
+        if !exssp.has_xll() {
+            return Ok(self.decode_lossy(exss, &exssp));
+        }
 
         // 3) Parse XLL before synthesizing the core: the core must be rendered at
         // the XLL's rate for the residual to line up.
@@ -221,7 +301,101 @@ impl HdDecoder {
             x_descriptor_offset: exssp.asset.xll_x_offset,
             x_descriptor_size: exssp.asset.xll_x_size,
             x_descriptor_navigation_used: self.xll.x_descriptor_navigation_used,
+            lossless: true,
+            xxch_decode_error: None,
         })
+    }
+
+    /// The lossy route: the core (already decoded) plus the asset's XXCH
+    /// channels make the bed; the DTS:X extension after the asset, when it
+    /// is the standard profile's, makes the four height feeds. A failing
+    /// component degrades to the bed without it, recorded in the frame,
+    /// never to a dropped frame.
+    fn decode_lossy(&mut self, exss: &[u8], exssp: &ExssParser) -> HdFrame {
+        // The lossless decoder's output is not this frame's: a reader of the
+        // integer tap must see nothing.
+        for slot in &mut self.xll.output {
+            *slot = None;
+        }
+
+        let asset = &exssp.asset;
+        let mut xxch_decode_error = None;
+        if exssp.has_xxch() {
+            match exss.get(asset.xxch_offset..asset.xxch_offset + asset.xxch_size) {
+                Some(bytes) => {
+                    if let Err(e) = self.core.decode_xxch(bytes) {
+                        xxch_decode_error = Some(core_error_kind(&e));
+                    }
+                }
+                None => xxch_decode_error = Some("xxch component bounds"),
+            }
+        }
+
+        let mut x_present = false;
+        let mut x_imax = false;
+        let mut x_payload = Vec::new();
+        let mut x_payload_offset = 0;
+        let mut x_bits_consumed = 0;
+        let mut x_decode_error = None;
+        if let Some(start) = exssp.extension_after_asset(exss) {
+            let end = exssp.substream_size().min(exss.len());
+            let blob = &exss[start..end];
+            let marker = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]);
+            x_present = marker == DCA_SYNCWORD_XLL_X;
+            x_imax = !x_present;
+            x_payload = blob.to_vec();
+            x_payload_offset = start;
+            if x_present {
+                match lossy_extension_set(blob) {
+                    Ok(set) => match self.core.decode_extension_set(set, FIXED_HEIGHT_COUNT) {
+                        Ok(consumed) => x_bits_consumed = consumed * 8,
+                        Err(e) => x_decode_error = Some(core_error_kind(&e)),
+                    },
+                    Err(kind) => x_decode_error = Some(kind),
+                }
+            } else {
+                x_decode_error = Some("alternate profile on a lossy carrier");
+            }
+        }
+
+        let core_out = self
+            .synth
+            .synthesize_fixed_by_speaker(&mut self.core, false);
+        let samples = core_out
+            .samples
+            .iter()
+            .map(|opt| {
+                opt.as_ref()
+                    .map(|v| v.iter().map(|&s| s as f32 / PCM_SCALE).collect())
+            })
+            .collect();
+        let x_samples = core_out
+            .extension
+            .into_iter()
+            .map(|channel| {
+                channel
+                    .into_iter()
+                    .map(|sample| sample as f32 / PCM_SCALE)
+                    .collect()
+            })
+            .collect();
+
+        HdFrame {
+            sample_rate: core_out.output_rate,
+            output_mask: core_out.ch_mask,
+            samples,
+            lossless: false,
+            xxch_decode_error,
+            x_present,
+            x_imax,
+            x_payload,
+            x_payload_offset,
+            x_samples,
+            x_pcm_bit_res: 24,
+            x_bits_consumed,
+            x_decode_error,
+            ..HdFrame::default()
+        }
     }
 }
 
@@ -401,5 +575,165 @@ mod tests {
             offset += core.frame_size + exss_size;
         }
         assert_eq!(frames, 100);
+    }
+}
+
+#[cfg(test)]
+mod lossy_carrier_tests {
+    use super::*;
+    use crate::dcadec::xmeta::{BedFold, SourceRole, XMetadata};
+
+    /// Every `[core][exss]` frame of a raw DTS-HD dump, decoded in order.
+    fn decode_dump(
+        dump: &str,
+        mut each: impl FnMut(&[u8], &[u8], Result<HdFrame, HdError>),
+    ) -> usize {
+        let bytes = std::fs::read(dump).unwrap();
+        let mut dec = HdDecoder::new();
+        let mut pos = 0usize;
+        let mut frames = 0usize;
+        while pos + 16 <= bytes.len() {
+            let Ok(info) = parse_header(&bytes[pos..]) else {
+                break;
+            };
+            let exss_start = pos + info.frame_size;
+            if exss_start + 4 > bytes.len()
+                || bytes[exss_start..exss_start + 4] != crate::SYNCWORD_SUBSTREAM.to_be_bytes()
+            {
+                break;
+            }
+            let Some(es) = exss_substream_size(&bytes[exss_start..]) else {
+                break;
+            };
+            let exss = &bytes[exss_start..exss_start + es];
+            each(
+                &bytes[pos..exss_start],
+                exss,
+                dec.decode(&bytes[pos..exss_start], exss),
+            );
+            frames += 1;
+            pos = exss_start + es;
+        }
+        frames
+    }
+
+    /// A lossy carrier (DTS-HD HRA: core + XXCH, DTS:X extension after the
+    /// asset): every frame yields the 7.1 bed and the four height feeds, and
+    /// its wrapper states their fold.
+    #[test]
+    fn lossy_carrier_decodes_the_bed_and_the_height_quartet() {
+        let Ok(dump) = std::env::var("HARLETTY_LOSSY_X_CORPUS") else {
+            eprintln!("skipping: HARLETTY_LOSSY_X_CORPUS is not set");
+            return;
+        };
+        let mut decoded = 0usize;
+        let frames = decode_dump(&dump, |_, exss, result| {
+            assert_eq!(exss_kind(exss), ExssKind::Lossy);
+            let frame = result.expect("lossy frame");
+            assert!(!frame.lossless);
+            assert_eq!(frame.xxch_decode_error, None);
+            assert_eq!(frame.x_decode_error, None);
+            assert!(frame.x_present && !frame.x_imax);
+            // C, L, R, Ls, Rs, LFE, Lsr, Rsr.
+            assert_eq!(frame.output_mask, 0x1bf);
+            let n = frame.bed_sample_count();
+            assert_eq!(n, 512);
+            assert_eq!(frame.samples.iter().filter(|s| s.is_some()).count(), 8);
+            assert_eq!(frame.x_samples.len(), 4);
+            assert!(frame.x_samples.iter().all(|feed| feed.len() == n));
+            assert_eq!(frame.x_pcm_bit_res, 24);
+            let metadata = XMetadata::parse(&frame.x_payload, 4).expect("wrapper");
+            for feed in 0..4 {
+                let source = metadata.source(feed).expect("height");
+                assert!(matches!(source.role, SourceRole::Height(_)));
+                assert!(matches!(source.fold, BedFold::Known(_)));
+            }
+            decoded += 1;
+        });
+        assert!(frames >= 100, "only {frames} frames in the corpus");
+        assert_eq!(decoded, frames);
+    }
+
+    /// The 7.1 bed of a lossy carrier matches ffmpeg's decode (interleaved
+    /// f32, ffmpeg 7.1 order) on every full-band speaker. The LFE is
+    /// compared loosely: this decoder interpolates it with the fixed-point
+    /// filter ffmpeg reserves for lossless reconstruction, whose passband
+    /// differs from the one ffmpeg's float output uses.
+    #[test]
+    fn lossy_carrier_bed_matches_ffmpeg() {
+        let (Ok(dump), Ok(reference)) = (
+            std::env::var("HARLETTY_LOSSY_X_CORPUS"),
+            std::env::var("HARLETTY_LOSSY_X_REFERENCE"),
+        ) else {
+            eprintln!("skipping: HARLETTY_LOSSY_X_CORPUS / HARLETTY_LOSSY_X_REFERENCE are not set");
+            return;
+        };
+        let reference: Vec<f32> = std::fs::read(reference)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // ffmpeg 7.1 order -> DCA speaker.
+        const ORDER: [usize; 8] = [1, 2, 0, 5, 7, 8, 3, 4];
+        let mut sq_err = [0f64; 8];
+        let mut sq_ref = [0f64; 8];
+        let mut dot = [0f64; 8];
+        let mut sq_ours = [0f64; 8];
+        let mut sample_pos = 0usize;
+        decode_dump(&dump, |_, _, result| {
+            let frame = result.expect("lossy frame");
+            let n = frame.bed_sample_count();
+            for (k, &spkr) in ORDER.iter().enumerate() {
+                let ours = frame.samples[spkr].as_ref().expect("bed speaker");
+                for (s, &v) in ours.iter().enumerate() {
+                    let Some(&r) = reference.get((sample_pos + s) * 8 + k) else {
+                        return;
+                    };
+                    let (v, r) = (v as f64, r as f64);
+                    sq_err[k] += (v - r) * (v - r);
+                    sq_ref[k] += r * r;
+                    sq_ours[k] += v * v;
+                    dot[k] += v * r;
+                }
+            }
+            sample_pos += n;
+        });
+        assert!(sample_pos > 48_000);
+        for k in 0..8 {
+            let rmse = (sq_err[k] / sample_pos as f64).sqrt();
+            if k == 3 {
+                let correlation = dot[k] / (sq_ours[k] * sq_ref[k]).sqrt();
+                assert!(correlation > 0.98, "LFE correlation {correlation}");
+                let ratio = (sq_ours[k] / sq_ref[k]).sqrt();
+                assert!((0.8..1.3).contains(&ratio), "LFE level ratio {ratio}");
+            } else {
+                assert!(rmse < 1e-5, "speaker {k}: rmse {rmse}");
+            }
+        }
+    }
+
+    /// The container around the bare set is read exactly, never guessed.
+    #[test]
+    fn lossy_extension_container_is_checked() {
+        let mut blob = vec![0u8; 40];
+        blob[..4].copy_from_slice(&DCA_SYNCWORD_XLL_X.to_be_bytes());
+        assert_eq!(
+            lossy_extension_set(&blob[..30]),
+            Err("short lossy extension")
+        );
+        assert_eq!(lossy_extension_set(&blob), Err("lossy extension container"));
+        blob[22..26].copy_from_slice(&LOSSY_EXTENSION_CONSTANT);
+        blob[26..28].copy_from_slice(&LOSSY_EXTENSION_NAVIGATION_HEAD);
+        blob[32] = LOSSY_EXTENSION_SET_MARKER;
+        let size = (blob.len() - LOSSY_EXTENSION_SET_OFFSET) as u16;
+        blob[28..30].copy_from_slice(&size.to_be_bytes());
+        let crc = crc16_ccitt(&blob[26..30]);
+        blob[30..32].copy_from_slice(&crc.to_be_bytes());
+        assert_eq!(lossy_extension_set(&blob).map(<[u8]>::len), Ok(7));
+        blob[29] ^= 1;
+        assert_eq!(
+            lossy_extension_set(&blob),
+            Err("lossy extension navigation crc")
+        );
     }
 }
