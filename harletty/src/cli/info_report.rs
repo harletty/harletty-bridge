@@ -34,7 +34,13 @@ pub const SCHEMA: u32 = 1;
 /// start reporting this label. A consumer holding the old label should map it
 /// onto the new one and re-probe, since the feed count did not change but its
 /// meaning did.
-pub const TAXONOMY_VERSION: u32 = 2;
+///
+/// 3: DTS:X on a lossy carrier (DTS-HD High Resolution Audio: core + XXCH
+/// with the extension after the asset) is decoded. Such tracks reported no
+/// spatial metadata and `codec` `DTS`; they now report `DTS:X-7.1.4` and the
+/// new `codec` value `DTS-HD HRA`. A consumer holding a `DTS` verdict for a
+/// track whose container says DTS-HD HRA should re-probe it.
+pub const TAXONOMY_VERSION: u32 = 3;
 
 /// The versions alone, for `harletty taxonomy`.
 #[derive(Debug, Serialize)]

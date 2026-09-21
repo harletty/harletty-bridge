@@ -8,6 +8,10 @@
 // Consumed by the XLL decoder (Phase 3); allow dead_code until that lands.
 #![allow(dead_code)]
 
+use super::xll::{
+    DCA_SYNCWORD_XLL_X, DCA_SYNCWORD_XLL_X_ALT_D0, DCA_SYNCWORD_XLL_X_ALT_D1,
+    DCA_SYNCWORD_XLL_X_ALT_D3, DCA_SYNCWORD_XLL_X_ALT_D4,
+};
 use crate::bitstream::BitReader;
 
 /// Extension masks (`enum DCAExtensionMask`, EXSS half).
@@ -124,6 +128,12 @@ pub(crate) struct ExssAsset {
 
     pub(crate) core_offset: usize,
     pub(crate) core_size: usize,
+    pub(crate) xbr_offset: usize,
+    pub(crate) xbr_size: usize,
+    pub(crate) xxch_offset: usize,
+    pub(crate) xxch_size: usize,
+    pub(crate) x96_offset: usize,
+    pub(crate) x96_size: usize,
     pub(crate) xll_offset: usize,
     pub(crate) xll_size: usize,
     pub(crate) xll_sync_present: bool,
@@ -168,10 +178,39 @@ impl ExssParser {
     pub(crate) fn has_xll(&self) -> bool {
         self.asset.extension_mask & DCA_EXSS_XLL != 0
     }
+
+    /// True when the asset carries an XXCH component: channels beyond the
+    /// core's, coded lossily (DTS-HD High Resolution Audio 7.1).
+    pub(crate) fn has_xxch(&self) -> bool {
+        self.asset.extension_mask & DCA_EXSS_XXCH != 0
+    }
+
+    /// Start, within `exss`, of the DTS:X extension a lossy carrier places
+    /// after its audio asset — found by its marker within a few bytes of
+    /// the asset's end (six bytes of unread data separate them in the
+    /// corpus). `None` when the substream ends with the asset.
+    pub(crate) fn extension_after_asset(&self, exss: &[u8]) -> Option<usize> {
+        const SCAN: usize = 32;
+        let from = self.asset.asset_offset + self.asset.asset_size;
+        let to = self.exss_size.min(exss.len()).min(from + SCAN);
+        let window = exss.get(from..to)?;
+        window
+            .windows(4)
+            .position(|w| {
+                matches!(
+                    u32::from_be_bytes([w[0], w[1], w[2], w[3]]),
+                    DCA_SYNCWORD_XLL_X
+                        | DCA_SYNCWORD_XLL_X_ALT_D0
+                        | DCA_SYNCWORD_XLL_X_ALT_D1
+                        | DCA_SYNCWORD_XLL_X_ALT_D3
+                        | DCA_SYNCWORD_XLL_X_ALT_D4
+                )
+            })
+            .map(|p| from + p)
+    }
 }
 
 impl ExssParser {
-
     /// Parse an EXSS substream (must start at the 0x64582025 syncword).
     pub(crate) fn parse(data: &[u8]) -> R<Self> {
         let mut s = ExssParser::default();
@@ -352,13 +391,13 @@ impl ExssParser {
                     }
                 }
                 if a.extension_mask & DCA_EXSS_XBR != 0 {
-                    rb(gb, 14)?; // xbr_size-1 (unused)
+                    a.xbr_size = rb(gb, 14)? as usize + 1;
                 }
                 if a.extension_mask & DCA_EXSS_XXCH != 0 {
-                    rb(gb, 14)?;
+                    a.xxch_size = rb(gb, 14)? as usize + 1;
                 }
                 if a.extension_mask & DCA_EXSS_X96 != 0 {
-                    rb(gb, 12)?;
+                    a.x96_size = rb(gb, 12)? as usize + 1;
                 }
                 if a.extension_mask & DCA_EXSS_LBR != 0 {
                     parse_lbr_parameters(gb)?;
@@ -453,12 +492,11 @@ impl ExssParser {
         let mut offs = a.asset_offset;
         let mut size = a.asset_size as isize;
 
-        // We only retain CORE and XLL component sizes. When XLL is present, an
-        // intervening XBR/XXCH/X96/LBR component would sit before it and shift the
-        // XLL offset; reject rather than miscompute. When there is NO XLL (e.g.
-        // DTS-HD HRA, which carries CORE + a lossy XBR extension), nothing reads
-        // the XLL offset, so let the EXSS parse succeed — the caller falls back to
-        // the DTS core for these.
+        // The lossless decoder has only been validated with XLL as the sole
+        // component after the core: an intervening XBR/XXCH/X96/LBR component
+        // is rejected rather than decoded around. Without XLL (DTS-HD HRA:
+        // CORE + XBR and/or XXCH), the lossy components are located in
+        // their stated order, as `set_exss_offsets` does.
         if a.extension_mask & DCA_EXSS_XLL != 0
             && a.extension_mask & (DCA_EXSS_XBR | DCA_EXSS_XXCH | DCA_EXSS_X96 | DCA_EXSS_LBR) != 0
         {
@@ -467,14 +505,46 @@ impl ExssParser {
             ));
         }
 
-        if a.extension_mask & DCA_EXSS_CORE != 0 {
-            a.core_offset = offs;
-            if a.core_size as isize > size {
-                return Err(ExssError::Invalid("core size out of bounds"));
+        let mut component = |flag: u32, offset: &mut usize, len: usize, what: &'static str| {
+            if a.extension_mask & flag == 0 {
+                return Ok(());
             }
-            offs += a.core_size;
-            size -= a.core_size as isize;
-        }
+            *offset = offs;
+            if len as isize > size {
+                return Err(ExssError::Invalid(what));
+            }
+            offs += len;
+            size -= len as isize;
+            Ok(())
+        };
+        let core_size = a.core_size;
+        let xbr_size = a.xbr_size;
+        let xxch_size = a.xxch_size;
+        let x96_size = a.x96_size;
+        component(
+            DCA_EXSS_CORE,
+            &mut a.core_offset,
+            core_size,
+            "core size out of bounds",
+        )?;
+        component(
+            DCA_EXSS_XBR,
+            &mut a.xbr_offset,
+            xbr_size,
+            "xbr size out of bounds",
+        )?;
+        component(
+            DCA_EXSS_XXCH,
+            &mut a.xxch_offset,
+            xxch_size,
+            "xxch size out of bounds",
+        )?;
+        component(
+            DCA_EXSS_X96,
+            &mut a.x96_offset,
+            x96_size,
+            "x96 size out of bounds",
+        )?;
         if a.extension_mask & DCA_EXSS_XLL != 0 {
             a.xll_offset = offs;
             if a.xll_size as isize > size {

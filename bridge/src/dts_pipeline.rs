@@ -23,8 +23,8 @@ use bridge_api::{
     RChannelLabel, RDecodedFrame, REvent, RMetadataFrame, RNameUpdate, RObjectChannel,
 };
 use dca::{
-    CorePcmFrame, FoldEstimator, FoldPlan, HdError, HdFrame, MAX_SOURCES, SourceRole,
-    SphericalPosition, XMetadata, XPresentation, exss_has_xll, exss_substream_size, parse_header,
+    CorePcmFrame, ExssKind, FoldEstimator, FoldPlan, HdError, HdFrame, MAX_SOURCES, SourceRole,
+    SphericalPosition, XMetadata, XPresentation, exss_kind, exss_substream_size, parse_header,
 };
 use serde::Deserialize;
 
@@ -131,6 +131,7 @@ pub(crate) struct DtsXState {
     estimation_noted: bool,
     parse_failures: u64,
     feed_dropouts: u64,
+    bed_extension_dropouts: u64,
 }
 
 impl DtsXState {
@@ -145,6 +146,18 @@ impl DtsXState {
                 } else {
                     "keeping the bed as authored and muting the extension channels"
                 }
+            );
+        }
+    }
+
+    /// A lossy carrier's XXCH channels did not decode this frame: the bed
+    /// is the core alone for it.
+    fn note_bed_extension_dropout(&mut self, reason: &str) {
+        self.bed_extension_dropouts += 1;
+        if self.bed_extension_dropouts == 1 || self.bed_extension_dropouts.is_power_of_two() {
+            log::warn!(
+                "dts: XXCH channels unavailable ({reason}, {} frames so far); playing the core bed",
+                self.bed_extension_dropouts
             );
         }
     }
@@ -196,14 +209,22 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
             if rest.len() < fs + es {
                 break;
             }
-            if exss_has_xll(&rest[fs..fs + es]) {
-                bridge.dts_profile = DtsProfile::Ma;
+            let kind = exss_kind(&rest[fs..fs + es]);
+            if kind != ExssKind::Core {
+                bridge.dts_profile = if kind == ExssKind::Lossless {
+                    DtsProfile::Ma
+                } else {
+                    DtsProfile::Hd
+                };
                 match bridge
                     .dts_hd_decoder
                     .decode(&rest[..fs], &rest[fs..fs + es])
                 {
                     Ok(hd) => {
                         let n = hd_samples(&hd);
+                        if let Some(kind) = hd.xxch_decode_error {
+                            bridge.dts_x.note_bed_extension_dropout(kind);
+                        }
                         if let Some((frame, emitted_objects)) = build_hd_frame_with_extensions(
                             &hd,
                             &mut bridge.dts_x,
@@ -212,19 +233,26 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                             &mut bridge.declared_object_channels,
                         ) {
                             bridge.dts_objects_active = emitted_objects;
-                            // The Auro side channel lives in the low bits of
-                            // the lossless integers, read off the decoder's
-                            // integer tap. The stage decides whether the
-                            // frame goes out as it is or unfolded.
-                            let active: Vec<usize> = (0..hd.samples.len())
-                                .filter(|&s| hd.samples[s].is_some())
-                                .collect();
-                            bridge.dts_auro.route(
-                                frame,
-                                &active,
-                                bridge.dts_hd_decoder.lossless_samples(),
-                                &mut result.frames,
-                            );
+                            if kind == ExssKind::Lossless {
+                                // The Auro side channel lives in the low bits
+                                // of the lossless integers, read off the
+                                // decoder's integer tap. The stage decides
+                                // whether the frame goes out as it is or
+                                // unfolded.
+                                let active: Vec<usize> = (0..hd.samples.len())
+                                    .filter(|&s| hd.samples[s].is_some())
+                                    .collect();
+                                bridge.dts_auro.route(
+                                    frame,
+                                    &active,
+                                    bridge.dts_hd_decoder.lossless_samples(),
+                                    &mut result.frames,
+                                );
+                            } else {
+                                // A lossy carrier has no side channel to read.
+                                bridge.dts_auro.not_a_carrier(&mut result.frames);
+                                result.frames.push(frame);
+                            }
                         }
                         bridge.total_samples += n as u64;
                         bridge.dts_frame_count += 1;
@@ -242,10 +270,10 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                     }
                 }
             } else {
-                // No XLL asset: DTS-HD HRA (and other lossy EXSS extensions) layer
-                // only high-frequency detail on top of an ordinary DTS core. We do
-                // not decode that extension, so render the core (5.1) and drop it,
-                // instead of failing the whole track.
+                // Nothing the HD decoder reads beyond the core: an XBR-only
+                // DTS-HD HRA layers high-frequency detail on top of an
+                // ordinary DTS core, which is not decoded, so render the
+                // core (5.1) and drop it instead of failing the whole track.
                 bridge.dts_profile = DtsProfile::Hd;
                 match bridge.dts_decoder.push_access_unit(&rest[..fs]) {
                     Ok(push) => {

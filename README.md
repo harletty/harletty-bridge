@@ -226,9 +226,10 @@ unix and `target\release\harletty_bridge.dll` on Windows. Point
 by [Rainbaby](https://github.com/truehdd)** — 85% of the shared-lineage
 code is byte-identical to upstream, including the whole DAMF master-set
 writer and the CAF/Wave64 writers. What was added here is E-AC-3 JOC and
-DTS/DTS:X input, the latter exported as ADM, and the unfolding of
-Auro-3D carriers (a DTS-HD MA track whose low bits hold a folded 9.1 to
-13.1 layout) into their bed and height layer.
+DTS/DTS:X input, the latter exported as ADM — on a DTS-HD MA carrier and on
+a lossy DTS-HD HRA one ([docs/dtsx-lossy-carrier.md](docs/dtsx-lossy-carrier.md)) —
+and the unfolding of Auro-3D carriers (a DTS-HD MA track whose low bits
+hold a folded 9.1 to 13.1 layout) into their bed and height layer.
 
 It turns those bitstreams into Dolby Atmos master files (`.atmos`,
 `.atmos.metadata`, plus CAF/WAV audio), reading a file or stdin, so it
@@ -271,7 +272,7 @@ damf/                # DAMF metadata + CAF/WAV writers (CLI-side only)
 truehdd-macros/      # proc macros used by the CAF writer and `info`
 truehd/              # TrueHD decoder crate (vendored, Apache-2.0)
 eac3/                # E-AC-3 (JOC) decoder crate
-dca/                 # DTS (core / DTS-HD MA / XLL) decoder crate
+dca/                 # DTS (core / XXCH / DTS-HD MA / XLL / DTS:X) decoder crate
 auro/                # Auro-Codec side channel: detection and unfold
 docs/                # protocol notes (IEC61937, OAMD shape, …)
 EAC3_PATCH_NOTES.md  # upstream patches to the E-AC-3 decoder
