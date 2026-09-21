@@ -101,6 +101,8 @@ enum Phase {
         speakers: Vec<usize>,
         outputs: Vec<StreamId>,
         labels: RVec<RChannelLabel>,
+        /// The original layout the carrier unfolds to, for the source label.
+        layout: auro::Layout,
         sample_rate: u32,
         scratch: Vec<i32>,
     },
@@ -130,6 +132,14 @@ impl DtsAuroState {
 
     pub(crate) fn is_unfolding(&self) -> bool {
         matches!(self.phase, Phase::Unfolding { .. })
+    }
+
+    /// The Auro-3D layout the carrier unfolds to, once it is confirmed.
+    pub(crate) fn unfolded_layout(&self) -> Option<auro::Layout> {
+        match &self.phase {
+            Phase::Unfolding { layout, .. } => Some(*layout),
+            _ => None,
+        }
     }
 
     /// Where Auro puts each channel of the unfolded layout
@@ -169,6 +179,7 @@ impl DtsAuroState {
                 unfolder,
                 speakers: carriers,
                 outputs,
+                layout: _,
                 labels,
                 sample_rate,
                 scratch,
@@ -305,6 +316,7 @@ impl DtsAuroState {
             speakers,
             outputs,
             labels,
+            layout: detection.original,
             sample_rate,
             scratch,
         };

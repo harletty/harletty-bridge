@@ -223,6 +223,42 @@ impl Layout {
             _ => "Auro-3D",
         }
     }
+
+    /// The Auro-3D name of this layout by its channel count — `9.1`,
+    /// `10.1`, `11.1`, `13.1` — for the layouts that have a common one.
+    /// [`Self::source_codec_label`] is `Auro-3D-` followed by it.
+    pub fn auro_name(self) -> Option<&'static str> {
+        match self.streams().map(|s| s.len) {
+            Some(10) => Some("9.1"),
+            Some(11) => Some("10.1"),
+            Some(12) => Some("11.1"),
+            Some(14) => Some("13.1"),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod auro_name_tests {
+    use super::Layout;
+
+    /// The two names agree for every layout the stream list knows.
+    #[test]
+    fn auro_name_is_the_source_codec_label_without_its_prefix() {
+        let mut named = 0;
+        for code in 0..=0xFFFFu32 {
+            let layout = Layout(code);
+            let expected = match layout.auro_name() {
+                Some(name) => {
+                    named += 1;
+                    format!("Auro-3D-{name}")
+                }
+                None => "Auro-3D".to_string(),
+            };
+            assert_eq!(layout.source_codec_label(), expected, "layout {code}");
+        }
+        assert!(named > 0, "no layout has an Auro-3D name");
+    }
 }
 
 /// A channel-input configuration: which original layout was folded into

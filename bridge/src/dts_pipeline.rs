@@ -28,7 +28,7 @@ use dca::{
 };
 use serde::Deserialize;
 
-use crate::bridge::AtmosBridge;
+use crate::bridge::{AtmosBridge, DtsProfile};
 use crate::frame_builders::float_to_pcm_i32;
 use crate::labels::{dca_bed_channel_to_r, dca_spatial_channel_to_r};
 use crate::metadata::declare_object_channels;
@@ -197,6 +197,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 break;
             }
             if exss_has_xll(&rest[fs..fs + es]) {
+                bridge.dts_profile = DtsProfile::Ma;
                 match bridge
                     .dts_hd_decoder
                     .decode(&rest[..fs], &rest[fs..fs + es])
@@ -245,6 +246,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 // only high-frequency detail on top of an ordinary DTS core. We do
                 // not decode that extension, so render the core (5.1) and drop it,
                 // instead of failing the whole track.
+                bridge.dts_profile = DtsProfile::Hd;
                 match bridge.dts_decoder.push_access_unit(&rest[..fs]) {
                     Ok(push) => {
                         bridge.dts_objects_active = false;
@@ -267,6 +269,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
             }
             consumed += fs + es;
         } else {
+            bridge.dts_profile = DtsProfile::Core;
             match bridge.dts_decoder.push_access_unit(&rest[..fs]) {
                 Ok(push) => {
                     let frame = build_core_frame(&push.pcm);
