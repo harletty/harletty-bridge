@@ -216,6 +216,11 @@ pub(crate) struct AtmosBridge {
     pub(crate) dts_x: DtsXState,
     /// True when the most recent `push_packet` used the DTS path.
     pub(crate) dts_active: bool,
+    /// Live stream fact: the latest DTS frame's surround pair is the
+    /// carrier's side-surround pair (Lss/Rss, ±90°) rather than its surround
+    /// pair (Ls/Rs, ±110°). Both play through `Ls`/`Rs`; this picks the angle
+    /// the pair is declared at (`fixed_channel_poses`).
+    pub(crate) dts_surrounds_on_side: bool,
     pub(crate) dts_fold_config: DtsFoldConfig,
     /// Live stream fact: the latest DTS frame emitted object channels. Set
     /// from what the frame presented rather than from its profile, so every
@@ -303,6 +308,7 @@ impl AtmosBridge {
             dts_frame_count: 0,
             dts_x: DtsXState::default(),
             dts_active: false,
+            dts_surrounds_on_side: false,
             dts_fold_config: DtsFoldConfig::from_env(),
             dts_objects_active: false,
             dts_profile: DtsProfile::default(),
@@ -364,6 +370,7 @@ impl AtmosBridge {
         self.dts_frame_count = 0;
         self.dts_x = DtsXState::default();
         self.dts_active = false;
+        self.dts_surrounds_on_side = false;
         self.dts_objects_active = false;
         self.dts_profile = DtsProfile::default();
         self.dts_auro.reset();
@@ -982,7 +989,7 @@ impl FormatBridge for AtmosBridge {
             if self.dts_auro.is_unfolding() {
                 self.dts_auro.declared_poses()
             } else {
-                crate::labels::dts_declared_poses()
+                crate::labels::dts_declared_poses(self.dts_surrounds_on_side)
             }
         } else {
             RVec::new()
@@ -1274,6 +1281,16 @@ mod raw_transport_tests {
                 .any(|p| p.label == bridge_api::RChannelLabel::Ls && p.azimuth_deg == -110.0),
             "DTS declares its ETSI angles"
         );
+        // A stream that named the pair Lss/Rss is declared on the side.
+        bridge.dts_surrounds_on_side = true;
+        let poses = bridge.fixed_channel_poses();
+        assert!(
+            poses
+                .iter()
+                .any(|p| p.label == bridge_api::RChannelLabel::Ls && p.azimuth_deg == -90.0),
+            "a side-surround pair is declared at ±90°"
+        );
+        bridge.dts_surrounds_on_side = false;
         bridge.dts_active = false;
         bridge.eac3_active = true;
         assert_eq!(bridge.source_family().as_str(), "dolby");

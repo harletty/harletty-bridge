@@ -517,6 +517,10 @@ pub(crate) struct XllDecoder {
     /// Output: speaker -> lossless int32 (24-bit) samples.
     pub(crate) output: Vec<Option<Vec<i32>>>,
     pub(crate) output_mask: u32,
+    /// The speaker mask as the channel sets code it, before the Lss/Rss ->
+    /// Ls/Rs slot normalisation of `output_mask`: the only way to tell a
+    /// side pair coded on the side (±90°) from one coded in the rear (±110°).
+    pub(crate) coded_mask: u32,
     pub(crate) sample_rate: u32,
     pub(crate) pcm_bit_res: usize,
     // DTS:X end-of-frame extension (ffmpeg only flags it, never parses it).
@@ -1866,7 +1870,9 @@ impl XllDecoder {
                 self.output[spkr] = Some(scaled);
             }
         }
-        // Normalize side-surround to Ls/Rs slots if present.
+        // Normalize side-surround to Ls/Rs slots if present, remembering
+        // what the carrier actually named.
+        self.coded_mask = self.output_mask;
         if self.output[DCA_SPEAKER_LSS].is_some() {
             self.output[3] = self.output[DCA_SPEAKER_LSS].take();
             self.output_mask = (self.output_mask & !(1 << DCA_SPEAKER_LSS)) | (1 << 3);

@@ -222,6 +222,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 {
                     Ok(hd) => {
                         let n = hd_samples(&hd);
+                        bridge.dts_surrounds_on_side = hd.surrounds_on_side();
                         if let Some(kind) = hd.xxch_decode_error {
                             bridge.dts_x.note_bed_extension_dropout(kind);
                         }
@@ -278,6 +279,8 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 match bridge.dts_decoder.push_access_unit(&rest[..fs]) {
                     Ok(push) => {
                         bridge.dts_objects_active = false;
+                        // A core names its surrounds Ls/Rs only.
+                        bridge.dts_surrounds_on_side = false;
                         bridge.dts_auro.not_a_carrier(&mut result.frames);
                         result.frames.push(build_core_frame(&push.pcm));
                         bridge.total_samples += push.pcm.samples_per_channel() as u64;
@@ -302,6 +305,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 Ok(push) => {
                     let frame = build_core_frame(&push.pcm);
                     bridge.dts_objects_active = false;
+                    bridge.dts_surrounds_on_side = false;
                     bridge.dts_auro.not_a_carrier(&mut result.frames);
                     bridge.total_samples += push.pcm.samples_per_channel() as u64;
                     bridge.dts_frame_count += 1;

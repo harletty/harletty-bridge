@@ -1137,6 +1137,27 @@ impl CoreDecoder {
         mask
     }
 
+    /// Speaker layout mask of the frame's output as the carrier names it:
+    /// [`Self::ch_mask`] with the core's surrounds under the side-surround
+    /// names (Lss/Rss) when the XXCH set calls them that.
+    pub(crate) fn coded_mask(&self) -> u32 {
+        let mut mask = self.core_ch_mask();
+        if self.xxch_present {
+            if mask & (1 << DCA_SPEAKER_LS) != 0
+                && self.xxch_core_mask & (1 << DCA_SPEAKER_LSS) != 0
+            {
+                mask = (mask & !(1 << DCA_SPEAKER_LS)) | (1 << DCA_SPEAKER_LSS);
+            }
+            if mask & (1 << DCA_SPEAKER_RS) != 0
+                && self.xxch_core_mask & (1 << DCA_SPEAKER_RSS) != 0
+            {
+                mask = (mask & !(1 << DCA_SPEAKER_RS)) | (1 << DCA_SPEAKER_RSS);
+            }
+            mask |= self.xxch_spkr_mask;
+        }
+        mask
+    }
+
     pub(crate) fn nchannels(&self) -> usize {
         self.nchannels
     }
