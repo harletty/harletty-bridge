@@ -11,7 +11,7 @@
 //   asset — a bare channel set in the core syntax — its four height feeds.
 //   Both are decoded by the core decoder.
 
-use crate::dcadec::core::{CoreDecoder, CoreError};
+use crate::dcadec::core::{CoreDecoder, CoreError, DCA_SPEAKER_LSS, DCA_SPEAKER_RSS};
 use crate::dcadec::exss::ExssParser;
 use crate::dcadec::synth::SynthState;
 use crate::dcadec::xll::{DCA_SYNCWORD_XLL_X, XllDecoder, XllError, crc16_ccitt};
@@ -104,7 +104,15 @@ impl From<ParseError> for HdError {
 #[derive(Default)]
 pub struct HdFrame {
     pub sample_rate: u32,
+    /// Active-speaker mask of `samples`, with a side-surround pair (Lss/Rss)
+    /// normalised into the Ls/Rs slots as ffmpeg does for a regular 5.1/7.1
+    /// layout.
     pub output_mask: u32,
+    /// The speaker mask as the carrier codes it, before that normalisation.
+    /// It differs from `output_mask` only by naming the surround pair
+    /// Lss/Rss (bits 9/10) instead of Ls/Rs (bits 3/4); see
+    /// [`Self::surrounds_on_side`].
+    pub coded_mask: u32,
     /// `samples[spkr]` = Some(f32 PCM in [-1, 1]) for active speakers.
     pub samples: Vec<Option<Vec<f32>>>,
     /// Whether `samples` are the lossless reconstruction of a Master Audio
@@ -156,6 +164,17 @@ pub struct HdFrame {
 }
 
 impl HdFrame {
+    /// Whether the surround pair in the Ls/Rs slots of `samples` is the
+    /// carrier's side-surround pair (Lss/Rss, "on side", ±90° in ETSI
+    /// TS 102 114 Table 6-22) rather than its surround pair (Ls/Rs, "on side
+    /// in rear", ±110°). A 7.1 carrier normally codes Lss/Rss + Lsr/Rsr; a
+    /// 5.1 one codes Ls/Rs. False for a frame that keeps Lss/Rss in their
+    /// own slots next to a coded Ls/Rs pair.
+    pub fn surrounds_on_side(&self) -> bool {
+        let side = (1 << DCA_SPEAKER_LSS) | (1 << DCA_SPEAKER_RSS);
+        self.coded_mask & side != 0 && self.output_mask & side == 0
+    }
+
     /// Samples per channel in the lossless bed, taken from the first active
     /// speaker, or 0 when no speaker is active.
     ///
@@ -281,6 +300,7 @@ impl HdDecoder {
         Ok(HdFrame {
             sample_rate: self.xll.sample_rate,
             output_mask: self.xll.output_mask,
+            coded_mask: self.xll.coded_mask,
             samples,
             x_present: self.xll.x_syncword_present,
             x_imax: self.xll.x_imax_syncword_present,
@@ -383,6 +403,7 @@ impl HdDecoder {
         HdFrame {
             sample_rate: core_out.output_rate,
             output_mask: core_out.ch_mask,
+            coded_mask: core_out.coded_mask,
             samples,
             lossless: false,
             xxch_decode_error,
@@ -501,6 +522,31 @@ mod tests {
             worst = worst.max(best);
         }
         assert!(worst < 1e-5, "not lossless (worst rmse {worst:.3e})");
+    }
+
+    /// The surround pair is "on the side" only when the carrier named it
+    /// Lss/Rss and the decoder folded it into the Ls/Rs slots.
+    #[test]
+    fn surrounds_on_side_follows_the_coded_names() {
+        let ls_rs = 0x1bf; // C, L, R, Ls, Rs, LFE, Lsr, Rsr
+        let lss_rss = (ls_rs & !0x18) | 0x600;
+        let frame = |output_mask, coded_mask| HdFrame {
+            output_mask,
+            coded_mask,
+            ..HdFrame::default()
+        };
+        assert!(
+            !frame(ls_rs, ls_rs).surrounds_on_side(),
+            "a 5.1/7.1 coded Ls/Rs"
+        );
+        assert!(
+            frame(ls_rs, lss_rss).surrounds_on_side(),
+            "Lss/Rss folded into Ls/Rs"
+        );
+        assert!(
+            !frame(ls_rs | 0x600, ls_rs | 0x600).surrounds_on_side(),
+            "Lss/Rss kept in their own slots next to a coded Ls/Rs pair"
+        );
     }
 
     #[test]
@@ -634,8 +680,11 @@ mod lossy_carrier_tests {
             assert_eq!(frame.xxch_decode_error, None);
             assert_eq!(frame.x_decode_error, None);
             assert!(frame.x_present && !frame.x_imax);
-            // C, L, R, Ls, Rs, LFE, Lsr, Rsr.
+            // C, L, R, Ls, Rs, LFE, Lsr, Rsr — the carrier names the
+            // surround pair Lss/Rss, the on-side pair.
             assert_eq!(frame.output_mask, 0x1bf);
+            assert_eq!(frame.coded_mask, 0x7a7);
+            assert!(frame.surrounds_on_side());
             let n = frame.bed_sample_count();
             assert_eq!(n, 512);
             assert_eq!(frame.samples.iter().filter(|s| s.is_some()).count(), 8);

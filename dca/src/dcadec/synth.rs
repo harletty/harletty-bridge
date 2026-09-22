@@ -556,6 +556,8 @@ pub(crate) struct CoreOutput {
     pub(crate) npcmsamples: usize,
     pub(crate) output_rate: u32,
     pub(crate) ch_mask: u32,
+    /// `ch_mask` under the carrier's own speaker names (`CoreDecoder::coded_mask`).
+    pub(crate) coded_mask: u32,
 }
 
 impl SynthState {
@@ -654,6 +656,7 @@ impl SynthState {
                 dec.sample_rate()
             },
             ch_mask: dec.ch_mask(),
+            coded_mask: dec.coded_mask(),
         }
     }
 }

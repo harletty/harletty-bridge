@@ -6,19 +6,26 @@ use truehd::structs::channel::ChannelLabel;
 /// level, for the bridge's channel declaration: the "approximate angle in
 /// horizontal plane" column of Table 6-22 (Loudspeaker Masks) of ETSI
 /// TS 102 114 V1.6.1 — C 0°, L/R ±30°, Ls/Rs ±110° ("on side in rear"),
-/// Lsr/Rsr ±150°, Cs 180°, Lc/Rc ±15°, Lw/Rw ±60°. The table gives the
-/// height speakers no angle, so they are not declared and take the
-/// renderer's own nominal directions. Every label is declared whatever the
-/// presentation carries: the renderer ignores the ones absent from the
-/// frame.
-pub(crate) fn dts_declared_poses() -> RVec<RChannelPose> {
+/// Lss/Rss ±90° ("on side"), Lsr/Rsr ±150°, Cs 180°, Lc/Rc ±15°, Lw/Rw
+/// ±60°. The table gives the height speakers no angle, so they are not
+/// declared and take the renderer's own nominal directions. Every label is
+/// declared whatever the presentation carries: the renderer ignores the
+/// ones absent from the frame.
+///
+/// The decoder plays both Ls/Rs and Lss/Rss through the renderer's `Ls`/`Rs`
+/// pair, so the pair's angle follows what the carrier named
+/// (`surrounds_on_side`, [`dca::HdFrame::surrounds_on_side`]): a 7.1 bed
+/// normally codes its sides as Lss/Rss and gets ±90°, a 5.1 bed codes
+/// Ls/Rs and gets ±110°.
+pub(crate) fn dts_declared_poses(surrounds_on_side: bool) -> RVec<RChannelPose> {
     use RChannelLabel::*;
+    let surround = if surrounds_on_side { 90.0 } else { 110.0 };
     [
         (C, 0.0),
         (L, -30.0),
         (R, 30.0),
-        (Ls, -110.0),
-        (Rs, 110.0),
+        (Ls, -surround),
+        (Rs, surround),
         (Lb, -150.0),
         (Rb, 150.0),
         (Cb, 180.0),
@@ -192,7 +199,7 @@ mod tests {
 
     #[test]
     fn dts_declares_its_lower_layer_at_the_etsi_angles_and_no_heights() {
-        let poses = dts_declared_poses();
+        let poses = dts_declared_poses(false);
         let angle = |label: RChannelLabel| {
             poses
                 .iter()
@@ -209,5 +216,31 @@ mod tests {
             "heights take the renderer's directions"
         );
         assert!(poses.iter().all(|p| p.elevation_deg == 0.0));
+    }
+
+    /// A carrier that names its surround pair Lss/Rss put it on the side:
+    /// the pair is declared at ±90°, everything else stays where it was.
+    #[test]
+    fn a_side_surround_pair_is_declared_on_the_side() {
+        let rear = dts_declared_poses(false);
+        let side = dts_declared_poses(true);
+        let angle = |poses: &RVec<RChannelPose>, label: RChannelLabel| {
+            poses
+                .iter()
+                .find(|p| p.label == label)
+                .map(|p| p.azimuth_deg)
+        };
+        assert_eq!(angle(&side, RChannelLabel::Ls), Some(-90.0));
+        assert_eq!(angle(&side, RChannelLabel::Rs), Some(90.0));
+        assert_eq!(angle(&side, RChannelLabel::Lb), Some(-150.0));
+        for (r, s) in rear.iter().zip(side.iter()) {
+            assert_eq!(r.label, s.label);
+            if !matches!(r.label, RChannelLabel::Ls | RChannelLabel::Rs) {
+                assert_eq!(
+                    (r.azimuth_deg, r.elevation_deg),
+                    (s.azimuth_deg, s.elevation_deg)
+                );
+            }
+        }
     }
 }
