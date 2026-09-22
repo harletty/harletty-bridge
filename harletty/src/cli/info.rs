@@ -7,7 +7,7 @@ use super::info_report::{Eac3Facts, InfoReport, Signature, Spatial, TrueHdFacts}
 use crate::codec_probe::{Codec, probe_codec};
 use crate::input::InputReader;
 use crate::settings::Settings;
-use crate::signature::{Outcome, State, Verifier};
+use crate::signature::{Outcome, State, Tally, Verifier};
 use crate::timestamp::time_str;
 use truehd::process::{
     PresentationMap, PresentationType,
@@ -255,6 +255,8 @@ fn truehd_report(analysis: Option<&AnalysisResultTuple>) -> InfoReport {
         checked: signature.tally.checked,
         verified: signature.tally.verified,
         mismatched: signature.tally.mismatched,
+        sync_checked: signature.tally.sync_checked,
+        sync_verified: signature.tally.sync_verified,
     });
     report.frames_seen = *frame_count as u64;
     report.seconds_seen = seconds;
@@ -549,6 +551,19 @@ fn update_final_stats(
     println!();
 }
 
+/// What the words in major-sync units said, when there were any: counted
+/// apart, since on some discs they fail beside units that all verify.
+fn sync_note(tally: &Tally) -> String {
+    match tally.sync_checked {
+        0 => String::new(),
+        n if tally.sync_verified == n => format!(", and {n} in major-sync units"),
+        n => format!(
+            "; {} of {n} in major-sync units are not, which does not decide the verdict",
+            n - tally.sync_verified
+        ),
+    }
+}
+
 /// The signature line of the summary: what was asked, and of how much.
 fn describe(signature: &Outcome) -> String {
     let tally = &signature.tally;
@@ -568,8 +583,10 @@ fn describe(signature: &Outcome) -> String {
             tally.frames
         ),
         State::Verified => format!(
-            "verified: {} of {} protection word(s) are the key's digest{from}",
-            tally.verified, tally.checked
+            "verified: {} of {} protection word(s) are the key's digest{}{from}",
+            tally.verified,
+            tally.checked,
+            sync_note(tally)
         ),
         State::Mismatch => format!(
             "MISMATCH: {} of {} protection word(s) are not the key's digest{from}",

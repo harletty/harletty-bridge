@@ -27,6 +27,17 @@
 //! encoder, a metadata edit — is, because it does not reproduce the digests
 //! it did not have the key to compute.
 //!
+//! Frames carried in an access unit that also carries a major sync are
+//! counted apart and do not decide the verdict. Across a library of
+//! commercial discs, every frame in a unit without a major sync verified, in
+//! every title, while in some titles the frames in major-sync units failed —
+//! all of them in one title, a few in another — and in others verified too.
+//! Whether a tool rewrote those headers after encoding or the digest covers
+//! them differently is not established; what is, is that such a failure sits
+//! next to thousands of units whose audio and metadata carry the key's
+//! digest, so it is no evidence that the stream was re-encoded. A match there
+//! still counts: a digest cannot be produced without the key.
+//!
 //! Without a key nothing is checked and nothing is claimed: [`State::Unchecked`]
 //! is not a verdict on the stream. The key itself is never logged, never
 //! reported and never written anywhere — only the path it was read from.
@@ -41,15 +52,17 @@ use truehd::structs::evolution::EvoProtectionStatus;
 pub enum State {
     /// No key on this machine, so the question was not asked.
     Unchecked,
-    /// No Evolution frame in what was read: a stream without object
-    /// metadata, or a read too short to reach its first frame. There is
-    /// nothing to sign, so this says nothing about how the stream was made.
+    /// Nothing that could be judged in what was read: no Evolution frame —
+    /// a stream without object metadata, or a read too short to reach its
+    /// first one — or only words in major-sync units that do not verify.
+    /// This says nothing about how the stream was made.
     Absent,
     /// Evolution frames were read, and none carried a protection word.
     Unsigned,
-    /// Every protection word read is the digest the key produces.
+    /// No word in a unit without a major sync failed, and at least one word
+    /// read is the digest the key produces.
     Verified,
-    /// At least one is not.
+    /// A word in a unit without a major sync is not the key's digest.
     Mismatch,
 }
 
@@ -74,21 +87,27 @@ pub struct Tally {
     /// Of those, the ones carrying an Evolution frame. A stream with none
     /// carries no object metadata either: there is nothing to sign.
     pub frames: u64,
-    /// Of those, the ones carrying a primary protection word.
+    /// Of those, in units without a major sync, the ones carrying a primary
+    /// protection word: the words the verdict rests on.
     pub checked: u64,
     /// Of those, the ones whose word is the digest of the key.
     pub verified: u64,
     /// Of those, the ones whose word is not.
     pub mismatched: u64,
+    /// Words in units that carry a major sync, counted apart; see the
+    /// module documentation.
+    pub sync_checked: u64,
+    /// Of those, the ones whose word is the digest of the key.
+    pub sync_verified: u64,
 }
 
 impl Tally {
     pub fn state(&self) -> State {
         if self.mismatched > 0 {
             State::Mismatch
-        } else if self.checked > 0 {
+        } else if self.verified + self.sync_verified > 0 {
             State::Verified
-        } else if self.frames > 0 {
+        } else if self.frames > 0 && self.sync_checked == 0 {
             State::Unsigned
         } else {
             State::Absent
@@ -168,12 +187,18 @@ impl Verifier {
             return;
         }
         self.tally.frames += 1;
+        let sync = unit.major_sync_info.is_some();
         match extra.verify_evo_protection(bytes, &self.key) {
             EvoProtectionStatus::Absent => {}
+            EvoProtectionStatus::Match if sync => {
+                self.tally.sync_checked += 1;
+                self.tally.sync_verified += 1;
+            }
             EvoProtectionStatus::Match => {
                 self.tally.checked += 1;
                 self.tally.verified += 1;
             }
+            EvoProtectionStatus::Mismatch { .. } if sync => self.tally.sync_checked += 1,
             status @ EvoProtectionStatus::Mismatch { .. } => {
                 self.tally.checked += 1;
                 self.tally.mismatched += 1;
@@ -229,9 +254,55 @@ mod tests {
             checked: 100,
             verified: 99,
             mismatched: 1,
+            ..Tally::default()
         };
         assert_eq!(tally.state(), State::Mismatch);
         assert_eq!(tally.state().as_str(), "mismatch");
+    }
+
+    /// Measured on a commercial disc: every frame in an ordinary unit
+    /// verifies, every frame in a major-sync unit does not. That is not a
+    /// re-encode.
+    #[test]
+    fn failures_confined_to_major_sync_units_leave_the_stream_verified() {
+        let tally = Tally {
+            units: 72_000,
+            frames: 1_877,
+            checked: 1_836,
+            verified: 1_836,
+            mismatched: 0,
+            sync_checked: 41,
+            sync_verified: 0,
+        };
+        assert_eq!(tally.state(), State::Verified);
+    }
+
+    /// A failure in an ordinary unit is a mismatch whatever the major-sync
+    /// units say.
+    #[test]
+    fn one_failure_in_an_ordinary_unit_is_a_mismatch_even_beside_good_syncs() {
+        let tally = Tally {
+            units: 480,
+            frames: 13,
+            checked: 11,
+            verified: 10,
+            mismatched: 1,
+            sync_checked: 2,
+            sync_verified: 2,
+        };
+        assert_eq!(tally.state(), State::Mismatch);
+    }
+
+    /// Only failing major-sync words: nothing that can be judged.
+    #[test]
+    fn only_failing_major_sync_words_are_absent() {
+        let tally = Tally {
+            units: 8,
+            frames: 1,
+            sync_checked: 1,
+            ..Tally::default()
+        };
+        assert_eq!(tally.state(), State::Absent);
     }
 
     #[test]
@@ -242,6 +313,7 @@ mod tests {
             checked: 100,
             verified: 100,
             mismatched: 0,
+            ..Tally::default()
         };
         assert_eq!(tally.state(), State::Verified);
     }
