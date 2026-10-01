@@ -18,6 +18,11 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 bridge-perf = ["truehd/perf"]
+# IAMF (AOMedia Immersive Audio Model and Formats) through iamf-rs. Off by
+# default: its Opus decoding links libopus (pkg-config, or OPUS_LIB_DIR), and
+# the Windows and macOS release builds do not provide one yet. The pure-Rust
+# Opus decoder iamf-rs also offers is far below realtime on real content.
+iamf = ["dep:iamf-obu", "dep:iamf-dec", "dep:iamf-codecs"]
 
 # Path deps reach out of the workspace to the sibling Omniphony checkout:
 # `bridge/../../Omniphony` is the workflow symlink locally and the second
@@ -35,6 +40,10 @@ log = "0.4"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml_ng = "0.10"
+# iamf-rs is not on crates.io: pinned to a reviewed commit.
+iamf-obu = { git = "https://github.com/baylesj/iamf-rs", rev = "01a562dd3a8e7ef29365dec9818da9e8a826cb33", optional = true }
+iamf-dec = { git = "https://github.com/baylesj/iamf-rs", rev = "01a562dd3a8e7ef29365dec9818da9e8a826cb33", default-features = false, optional = true }
+iamf-codecs = { git = "https://github.com/baylesj/iamf-rs", rev = "01a562dd3a8e7ef29365dec9818da9e8a826cb33", default-features = false, features = ["pcm", "flac", "aac", "opus-ffi"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -77,6 +77,10 @@ pub(crate) enum RawCodec {
     TrueHd,
     Eac3,
     Dts,
+    /// An IAMF OBU stream. Recognised whether or not the `iamf` feature is
+    /// built, so a stream the bridge cannot decode is refused by name instead
+    /// of being fed to the TrueHD fallback.
+    Iamf,
 }
 
 /// Which DTS carrier the frames come in: what the demux found after the
@@ -99,7 +103,13 @@ pub(crate) enum DtsProfile {
 /// declare the codec via `configure("input_codec", …)`. Checks the most
 /// specific pattern first: the TrueHD major-sync word `0xF8726FBA` at offset 4,
 /// then the E-AC3/AC-3 sync word `0x0B77` at offset 0 (incl. byte-swapped).
+/// An IAMF stream opens with its sequence header, whose `iamf` code is checked
+/// before all of them: its first byte (`0xF8`–`0xFF`) is also where a TrueHD
+/// major sync's first byte can sit.
 fn sniff_raw_codec(data: &[u8]) -> Option<RawCodec> {
+    if is_iamf_sequence_header(data) {
+        return Some(RawCodec::Iamf);
+    }
     if data.len() >= 8 && data[4] == 0xF8 && data[5] == 0x72 && data[6] == 0x6F && data[7] == 0xBA {
         return Some(RawCodec::TrueHd);
     }
@@ -116,6 +126,20 @@ fn sniff_raw_codec(data: &[u8]) -> Option<RawCodec> {
         return Some(RawCodec::Eac3);
     }
     None
+}
+
+/// An IA sequence header OBU (type 31) at offset 0 whose payload starts with
+/// the `iamf` code (IAMF §3.4). The size field between the two is a leb128.
+fn is_iamf_sequence_header(data: &[u8]) -> bool {
+    if data.first().is_none_or(|&header| header >> 3 != 31) {
+        return false;
+    }
+    let size_len = data
+        .iter()
+        .skip(1)
+        .take(8)
+        .position(|&byte| byte & 0x80 == 0);
+    size_len.is_some_and(|n| data.get(2 + n..6 + n) == Some(b"iamf".as_slice()))
 }
 
 /// Decoder state for every supported format, owned by one bridge instance.
@@ -231,6 +255,15 @@ pub(crate) struct AtmosBridge {
     /// Auro-3D detection and unfolding over the lossless DTS-HD output.
     /// Holds the first frames back until the carrier question is settled.
     pub(crate) dts_auro: DtsAuroState,
+    // ── IAMF pipeline ────────────────────────────────────────────────
+    #[cfg(feature = "iamf")]
+    pub(crate) iamf: Box<crate::iamf_pipeline::IamfState>,
+    /// An IAMF stream was refused because the feature is not built: said
+    /// once per stream rather than on every packet.
+    #[cfg(not(feature = "iamf"))]
+    pub(crate) iamf_refusal_reported: bool,
+    /// True when the most recent `push_packet` used the IAMF path.
+    pub(crate) iamf_active: bool,
     // ── Shared ───────────────────────────────────────────────────────
     pub(crate) presentation: u8,
     pub(crate) strict: bool,
@@ -313,6 +346,11 @@ impl AtmosBridge {
             dts_objects_active: false,
             dts_profile: DtsProfile::default(),
             dts_auro: DtsAuroState::default(),
+            #[cfg(feature = "iamf")]
+            iamf: Box::default(),
+            #[cfg(not(feature = "iamf"))]
+            iamf_refusal_reported: false,
+            iamf_active: false,
             presentation,
             strict,
             total_samples: 0,
@@ -374,6 +412,16 @@ impl AtmosBridge {
         self.dts_objects_active = false;
         self.dts_profile = DtsProfile::default();
         self.dts_auro.reset();
+
+        // IAMF reset: the stream position goes, the sequence's configuration
+        // stays, so decoding resumes without waiting for a sequence header.
+        #[cfg(feature = "iamf")]
+        self.iamf.reset();
+        #[cfg(not(feature = "iamf"))]
+        {
+            self.iamf_refusal_reported = false;
+        }
+        self.iamf_active = false;
         // Re-sniff after reset, but keep any host-declared codec.
         self.raw_codec = None;
 
@@ -491,6 +539,13 @@ impl AtmosBridge {
         if let Some(c) = sniff_raw_codec(data) {
             self.raw_codec = Some(c);
             return c;
+        }
+        // An IAMF stream only announces itself in its sequence header, so a
+        // reset (a seek) is followed by temporal units with nothing to sniff.
+        // While the sequence is still configured they are its continuation.
+        #[cfg(feature = "iamf")]
+        if self.iamf.has_sequence() {
+            return RawCodec::Iamf;
         }
         RawCodec::TrueHd
     }
@@ -707,7 +762,9 @@ impl FormatBridge for AtmosBridge {
                 // us against what the SPDIF path receives. Triggered only until the
                 // first frame is successfully decoded; cleared on reset so post-seek
                 // packets log again.
-                match self.resolve_raw_codec(data.as_slice()) {
+                let codec = self.resolve_raw_codec(data.as_slice());
+                self.iamf_active = codec == RawCodec::Iamf;
+                match codec {
                     RawCodec::Eac3 => {
                         self.eac3_active = true;
                         self.dts_active = false;
@@ -725,10 +782,26 @@ impl FormatBridge for AtmosBridge {
                         self.dts_buf.extend_from_slice(data.as_slice());
                         crate::dts_pipeline::drain_dts(self, &mut result);
                     }
+                    RawCodec::Iamf => {
+                        self.eac3_active = false;
+                        self.dts_active = false;
+                        #[cfg(feature = "iamf")]
+                        crate::iamf_pipeline::push_iamf(self, data.as_slice(), &mut result);
+                        #[cfg(not(feature = "iamf"))]
+                        if !self.iamf_refusal_reported {
+                            // Reported once per stream, not per packet.
+                            self.iamf_refusal_reported = true;
+                            let msg = "iamf: this bridge was built without IAMF support";
+                            log::warn!("{msg}");
+                            result.error_message = msg.into();
+                        }
+                    }
                 }
                 result
             }
             RInputTransport::Iec61937 => {
+                // IAMF has no IEC 61937 data type: it only comes raw.
+                self.iamf_active = false;
                 // ── TrueHD (data type 0x16) ───────────────────────────
                 if MatStream::accepts_data_type(data_type) {
                     self.eac3_active = false;
@@ -856,10 +929,18 @@ impl FormatBridge for AtmosBridge {
     }
 
     fn is_ready(&self) -> bool {
+        #[cfg(feature = "iamf")]
+        if self.iamf.frame_count > 0 {
+            return true;
+        }
         self.frame_count > 0 || self.eac3_frame_count > 0 || self.dts_frame_count > 0
     }
 
     fn has_objects(&self) -> bool {
+        if self.iamf_active {
+            // Every mix is rendered to a 7.1.4 bed in the bridge.
+            return false;
+        }
         if self.dts_active {
             if self.dts_objects_active {
                 return true;
@@ -923,6 +1004,7 @@ impl FormatBridge for AtmosBridge {
                     "eac3" | "ec3" | "e-ac3" | "ac3" => Some(RawCodec::Eac3),
                     "truehd" | "mlp" => Some(RawCodec::TrueHd),
                     "dts" | "dca" | "dtsx" | "dts:x" | "dts-hd" | "dtshd" => Some(RawCodec::Dts),
+                    "iamf" => Some(RawCodec::Iamf),
                     "auto" | "" => None,
                     s => {
                         log::warn!("atmos-bridge: unknown input_codec {s:?}");
@@ -984,7 +1066,13 @@ impl FormatBridge for AtmosBridge {
         // Auro-3D carrier declares its whole layout from Auro's setup table,
         // and DTS declares its lower layer from the ETSI loudspeaker table.
         // Dolby's bed is defined in its room cube, not by angles, and
-        // declares nothing: the renderer's room model is its model.
+        // declares nothing: the renderer's room model is its model. IAMF's
+        // bed is the BS.2051 layout the decoder rendered to, whose angles
+        // the recommendation states.
+        #[cfg(feature = "iamf")]
+        if self.iamf_active {
+            return crate::iamf_pipeline::declared_poses();
+        }
         if self.dts_active {
             if self.dts_auro.is_unfolding() {
                 self.dts_auro.declared_poses()
@@ -1000,8 +1088,11 @@ impl FormatBridge for AtmosBridge {
         // The renderer's placement policy is chosen per family
         // (`renderer::placement`): Dolby's codecs share the room-cube bed,
         // DTS its ITU angles, and an unfolded Auro-3D carrier is its own
-        // family with its own default (a sphere).
-        RString::from(if self.dts_active {
+        // family with its own default (a sphere). IAMF has no family of its
+        // own yet: the empty name is the generic family.
+        RString::from(if self.iamf_active {
+            ""
+        } else if self.dts_active {
             if self.dts_auro.is_unfolding() {
                 "auro"
             } else {
@@ -1019,6 +1110,10 @@ impl FormatBridge for AtmosBridge {
         // guess, and the host has its own.
         if !self.is_ready() {
             return RString::new();
+        }
+        #[cfg(feature = "iamf")]
+        if self.iamf_active {
+            return RString::from(self.iamf.description().unwrap_or("IAMF"));
         }
         let mut label = String::with_capacity(40);
         if self.dts_active {
@@ -1201,6 +1296,30 @@ mod raw_transport_tests {
     fn sniff_unknown_is_none() {
         assert_eq!(sniff_raw_codec(&[0x12, 0x34, 0x56, 0x78]), None);
         assert_eq!(sniff_raw_codec(&[0x0B]), None); // too short
+    }
+
+    #[test]
+    fn sniff_detects_an_iamf_sequence_header() {
+        // OBU type 31, obu_size 6, then ia_code "iamf" and the profiles.
+        let header = [0xF8, 0x06, b'i', b'a', b'm', b'f', 0x00, 0x00];
+        assert_eq!(sniff_raw_codec(&header), Some(RawCodec::Iamf));
+        // A two-byte obu_size moves the code along.
+        let long = [0xF8, 0x86, 0x00, b'i', b'a', b'm', b'f', 0x00];
+        assert_eq!(sniff_raw_codec(&long), Some(RawCodec::Iamf));
+        // The same first byte without the code is not IAMF, and a TrueHD
+        // major sync at offset 4 still reads as TrueHD.
+        assert_eq!(sniff_raw_codec(&[0xF8, 0x06, b'x', b'a', b'm', b'f']), None);
+        let thd = [0xF8, 0x00, 0x00, 0x00, 0xF8, 0x72, 0x6F, 0xBA];
+        assert_eq!(sniff_raw_codec(&thd), Some(RawCodec::TrueHd));
+        // Truncated before the code.
+        assert_eq!(sniff_raw_codec(&[0xF8, 0x06, b'i', b'a']), None);
+    }
+
+    #[test]
+    fn configure_input_codec_accepts_iamf() {
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("input_codec".into(), "iamf".into()));
+        assert_eq!(bridge.forced_raw_codec, Some(RawCodec::Iamf));
     }
 
     #[test]

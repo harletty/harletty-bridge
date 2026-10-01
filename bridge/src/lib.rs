@@ -6,6 +6,8 @@ mod dts_spdif;
 mod eac3_pipeline;
 mod eac3_spdif;
 mod frame_builders;
+#[cfg(feature = "iamf")]
+mod iamf_pipeline;
 mod labels;
 mod logging;
 mod mat;
