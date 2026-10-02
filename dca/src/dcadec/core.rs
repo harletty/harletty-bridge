@@ -721,10 +721,9 @@ impl CoreDecoder {
 
     fn parse_block_codes(&self, gb: &mut BitReader, audio: &mut [i32; 8], abits: i32) -> R<()> {
         let nbits = BLOCK_CODE_NBITS[abits as usize - 1] as usize;
-        let code1 = rb(gb, nbits)? as i32;
-        let code2 = rb(gb, nbits)? as i32;
-        let levels = QUANT_LEVELS[abits as usize] as i32;
-        if decode_blockcodes(code1, code2, levels, audio) != 0 {
+        let code1 = rb(gb, nbits)?;
+        let code2 = rb(gb, nbits)?;
+        if !decode_blockcodes(code1, code2, abits as usize, audio) {
             return Err(CoreError::Invalid("block code"));
         }
         Ok(())
@@ -1186,18 +1185,128 @@ pub(crate) fn primary_bed_layout(mode: AudioMode) -> &'static [BedChannel] {
     }
 }
 
-/// `decode_blockcodes` — returns leftover (nonzero => error).
-fn decode_blockcodes(mut code1: i32, mut code2: i32, levels: i32, audio: &mut [i32; 8]) -> i32 {
-    let offset = (levels - 1) / 2;
-    for n in 0..DCA_SUBBAND_SAMPLES / 2 {
-        let div = code1 / levels;
-        audio[n] = code1 - div * levels - offset;
-        code1 = div;
+/// What splits a block code of bit allocation `abits` (1 to 7) in two.
+///
+/// A code packs four samples as base-`levels` digits. Peeling them off one
+/// division at a time chains four divisions; instead one multiplication
+/// splits the code into two two-digit halves, each then read from a table.
+#[derive(Clone, Copy)]
+struct BlockCode {
+    /// `levels * levels`: a half is below this.
+    square: u32,
+    /// `2^32 / square + 1`: `(code * reciprocal) >> 32` is `code / square`
+    /// for every code of at most 19 bits.
+    reciprocal: u64,
+    /// Where the halves of this allocation start in `BLOCK_CODE_PAIRS`.
+    first: usize,
+}
+
+const BLOCK_CODE_PAIR_COUNT: usize = 9 + 25 + 49 + 81 + 169 + 289 + 625;
+
+const fn block_codes() -> ([BlockCode; 7], [[i8; 2]; BLOCK_CODE_PAIR_COUNT]) {
+    let mut codes = [BlockCode {
+        square: 0,
+        reciprocal: 0,
+        first: 0,
+    }; 7];
+    let mut pairs = [[0i8; 2]; BLOCK_CODE_PAIR_COUNT];
+    let mut first = 0;
+    let mut i = 0;
+    while i < 7 {
+        let levels = QUANT_LEVELS[i + 1];
+        let square = levels * levels;
+        codes[i] = BlockCode {
+            square,
+            reciprocal: (1u64 << 32) / square as u64 + 1,
+            first,
+        };
+        let offset = (levels as i32 - 1) / 2;
+        let mut half = 0;
+        while half < square {
+            pairs[first + half as usize] = [
+                ((half % levels) as i32 - offset) as i8,
+                ((half / levels) as i32 - offset) as i8,
+            ];
+            half += 1;
+        }
+        first += square as usize;
+        i += 1;
     }
-    for n in DCA_SUBBAND_SAMPLES / 2..DCA_SUBBAND_SAMPLES {
-        let div = code2 / levels;
-        audio[n] = code2 - div * levels - offset;
-        code2 = div;
+    assert!(first == BLOCK_CODE_PAIR_COUNT);
+    (codes, pairs)
+}
+
+static BLOCK_CODES: [BlockCode; 7] = block_codes().0;
+/// For each bit allocation, the two samples of every half code.
+static BLOCK_CODE_PAIRS: [[i8; 2]; BLOCK_CODE_PAIR_COUNT] = block_codes().1;
+
+/// `decode_blockcodes`: the eight samples of two block codes. False when a
+/// code holds more than its four digits.
+#[inline]
+fn decode_blockcodes(code1: u32, code2: u32, abits: usize, audio: &mut [i32; 8]) -> bool {
+    let BlockCode {
+        square,
+        reciprocal,
+        first,
+    } = BLOCK_CODES[abits - 1];
+    let pairs = &BLOCK_CODE_PAIRS[first..first + square as usize];
+    let high1 = ((code1 as u64 * reciprocal) >> 32) as u32;
+    let high2 = ((code2 as u64 * reciprocal) >> 32) as u32;
+    if high1 >= square || high2 >= square {
+        return false;
     }
-    code1 | code2
+    let halves = [code1 - high1 * square, high1, code2 - high2 * square, high2];
+    for (samples, half) in audio.chunks_exact_mut(2).zip(halves) {
+        let pair = pairs[half as usize];
+        samples[0] = pair[0] as i32;
+        samples[1] = pair[1] as i32;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ffmpeg's `decode_blockcodes`: one division per sample.
+    fn reference(mut code1: i32, mut code2: i32, levels: i32, audio: &mut [i32; 8]) -> i32 {
+        let offset = (levels - 1) / 2;
+        for n in 0..DCA_SUBBAND_SAMPLES / 2 {
+            let div = code1 / levels;
+            audio[n] = code1 - div * levels - offset;
+            code1 = div;
+        }
+        for n in DCA_SUBBAND_SAMPLES / 2..DCA_SUBBAND_SAMPLES {
+            let div = code2 / levels;
+            audio[n] = code2 - div * levels - offset;
+            code2 = div;
+        }
+        code1 | code2
+    }
+
+    /// Every code of every allocation, in both positions, decodes to the
+    /// samples the division chain gives and is refused when it is.
+    #[test]
+    fn block_codes_match_the_division_chain() {
+        for abits in 1..=7usize {
+            let levels = QUANT_LEVELS[abits] as i32;
+            let nbits = BLOCK_CODE_NBITS[abits - 1];
+            for code in 0..1u32 << nbits {
+                let other = (code * 7 + 3) % (levels * levels * levels * levels) as u32;
+                for (code1, code2) in [(code, other), (other, code)] {
+                    let mut expected = [0i32; 8];
+                    let valid = reference(code1 as i32, code2 as i32, levels, &mut expected) == 0;
+                    let mut audio = [0i32; 8];
+                    assert_eq!(
+                        decode_blockcodes(code1, code2, abits, &mut audio),
+                        valid,
+                        "abits {abits}, codes {code1} {code2}"
+                    );
+                    if valid {
+                        assert_eq!(audio, expected, "abits {abits}, codes {code1} {code2}");
+                    }
+                }
+            }
+        }
+    }
 }
