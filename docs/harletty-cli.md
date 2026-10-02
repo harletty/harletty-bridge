@@ -339,6 +339,17 @@ Read that as: the output is no longer bit-exact to the source across
 those 14 ms, but it is still in sync. If you would rather the run failed
 loudly than substituted anything, use `--strict`.
 
+An E-AC-3 output keeps **one channel layout** through the damage, the one
+of the first frame that decoded. In a JOC stream an access unit that
+fails to decode is silence in every channel of the `.atmos.audio`, and
+one that decodes without its objects is written as its bed, in the bed's
+place, with the object channels silent. A channel the file has no place
+for (the back pair of a 7.1 frame in a 5.1 file) is dropped, with a
+warning. The one case where the file changes is a stream that starts as
+a plain bed and carries objects later: the bed already written is
+rewritten as the head of the `.atmos.audio`, objects silent, so the
+master set covers the stream from its first sample.
+
 Errors at the *extractor* level — where framing itself is lost and the
 decoder resynchronises — are not compensated this way, because the number
 of access units that went by is unknowable. They remain a possible source
