@@ -405,9 +405,7 @@ fn get_linear(gb: &mut BitReader, n: usize) -> R<i32> {
 
 #[inline]
 fn get_rice(gb: &mut BitReader, k: usize) -> R<i32> {
-    let q = gb.get_unary(1 << 20) as u32;
-    let low = if k > 0 { rb(gb, k)? } else { 0 };
-    let v = (q << k) | low;
+    let v = gb.read_rice(k, 1 << 20).ok_or(XllError::Bitstream)?;
     Ok(((v >> 1) ^ (0u32.wrapping_sub(v & 1))) as i32)
 }
 

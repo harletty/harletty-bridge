@@ -169,6 +169,31 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// A Rice code: a unary quotient (`get_unary(max_quotient)`) then `k`
+    /// remainder bits (`read_bits(k)`), as `(quotient << k) | remainder`.
+    /// `None` when the remainder fails to read (the quotient never fails).
+    #[inline]
+    pub(crate) fn read_rice(&mut self, k: usize, max_quotient: usize) -> Option<u32> {
+        // Common case: quotient, stop bit and remainder all in the next 32
+        // bits, read with one load.
+        if k < 32 && self.remaining() >= 32 {
+            let peek = self.peek_padded(32);
+            let q = peek.leading_zeros() as usize;
+            if q + 1 + k <= 32 && q < max_quotient {
+                let low = if k == 0 {
+                    0
+                } else {
+                    (peek << (q + 1)) >> (32 - k)
+                };
+                self.bit_pos += q + 1 + k;
+                return Some(((q as u32) << k) | low);
+            }
+        }
+        let q = self.get_unary(max_quotient) as u32;
+        let low = if k > 0 { self.read_bits(k)? } else { 0 };
+        Some(q.wrapping_shl(k as u32) | low)
+    }
+
     /// Skip an arbitrary number of bits (may exceed 32; `skip_bits_long`).
     pub(crate) fn skip_bits_long(&mut self, bits: usize) -> Option<()> {
         if self.bits_left(bits) {
@@ -218,7 +243,7 @@ mod tests {
         len
     }
 
-    /// Reads of every width and unary runs at every offset, up to and past
+    /// Reads of every width, unary runs and Rice codes at every offset, up to and past
     /// the end of the data and of a limit set below it.
     #[test]
     fn word_reads_match_bit_reads() {
@@ -245,8 +270,26 @@ mod tests {
                 fast.set_limit_bits(limit);
                 let mut pos = start.min(limit);
                 loop {
-                    let op = next() % 3;
-                    if op == 2 {
+                    let op = next() % 4;
+                    if op == 3 {
+                        let k = (next() % 34) as usize;
+                        let max_q = [3usize, 40, 1 << 20][(next() % 3) as usize];
+                        let a = fast.read_rice(k, max_q);
+                        let q = unary_reference(&data, limit, &mut pos, max_q) as u32;
+                        let b = read_reference(&data, limit, &mut pos, k).map(|low| {
+                            if k > 0 {
+                                q.wrapping_shl(k as u32) | low
+                            } else {
+                                q
+                            }
+                        });
+                        assert_eq!(a, b);
+                        if a.is_none() {
+                            // A failed remainder read leaves the quotient consumed.
+                            assert_eq!(fast.position(), pos);
+                            break;
+                        }
+                    } else if op == 2 {
                         let n = (next() % 70) as usize;
                         let a = fast.get_unary(n);
                         let b = unary_reference(&data, limit, &mut pos, n);
