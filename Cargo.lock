@@ -677,7 +677,7 @@ dependencies = [
 [[package]]
 name = "iamf-codecs"
 version = "0.2.0"
-source = "git+https://github.com/baylesj/iamf-rs?rev=01a562dd3a8e7ef29365dec9818da9e8a826cb33#01a562dd3a8e7ef29365dec9818da9e8a826cb33"
+source = "git+https://github.com/harletty/iamf-rs?rev=1f841d2cc7ee39d3e9b9bf1293bda64063aa4972#1f841d2cc7ee39d3e9b9bf1293bda64063aa4972"
 dependencies = [
  "iamf-dec",
  "iamf-obu",
@@ -690,7 +690,7 @@ dependencies = [
 [[package]]
 name = "iamf-dec"
 version = "0.2.0"
-source = "git+https://github.com/baylesj/iamf-rs?rev=01a562dd3a8e7ef29365dec9818da9e8a826cb33#01a562dd3a8e7ef29365dec9818da9e8a826cb33"
+source = "git+https://github.com/harletty/iamf-rs?rev=1f841d2cc7ee39d3e9b9bf1293bda64063aa4972#1f841d2cc7ee39d3e9b9bf1293bda64063aa4972"
 dependencies = [
  "iamf-obu",
 ]
@@ -698,12 +698,12 @@ dependencies = [
 [[package]]
 name = "iamf-obu"
 version = "0.2.0"
-source = "git+https://github.com/baylesj/iamf-rs?rev=01a562dd3a8e7ef29365dec9818da9e8a826cb33#01a562dd3a8e7ef29365dec9818da9e8a826cb33"
+source = "git+https://github.com/harletty/iamf-rs?rev=1f841d2cc7ee39d3e9b9bf1293bda64063aa4972#1f841d2cc7ee39d3e9b9bf1293bda64063aa4972"
 
 [[package]]
 name = "iamf-opus-ffi"
 version = "0.2.0"
-source = "git+https://github.com/baylesj/iamf-rs?rev=01a562dd3a8e7ef29365dec9818da9e8a826cb33#01a562dd3a8e7ef29365dec9818da9e8a826cb33"
+source = "git+https://github.com/harletty/iamf-rs?rev=1f841d2cc7ee39d3e9b9bf1293bda64063aa4972#1f841d2cc7ee39d3e9b9bf1293bda64063aa4972"
 dependencies = [
  "pkg-config",
 ]
