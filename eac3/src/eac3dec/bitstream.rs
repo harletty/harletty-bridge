@@ -42,6 +42,31 @@ impl<'a> BitReader<'a> {
         self.data
     }
 
+    /// The bits of `data` from `bit_pos` on at the top of a word, 57 of them
+    /// at least, zeros past the end: for a loop that keeps the position
+    /// itself, reads fields of known width with a shift, and checks where it
+    /// stopped against [`Self::limit_bits`] once it is done.
+    #[inline(always)]
+    pub(crate) fn word_at(data: &[u8], bit_pos: usize) -> u64 {
+        let byte_pos = bit_pos >> 3;
+        let word = match data.get(byte_pos..byte_pos + 8) {
+            Some(word) => u64::from_be_bytes(word.try_into().unwrap()),
+            None => Self::last_word(data, byte_pos),
+        };
+        word << (bit_pos & 7)
+    }
+
+    /// The bytes of `data` from `byte_pos` on, fewer than eight, as a word
+    /// with zeros after them.
+    #[cold]
+    fn last_word(data: &[u8], byte_pos: usize) -> u64 {
+        let mut word = [0u8; 8];
+        let tail = &data[byte_pos.min(data.len())..];
+        let kept = tail.len().min(8);
+        word[..kept].copy_from_slice(&tail[..kept]);
+        u64::from_be_bytes(word)
+    }
+
     pub(crate) fn set_limit_bits(&mut self, bit_size: usize) {
         self.bit_size = bit_size.min(self.data.len() * 8);
         if self.bit_pos > self.bit_size {
