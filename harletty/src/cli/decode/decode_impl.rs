@@ -93,11 +93,16 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
 
     let state = WriterState { fail_level };
 
-    // Setup required presentations
+    // Only the substreams the presentation is made of are parsed: a 7.1
+    // presentation often stands on its own substreams, next to those of a
+    // stereo one it has no use for. Strict mode parses those of every
+    // presentation below it as well, which is what checks them.
     let mut required_presentations = [false; MAX_PRESENTATIONS];
-    required_presentations[..=presentation as usize]
-        .iter_mut()
-        .for_each(|p| *p = true);
+    if strict_mode {
+        required_presentations[..=presentation as usize].fill(true);
+    } else {
+        required_presentations[presentation as usize] = true;
+    }
     parser.set_required_presentations(&required_presentations);
 
     // Spawn decoder thread
