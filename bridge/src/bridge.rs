@@ -14,9 +14,9 @@ use crate::ac3_native::NativeAc3Decoder;
 use crate::auro_pipeline::DtsAuroState;
 use crate::dts_pipeline::{DtsFoldConfig, DtsXState};
 use crate::eac3_pipeline::{
-    PendingEac3Dependent, build_legacy_ac3_core_failure_silence, diagnose_eac3_frame,
-    eac3_frame_can_carry_dependents, eac3_frame_carries_joc, eac3_frame_carries_self_contained_joc,
-    inspect_eac3_frame, is_legacy_ac3_frame, is_temporary_eac3_silence_frame, process_eac3_frame,
+    Eac3IndependentOutcome, PendingEac3Dependent, build_legacy_ac3_core_failure_silence,
+    decode_eac3_independent, decode_eac3_inspected, diagnose_eac3_frame, eac3_frame_carries_joc,
+    inspect_eac3_frame, is_legacy_ac3_frame, is_temporary_eac3_silence_frame,
 };
 use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::validate_frame_shape;
@@ -206,6 +206,11 @@ pub(crate) struct AtmosBridge {
     /// per-stream state never interferes).
     pub(crate) eac3_dependent_pcm_decoder: Box<PcmDecoder>,
     pub(crate) eac3_object_decoder: Box<ObjectPcmDecoder>,
+    /// Whether the last independent E-AC-3 frame carried JOC its own channels
+    /// satisfy, so the next one is decoded by the object decoder first. Only
+    /// a guess at the decoder to try: `decode_eac3_independent` confirms it on
+    /// every frame.
+    pub(crate) eac3_expect_self_contained_joc: bool,
     pub(crate) ac3_decoder: Box<NativeAc3Decoder>,
     /// The core of a presentation whose dependent has not arrived yet.
     ///
@@ -327,6 +332,7 @@ impl AtmosBridge {
             eac3_pcm_decoder: eac3_pcm,
             eac3_dependent_pcm_decoder: eac3_dependent_pcm,
             eac3_object_decoder: eac3_obj,
+            eac3_expect_self_contained_joc: false,
             ac3_decoder: Box::new(NativeAc3Decoder::default()),
             pending_eac3_core: None,
             eac3_frame_count: 0,
@@ -562,19 +568,31 @@ impl AtmosBridge {
     ) -> Result<(), ()> {
         self.eac3_frame_count += 1;
         // A dependent substream belongs to the access unit it immediately
-        // follows, so any other kind of unit ends the group in hand.
-        let inspection = match inspect_eac3_frame(frame) {
-            Ok(info) if info.frame_type == FrameType::Dependent => {
-                return self.push_eac3_dependent(frame, info, result);
+        // follows, so any other kind of unit ends the group in hand. Only a
+        // dependent is inspected in full here: it is held with what the
+        // inspection found, and one whose inspection fails is handled as the
+        // frame of unknown type it then is.
+        let header = eac3::parse_header(frame).ok();
+        let is_legacy = is_legacy_ac3_frame(frame);
+        let inspection = if is_legacy
+            || header.is_some_and(|header| header.stream_type == eac3::StreamType::Dependent)
+        {
+            match inspect_eac3_frame(frame) {
+                Ok(info) if info.frame_type == FrameType::Dependent => {
+                    return self.push_eac3_dependent(frame, info, result);
+                }
+                inspection => Some(inspection),
             }
-            inspection => inspection,
+        } else {
+            None
         };
 
         if let Err(()) = self.finish_presentation(result) {
             return Err(());
         }
 
-        let decode_result = if is_legacy_ac3_frame(frame) {
+        let decode_result = if is_legacy {
+            let inspection = inspection.unwrap_or_else(|| inspect_eac3_frame(frame));
             match self.ac3_decoder.decode_frame(frame) {
                 Ok(core) => {
                     diagnose_eac3_frame(self, frame, &inspection);
@@ -612,38 +630,34 @@ impl AtmosBridge {
                         .ok_or_else(|| format!("AC-3 core decode error: {err}"))
                 }
             }
-        } else if eac3_frame_can_carry_dependents(&inspection)
-            && !eac3_frame_carries_self_contained_joc(&inspection)
-        {
+        } else {
             // A plain independent core might be the first half of a group, and
-            // nothing in it says whether a dependent follows. Hold it until the
-            // next access unit answers that. A converted-AC-3 frame is excluded:
-            // ETSI allows it no dependents, so buffering it would add latency
-            // for a partner that cannot arrive. An independent whose own JOC
-            // payload declares a downmix wider than the frame carries is the
-            // opposite case - its extension pair, the back channels or the top
-            // front ones, is in a dependent, and emitting the frame alone would
-            // reconstruct from a bed two channels short of its own header - so
-            // that one is held too.
-            match self.eac3_pcm_decoder.push_access_unit(frame) {
-                Ok(push) => {
-                    diagnose_eac3_frame(self, frame, &inspection);
-                    crate::eac3_pipeline::note_eac3_dialogue_level(self, &push.info);
+            // nothing in it says whether a dependent follows: it is held until
+            // the next access unit answers that. A converted-AC-3 frame cannot
+            // carry dependents (ETSI allows it none), and an independent whose
+            // JOC payload its own channels satisfy is a complete presentation:
+            // both are emitted at once, which keeps the common 5.1-core Atmos
+            // stream free of the access unit of latency buffering would add.
+            // An independent whose JOC declares a wider downmix than it carries
+            // is held like a plain core, so its dependents reach the bed.
+            let outcome = match &inspection {
+                Some(inspection) => decode_eac3_inspected(self, frame, inspection),
+                None => {
+                    let can_carry_dependents = header
+                        .is_some_and(|header| header.stream_type == eac3::StreamType::Independent);
+                    decode_eac3_independent(self, frame, can_carry_dependents)
+                }
+            };
+            match outcome {
+                Eac3IndependentOutcome::Hold(push) => {
                     self.pending_eac3_core = Some(PendingEac3Presentation {
                         core: PendingEac3Core::Independent(Box::new(push)),
                         dependents: Vec::new(),
                     });
                     return Ok(());
                 }
-                Err(err) => Err(format!("E-AC3 core decode error: {err}")),
+                Eac3IndependentOutcome::Emit(decoded) => decoded,
             }
-        } else {
-            // A JOC payload the frame's own channels satisfy is a complete
-            // presentation - the reconstruction takes the core it arrived with
-            // and wants no dependent - so it is emitted straight away rather
-            // than buffered. That keeps the common 5.1-core Atmos stream free of
-            // the access unit of latency buffering would add.
-            process_eac3_frame(self, frame, &inspection)
         };
 
         match decode_result {
