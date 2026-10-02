@@ -395,6 +395,70 @@ fn rmul15(a: i32, b: i32) -> i32 {
     (((a as i64 * b as i64) + (1 << 14)) >> 15) as i32
 }
 
+sample_loop! {
+    /// Add the core to a residual channel: `dst += (src + round) >> shift`.
+    fn add_core(dst: &mut [i32], src: &[i32], round: i32, shift: usize) {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = d.wrapping_add((s + round) >> shift);
+        }
+    }
+}
+
+sample_loop! {
+    /// Add the core to a residual channel an embedded downmix scaled:
+    /// `dst += clip23((mul16(src, scale) + round) >> shift)`.
+    fn add_scaled_core(dst: &mut [i32], src: &[i32], scale: i32, round: i32, shift: usize) {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = d.wrapping_add(clip23((mul16(s, scale) + round) >> shift));
+        }
+    }
+}
+
+sample_loop! {
+    /// Take a downmixed channel out: `dst -= rmul15(src, coeff)`.
+    fn sub_scaled(dst: &mut [i32], src: &[i32], coeff: i32) {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = d.wrapping_sub(rmul15(s, coeff));
+        }
+    }
+}
+
+sample_loop! {
+    /// Undo a pairwise decorrelation: `dst += (src * coeff + 4) >> 3`.
+    fn add_decorrelated(dst: &mut [i32], src: &[i32], coeff: i32) {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = d.wrapping_add((s.wrapping_mul(coeff) + (1 << 2)) >> 3);
+        }
+    }
+}
+
+sample_loop! {
+    /// `samples <<= shift`, clipped to 24 bits.
+    fn shift_clip(samples: &mut [i32], shift: usize) {
+        for s in samples {
+            *s = clip23(s.wrapping_mul(1 << shift));
+        }
+    }
+}
+
+sample_loop! {
+    /// `msb = (msb << shift) + (lsb << adjust)`.
+    fn join_lsb(msb: &mut [i32], lsb: &[i32], shift: usize, adjust: usize) {
+        for (m, &l) in msb.iter_mut().zip(lsb) {
+            *m = m.wrapping_mul(1 << shift) + (l << adjust);
+        }
+    }
+}
+
+sample_loop! {
+    /// `samples <<= shift`.
+    fn shift_up(samples: &mut [i32], shift: usize) {
+        for s in samples {
+            *s = s.wrapping_mul(1 << shift);
+        }
+    }
+}
+
 #[inline]
 fn get_linear(gb: &mut BitReader, n: usize) -> R<i32> {
     if n == 0 {
@@ -410,12 +474,39 @@ fn get_rice(gb: &mut BitReader, k: usize) -> R<i32> {
     Ok(((v >> 1) ^ (0u32.wrapping_sub(v & 1))) as i32)
 }
 
+/// `get_rice` for every sample of `out`.
+fn get_rice_run(gb: &mut BitReader, k: usize, out: &mut [i32]) -> R<()> {
+    gb.read_rice_run(k, out).ok_or(XllError::Bitstream)
+}
+
+/// `get_linear` for every sample of `out`.
+fn get_linear_run(gb: &mut BitReader, n: usize, out: &mut [i32]) -> R<()> {
+    let raw: &mut [u32] = raw_fields(out);
+    gb.read_bits_run(n, raw).ok_or(XllError::Bitstream)?;
+    for v in raw {
+        *v = (*v >> 1) ^ 0u32.wrapping_sub(*v & 1);
+    }
+    Ok(())
+}
+
+/// `get_bits` for every sample of `out`.
+fn get_bits_run(gb: &mut BitReader, n: usize, out: &mut [i32]) -> R<()> {
+    gb.read_bits_run(n, raw_fields(out))
+        .ok_or(XllError::Bitstream)
+}
+
+/// A sample buffer as the raw fields read into it.
+fn raw_fields(samples: &mut [i32]) -> &mut [u32] {
+    // SAFETY: `i32` and `u32` have the same size, alignment and validity.
+    unsafe { std::slice::from_raw_parts_mut(samples.as_mut_ptr().cast(), samples.len()) }
+}
+
 /// Inverse adaptive prediction: from sample `order` on, subtract from each
 /// residual the clipped prediction made from the `order` samples before it,
 /// `coeff[order - 1 - k]` weighing `buf[j + k]`. Each prediction reads the
 /// sample just produced, so the work is serial; dispatching on the order
 /// (at most 15) lets each length unroll and keep its taps in registers.
-fn inverse_adaptive_prediction(
+pub(super) fn inverse_adaptive_prediction(
     buf: &mut [i32],
     coeff: &[i32; DCA_XLL_PRED_ORDER_MAX],
     order: usize,
@@ -622,6 +713,9 @@ pub(crate) struct XllDecoder {
     x_descriptor_offset: Option<usize>,
     x_descriptor_size: Option<usize>,
     pub(crate) x_descriptor_navigation_used: bool,
+    /// Scratch of the vector prediction.
+    #[cfg(target_arch = "x86_64")]
+    prediction: super::xll_avx2::Scratch,
 }
 
 #[derive(Clone, Copy)]
@@ -1680,16 +1774,11 @@ impl XllDecoder {
             let buf = &mut c.band.msb[i];
 
             if !c.rice_code_flag[k] {
-                for s in 0..na {
-                    buf[seg_base + s] = get_linear(gb, c.bitalloc_part_a[k])?;
-                }
-                for s in 0..nb {
-                    buf[seg_base + na + s] = get_linear(gb, c.bitalloc_part_b[k])?;
-                }
+                let (part_a, part_b) = buf[seg_base..seg_base + nsegsamples].split_at_mut(na);
+                get_linear_run(gb, c.bitalloc_part_a[k], part_a)?;
+                get_linear_run(gb, c.bitalloc_part_b[k], part_b)?;
             } else {
-                for s in 0..na {
-                    buf[seg_base + s] = get_rice(gb, c.bitalloc_part_a[k])?;
-                }
+                get_rice_run(gb, c.bitalloc_part_a[k], &mut buf[seg_base..seg_base + na])?;
                 if c.bitalloc_hybrid_linear[k] != 0 {
                     let niso = rb(gb, nsegsamples_log2)? as usize;
                     for s in 0..nb {
@@ -1710,9 +1799,8 @@ impl XllDecoder {
                         }
                     }
                 } else {
-                    for s in 0..nb {
-                        buf[seg_base + na + s] = get_rice(gb, c.bitalloc_part_b[k])?;
-                    }
+                    let part_b = &mut buf[seg_base + na..seg_base + nsegsamples];
+                    get_rice_run(gb, c.bitalloc_part_b[k], part_b)?;
                 }
             }
         }
@@ -1731,9 +1819,7 @@ impl XllDecoder {
                 if w != 0 {
                     let seg_base = seg * nsegsamples;
                     let lbuf = &mut c.band.lsb[i];
-                    for s in 0..nsegsamples {
-                        lbuf[seg_base + s] = rb(gb, w)? as i32;
-                    }
+                    get_bits_run(gb, w, &mut lbuf[seg_base..seg_base + nsegsamples])?;
                 }
             }
         }
@@ -1746,11 +1832,14 @@ impl XllDecoder {
         let b = &mut c.band;
 
         // Inverse adaptive or fixed prediction.
+        let mut coeffs = [[0i32; DCA_XLL_PRED_ORDER_MAX]; DCA_XLL_CHANNELS_MAX];
+        // The adaptively predicted channels not yet run, `pending` of them.
+        let mut adaptive = [0usize; DCA_XLL_CHANNELS_MAX];
+        let mut pending = 0;
         for i in 0..c.nchannels {
             let order = b.adapt_pred_order[i];
-            let buf = &mut b.msb[i];
             if order > 0 {
-                let mut coeff = [0i32; DCA_XLL_PRED_ORDER_MAX];
+                let coeff = &mut coeffs[i];
                 for j in 0..order {
                     let rc = b.adapt_refl_coeff[i][j];
                     for k in 0..(j + 1) / 2 {
@@ -1761,14 +1850,54 @@ impl XllDecoder {
                     }
                     coeff[j] = rc;
                 }
-                inverse_adaptive_prediction(&mut buf[..nsamples], &coeff, order);
+                adaptive[pending] = i;
+                pending += 1;
             } else {
+                let buf = &mut b.msb[i];
                 for _ in 0..b.fixed_pred_order[i] {
                     for k in 1..nsamples {
                         buf[k] = buf[k].wrapping_add(buf[k - 1]);
                     }
                 }
             }
+        }
+        // Four channels at a time where the CPU can; a channel left alone
+        // gains nothing from it.
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::has_avx2() {
+            use super::xll_avx2::{Group, predict_group};
+            let whole = adaptive[..pending]
+                .iter()
+                .all(|&i| b.adapt_pred_order[i] < nsamples && b.msb[i].len() >= nsamples);
+            while whole && pending >= 2 {
+                let count = pending.min(4);
+                let channels = &adaptive[pending - count..pending];
+                pending -= count;
+                let mut taken: [Vec<i32>; 4] = Default::default();
+                for (taken, &i) in taken.iter_mut().zip(channels) {
+                    *taken = std::mem::take(&mut b.msb[i]);
+                }
+                let mut group = Group {
+                    samples: Default::default(),
+                    coeff: [&coeffs[0]; 4],
+                    order: [0; 4],
+                    count,
+                };
+                for (lane, (taken, &i)) in taken.iter_mut().zip(channels).enumerate() {
+                    group.samples[lane] = &mut taken[..nsamples];
+                    group.coeff[lane] = &coeffs[i];
+                    group.order[lane] = b.adapt_pred_order[i];
+                }
+                // SAFETY: AVX2 was detected above.
+                unsafe { predict_group(group, &mut self.prediction, inverse_adaptive_prediction) };
+                for (taken, &i) in taken.into_iter().zip(channels) {
+                    b.msb[i] = taken;
+                }
+            }
+        }
+        for &i in &adaptive[..pending] {
+            let order = b.adapt_pred_order[i];
+            inverse_adaptive_prediction(&mut b.msb[i][..nsamples], &coeffs[i], order);
         }
 
         // Inverse pairwise channel decorrelation + reorder to original order.
@@ -1777,11 +1906,8 @@ impl XllDecoder {
                 let coeff = b.decor_coeff[i];
                 if coeff != 0 {
                     // dst = msb[2i+1], src = msb[2i]
-                    for n in 0..nsamples {
-                        let s = b.msb[i * 2][n];
-                        b.msb[i * 2 + 1][n] = b.msb[i * 2 + 1][n]
-                            .wrapping_add((s.wrapping_mul(coeff) + (1 << 2)) >> 3);
-                    }
+                    let (src, dst) = b.msb[i * 2..i * 2 + 2].split_at_mut(1);
+                    add_decorrelated(&mut dst[0][..nsamples], &src[0][..nsamples], coeff);
                 }
             }
             // Permute msb so that msb[orig_order[i]] = decoded[i], in place
@@ -1828,16 +1954,11 @@ impl XllDecoder {
             let c = &mut self.chset[chs];
             let has_lsb = c.band.nscalablelsbs[ch] != 0;
             let adj = c.band.bit_width_adjust[ch];
+            let msb = &mut c.band.msb[ch][..nsamples];
             if has_lsb {
-                for n in 0..nsamples {
-                    let msb = c.band.msb[ch][n];
-                    let lsb = c.band.lsb[ch][n];
-                    c.band.msb[ch][n] = msb.wrapping_mul(1 << shift) + (lsb << adj);
-                }
+                join_lsb(msb, &c.band.lsb[ch][..nsamples], shift, adj);
             } else {
-                for n in 0..nsamples {
-                    c.band.msb[ch][n] = c.band.msb[ch][n].wrapping_mul(1 << shift);
-                }
+                shift_up(msb, shift);
             }
         }
     }
@@ -1892,9 +2013,7 @@ impl XllDecoder {
                             (&mut tail[0].band.msb[j], &head[o_idx].band.msb[k])
                         }
                     };
-                    for n in 0..nsamples {
-                        dst[n] = dst[n].wrapping_sub(rmul15(src[n], cf));
-                    }
+                    sub_scaled(&mut dst[..nsamples], &src[..nsamples], cf);
                 }
             }
             nchannels += c_nch;
@@ -1935,17 +2054,14 @@ impl XllDecoder {
             let src = core.samples[spkr]
                 .as_ref()
                 .ok_or(XllError::Invalid("missing core speaker samples"))?;
+            let src = &src[..nsamples];
             if let Some(o) = o_idx {
                 let si = self.chset[o].dmix_scale_inv[hier_ofs + ch];
-                let dst = &mut self.chset[chs].band.msb[ch];
-                for n in 0..nsamples {
-                    dst[n] = dst[n].wrapping_add(clip23((mul16(src[n], si) + round) >> shift));
-                }
+                let dst = &mut self.chset[chs].band.msb[ch][..nsamples];
+                add_scaled_core(dst, src, si, round, shift);
             } else {
-                let dst = &mut self.chset[chs].band.msb[ch];
-                for n in 0..nsamples {
-                    dst[n] = dst[n].wrapping_add((src[n] + round) >> shift);
-                }
+                let dst = &mut self.chset[chs].band.msb[ch][..nsamples];
+                add_core(dst, src, round, shift);
             }
         }
         Ok(())
@@ -2003,9 +2119,7 @@ impl XllDecoder {
                 // Scaled in place and handed out: the next frame draws its
                 // buffers back from the pool.
                 let mut buf = std::mem::take(&mut self.chset[chs].band.msb[ch]);
-                for s in &mut buf {
-                    *s = clip23(s.wrapping_mul(1 << shift));
-                }
+                shift_clip(&mut buf, shift);
                 if let Some(old) = self.output[spkr].replace(buf) {
                     self.pool.give(old);
                 }

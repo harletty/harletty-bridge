@@ -16,6 +16,11 @@ log = "0.4"
 thiserror = "2.0"
 rustfft = "6.4"
 
+# `--cfg dca_force_scalar` keeps the decoder on its portable code (see
+# `src/cpu.rs`).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(dca_force_scalar)'] }
+
 # Keep the offline parser's synthetic corruption tests in the normal CI suite.
 [[example]]
 name = "xll_private_metadata"

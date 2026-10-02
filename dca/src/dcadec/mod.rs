@@ -3,11 +3,42 @@
 // DCA core decoder internals: generated tables, Huffman VLCs, and the subband
 // DSP decode (ported incrementally from ffmpeg's dca_core.c / dcadsp.c).
 
+/// Define an elementwise loop over sample buffers that runs as AVX2 code
+/// where the CPU has it: the same loop compiled twice. The arithmetic is
+/// integer, so both give the same samples; the baseline x86-64 target has no
+/// instructions for the 24-bit clips and the 64-bit products these loops
+/// are made of.
+macro_rules! sample_loop {
+    ($(#[$doc:meta])* fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $body:block) => {
+        $(#[$doc])*
+        fn $name($($arg: $ty),*) {
+            #[inline(always)]
+            fn body($($arg: $ty),*) $body
+            #[cfg(target_arch = "x86_64")]
+            {
+                #[target_feature(enable = "avx2")]
+                fn avx2($($arg: $ty),*) {
+                    body($($arg),*)
+                }
+                if $crate::cpu::has_avx2() {
+                    // SAFETY: AVX2 was just detected.
+                    return unsafe { avx2($($arg),*) };
+                }
+            }
+            body($($arg),*)
+        }
+    };
+}
+
 pub(crate) mod buffers;
 pub(crate) mod core;
 pub(crate) mod exss;
 pub(crate) mod huffman;
 pub(crate) mod synth;
+#[cfg(target_arch = "x86_64")]
+mod synth_avx2;
 pub(crate) mod tables;
 pub(crate) mod xll;
+#[cfg(target_arch = "x86_64")]
+mod xll_avx2;
 pub(crate) mod xmeta;

@@ -11,6 +11,7 @@ mod bitstream;
 #[cfg(test)]
 mod bitstream_writer;
 
+mod cpu;
 mod dcadec;
 pub mod extract;
 pub mod hd;
