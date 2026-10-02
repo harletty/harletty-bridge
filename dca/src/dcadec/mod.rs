@@ -8,6 +8,8 @@ pub(crate) mod core;
 pub(crate) mod exss;
 pub(crate) mod huffman;
 pub(crate) mod synth;
+#[cfg(target_arch = "x86_64")]
+mod synth_avx2;
 pub(crate) mod tables;
 pub(crate) mod xll;
 pub(crate) mod xmeta;

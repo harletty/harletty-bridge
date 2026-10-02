@@ -70,7 +70,7 @@ fn clp_v(buf: &mut [i32], len: usize) {
 }
 
 #[rustfmt::skip]
-const DCT_A: [[i32; 8]; 8] = [
+pub(super) const DCT_A: [[i32; 8]; 8] = [
     [ 8348215,  8027397,  7398092,  6484482,  5321677,  3954362,  2435084,   822227 ],
     [ 8027397,  5321677,   822227, -3954362, -7398092, -8348215, -6484482, -2435084 ],
     [ 7398092,   822227, -6484482, -8027397, -2435084,  5321677,  8348215,  3954362 ],
@@ -82,7 +82,7 @@ const DCT_A: [[i32; 8]; 8] = [
 ];
 
 #[rustfmt::skip]
-const DCT_B: [[i32; 7]; 8] = [
+pub(super) const DCT_B: [[i32; 7]; 8] = [
     [  8227423,  7750063,  6974873,  5931642,  4660461,  3210181,  1636536 ],
     [  6974873,  3210181, -1636536, -5931642, -8227423, -7750063, -4660461 ],
     [  4660461, -3210181, -8227423, -5931642,  1636536,  7750063,  6974873 ],
@@ -93,15 +93,15 @@ const DCT_B: [[i32; 7]; 8] = [
     [ -8227423,  7750063, -6974873,  5931642, -4660461,  3210181, -1636536 ],
 ];
 
-const MOD_A: [i32; 16] = [
+pub(super) const MOD_A: [i32; 16] = [
     4199362, 4240198, 4323885, 4454708, 4639772, 4890013, 5221943, 5660703, -6245623, -7040975,
     -8158494, -9809974, -12450076, -17261920, -28585092, -85479984,
 ];
-const MOD_B: [i32; 8] = [
+pub(super) const MOD_B: [i32; 8] = [
     4214598, 4383036, 4755871, 5425934, 6611520, 8897610, 14448934, 42791536,
 ];
 #[rustfmt::skip]
-const MOD_C: [i32; 32] = [
+pub(super) const MOD_C: [i32; 32] = [
      1048892,  1051425,   1056522,   1064244,  1074689,  1087987,   1104313,   1123884,
      1146975,  1173922,   1205139,   1241133,  1282529,  1330095,   1384791,   1447815,
     -1520688, -1605358,  -1704360,  -1821051, -1959964, -2127368,  -2332183,  -2587535,
@@ -166,7 +166,7 @@ fn mod_c(input: &[i32], output: &mut [i32]) {
 }
 
 #[inline(always)]
-fn imdct_half_32(output: &mut [i32; 32], input: &[i32; 32]) {
+pub(super) fn imdct_half_32(output: &mut [i32; 32], input: &[i32; 32]) {
     let mut buf_a = [0i32; 32];
     let mut buf_b = [0i32; 32];
 
@@ -223,7 +223,7 @@ fn imdct_half_32(output: &mut [i32; 32], input: &[i32; 32]) {
 // ───────────────────────── imdct_half_64 (dcadct.c) ───────────────────────
 
 #[rustfmt::skip]
-const MOD64_A: [i32; 32] = [
+pub(super) const MOD64_A: [i32; 32] = [
       4195568,   4205700,   4226086,    4256977,
       4298755,   4351949,   4417251,    4495537,
       4587901,   4695690,   4820557,    4964534,
@@ -235,7 +235,7 @@ const MOD64_A: [i32; 32] = [
 ];
 
 #[rustfmt::skip]
-const MOD64_B: [i32; 16] = [
+pub(super) const MOD64_B: [i32; 16] = [
      4199362,  4240198,  4323885,  4454708,
      4639772,  4890013,  5221943,  5660703,
      6245623,  7040975,  8158494,  9809974,
@@ -243,7 +243,7 @@ const MOD64_B: [i32; 16] = [
 ];
 
 #[rustfmt::skip]
-const MOD64_C: [i32; 64] = [
+pub(super) const MOD64_C: [i32; 64] = [
       741511,    741958,    742853,    744199,
       746001,    748262,    750992,    754197,
       757888,    762077,    766777,    772003,
@@ -302,7 +302,7 @@ fn mod64_c(input: &[i32], output: &mut [i32]) {
 }
 
 #[inline(always)]
-fn imdct_half_64(output: &mut [i32; 64], input: &[i32; 64]) {
+pub(super) fn imdct_half_64(output: &mut [i32; 64], input: &[i32; 64]) {
     let mut buf_a = [0i32; 64];
     let mut buf_b = [0i32; 64];
 
@@ -392,6 +392,10 @@ fn imdct_half_64(output: &mut [i32; 64], input: &[i32; 64]) {
 /// the 64-band one) stored twice back to back: every write lands at `offset`
 /// and `offset + period`, so the window always reads one contiguous run
 /// `hist1[offset..offset + period]` instead of wrapping around the end.
+///
+/// The AVX2 bank keeps the same history another way: `hist1` holds the
+/// transforms of the last 15 blocks, newest first, and `offset` is unused.
+/// A channel is only ever run by one of the two.
 struct ChannelSynth {
     hist1: [i32; 2048],
     hist2: [i32; 64],
@@ -485,10 +489,11 @@ impl ChannelSynth {
     }
 }
 
-/// Which build of the filter-bank loops runs: the baseline one, or the same
-/// code compiled for AVX2 when the CPU has it. The arithmetic is integer, so
-/// both produce identical samples; AVX2 vectorizes the 23-bit clips and the
-/// window products the baseline x86-64 target has no instructions for.
+/// Which filter bank runs: the portable one of this file, or the one written
+/// for AVX2 (`synth_avx2.rs`) when the CPU has it. The arithmetic is integer,
+/// so both produce identical samples; AVX2 has the 23-bit clips and the
+/// 64-bit products the baseline x86-64 target has no vector instructions
+/// for.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Isa {
     Baseline,
@@ -509,39 +514,38 @@ impl Isa {
 /// Run one channel's subbands through the 32-band bank, one block of 32 PCM
 /// samples per subband sample: `subs[band][block]` in, `dst[block * 32 + n]`
 /// out (`dst.len() / 32` blocks).
+/// `work` is scratch the vector code keeps between calls.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
 fn bank_32(
     isa: Isa,
     synth: &mut ChannelSynth,
-    window: &[i32; 512],
+    work: &mut Vec<i32>,
+    perfect: bool,
     subs: &[&[i32]; DCA_SUBBANDS],
     dst: &mut [i32],
 ) {
     match isa {
-        Isa::Baseline => bank_32_body(synth, window, subs, dst),
+        Isa::Baseline => bank_32_body(synth, perfect, subs, dst),
         #[cfg(target_arch = "x86_64")]
         // SAFETY: `Isa::Avx2` is only chosen when the CPU reports AVX2.
-        Isa::Avx2 => unsafe { bank_32_avx2(synth, window, subs, dst) },
+        Isa::Avx2 => unsafe {
+            super::synth_avx2::bank_32(&mut synth.hist1, &mut synth.hist2, work, perfect, subs, dst)
+        },
     }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-fn bank_32_avx2(
-    synth: &mut ChannelSynth,
-    window: &[i32; 512],
-    subs: &[&[i32]; DCA_SUBBANDS],
-    dst: &mut [i32],
-) {
-    bank_32_body(synth, window, subs, dst)
 }
 
 #[inline(always)]
 fn bank_32_body(
     synth: &mut ChannelSynth,
-    window: &[i32; 512],
+    perfect: bool,
     subs: &[&[i32]; DCA_SUBBANDS],
     dst: &mut [i32],
 ) {
+    let window: &[i32; 512] = if perfect {
+        &FIR_32BANDS_PERFECT_FIXED
+    } else {
+        &FIR_32BANDS_NONPERFECT_FIXED
+    };
     let mut input = [0i32; 32];
     let mut out = [0i32; 32];
     for (j, block) in dst.chunks_exact_mut(32).enumerate() {
@@ -555,19 +559,22 @@ fn bank_32_body(
 
 /// The 64-band (X96) counterpart of [`bank_32`], driven by the 32 base
 /// subbands only (the upper 32 stay zero): `dst.len() / 64` blocks.
-fn bank_64(isa: Isa, synth: &mut ChannelSynth, subs: &[&[i32]; DCA_SUBBANDS], dst: &mut [i32]) {
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+fn bank_64(
+    isa: Isa,
+    synth: &mut ChannelSynth,
+    work: &mut Vec<i32>,
+    subs: &[&[i32]; DCA_SUBBANDS],
+    dst: &mut [i32],
+) {
     match isa {
         Isa::Baseline => bank_64_body(synth, subs, dst),
         #[cfg(target_arch = "x86_64")]
         // SAFETY: `Isa::Avx2` is only chosen when the CPU reports AVX2.
-        Isa::Avx2 => unsafe { bank_64_avx2(synth, subs, dst) },
+        Isa::Avx2 => unsafe {
+            super::synth_avx2::bank_64(&mut synth.hist1, &mut synth.hist2, work, subs, dst)
+        },
     }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-fn bank_64_avx2(synth: &mut ChannelSynth, subs: &[&[i32]; DCA_SUBBANDS], dst: &mut [i32]) {
-    bank_64_body(synth, subs, dst)
 }
 
 #[inline(always)]
@@ -589,6 +596,8 @@ pub(crate) struct SynthState {
     isa: Isa,
     /// One channel's fixed-point output, reused by the float path.
     scratch: Vec<i32>,
+    /// Scratch of the vector filter bank.
+    work: Vec<i32>,
     /// Whether the delay lines currently hold 64-band (X96) history. Switching
     /// bank size invalidates them, so they are erased on change — this mirrors
     /// ffmpeg's `set_filter_mode` / `erase_dsp_history`.
@@ -604,6 +613,7 @@ impl Default for SynthState {
             channels: Vec::new(),
             isa: Isa::detect(),
             scratch: Vec::new(),
+            work: Vec::new(),
             x96_mode: false,
             lfe_x96_hist: 0,
         }
@@ -645,11 +655,7 @@ impl SynthState {
             self.channels.resize_with(nch, ChannelSynth::default);
         }
 
-        let window: &[i32; 512] = if dec.filter_perfect() {
-            &FIR_32BANDS_PERFECT_FIXED
-        } else {
-            &FIR_32BANDS_NONPERFECT_FIXED
-        };
+        let perfect = dec.filter_perfect();
 
         fullband.resize_with(nch, Vec::new);
         self.scratch.resize(nsamples, 0);
@@ -662,7 +668,8 @@ impl SynthState {
             bank_32(
                 self.isa,
                 &mut self.channels[ch],
-                window,
+                &mut self.work,
+                perfect,
                 &subs,
                 &mut self.scratch,
             );
@@ -732,11 +739,7 @@ impl SynthState {
         if self.channels.len() < nch {
             self.channels.resize_with(nch, ChannelSynth::default);
         }
-        let window: &[i32; 512] = if dec.filter_perfect() {
-            &FIR_32BANDS_PERFECT_FIXED
-        } else {
-            &FIR_32BANDS_NONPERFECT_FIXED
-        };
+        let perfect = dec.filter_perfect();
 
         out.pool.give_slots(&mut out.samples);
         out.samples.resize_with(DCA_SPEAKER_COUNT, || None);
@@ -749,9 +752,22 @@ impl SynthState {
             }
             let mut dst = out.pool.zeroed(nsamples);
             if x96_synth {
-                bank_64(self.isa, &mut self.channels[ch], &subs, &mut dst);
+                bank_64(
+                    self.isa,
+                    &mut self.channels[ch],
+                    &mut self.work,
+                    &subs,
+                    &mut dst,
+                );
             } else {
-                bank_32(self.isa, &mut self.channels[ch], window, &subs, &mut dst);
+                bank_32(
+                    self.isa,
+                    &mut self.channels[ch],
+                    &mut self.work,
+                    perfect,
+                    &subs,
+                    &mut dst,
+                );
             }
             match dec.speaker_for(ch) {
                 Some(spkr) => {
@@ -976,49 +992,61 @@ mod tests {
         }
     }
 
-    /// Both builds of the bank loops produce the same samples, on both banks
-    /// and across delay-line wraps, including inputs loud enough to clip.
+    /// Every build of the banks produces the same samples as the baseline:
+    /// both banks, both 32-band windows, over frames of several lengths
+    /// (shorter than the history, not a multiple of eight blocks) so the
+    /// history carries from one frame to the next, with quiet blocks and
+    /// blocks loud enough to clip.
     #[test]
     fn every_isa_matches_the_baseline() {
+        let frames = [16usize, 8, 5, 32, 16, 3, 128, 16];
+        let total: usize = frames.iter().sum();
         let mut state = 777u32;
         let subs_data: Vec<Vec<i32>> = (0..DCA_SUBBANDS)
             .map(|band| {
-                (0..48)
-                    .map(|_| {
+                (0..total)
+                    .map(|block| {
                         state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
                         let x = (((state >> 8) & 0x1f_ffff) as i32) - 0x10_0000;
-                        if band % 5 == 0 { x << 3 } else { x }
+                        match (block / 7) % 3 {
+                            0 => x >> 9,
+                            1 if band % 5 == 0 => x << 3,
+                            _ => x,
+                        }
                     })
                     .collect()
             })
             .collect();
-        let mut subs: [&[i32]; DCA_SUBBANDS] = [&[]; DCA_SUBBANDS];
-        for (s, d) in subs.iter_mut().zip(&subs_data) {
-            *s = d;
-        }
-        let run = |isa: Isa| {
-            let mut synth = ChannelSynth::default();
-            let mut out32 = vec![0i32; 48 * 32];
-            bank_32(
-                isa,
-                &mut synth,
-                &FIR_32BANDS_PERFECT_FIXED,
-                &subs,
-                &mut out32,
-            );
-            let mut synth = ChannelSynth::default();
-            let mut out64 = vec![0i32; 48 * 64];
-            bank_64(isa, &mut synth, &subs, &mut out64);
+        let run = |isa: Isa, perfect: bool| {
+            let mut work = Vec::new();
+            let mut synth32 = ChannelSynth::default();
+            let mut synth64 = ChannelSynth::default();
+            let mut out32 = vec![0i32; total * 32];
+            let mut out64 = vec![0i32; total * 64];
+            let mut first = 0;
+            for blocks in frames {
+                let mut subs: [&[i32]; DCA_SUBBANDS] = [&[]; DCA_SUBBANDS];
+                for (s, d) in subs.iter_mut().zip(&subs_data) {
+                    *s = &d[first..first + blocks];
+                }
+                let dst = &mut out32[first * 32..(first + blocks) * 32];
+                bank_32(isa, &mut synth32, &mut work, perfect, &subs, dst);
+                let dst = &mut out64[first * 64..(first + blocks) * 64];
+                bank_64(isa, &mut synth64, &mut work, &subs, dst);
+                first += blocks;
+            }
             (out32, out64)
         };
-        let baseline = run(Isa::Baseline);
-        assert!(
-            baseline
-                .0
-                .iter()
-                .any(|&x| x == (1 << 23) - 1 || x == -(1 << 23))
-        );
-        assert_eq!(run(Isa::detect()), baseline);
+        for perfect in [true, false] {
+            let baseline = run(Isa::Baseline, perfect);
+            assert!(
+                baseline
+                    .0
+                    .iter()
+                    .any(|&x| x == (1 << 23) - 1 || x == -(1 << 23))
+            );
+            assert!(run(Isa::detect(), perfect) == baseline);
+        }
     }
 
     /// The 96 kHz LFE image-rejection filter (`lfe_x96_fixed`), which doubles
