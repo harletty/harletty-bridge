@@ -115,6 +115,24 @@ fn mul(a: i32, b: i32, bits: u32) -> i32 {
     norm(a as i64 * b as i64, bits)
 }
 
+sample_loop! {
+    /// `samples = mul(samples, scale, 16)`.
+    fn scale_samples(samples: &mut [i32], scale: i32) {
+        for x in samples {
+            *x = mul(*x, scale, 16);
+        }
+    }
+}
+
+sample_loop! {
+    /// `dst -= mul(src, coeff, 15)`.
+    fn sub_scaled(dst: &mut [i32], src: &[i32], coeff: i32) {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = d.wrapping_sub(mul(s, coeff, 15));
+        }
+    }
+}
+
 /// `ff_dcaadpcm_predict`.
 #[inline]
 fn adpcm_predict(pred_vq_index: usize, input: &[i32]) -> i32 {
@@ -1027,9 +1045,7 @@ impl CoreDecoder {
                 .get_mut(self.output_slot(spkr))
                 .and_then(Option::as_mut)
             {
-                for x in buf.iter_mut() {
-                    *x = mul(*x, scale_inv, 16);
-                }
+                scale_samples(buf, scale_inv);
             }
         }
         let mut coeff = self.xxch_dmix_coeff.iter();
@@ -1057,9 +1073,7 @@ impl CoreDecoder {
                 let (Some(src_buf), Some(dst_buf)) = (src_buf, dst_buf) else {
                     continue;
                 };
-                for (d, &s) in dst_buf.iter_mut().zip(src_buf.iter()) {
-                    *d = d.wrapping_sub(mul(s, c, 15));
-                }
+                sub_scaled(dst_buf, src_buf, c);
             }
         }
     }
