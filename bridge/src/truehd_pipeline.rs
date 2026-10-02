@@ -8,6 +8,7 @@ use truehd::process::{
     extract::Extractor,
     parse::Parser,
 };
+use truehd::structs::access_unit::AccessUnit;
 
 use crate::bridge::{AtmosBridge, DrcMode};
 use crate::labels::{channel_label_to_r, oamd_speaker_to_label};
@@ -21,7 +22,12 @@ use crate::perf::PerfStats;
 /// reset, and parse recovery — and each one used to re-apply the settings itself. A
 /// setting applied in two of the three is a setting that silently reverts at the third,
 /// so they all come from here.
-pub(crate) fn configure_parser(parser: &mut Parser, fail_level: log::Level, presentation: u8) {
+pub(crate) fn configure_parser(
+    parser: &mut Parser,
+    fail_level: log::Level,
+    presentation: u8,
+    drc_mode: DrcMode,
+) {
     parser.set_fail_level(fail_level);
 
     // The byte-domain FIFO depth model answers whether a stream is legal to author on a
@@ -29,12 +35,35 @@ pub(crate) fn configure_parser(parser: &mut Parser, fail_level: log::Level, pres
     // the model otherwise accounts every access unit for an answer nothing reads.
     parser.set_check_fifo(false);
 
-    // Require all presentations up to and including the requested one.
-    let mut required_presentations = [false; MAX_PRESENTATIONS];
-    required_presentations[..=presentation as usize]
-        .iter_mut()
-        .for_each(|p| *p = true);
-    parser.set_required_presentations(&required_presentations);
+    parser.set_required_presentations(&required_presentations(presentation, drc_mode));
+}
+
+/// The presentations the parser is asked for, which decide the substreams it
+/// reads.
+///
+/// The one that is decoded, and the parser works out which substreams that
+/// takes: a 7.1 presentation often stands on its own substreams, next to those
+/// of a stereo one that nothing here listens to.
+///
+/// Heavy DRC takes every presentation below it as well. Its gain is looked for
+/// from the decoded presentation down, and is stated in a substream's restart
+/// header, which is only read with the substream. The standard gain is stated
+/// in the directory of the access unit, which is read whole whatever is asked
+/// for.
+pub(crate) fn required_presentations(
+    presentation: u8,
+    drc_mode: DrcMode,
+) -> [bool; MAX_PRESENTATIONS] {
+    let mut required = [false; MAX_PRESENTATIONS];
+
+    // The DRC log prints the heavy gain of every substream.
+    if drc_mode == DrcMode::Heavy || drc_diag_log_enabled() {
+        required[..=presentation as usize].fill(true);
+    } else {
+        required[presentation as usize] = true;
+    }
+
+    required
 }
 
 /// How many branch points the parser may hold before the list is dropped.
@@ -58,6 +87,8 @@ struct DrainContext<'a> {
     current_dialogue_level: &'a mut Option<i8>,
     recovering_until_major_sync: &'a mut bool,
     drc_mode: DrcMode,
+    /// See [`AtmosBridge::truehd_presentations_stale`].
+    presentations_stale: &'a mut bool,
     total_samples: &'a mut u64,
     declared_object_channels: &'a mut Option<RVec<bridge_api::RObjectChannel>>,
     spatial_labels: &'a mut Option<RVec<RChannelLabel>>,
@@ -75,7 +106,8 @@ impl DrainContext<'_> {
         *self.parser = Parser::default();
         *self.decoder = Decoder::default();
         self.decoder.set_fail_level(fail_level);
-        configure_parser(self.parser, fail_level, self.presentation);
+        configure_parser(self.parser, fail_level, self.presentation, self.drc_mode);
+        *self.presentations_stale = false;
 
         *self.current_substream_info = None;
         *self.current_extended_substream_info = None;
@@ -90,10 +122,12 @@ impl DrainContext<'_> {
 // TrueHD drain_frames — unchanged.
 // ---------------------------------------------------------------------------
 
-/// `decoded` is where each access unit is decoded: what it held is written over,
-/// and nothing of it is read past the access unit's own samples.
+/// `access_unit` is where each frame is parsed and `decoded` where it is
+/// decoded: what they held is written over, and nothing of it is read past the
+/// frame's own blocks and samples.
 fn drain_frames(
     ctx: &mut DrainContext<'_>,
+    access_unit: &mut AccessUnit,
     decoded: &mut DecodedAccessUnit,
 ) -> (Vec<RDecodedFrame>, Option<String>) {
     let mut frames = Vec::new();
@@ -122,10 +156,22 @@ fn drain_frames(
                     *ctx.recovering_until_major_sync = false;
                 }
 
+                // A substream the parser takes up in mid-stream is read without the
+                // restart header it started from. A major sync brings one for
+                // every substream.
+                if *ctx.presentations_stale && raw_frame.is_major_sync() {
+                    ctx.parser
+                        .set_required_presentations(&required_presentations(
+                            ctx.presentation,
+                            ctx.drc_mode,
+                        ));
+                    *ctx.presentations_stale = false;
+                }
+
                 #[cfg(feature = "bridge-perf")]
                 let parse_started = Instant::now();
-                let access_unit = match ctx.parser.parse(&raw_frame) {
-                    Ok(au) => au,
+                match ctx.parser.parse_into(&raw_frame, access_unit) {
+                    Ok(()) => {}
                     Err(e) => {
                         let msg = format!("Parse error at frame {}: {e}", ctx.frame_count);
                         log::error!("{msg}");
@@ -216,7 +262,7 @@ fn drain_frames(
                 #[cfg(feature = "bridge-perf")]
                 let decode_started = Instant::now();
                 match ctx.decoder.decode_presentation_into(
-                    &access_unit,
+                    access_unit,
                     ctx.presentation as usize,
                     decoded,
                 ) {
@@ -478,6 +524,7 @@ pub(crate) fn process_extractor_input(
             current_dialogue_level: &mut bridge.current_dialogue_level,
             recovering_until_major_sync: &mut bridge.recovering_until_major_sync,
             drc_mode: bridge.drc_mode,
+            presentations_stale: &mut bridge.truehd_presentations_stale,
             total_samples: &mut bridge.total_samples,
             declared_object_channels: &mut bridge.declared_object_channels,
             spatial_labels: &mut bridge.truehd_spatial_labels,
@@ -486,7 +533,11 @@ pub(crate) fn process_extractor_input(
         #[cfg(feature = "bridge-perf")]
         let drain_started = Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drain_frames(&mut ctx, &mut bridge.truehd_decoded)
+            drain_frames(
+                &mut ctx,
+                &mut bridge.truehd_access_unit,
+                &mut bridge.truehd_decoded,
+            )
         }));
         #[cfg(feature = "bridge-perf")]
         bridge.perf.record_drain(drain_started.elapsed());
