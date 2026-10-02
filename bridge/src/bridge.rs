@@ -19,7 +19,7 @@ use crate::eac3_pipeline::{
     inspect_eac3_frame, is_legacy_ac3_frame, is_temporary_eac3_silence_frame, process_eac3_frame,
 };
 use crate::eac3_spdif::Eac3SpdifStream;
-use crate::frame_builders::PcmStats;
+use crate::frame_builders::validate_frame_shape;
 use crate::logging::bridge_diag_log;
 use crate::mat::MatStream;
 use crate::perf::PerfStats;
@@ -648,7 +648,7 @@ impl AtmosBridge {
 
         match decode_result {
             Ok(decoded_frame) => {
-                if let Err(reason) = PcmStats::from_frame(&decoded_frame) {
+                if let Err(reason) = validate_frame_shape(&decoded_frame) {
                     bridge_diag_log(
                         log::Level::Warn,
                         &format!(
