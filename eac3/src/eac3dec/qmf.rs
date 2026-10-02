@@ -2,13 +2,12 @@
 
 #![allow(clippy::excessive_precision, clippy::items_after_test_module)]
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 
 #[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::{
-    float32x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vfmsq_f32, vld1q_f32, vmulq_f32,
-    vst1q_f32,
-};
+use std::arch::aarch64::{vfmaq_f32, vld1q_f32, vmulq_f32, vst1q_f32};
 
 pub(crate) const QMF_SUBBANDS: usize = 64;
 const QMF_DOUBLE_LENGTH: usize = QMF_SUBBANDS * 2;
@@ -53,6 +52,8 @@ pub(crate) struct QuadratureMirrorFilterBank {
     input_stream_forward_head: usize,
     input_stream_inverse: [f32; QMF_INVERSE_STORAGE_LEN],
     input_stream_inverse_head: usize,
+    fft_buffer: [Complex32; QMF_DOUBLE_LENGTH],
+    fft_scratch: Vec<Complex32>,
 }
 
 impl QuadratureMirrorFilterBank {
@@ -62,6 +63,8 @@ impl QuadratureMirrorFilterBank {
             input_stream_forward_head: 0,
             input_stream_inverse: [0.0; QMF_INVERSE_STORAGE_LEN],
             input_stream_inverse_head: 0,
+            fft_buffer: [Complex32::new(0.0, 0.0); QMF_DOUBLE_LENGTH],
+            fft_scratch: vec![Complex32::new(0.0, 0.0); qmf_transforms().scratch_len],
         }
     }
 
@@ -84,11 +87,25 @@ impl QuadratureMirrorFilterBank {
         let mut grouping = [0.0f32; QMF_DOUBLE_LENGTH];
         compute_forward_grouping(window, &mut grouping);
 
-        let cache = qmf_cache();
+        // X[k] = sum_n g[n] e^{i pi (k + 1/2)(n - 1/2) / 64}: a 128-point DFT
+        // of the pre-twiddled grouping, of which the first 64 bins are kept.
+        let transforms = qmf_transforms();
+        for ((slot, value), twiddle) in self
+            .fft_buffer
+            .iter_mut()
+            .zip(grouping)
+            .zip(&transforms.forward_pre)
+        {
+            *slot = *twiddle * value;
+        }
+        transforms
+            .fft
+            .process_with_scratch(&mut self.fft_buffer, &mut self.fft_scratch);
         let mut result = QmfSubbands::zero();
-        for subband in 0..QMF_SUBBANDS {
-            result.real[subband] = dot_product(&cache.forward_real[subband], &grouping);
-            result.imaginary[subband] = dot_product(&cache.forward_imaginary[subband], &grouping);
+        for (subband, twiddle) in transforms.forward_post.iter().enumerate() {
+            let value = self.fft_buffer[subband] * *twiddle;
+            result.real[subband] = value.re;
+            result.imaginary[subband] = value.im;
         }
         result
     }
@@ -102,18 +119,31 @@ impl QuadratureMirrorFilterBank {
             QMF_INVERSE_RING_LEN,
         );
 
-        let cache = qmf_cache();
-        for sample in 0..QMF_DOUBLE_LENGTH {
-            let value = dot_product_signed(
-                &cache.inverse_real_by_sample[sample],
-                &input.real,
-                &cache.inverse_imaginary_by_sample[sample],
-                &input.imaginary,
-            );
-            let slot = self.input_stream_inverse_head + sample;
-            self.input_stream_inverse[slot] = value;
-            self.input_stream_inverse[slot + QMF_INVERSE_RING_LEN] = value;
+        // v[s] = sum_k re[k] cos(phi) - im[k] sin(phi), phi = pi (k + 1/2)(s - 127.5) / 64,
+        // scaled by 1/64: the real part of a 128-point DFT of the pre-twiddled
+        // subbands, zero-padded past the 64th.
+        let transforms = qmf_transforms();
+        for (subband, twiddle) in transforms.inverse_pre.iter().enumerate() {
+            self.fft_buffer[subband] =
+                *twiddle * Complex32::new(input.real[subband], input.imaginary[subband]);
         }
+        self.fft_buffer[QMF_SUBBANDS..].fill(Complex32::new(0.0, 0.0));
+        transforms
+            .fft
+            .process_with_scratch(&mut self.fft_buffer, &mut self.fft_scratch);
+        let mut values = [0.0f32; QMF_DOUBLE_LENGTH];
+        for ((slot, value), twiddle) in values
+            .iter_mut()
+            .zip(&self.fft_buffer)
+            .zip(&transforms.inverse_post)
+        {
+            *slot = value.re * twiddle.re - value.im * twiddle.im;
+        }
+        let head = self.input_stream_inverse_head;
+        self.input_stream_inverse[head..head + QMF_DOUBLE_LENGTH].copy_from_slice(&values);
+        self.input_stream_inverse
+            [head + QMF_INVERSE_RING_LEN..head + QMF_INVERSE_RING_LEN + QMF_DOUBLE_LENGTH]
+            .copy_from_slice(&values);
 
         let window = &self.input_stream_inverse
             [self.input_stream_inverse_head..self.input_stream_inverse_head + QMF_INVERSE_RING_LEN];
@@ -127,116 +157,12 @@ impl Default for QuadratureMirrorFilterBank {
     }
 }
 
-/// Number of independent accumulators used by the scalar fallbacks.
-///
-/// A single accumulator makes the dot product latency-bound: every multiply-add
-/// waits on the previous one. Eight partial sums break that chain so the loop
-/// becomes throughput-bound instead. This matters most where no vector unit is
-/// reachable, which is exactly the fallback's job (see [`dot_product`]).
-#[cfg(any(test, not(target_arch = "aarch64")))]
-const SCALAR_ACCUMULATORS: usize = 8;
-
 /// The NEON paths below are gated on `target_arch`, not `target_feature`: only
 /// aarch64 takes them. Every other target — x86_64 included, not just 32-bit ARM
 /// — runs the scalar fallbacks. `-C target-feature=+neon` does not reach this
 /// gate and will not switch a 32-bit ARM build onto the intrinsics; ARMv7
 /// Advanced SIMD is not IEEE-754 conformant for `f32`, so the autovectoriser
 /// declines there as well and the fallbacks are all that runs.
-fn dot_product(lhs: &[f32; QMF_DOUBLE_LENGTH], rhs: &[f32; QMF_DOUBLE_LENGTH]) -> f32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { dot_product_neon(lhs.as_ptr(), rhs.as_ptr(), QMF_DOUBLE_LENGTH) }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        dot_product_scalar(lhs, rhs)
-    }
-}
-
-#[cfg(any(test, not(target_arch = "aarch64")))]
-fn dot_product_scalar(lhs: &[f32], rhs: &[f32]) -> f32 {
-    let len = lhs.len().min(rhs.len());
-    let mut acc = [0.0f32; SCALAR_ACCUMULATORS];
-    let mut index = 0usize;
-    while index + SCALAR_ACCUMULATORS <= len {
-        for (lane, sum) in acc.iter_mut().enumerate() {
-            *sum += lhs[index + lane] * rhs[index + lane];
-        }
-        index += SCALAR_ACCUMULATORS;
-    }
-    let mut sum = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
-    while index < len {
-        sum += lhs[index] * rhs[index];
-        index += 1;
-    }
-    sum
-}
-
-/// Single-accumulator reference, kept as the yardstick the tests compare against.
-#[cfg(test)]
-fn dot_product_naive(lhs: &[f32], rhs: &[f32]) -> f32 {
-    let mut sum = 0.0f32;
-    for index in 0..lhs.len() {
-        sum += lhs[index] * rhs[index];
-    }
-    sum
-}
-
-fn dot_product_signed(
-    positive_lhs: &[f32; QMF_SUBBANDS],
-    positive_rhs: &[f32; QMF_SUBBANDS],
-    negative_lhs: &[f32; QMF_SUBBANDS],
-    negative_rhs: &[f32; QMF_SUBBANDS],
-) -> f32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe {
-            dot_product_signed_neon(
-                positive_lhs.as_ptr(),
-                positive_rhs.as_ptr(),
-                negative_lhs.as_ptr(),
-                negative_rhs.as_ptr(),
-                QMF_SUBBANDS,
-            )
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        dot_product_signed_scalar(positive_lhs, positive_rhs, negative_lhs, negative_rhs)
-    }
-}
-
-/// Accumulating the positive and negative halves into one running sum chains
-/// every multiply-add against the previous two. Two banks of partial sums keep
-/// the halves independent; they are only combined once, at the end.
-#[cfg(any(test, not(target_arch = "aarch64")))]
-fn dot_product_signed_scalar(
-    positive_lhs: &[f32; QMF_SUBBANDS],
-    positive_rhs: &[f32; QMF_SUBBANDS],
-    negative_lhs: &[f32; QMF_SUBBANDS],
-    negative_rhs: &[f32; QMF_SUBBANDS],
-) -> f32 {
-    const LANES: usize = SCALAR_ACCUMULATORS / 2;
-    let mut positive = [0.0f32; LANES];
-    let mut negative = [0.0f32; LANES];
-    let mut index = 0usize;
-    while index + LANES <= QMF_SUBBANDS {
-        for lane in 0..LANES {
-            positive[lane] += positive_lhs[index + lane] * positive_rhs[index + lane];
-            negative[lane] += negative_lhs[index + lane] * negative_rhs[index + lane];
-        }
-        index += LANES;
-    }
-    let mut sum = ((positive[0] + positive[1]) + (positive[2] + positive[3]))
-        - ((negative[0] + negative[1]) + (negative[2] + negative[3]));
-    while index < QMF_SUBBANDS {
-        sum += positive_lhs[index] * positive_rhs[index];
-        sum -= negative_lhs[index] * negative_rhs[index];
-        index += 1;
-    }
-    sum
-}
-
 fn compute_forward_grouping(window: &[f32], grouping: &mut [f32; QMF_DOUBLE_LENGTH]) {
     debug_assert_eq!(window.len(), QMF_FORWARD_RING_LEN);
     #[cfg(target_arch = "aarch64")]
@@ -299,158 +225,42 @@ fn wrap_ring_head(head: usize, step: usize, len: usize) -> usize {
     }
 }
 
-struct QmfCache {
-    forward_real: [[f32; QMF_DOUBLE_LENGTH]; QMF_SUBBANDS],
-    forward_imaginary: [[f32; QMF_DOUBLE_LENGTH]; QMF_SUBBANDS],
-    inverse_real_by_sample: [[f32; QMF_SUBBANDS]; QMF_DOUBLE_LENGTH],
-    inverse_imaginary_by_sample: [[f32; QMF_SUBBANDS]; QMF_DOUBLE_LENGTH],
+/// The 128-point DFT both directions are computed with, and the twiddles that
+/// turn it into the bank's complex modulation. Twiddles are evaluated in `f64`
+/// so the phases (up to ~400 rad for the direct matrix) lose nothing to `f32`.
+struct QmfTransforms {
+    fft: Arc<dyn Fft<f32>>,
+    scratch_len: usize,
+    /// `e^{i pi n / 128}`
+    forward_pre: [Complex32; QMF_DOUBLE_LENGTH],
+    /// `e^{-i pi (k + 1/2) / 128}`
+    forward_post: [Complex32; QMF_SUBBANDS],
+    /// `e^{i pi k / 128}`
+    inverse_pre: [Complex32; QMF_SUBBANDS],
+    /// `-e^{i pi (s + 1/2) / 128} / 64`
+    inverse_post: [Complex32; QMF_DOUBLE_LENGTH],
 }
 
-fn qmf_cache() -> &'static QmfCache {
-    static CACHE: OnceLock<QmfCache> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        let mut cache = QmfCache {
-            forward_real: [[0.0; QMF_DOUBLE_LENGTH]; QMF_SUBBANDS],
-            forward_imaginary: [[0.0; QMF_DOUBLE_LENGTH]; QMF_SUBBANDS],
-            inverse_real_by_sample: [[0.0; QMF_SUBBANDS]; QMF_DOUBLE_LENGTH],
-            inverse_imaginary_by_sample: [[0.0; QMF_SUBBANDS]; QMF_DOUBLE_LENGTH],
+fn qmf_transforms() -> &'static QmfTransforms {
+    static TRANSFORMS: OnceLock<QmfTransforms> = OnceLock::new();
+    TRANSFORMS.get_or_init(|| {
+        let fft = FftPlanner::<f32>::new().plan_fft_inverse(QMF_DOUBLE_LENGTH);
+        let scratch_len = fft.get_inplace_scratch_len();
+        let unit = |phase: f64, scale: f64| {
+            Complex32::new((phase.cos() * scale) as f32, (phase.sin() * scale) as f32)
         };
-        let subband_div = 1.0f32 / QMF_SUBBANDS as f32;
-        for subband in 0..QMF_SUBBANDS {
-            for sample in 0..QMF_DOUBLE_LENGTH {
-                let exp = std::f32::consts::PI
-                    * (subband as f32 + 0.5)
-                    * (sample as f32 - 0.5)
-                    * subband_div;
-                cache.forward_real[subband][sample] = exp.cos();
-                cache.forward_imaginary[subband][sample] = exp.sin();
-
-                let inverse_exp = std::f32::consts::PI
-                    * (subband as f32 + 0.5)
-                    * (sample as f32 - QMF_DOUBLE_LENGTH as f32 + 0.5)
-                    * subband_div;
-                cache.inverse_real_by_sample[sample][subband] = inverse_exp.cos() * subband_div;
-                cache.inverse_imaginary_by_sample[sample][subband] =
-                    inverse_exp.sin() * subband_div;
-            }
+        let step = std::f64::consts::PI / QMF_DOUBLE_LENGTH as f64;
+        QmfTransforms {
+            fft,
+            scratch_len,
+            forward_pre: std::array::from_fn(|n| unit(step * n as f64, 1.0)),
+            forward_post: std::array::from_fn(|k| unit(-step * (k as f64 + 0.5), 1.0)),
+            inverse_pre: std::array::from_fn(|k| unit(step * k as f64, 1.0)),
+            inverse_post: std::array::from_fn(|s| {
+                unit(step * (s as f64 + 0.5), -1.0 / QMF_SUBBANDS as f64)
+            }),
         }
-        cache
     })
-}
-
-#[cfg(target_arch = "aarch64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[inline(always)]
-unsafe fn horizontal_sum_f32x4(
-    acc0: float32x4_t,
-    acc1: float32x4_t,
-    acc2: float32x4_t,
-    acc3: float32x4_t,
-) -> f32 {
-    vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)))
-}
-
-#[cfg(target_arch = "aarch64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[inline(always)]
-unsafe fn dot_product_neon(lhs: *const f32, rhs: *const f32, len: usize) -> f32 {
-    let mut acc0 = vdupq_n_f32(0.0);
-    let mut acc1 = vdupq_n_f32(0.0);
-    let mut acc2 = vdupq_n_f32(0.0);
-    let mut acc3 = vdupq_n_f32(0.0);
-    let mut index = 0usize;
-    while index + 16 <= len {
-        acc0 = vfmaq_f32(acc0, vld1q_f32(lhs.add(index)), vld1q_f32(rhs.add(index)));
-        acc1 = vfmaq_f32(
-            acc1,
-            vld1q_f32(lhs.add(index + 4)),
-            vld1q_f32(rhs.add(index + 4)),
-        );
-        acc2 = vfmaq_f32(
-            acc2,
-            vld1q_f32(lhs.add(index + 8)),
-            vld1q_f32(rhs.add(index + 8)),
-        );
-        acc3 = vfmaq_f32(
-            acc3,
-            vld1q_f32(lhs.add(index + 12)),
-            vld1q_f32(rhs.add(index + 12)),
-        );
-        index += 16;
-    }
-    let mut sum = horizontal_sum_f32x4(acc0, acc1, acc2, acc3);
-    while index < len {
-        sum += *lhs.add(index) * *rhs.add(index);
-        index += 1;
-    }
-    sum
-}
-
-#[cfg(target_arch = "aarch64")]
-#[allow(unsafe_op_in_unsafe_fn)]
-#[inline(always)]
-unsafe fn dot_product_signed_neon(
-    positive_lhs: *const f32,
-    positive_rhs: *const f32,
-    negative_lhs: *const f32,
-    negative_rhs: *const f32,
-    len: usize,
-) -> f32 {
-    let mut acc0 = vdupq_n_f32(0.0);
-    let mut acc1 = vdupq_n_f32(0.0);
-    let mut acc2 = vdupq_n_f32(0.0);
-    let mut acc3 = vdupq_n_f32(0.0);
-    let mut index = 0usize;
-    while index + 16 <= len {
-        acc0 = vfmaq_f32(
-            acc0,
-            vld1q_f32(positive_lhs.add(index)),
-            vld1q_f32(positive_rhs.add(index)),
-        );
-        acc0 = vfmsq_f32(
-            acc0,
-            vld1q_f32(negative_lhs.add(index)),
-            vld1q_f32(negative_rhs.add(index)),
-        );
-        acc1 = vfmaq_f32(
-            acc1,
-            vld1q_f32(positive_lhs.add(index + 4)),
-            vld1q_f32(positive_rhs.add(index + 4)),
-        );
-        acc1 = vfmsq_f32(
-            acc1,
-            vld1q_f32(negative_lhs.add(index + 4)),
-            vld1q_f32(negative_rhs.add(index + 4)),
-        );
-        acc2 = vfmaq_f32(
-            acc2,
-            vld1q_f32(positive_lhs.add(index + 8)),
-            vld1q_f32(positive_rhs.add(index + 8)),
-        );
-        acc2 = vfmsq_f32(
-            acc2,
-            vld1q_f32(negative_lhs.add(index + 8)),
-            vld1q_f32(negative_rhs.add(index + 8)),
-        );
-        acc3 = vfmaq_f32(
-            acc3,
-            vld1q_f32(positive_lhs.add(index + 12)),
-            vld1q_f32(positive_rhs.add(index + 12)),
-        );
-        acc3 = vfmsq_f32(
-            acc3,
-            vld1q_f32(negative_lhs.add(index + 12)),
-            vld1q_f32(negative_rhs.add(index + 12)),
-        );
-        index += 16;
-    }
-    let mut sum = horizontal_sum_f32x4(acc0, acc1, acc2, acc3);
-    while index < len {
-        sum += *positive_lhs.add(index) * *positive_rhs.add(index);
-        sum -= *negative_lhs.add(index) * *negative_rhs.add(index);
-        index += 1;
-    }
-    sum
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -526,6 +336,8 @@ unsafe fn compute_inverse_output_neon(window: *const f32, output: *mut f32) {
 
 #[cfg(test)]
 mod tests {
+    use std::f64::consts::PI;
+
     use super::*;
 
     struct ReferenceQmfBank {
@@ -564,12 +376,18 @@ mod tests {
                 *slot = sum;
             }
 
-            let cache = qmf_cache();
+            // The modulation summed directly, in `f64`.
             let mut result = QmfSubbands::zero();
             for subband in 0..QMF_SUBBANDS {
-                result.real[subband] = dot_product_naive(&cache.forward_real[subband], &grouping);
-                result.imaginary[subband] =
-                    dot_product_naive(&cache.forward_imaginary[subband], &grouping);
+                let (mut real, mut imaginary) = (0.0f64, 0.0f64);
+                for (sample, value) in grouping.iter().enumerate() {
+                    let phase =
+                        PI * (subband as f64 + 0.5) * (sample as f64 - 0.5) / QMF_SUBBANDS as f64;
+                    real += *value as f64 * phase.cos();
+                    imaginary += *value as f64 * phase.sin();
+                }
+                result.real[subband] = real as f32;
+                result.imaginary[subband] = imaginary as f32;
             }
             result
         }
@@ -579,15 +397,17 @@ mod tests {
             self.input_stream_inverse
                 .copy_within(0..inverse_len - QMF_DOUBLE_LENGTH, QMF_DOUBLE_LENGTH);
 
-            let cache = qmf_cache();
             for sample in 0..QMF_DOUBLE_LENGTH {
-                let mut value = 0.0f32;
+                let mut value = 0.0f64;
                 for subband in 0..QMF_SUBBANDS {
-                    value += cache.inverse_real_by_sample[sample][subband] * input.real[subband];
-                    value -= cache.inverse_imaginary_by_sample[sample][subband]
-                        * input.imaginary[subband];
+                    let phase = PI
+                        * (subband as f64 + 0.5)
+                        * (sample as f64 - QMF_DOUBLE_LENGTH as f64 + 0.5)
+                        / QMF_SUBBANDS as f64;
+                    value += input.real[subband] as f64 * phase.cos()
+                        - input.imaginary[subband] as f64 * phase.sin();
                 }
-                self.input_stream_inverse[sample] = value;
+                self.input_stream_inverse[sample] = (value / QMF_SUBBANDS as f64) as f32;
             }
 
             output.fill(0.0);
@@ -608,49 +428,6 @@ mod tests {
                             * QMF_COEFFS[coeff_pair + sample];
                 }
             }
-        }
-    }
-
-    #[test]
-    fn scalar_dot_products_match_the_single_accumulator_reference() {
-        const TOLERANCE: f32 = 1e-5;
-        let mut seed = 0x0bad_f00d;
-        for _ in 0..64 {
-            let mut lhs = [0.0f32; QMF_DOUBLE_LENGTH];
-            let mut rhs = [0.0f32; QMF_DOUBLE_LENGTH];
-            for index in 0..QMF_DOUBLE_LENGTH {
-                lhs[index] = next_sample(&mut seed);
-                rhs[index] = next_sample(&mut seed);
-            }
-            let actual = dot_product_scalar(&lhs, &rhs);
-            let expected = dot_product_naive(&lhs, &rhs);
-            assert!(
-                (actual - expected).abs() <= TOLERANCE,
-                "dot_product_scalar mismatch: {actual} vs {expected}",
-            );
-
-            let mut positive_lhs = [0.0f32; QMF_SUBBANDS];
-            let mut positive_rhs = [0.0f32; QMF_SUBBANDS];
-            let mut negative_lhs = [0.0f32; QMF_SUBBANDS];
-            let mut negative_rhs = [0.0f32; QMF_SUBBANDS];
-            for index in 0..QMF_SUBBANDS {
-                positive_lhs[index] = next_sample(&mut seed);
-                positive_rhs[index] = next_sample(&mut seed);
-                negative_lhs[index] = next_sample(&mut seed);
-                negative_rhs[index] = next_sample(&mut seed);
-            }
-            let actual = dot_product_signed_scalar(
-                &positive_lhs,
-                &positive_rhs,
-                &negative_lhs,
-                &negative_rhs,
-            );
-            let expected = dot_product_naive(&positive_lhs, &positive_rhs)
-                - dot_product_naive(&negative_lhs, &negative_rhs);
-            assert!(
-                (actual - expected).abs() <= TOLERANCE,
-                "dot_product_signed_scalar mismatch: {actual} vs {expected}",
-            );
         }
     }
 
