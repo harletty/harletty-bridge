@@ -201,6 +201,20 @@ pub(crate) struct AllocationState {
     /// of the exponents and these, so a block that reuses its exponents and
     /// repeats them has its `bap` already (FFmpeg's `bit_alloc_stages`).
     allocated_with: Option<AllocationArgs>,
+    /// What `count_mantissa_bits` last found in `bap`, while `bap` is unchanged.
+    mantissa_counts: Option<MantissaCounts>,
+}
+
+/// The bins of a `bap` range, sorted into what `count_mantissa_bits` needs:
+/// the bits of the ungrouped mantissas, and how many of each grouped kind.
+#[derive(Debug, Clone, Copy)]
+struct MantissaCounts {
+    start: usize,
+    end: usize,
+    bits: usize,
+    bap1: usize,
+    bap2: usize,
+    bap4: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -256,12 +270,14 @@ impl AllocationState {
             mask: vec![0; MASK_BANDS],
             grouped_scratch: Vec::new(),
             allocated_with: None,
+            mantissa_counts: None,
         }
     }
 
     pub(crate) fn clear_bap(&mut self) {
         self.bap.fill(0);
         self.allocated_with = None;
+        self.mantissa_counts = None;
     }
 
     pub(crate) fn read_channel_exponents(
@@ -382,6 +398,7 @@ impl AllocationState {
         }) {
             return Ok(());
         }
+        self.mantissa_counts = None;
         let args = AllocationArgs {
             start,
             end,
@@ -524,24 +541,43 @@ impl AllocationState {
     }
 
     pub(crate) fn count_mantissa_bits(
-        &self,
+        &mut self,
         start: usize,
         end: usize,
         group_state: &mut MantissaGroupState,
     ) -> usize {
-        let mut bits = 0usize;
-        let mut bap1 = 0usize;
-        let mut bap2 = 0usize;
-        let mut bap4 = 0usize;
-
-        for bin in start..end {
-            match self.bap[bin] {
-                1 => bap1 += 1,
-                2 => bap2 += 1,
-                4 => bap4 += 1,
-                value => bits += BAP_BITS[value as usize],
+        // A block that kept its bit allocation has the same counts; only the
+        // grouping carried in from the channels before it differs.
+        let counts = match self.mantissa_counts {
+            Some(counts) if counts.start == start && counts.end == end => counts,
+            _ => {
+                let mut counts = MantissaCounts {
+                    start,
+                    end,
+                    bits: 0,
+                    bap1: 0,
+                    bap2: 0,
+                    bap4: 0,
+                };
+                for bin in start..end {
+                    match self.bap[bin] {
+                        1 => counts.bap1 += 1,
+                        2 => counts.bap2 += 1,
+                        4 => counts.bap4 += 1,
+                        value => counts.bits += BAP_BITS[value as usize],
+                    }
+                }
+                self.mantissa_counts = Some(counts);
+                counts
             }
-        }
+        };
+        let MantissaCounts {
+            mut bits,
+            bap1,
+            bap2,
+            bap4,
+            ..
+        } = counts;
 
         bits += ((group_state.bap1_pos + bap1) / 3) * BAP_BITS[1];
         bits += ((group_state.bap2_pos + bap2) / 3) * BAP_BITS[2];
