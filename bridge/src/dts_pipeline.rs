@@ -132,6 +132,9 @@ pub(crate) struct DtsXState {
     parse_failures: u64,
     feed_dropouts: u64,
     bed_extension_dropouts: u64,
+    /// The decoded frame, kept from packet to packet so the decoder refills
+    /// its buffers instead of allocating new ones.
+    frame: HdFrame,
 }
 
 impl DtsXState {
@@ -216,11 +219,12 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 } else {
                     DtsProfile::Hd
                 };
+                let mut hd = std::mem::take(&mut bridge.dts_x.frame);
                 match bridge
                     .dts_hd_decoder
-                    .decode(&rest[..fs], &rest[fs..fs + es])
+                    .decode_into(&rest[..fs], &rest[fs..fs + es], &mut hd)
                 {
-                    Ok(hd) => {
+                    Ok(()) => {
                         let n = hd_samples(&hd);
                         bridge.dts_surrounds_on_side = hd.surrounds_on_side();
                         if let Some(kind) = hd.xxch_decode_error {
@@ -270,6 +274,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                         }
                     }
                 }
+                bridge.dts_x.frame = hd;
             } else {
                 // Nothing the HD decoder reads beyond the core: an XBR-only
                 // DTS-HD HRA layers high-frequency detail on top of an
