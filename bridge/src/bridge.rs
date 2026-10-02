@@ -10,6 +10,7 @@ use std::env;
 use std::time::Instant;
 use truehd::process::decode::DecodedAccessUnit;
 use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, parse::Parser};
+use truehd::structs::access_unit::AccessUnit;
 
 use crate::ac3_native::NativeAc3Decoder;
 use crate::auro_pipeline::DtsAuroState;
@@ -25,7 +26,7 @@ use crate::frame_builders::validate_frame_shape;
 use crate::logging::bridge_diag_log;
 use crate::mat::MatStream;
 use crate::perf::PerfStats;
-use crate::truehd_pipeline::{configure_parser, process_extractor_input};
+use crate::truehd_pipeline::{configure_parser, process_extractor_input, required_presentations};
 
 #[derive(Debug, Default)]
 pub(crate) struct Eac3DiagStats {
@@ -197,6 +198,10 @@ pub(crate) struct AtmosBridge {
     pub(crate) mat_stream: MatStream,
     pub(crate) extractor: Extractor,
     pub(crate) parser: Box<Parser>,
+    /// The access unit every frame is parsed into. Kept from one to the next: a
+    /// new one allocates the blocks of each substream and the sample rows of
+    /// each block, to free them as soon as the frame is decoded.
+    pub(crate) truehd_access_unit: Box<AccessUnit>,
     pub(crate) decoder: Box<Decoder>,
     /// The access unit the decoder writes its samples into. Kept from one to the
     /// next: a new one is 10 KiB to build and copy out for every 1/1200 s of
@@ -286,6 +291,9 @@ pub(crate) struct AtmosBridge {
     pub(crate) current_substream_info: Option<u8>,
     pub(crate) current_extended_substream_info: Option<u8>,
     pub(crate) recovering_until_major_sync: bool,
+    /// The DRC mode changed which presentations the TrueHD parser is to be asked
+    /// for, and it has not been asked yet: it is at the next major sync.
+    pub(crate) truehd_presentations_stale: bool,
     pub(crate) drc_mode: DrcMode,
     pub(crate) frame_count: u64,
     /// Last object↔channel declaration emitted (sparse re-emission on change
@@ -314,7 +322,7 @@ impl AtmosBridge {
             log::Level::Error
         };
         decoder.set_fail_level(fail_level);
-        configure_parser(&mut parser, fail_level, presentation);
+        configure_parser(&mut parser, fail_level, presentation, DrcMode::default());
 
         let eac3_log_level = if strict {
             log::Level::Warn
@@ -332,6 +340,7 @@ impl AtmosBridge {
             mat_stream: MatStream::default(),
             extractor: Extractor::default(),
             parser,
+            truehd_access_unit: Box::default(),
             decoder,
             truehd_decoded: Box::default(),
             eac3_spdif: Eac3SpdifStream::default(),
@@ -371,6 +380,7 @@ impl AtmosBridge {
             current_substream_info: None,
             current_extended_substream_info: None,
             recovering_until_major_sync: false,
+            truehd_presentations_stale: false,
             drc_mode: DrcMode::Off,
             frame_count: 0,
             declared_object_channels: None,
@@ -447,7 +457,13 @@ impl AtmosBridge {
         self.decoder.set_fail_level(fail_level);
         self.eac3_pcm_decoder.set_debug_log_level(fail_level);
         self.eac3_object_decoder.set_debug_log_level(fail_level);
-        configure_parser(&mut self.parser, fail_level, self.presentation);
+        configure_parser(
+            &mut self.parser,
+            fail_level,
+            self.presentation,
+            self.drc_mode,
+        );
+        self.truehd_presentations_stale = false;
         self.declared_object_channels = None;
         self.truehd_spatial_labels = None;
         self.recovering_until_major_sync = false;
@@ -1062,12 +1078,9 @@ impl FormatBridge for AtmosBridge {
                     },
                 };
                 self.presentation = p;
-                let mut required_presentations = [false; MAX_PRESENTATIONS];
-                required_presentations[..=p as usize]
-                    .iter_mut()
-                    .for_each(|v| *v = true);
                 self.parser
-                    .set_required_presentations(&required_presentations);
+                    .set_required_presentations(&required_presentations(p, self.drc_mode));
+                self.truehd_presentations_stale = false;
                 log::debug!("atmos-bridge: presentation set to {p}");
                 true
             }
@@ -1274,6 +1287,11 @@ impl FormatBridge for AtmosBridge {
                 self.drc_mode, new_mode
             ),
         );
+        if required_presentations(self.presentation, new_mode)
+            != required_presentations(self.presentation, self.drc_mode)
+        {
+            self.truehd_presentations_stale = true;
+        }
         self.drc_mode = new_mode;
         true
     }
@@ -1527,6 +1545,77 @@ mod raw_transport_tests {
         assert_eq!(bridge.source_label().as_str(), "Dolby TrueHD");
         bridge.truehd_spatial_labels = Some(RVec::new());
         assert_eq!(bridge.source_label().as_str(), "Dolby TrueHD + Dolby Atmos");
+    }
+
+    /// The presentations asked of the TrueHD parser follow the DRC mode, and a
+    /// mode set in mid-stream reaches the parser at the next major sync, where
+    /// every substream can be taken up, with the frames a bridge in that mode
+    /// from the start hands out.
+    #[test]
+    fn truehd_presentations_follow_the_drc_mode_at_a_major_sync() {
+        use crate::truehd_pipeline::required_presentations;
+
+        // The DRC log asks for every presentation whatever the mode.
+        if crate::logging::drc_diag_log_enabled() {
+            return;
+        }
+
+        assert_eq!(
+            required_presentations(2, DrcMode::Off),
+            [false, false, true, false]
+        );
+        assert_eq!(
+            required_presentations(2, DrcMode::Standard),
+            [false, false, true, false]
+        );
+        assert_eq!(
+            required_presentations(2, DrcMode::Heavy),
+            [true, true, true, false]
+        );
+
+        // One major sync and one access unit after it, four times over.
+        let unit = truehd::process::EXAMPLE_DATA;
+        let push = |bridge: &mut AtmosBridge, copies: usize| {
+            let bytes = unit.repeat(copies);
+            let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
+
+            assert!(result.error_message.is_empty(), "{}", result.error_message);
+            assert!(!result.did_reset);
+            result
+                .frames
+                .into_iter()
+                .map(|f| (f.pcm.to_vec(), f.drc_gain.to_bits(), f.drc_ramp_duration))
+                .collect::<Vec<_>>()
+        };
+
+        let mut heavy = AtmosBridge::new(false);
+        heavy.configure("input_codec".into(), "truehd".into());
+        assert!(heavy.set_drc_mode("heavy/RF".into()));
+        let mut expected = push(&mut heavy, 1);
+        expected.extend(push(&mut heavy, 3));
+        assert!(!heavy.truehd_presentations_stale);
+
+        let mut bridge = AtmosBridge::new(false);
+        bridge.configure("input_codec".into(), "truehd".into());
+        let mut frames = push(&mut bridge, 1);
+        assert!(!bridge.truehd_presentations_stale);
+
+        // Nothing is asked of the parser between two major syncs.
+        assert!(bridge.set_drc_mode("standard/line".into()));
+        assert!(!bridge.truehd_presentations_stale);
+        assert!(bridge.set_drc_mode("heavy/RF".into()));
+        assert!(bridge.truehd_presentations_stale);
+
+        frames.extend(push(&mut bridge, 3));
+        assert!(!bridge.truehd_presentations_stale);
+
+        assert!(frames.len() >= 6, "{} frames", frames.len());
+        assert_eq!(frames.len(), expected.len());
+        for (i, (frame, expected)) in frames.iter().zip(&expected).enumerate() {
+            assert_eq!(frame.0, expected.0, "samples of frame {i}");
+        }
+        // From the major sync after the mode was set, the gains too.
+        assert_eq!(frames[4..], expected[4..]);
     }
 
     // End-to-end: feed a raw DTS core stream through the FormatBridge and check

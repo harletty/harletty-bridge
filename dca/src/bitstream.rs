@@ -194,6 +194,97 @@ impl<'a> BitReader<'a> {
         Some(q.wrapping_shl(k as u32) | low)
     }
 
+    /// `out.len()` Rice codes of parameter `k` in a row, each stored as the
+    /// signed value its low bit folds (`(v >> 1) ^ -(v & 1)`): what
+    /// [`Self::read_rice`] with an unbounded quotient reads one at a time,
+    /// stopping at the first that fails.
+    ///
+    /// The position stays in a register across the run, and each code is
+    /// read from the word loaded while the code before it was decoded, so
+    /// the load is not part of what one code waits on from the last.
+    pub(crate) fn read_rice_run(&mut self, k: usize, out: &mut [i32]) -> Option<()> {
+        #[inline(always)]
+        fn fold(v: u32) -> i32 {
+            ((v >> 1) ^ 0u32.wrapping_sub(v & 1)) as i32
+        }
+        let mut done = 0;
+        if k < 32 && self.bit_size >= 64 && self.bit_pos <= self.bit_size - 64 {
+            // A code starting at or before `last` has 64 bits of data after
+            // its first: the word holding them can be loaded whole.
+            let last = self.bit_size - 64;
+            let data = self.data;
+            let word_at =
+                |byte: usize| u64::from_be_bytes(data[byte..byte + 8].try_into().unwrap());
+            let mut pos = self.bit_pos;
+            let mut base = pos >> 3;
+            let mut word = word_at(base);
+            while done < out.len() && pos <= last {
+                let here = pos >> 3;
+                let fresh = word_at(here);
+                // `word` starts at the byte the previous code started in:
+                // this code's bits follow the `used` first ones.
+                let used = pos - 8 * base;
+                let mut window = word << used;
+                let mut valid = 64 - used;
+                let mut quotient = window.leading_zeros() as usize;
+                if quotient + 1 + k >= valid {
+                    // It runs past that word: read it from its own.
+                    window = fresh << (pos & 7);
+                    valid = 64 - (pos & 7);
+                    quotient = window.leading_zeros() as usize;
+                    if quotient + 1 + k >= valid {
+                        break;
+                    }
+                }
+                let low = ((window << (quotient + 1)) >> 1 >> (63 - k)) as u32;
+                out[done] = fold(((quotient as u32) << k) | low);
+                done += 1;
+                pos += quotient + 1 + k;
+                word = fresh;
+                base = here;
+            }
+            self.bit_pos = pos;
+        }
+        for slot in &mut out[done..] {
+            *slot = fold(self.read_rice(k, 1 << 20)?);
+        }
+        Some(())
+    }
+
+    /// `out.len()` fields of `bits` bits (at most 32) in a row, as
+    /// [`Self::read_bits`] reads them one at a time, stopping at the first
+    /// that fails.
+    pub(crate) fn read_bits_run(&mut self, bits: usize, out: &mut [u32]) -> Option<()> {
+        if bits == 0 {
+            out.fill(0);
+            return Some(());
+        }
+        let mut done = 0;
+        if bits <= 32 && self.bit_size >= 64 {
+            // As in `read_rice_run`: fields whose word can be loaded whole.
+            let last = self.bit_size - 64;
+            let data = self.data;
+            let first = self.bit_pos;
+            let whole = if first <= last {
+                ((last - first) / bits + 1).min(out.len())
+            } else {
+                0
+            };
+            for (i, slot) in out[..whole].iter_mut().enumerate() {
+                let pos = first + i * bits;
+                let byte = pos >> 3;
+                let word = u64::from_be_bytes(data[byte..byte + 8].try_into().unwrap());
+                *slot = ((word << (pos & 7)) >> (64 - bits)) as u32;
+            }
+            self.bit_pos = first + whole * bits;
+            done = whole;
+        }
+        for slot in &mut out[done..] {
+            *slot = self.read_bits(bits)?;
+        }
+        Some(())
+    }
+
     /// Skip an arbitrary number of bits (may exceed 32; `skip_bits_long`).
     pub(crate) fn skip_bits_long(&mut self, bits: usize) -> Option<()> {
         if self.bits_left(bits) {
@@ -307,6 +398,80 @@ mod tests {
                     assert_eq!(fast.position(), pos);
                 }
             }
+        }
+    }
+
+    /// Runs of Rice codes and of fixed-width fields against the same reads
+    /// made one at a time: same values, same failure, same position after,
+    /// at every offset, across zero stretches (long quotients) and up to
+    /// and past a limit set below the end of the data.
+    #[test]
+    fn runs_match_single_reads() {
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            state >> 8
+        };
+        for round in 0..3000 {
+            let len = 1 + (next() % 96) as usize;
+            let mut data: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            // Zero stretches make quotients longer than a word.
+            if round % 3 == 0 {
+                let at = (next() as usize) % len;
+                let n = (next() as usize % 12).min(len - at);
+                data[at..at + n].fill(0);
+            }
+            let limit = if round % 4 == 0 {
+                (next() as usize) % (len * 8 + 1)
+            } else {
+                len * 8
+            };
+            let start = (next() as usize) % (len * 8 + 1);
+            let count = (next() % 48) as usize;
+            let param = (next() % 35) as usize;
+
+            let mut single = BitReader::with_offset(&data, start);
+            single.set_limit_bits(limit);
+            let mut run = single;
+
+            let mut expected = vec![0i32; count];
+            let mut read = 0;
+            let mut complete = true;
+            for slot in expected.iter_mut() {
+                match single.read_rice(param, 1 << 20) {
+                    Some(v) => *slot = ((v >> 1) ^ 0u32.wrapping_sub(v & 1)) as i32,
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+                read += 1;
+            }
+            let mut out = vec![0i32; count];
+            assert_eq!(run.read_rice_run(param, &mut out).is_some(), complete);
+            assert_eq!(out[..read], expected[..read], "rice k {param}");
+            assert_eq!(run.position(), single.position(), "rice k {param}");
+
+            let mut single = BitReader::with_offset(&data, start);
+            single.set_limit_bits(limit);
+            let mut run = single;
+            let mut expected = vec![0u32; count];
+            let mut read = 0;
+            let mut complete = true;
+            for slot in expected.iter_mut() {
+                match single.read_bits(param) {
+                    Some(v) => *slot = v,
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+                read += 1;
+            }
+            let mut out = vec![0u32; count];
+            assert_eq!(run.read_bits_run(param, &mut out).is_some(), complete);
+            assert_eq!(out[..read], expected[..read], "bits {param}");
+            assert_eq!(run.position(), single.position(), "bits {param}");
         }
     }
 }

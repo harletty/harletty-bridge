@@ -20,4 +20,4 @@ strip = "symbols"
 # keep asking for the crates.io version, so dropping this section goes back
 # to it. Move the pin only to a commit that stays reachable on the fork.
 [patch.crates-io]
-truehd = { git = "https://github.com/harletty/truehdd", rev = "600355da1edb3ba51cc0064f76e9dd57198a0bb4" }
+truehd = { git = "https://github.com/harletty/truehdd", rev = "b3faa1260c4577f3bfc6d440fcdd07080e6af79c" }

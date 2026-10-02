@@ -3,6 +3,7 @@ use indicatif::ProgressBar;
 use std::sync::mpsc;
 use truehd::process::decode::DecodedAccessUnit;
 use truehd::process::{decode::Decoder, extract::Extractor, parse::Parser};
+use truehd::structs::access_unit::AccessUnit;
 use truehd::structs::channel::ChannelLabel;
 
 /// Shape of the last access unit that came through cleanly.
@@ -54,6 +55,10 @@ impl AccessUnitShape {
 pub struct ProcessFramesContext<'a> {
     pub extractor: &'a mut Extractor,
     pub parser: &'a mut Parser,
+    /// Where every frame is parsed: a new one for each allocates the blocks of
+    /// its substreams and the sample rows of each block, to free them once the
+    /// frame is decoded.
+    pub access_unit: &'a mut AccessUnit,
     pub decoder: &'a mut Decoder,
     pub frames_processed: &'a mut u64,
     pub frame_count: &'a mut u64,
@@ -123,11 +128,11 @@ pub fn process_frames(ctx: &mut ProcessFramesContext) -> Result<bool> {
                     *ctx.recovering_until_major_sync = false;
                 }
 
-                match ctx.parser.parse(&frame) {
-                    Ok(access_unit) => {
+                match ctx.parser.parse_into(&frame, ctx.access_unit) {
+                    Ok(()) => {
                         // Check for substream_info changes after parsing
                         let mut substream_info_changed = false;
-                        if let Some(major_sync) = &access_unit.major_sync_info {
+                        if let Some(major_sync) = &ctx.access_unit.major_sync_info {
                             // Check if substream_info has changed
                             match *ctx.current_substream_info {
                                 Some(current) if current != major_sync.substream_info => {
@@ -174,7 +179,7 @@ pub fn process_frames(ctx: &mut ProcessFramesContext) -> Result<bool> {
                         let mut decoded = ctx.spare.try_recv().unwrap_or_default();
 
                         match ctx.decoder.decode_presentation_into(
-                            &access_unit,
+                            ctx.access_unit,
                             ctx.presentation as usize,
                             &mut decoded,
                         ) {
@@ -280,6 +285,7 @@ mod tests {
         let mut extractor = Extractor::default();
 
         let mut parser = Parser::default();
+        let mut access_unit = AccessUnit::default();
         let mut decoder = Decoder::default();
         let (mut frames_processed, mut frame_count, mut total_samples) = (0u64, 0u64, 0u64);
         let (mut substream_info, mut extended_substream_info) = (None, None);
@@ -290,6 +296,7 @@ mod tests {
         let mut ctx = ProcessFramesContext {
             extractor: &mut extractor,
             parser: &mut parser,
+            access_unit: &mut access_unit,
             decoder: &mut decoder,
             frames_processed: &mut frames_processed,
             frame_count: &mut frame_count,

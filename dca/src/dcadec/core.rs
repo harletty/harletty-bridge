@@ -94,14 +94,14 @@ fn prm_ch_to_spkr(mode: AudioMode, ch: usize) -> usize {
 
 // ───────────────────────── fixed-point helpers (dcamath.h) ─────────────────
 
-#[inline]
+#[inline(always)]
 fn clip23(a: i32) -> i32 {
     let lo = -(1 << 23);
     let hi = (1 << 23) - 1;
     a.clamp(lo, hi)
 }
 
-#[inline]
+#[inline(always)]
 fn norm(a: i64, bits: u32) -> i32 {
     if bits > 0 {
         ((a + (1i64 << (bits - 1))) >> bits) as i32
@@ -110,13 +110,31 @@ fn norm(a: i64, bits: u32) -> i32 {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn mul(a: i32, b: i32, bits: u32) -> i32 {
     norm(a as i64 * b as i64, bits)
 }
 
+sample_loop! {
+    /// `samples = mul(samples, scale, 16)`.
+    fn scale_samples(samples: &mut [i32], scale: i32) {
+        for x in samples {
+            *x = mul(*x, scale, 16);
+        }
+    }
+}
+
+sample_loop! {
+    /// `dst -= mul(src, coeff, 15)`.
+    fn sub_scaled(dst: &mut [i32], src: &[i32], coeff: i32) {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = d.wrapping_sub(mul(s, coeff, 15));
+        }
+    }
+}
+
 /// `ff_dcaadpcm_predict`.
-#[inline]
+#[inline(always)]
 fn adpcm_predict(pred_vq_index: usize, input: &[i32]) -> i32 {
     let coeff = &ADPCM_VB[pred_vq_index];
     let mut pred = 0i64;
@@ -166,6 +184,7 @@ enum Header {
 }
 
 /// `ff_dca_core_dequantize` (residual=false).
+#[inline(always)]
 fn dequantize(output: &mut [i32], input: &[i32], step_size: i32, scale: i32) {
     let mut step_scale = step_size as i64 * scale as i64;
     let mut shift = 0u32;
@@ -179,15 +198,6 @@ fn dequantize(output: &mut [i32], input: &[i32], step_size: i32, scale: i32) {
 }
 
 // ───────────────────────── decoder state ──────────────────────────────────
-
-/// Per-channel subband storage: `[band]` -> buffer of `DCA_ADPCM_COEFFS`
-/// history words followed by `npcmblocks` decoded samples. Persists across
-/// frames for ADPCM history.
-#[derive(Default, Clone)]
-struct ChannelBands {
-    /// `sub[band]`, each `DCA_ADPCM_COEFFS + npcmblocks` long.
-    sub: Vec<Vec<i32>>,
-}
 
 #[derive(Default)]
 pub(crate) struct CoreDecoder {
@@ -239,8 +249,14 @@ pub(crate) struct CoreDecoder {
     joint_scale_factors: [[i32; DCA_SUBBANDS]; DCA_CHANNELS],
 
     // persistent sample buffers
-    bands: Vec<ChannelBands>, // [ch]
-    lfe_samples: Vec<i32>,    // DCA_LFE_HISTORY + npcmblocks/2
+    /// Subband samples, one row per channel and band (`[ch][band]`, see
+    /// `band_range`): `DCA_ADPCM_COEFFS` history words followed by the
+    /// frame's `npcmblocks` decoded samples. The history persists across
+    /// frames for ADPCM.
+    bands: Vec<i32>,
+    /// Length of a row of `bands`.
+    band_len: usize,
+    lfe_samples: Vec<i32>, // DCA_LFE_HISTORY + npcmblocks/2
 }
 
 #[derive(Debug)]
@@ -267,33 +283,45 @@ fn rsb(gb: &mut BitReader, n: usize) -> R<i32> {
 
 impl CoreDecoder {
     pub(crate) fn reset(&mut self) {
-        for ch in &mut self.bands {
-            for b in &mut ch.sub {
-                b.iter_mut().for_each(|x| *x = 0);
-            }
-        }
+        self.bands.fill(0);
         self.lfe_samples.iter_mut().for_each(|x| *x = 0);
+    }
+
+    /// Where the row of channel `ch`, band `band` lies in `bands`.
+    #[inline(always)]
+    fn band_range(&self, ch: usize, band: usize) -> std::ops::Range<usize> {
+        let start = (ch * DCA_SUBBANDS + band) * self.band_len;
+        start..start + self.band_len
+    }
+
+    /// The rows of `band` in two distinct channels: `src` to read, `dst`
+    /// to write.
+    #[inline(always)]
+    fn band_pair(&mut self, src_ch: usize, dst_ch: usize, band: usize) -> (&[i32], &mut [i32]) {
+        debug_assert_ne!(src_ch, dst_ch);
+        let (src, dst) = (self.band_range(src_ch, band), self.band_range(dst_ch, band));
+        if src.start < dst.start {
+            let (head, tail) = self.bands.split_at_mut(dst.start);
+            (&head[src], &mut tail[..dst.len()])
+        } else {
+            let (head, tail) = self.bands.split_at_mut(src.start);
+            (&tail[..src.len()], &mut head[dst])
+        }
     }
 
     fn alloc_buffers(&mut self) {
         let band_len = DCA_ADPCM_COEFFS + self.npcmblocks;
-        if self.bands.len() != DCA_CHANNELS {
-            self.bands = vec![ChannelBands::default(); DCA_CHANNELS];
-        }
-        for ch in &mut self.bands {
-            if ch.sub.len() != DCA_SUBBANDS || ch.sub[0].len() != band_len {
-                ch.sub = vec![vec![0i32; band_len]; DCA_SUBBANDS];
-            }
+        if self.band_len != band_len || self.bands.len() != DCA_CHANNELS * DCA_SUBBANDS * band_len {
+            self.bands = vec![0i32; DCA_CHANNELS * DCA_SUBBANDS * band_len];
+            self.band_len = band_len;
         }
         let lfe_len = DCA_LFE_HISTORY + self.npcmblocks / 2;
         if self.lfe_samples.len() != lfe_len {
             self.lfe_samples = vec![0i32; lfe_len];
         }
         if !self.predictor_history {
-            for ch in &mut self.bands {
-                for b in &mut ch.sub {
-                    b[..DCA_ADPCM_COEFFS].iter_mut().for_each(|x| *x = 0);
-                }
+            for row in self.bands.chunks_exact_mut(band_len) {
+                row[..DCA_ADPCM_COEFFS].fill(0);
             }
         }
     }
@@ -693,6 +721,7 @@ impl CoreDecoder {
     }
 
     /// `extract_audio` — returns (huffman_used, samples[8]).
+    #[inline(always)]
     fn extract_audio(&self, gb: &mut BitReader, abits: i32, ch: usize) -> R<(bool, [i32; 8])> {
         let mut audio = [0i32; 8];
         if abits == 0 {
@@ -719,17 +748,18 @@ impl CoreDecoder {
         Ok((false, audio))
     }
 
+    #[inline(always)]
     fn parse_block_codes(&self, gb: &mut BitReader, audio: &mut [i32; 8], abits: i32) -> R<()> {
         let nbits = BLOCK_CODE_NBITS[abits as usize - 1] as usize;
-        let code1 = rb(gb, nbits)? as i32;
-        let code2 = rb(gb, nbits)? as i32;
-        let levels = QUANT_LEVELS[abits as usize] as i32;
-        if decode_blockcodes(code1, code2, levels, audio) != 0 {
+        let code1 = rb(gb, nbits)?;
+        let code2 = rb(gb, nbits)?;
+        if !decode_blockcodes(code1, code2, abits as usize, audio) {
             return Err(CoreError::Invalid("block code"));
         }
         Ok(())
     }
 
+    #[inline(always)]
     fn parse_subframe_audio(
         &mut self,
         gb: &mut BitReader,
@@ -799,7 +829,8 @@ impl CoreDecoder {
                         scale = clip23((adj * scale as i64 >> 22) as i32);
                     }
                     let base = DCA_ADPCM_COEFFS + ofs;
-                    let buf = &mut self.bands[ch].sub[band][base..base + DCA_SUBBAND_SAMPLES];
+                    let row = self.band_range(ch, band);
+                    let buf = &mut self.bands[row][base..base + DCA_SUBBAND_SAMPLES];
                     dequantize(buf, &audio, step_size, scale);
                 }
             }
@@ -827,23 +858,27 @@ impl CoreDecoder {
         Ok(())
     }
 
+    #[inline(always)]
     fn decode_hf(&mut self, ch: usize, vq_index: &[i32], ofs: usize, len: usize) {
         for i in self.subband_vq_start[ch]..self.nsubbands[ch] {
             let coeff = &HIGH_FREQ_VQ[vq_index[i] as usize];
             let scale = self.scale_factors[ch][i][0];
             let base = DCA_ADPCM_COEFFS + ofs;
-            for j in 0..len {
-                self.bands[ch].sub[i][base + j] =
-                    clip23(((coeff[j] as i32 * scale) + (1 << 3)) >> 4);
+            let row = self.band_range(ch, i);
+            let buf = &mut self.bands[row][base..base + len];
+            for (x, &c) in buf.iter_mut().zip(&coeff[..len]) {
+                *x = clip23(((c as i32 * scale) + (1 << 3)) >> 4);
             }
         }
     }
 
+    #[inline(always)]
     fn inverse_adpcm(&mut self, ch: usize, sub_pos: usize, len: usize) {
         for band in 0..self.nsubbands[ch] {
             if self.prediction_mode[ch][band] {
                 let pred_id = self.prediction_vq_index[ch][band];
-                let buf = &mut self.bands[ch].sub[band];
+                let row = self.band_range(ch, band);
+                let buf = &mut self.bands[row];
                 for j in 0..len {
                     // input window = buf[sub_pos+j .. sub_pos+j+4]
                     let win = [
@@ -860,13 +895,14 @@ impl CoreDecoder {
         }
     }
 
+    #[inline(always)]
     fn decode_joint(&mut self, ch: usize, src_ch: usize, ofs: usize, len: usize) {
         for band in self.nsubbands[ch]..self.nsubbands[src_ch] {
             let scale = self.joint_scale_factors[ch][band];
             let base = DCA_ADPCM_COEFFS + ofs;
-            for j in 0..len {
-                let src = self.bands[src_ch].sub[band][base + j];
-                self.bands[ch].sub[band][base + j] = clip23(mul(src, scale, 17));
+            let (src, dst) = self.band_pair(src_ch, ch, band);
+            for (d, &s) in dst[base..base + len].iter_mut().zip(&src[base..base + len]) {
+                *d = clip23(mul(s, scale, 17));
             }
         }
     }
@@ -875,6 +911,38 @@ impl CoreDecoder {
     /// header, or an extension set whose channels start at `xch_base` — and
     /// decode its subband samples for the frame.
     fn parse_frame_data(
+        &mut self,
+        gb: &mut BitReader,
+        data: &[u8],
+        header: Header,
+        xch_base: usize,
+    ) -> R<()> {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::has_avx2() {
+            // SAFETY: `has_avx2` covers the features the function is
+            // compiled for.
+            return unsafe { self.parse_frame_data_avx2(gb, data, header, xch_base) };
+        }
+        self.parse_frame_data_body(gb, data, header, xch_base)
+    }
+
+    /// `parse_frame_data_body` compiled for AVX2: the same code, whose
+    /// dequantization, vector-quantized bands and joint bands then use the
+    /// 24-bit clips and 64-bit products the baseline target lacks.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+    fn parse_frame_data_avx2(
+        &mut self,
+        gb: &mut BitReader,
+        data: &[u8],
+        header: Header,
+        xch_base: usize,
+    ) -> R<()> {
+        self.parse_frame_data_body(gb, data, header, xch_base)
+    }
+
+    #[inline(always)]
+    fn parse_frame_data_body(
         &mut self,
         gb: &mut BitReader,
         data: &[u8],
@@ -902,15 +970,13 @@ impl CoreDecoder {
                 nsubbands = nsubbands.max(self.nsubbands[self.joint_intensity_index[ch] - 1]);
             }
             for band in 0..nsubbands {
-                let buf = &mut self.bands[ch].sub[band];
+                let row = self.band_range(ch, band);
+                let buf = &mut self.bands[row];
                 // history (first 4) = last 4 decoded samples
-                for k in 0..DCA_ADPCM_COEFFS {
-                    buf[k] = buf[self.npcmblocks + k];
-                }
+                buf.copy_within(self.npcmblocks..self.npcmblocks + DCA_ADPCM_COEFFS, 0);
             }
-            for band in nsubbands..DCA_SUBBANDS {
-                self.bands[ch].sub[band].iter_mut().for_each(|x| *x = 0);
-            }
+            let inactive = self.band_range(ch, nsubbands).start..self.band_range(ch + 1, 0).start;
+            self.bands[inactive].fill(0);
         }
         Ok(())
     }
@@ -987,11 +1053,9 @@ impl CoreDecoder {
             Err(e) => {
                 self.nchannels = base;
                 self.extension_base = base;
-                for ch in base..base + nchannels {
-                    for band in &mut self.bands[ch].sub {
-                        band.iter_mut().for_each(|x| *x = 0);
-                    }
-                }
+                let dropped =
+                    self.band_range(base, 0).start..self.band_range(base + nchannels, 0).start;
+                self.bands[dropped].fill(0);
                 Err(e)
             }
         }
@@ -1020,9 +1084,7 @@ impl CoreDecoder {
                 .get_mut(self.output_slot(spkr))
                 .and_then(Option::as_mut)
             {
-                for x in buf.iter_mut() {
-                    *x = mul(*x, scale_inv, 16);
-                }
+                scale_samples(buf, scale_inv);
             }
         }
         let mut coeff = self.xxch_dmix_coeff.iter();
@@ -1050,9 +1112,7 @@ impl CoreDecoder {
                 let (Some(src_buf), Some(dst_buf)) = (src_buf, dst_buf) else {
                     continue;
                 };
-                for (d, &s) in dst_buf.iter_mut().zip(src_buf.iter()) {
-                    *d = d.wrapping_sub(mul(s, c, 15));
-                }
+                sub_scaled(dst_buf, src_buf, c);
             }
         }
     }
@@ -1092,7 +1152,7 @@ impl CoreDecoder {
 
     /// Decoded samples for channel `ch`, band `band` (npcmblocks long).
     pub(crate) fn subband(&self, ch: usize, band: usize) -> &[i32] {
-        &self.bands[ch].sub[band][DCA_ADPCM_COEFFS..DCA_ADPCM_COEFFS + self.npcmblocks]
+        &self.bands[self.band_range(ch, band)][DCA_ADPCM_COEFFS..]
     }
 
     pub(crate) fn lfe(&self) -> &[i32] {
@@ -1186,18 +1246,128 @@ pub(crate) fn primary_bed_layout(mode: AudioMode) -> &'static [BedChannel] {
     }
 }
 
-/// `decode_blockcodes` — returns leftover (nonzero => error).
-fn decode_blockcodes(mut code1: i32, mut code2: i32, levels: i32, audio: &mut [i32; 8]) -> i32 {
-    let offset = (levels - 1) / 2;
-    for n in 0..DCA_SUBBAND_SAMPLES / 2 {
-        let div = code1 / levels;
-        audio[n] = code1 - div * levels - offset;
-        code1 = div;
+/// What splits a block code of bit allocation `abits` (1 to 7) in two.
+///
+/// A code packs four samples as base-`levels` digits. Peeling them off one
+/// division at a time chains four divisions; instead one multiplication
+/// splits the code into two two-digit halves, each then read from a table.
+#[derive(Clone, Copy)]
+struct BlockCode {
+    /// `levels * levels`: a half is below this.
+    square: u32,
+    /// `2^32 / square + 1`: `(code * reciprocal) >> 32` is `code / square`
+    /// for every code of at most 19 bits.
+    reciprocal: u64,
+    /// Where the halves of this allocation start in `BLOCK_CODE_PAIRS`.
+    first: usize,
+}
+
+const BLOCK_CODE_PAIR_COUNT: usize = 9 + 25 + 49 + 81 + 169 + 289 + 625;
+
+const fn block_codes() -> ([BlockCode; 7], [[i8; 2]; BLOCK_CODE_PAIR_COUNT]) {
+    let mut codes = [BlockCode {
+        square: 0,
+        reciprocal: 0,
+        first: 0,
+    }; 7];
+    let mut pairs = [[0i8; 2]; BLOCK_CODE_PAIR_COUNT];
+    let mut first = 0;
+    let mut i = 0;
+    while i < 7 {
+        let levels = QUANT_LEVELS[i + 1];
+        let square = levels * levels;
+        codes[i] = BlockCode {
+            square,
+            reciprocal: (1u64 << 32) / square as u64 + 1,
+            first,
+        };
+        let offset = (levels as i32 - 1) / 2;
+        let mut half = 0;
+        while half < square {
+            pairs[first + half as usize] = [
+                ((half % levels) as i32 - offset) as i8,
+                ((half / levels) as i32 - offset) as i8,
+            ];
+            half += 1;
+        }
+        first += square as usize;
+        i += 1;
     }
-    for n in DCA_SUBBAND_SAMPLES / 2..DCA_SUBBAND_SAMPLES {
-        let div = code2 / levels;
-        audio[n] = code2 - div * levels - offset;
-        code2 = div;
+    assert!(first == BLOCK_CODE_PAIR_COUNT);
+    (codes, pairs)
+}
+
+static BLOCK_CODES: [BlockCode; 7] = block_codes().0;
+/// For each bit allocation, the two samples of every half code.
+static BLOCK_CODE_PAIRS: [[i8; 2]; BLOCK_CODE_PAIR_COUNT] = block_codes().1;
+
+/// `decode_blockcodes`: the eight samples of two block codes. False when a
+/// code holds more than its four digits.
+#[inline(always)]
+fn decode_blockcodes(code1: u32, code2: u32, abits: usize, audio: &mut [i32; 8]) -> bool {
+    let BlockCode {
+        square,
+        reciprocal,
+        first,
+    } = BLOCK_CODES[abits - 1];
+    let pairs = &BLOCK_CODE_PAIRS[first..first + square as usize];
+    let high1 = ((code1 as u64 * reciprocal) >> 32) as u32;
+    let high2 = ((code2 as u64 * reciprocal) >> 32) as u32;
+    if high1 >= square || high2 >= square {
+        return false;
     }
-    code1 | code2
+    let halves = [code1 - high1 * square, high1, code2 - high2 * square, high2];
+    for (samples, half) in audio.chunks_exact_mut(2).zip(halves) {
+        let pair = pairs[half as usize];
+        samples[0] = pair[0] as i32;
+        samples[1] = pair[1] as i32;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ffmpeg's `decode_blockcodes`: one division per sample.
+    fn reference(mut code1: i32, mut code2: i32, levels: i32, audio: &mut [i32; 8]) -> i32 {
+        let offset = (levels - 1) / 2;
+        for n in 0..DCA_SUBBAND_SAMPLES / 2 {
+            let div = code1 / levels;
+            audio[n] = code1 - div * levels - offset;
+            code1 = div;
+        }
+        for n in DCA_SUBBAND_SAMPLES / 2..DCA_SUBBAND_SAMPLES {
+            let div = code2 / levels;
+            audio[n] = code2 - div * levels - offset;
+            code2 = div;
+        }
+        code1 | code2
+    }
+
+    /// Every code of every allocation, in both positions, decodes to the
+    /// samples the division chain gives and is refused when it is.
+    #[test]
+    fn block_codes_match_the_division_chain() {
+        for abits in 1..=7usize {
+            let levels = QUANT_LEVELS[abits] as i32;
+            let nbits = BLOCK_CODE_NBITS[abits - 1];
+            for code in 0..1u32 << nbits {
+                let other = (code * 7 + 3) % (levels * levels * levels * levels) as u32;
+                for (code1, code2) in [(code, other), (other, code)] {
+                    let mut expected = [0i32; 8];
+                    let valid = reference(code1 as i32, code2 as i32, levels, &mut expected) == 0;
+                    let mut audio = [0i32; 8];
+                    assert_eq!(
+                        decode_blockcodes(code1, code2, abits, &mut audio),
+                        valid,
+                        "abits {abits}, codes {code1} {code2}"
+                    );
+                    if valid {
+                        assert_eq!(audio, expected, "abits {abits}, codes {code1} {code2}");
+                    }
+                }
+            }
+        }
+    }
 }
