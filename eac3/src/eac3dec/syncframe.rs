@@ -325,6 +325,78 @@ pub struct AudioFrameInfo {
     pub block_payload_start_bit_offset: usize,
 }
 
+impl AudioFrameInfo {
+    /// Make `self` a copy of `source`, reusing `self`'s vectors: the decoder
+    /// copies each frame's fields into the one it updates block by block.
+    /// `source` is destructured, so a field added to the struct and not here
+    /// does not compile.
+    fn copy_from(&mut self, source: &Self) {
+        let Self {
+            exponent_strategies_embedded,
+            adaptive_hybrid_transform_enabled,
+            coupling_uses_aht,
+            channel_uses_aht,
+            lfe_uses_aht,
+            snr_offset_strategy,
+            transient_processing_enabled,
+            block_switching_enabled,
+            dithering_enabled,
+            bit_allocation_mode_enabled,
+            frame_gain_syntax_enabled,
+            delta_bit_allocation_enabled,
+            skip_field_syntax_enabled,
+            spectral_extension_attenuation_enabled,
+            coupling_strategy_updates,
+            coupling_in_use,
+            coupling_exponent_strategy,
+            channel_exponent_strategy,
+            lfe_exponent_strategy,
+            converter_exponent_strategy_present,
+            converter_exponent_strategy,
+            frame_csnr_offset,
+            frame_fsnr_offset,
+            transient_processors,
+            spectral_extension_attenuation,
+            block_start_info_present,
+            block_start_info_bit_len,
+            block_payload_start_bit_offset,
+        } = source;
+        self.exponent_strategies_embedded = *exponent_strategies_embedded;
+        self.adaptive_hybrid_transform_enabled = *adaptive_hybrid_transform_enabled;
+        self.coupling_uses_aht = *coupling_uses_aht;
+        self.channel_uses_aht.clone_from(channel_uses_aht);
+        self.lfe_uses_aht = *lfe_uses_aht;
+        self.snr_offset_strategy = *snr_offset_strategy;
+        self.transient_processing_enabled = *transient_processing_enabled;
+        self.block_switching_enabled = *block_switching_enabled;
+        self.dithering_enabled = *dithering_enabled;
+        self.bit_allocation_mode_enabled = *bit_allocation_mode_enabled;
+        self.frame_gain_syntax_enabled = *frame_gain_syntax_enabled;
+        self.delta_bit_allocation_enabled = *delta_bit_allocation_enabled;
+        self.skip_field_syntax_enabled = *skip_field_syntax_enabled;
+        self.spectral_extension_attenuation_enabled = *spectral_extension_attenuation_enabled;
+        self.coupling_strategy_updates
+            .clone_from(coupling_strategy_updates);
+        self.coupling_in_use.clone_from(coupling_in_use);
+        self.coupling_exponent_strategy
+            .clone_from(coupling_exponent_strategy);
+        self.channel_exponent_strategy
+            .clone_from(channel_exponent_strategy);
+        self.lfe_exponent_strategy.clone_from(lfe_exponent_strategy);
+        self.converter_exponent_strategy_present = *converter_exponent_strategy_present;
+        self.converter_exponent_strategy
+            .clone_from(converter_exponent_strategy);
+        self.frame_csnr_offset = *frame_csnr_offset;
+        self.frame_fsnr_offset = *frame_fsnr_offset;
+        self.transient_processors.clone_from(transient_processors);
+        self.spectral_extension_attenuation
+            .clone_from(spectral_extension_attenuation);
+        self.block_start_info_present = *block_start_info_present;
+        self.block_start_info_bit_len = *block_start_info_bit_len;
+        self.block_payload_start_bit_offset = *block_payload_start_bit_offset;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlockDrcInfo {
     pub dynamic_range_exists: [bool; 2],
@@ -513,9 +585,30 @@ struct ParsedAudioFrame {
     block_start_bit_offsets: Option<Vec<usize>>,
 }
 
+/// Each fullband channel's end mantissa for one block. `acmod` allows at
+/// most five fullband channels, so this lives on the stack.
 struct BlockAllocationInfo {
-    channel_end_mantissas: Vec<usize>,
+    end_mantissas: [usize; MAX_FULLBAND_CHANNELS],
+    channels: usize,
 }
+
+impl BlockAllocationInfo {
+    fn new(end_mantissas: &[usize]) -> Self {
+        let mut stored = [0; MAX_FULLBAND_CHANNELS];
+        stored[..end_mantissas.len()].copy_from_slice(end_mantissas);
+        Self {
+            end_mantissas: stored,
+            channels: end_mantissas.len(),
+        }
+    }
+
+    fn channel_end_mantissas(&self) -> &[usize] {
+        &self.end_mantissas[..self.channels]
+    }
+}
+
+/// The most fullband channels an `acmod` describes (3/2).
+const MAX_FULLBAND_CHANNELS: usize = 5;
 
 #[derive(Debug, Default)]
 struct TrailingAuxDataInfo {
@@ -741,6 +834,9 @@ pub(crate) struct CoreDecodeState {
     block_syntax: Option<BlockSyntaxState>,
     imdct: Vec<ImdctState>,
     lfe_imdct: Option<ImdctState>,
+    /// The frame's audio frame fields, which the block loop updates as it
+    /// goes; kept between frames only so its vectors are reused.
+    audio_frame: Option<AudioFrameInfo>,
 }
 
 impl CoreDecodeState {
@@ -2810,9 +2906,9 @@ fn read_exponents(
         if state.ecplinu {
             // TODO: Derive exponent group sizes for enhanced coupling instead of falling back.
             state.clear_coupling();
-            return Ok(BlockAllocationInfo {
-                channel_end_mantissas: vec![0; fullband_channels],
-            });
+            return Ok(BlockAllocationInfo::new(
+                &[0; MAX_FULLBAND_CHANNELS][..fullband_channels],
+            ));
         }
         if let Some(strategy) = audio_frame.coupling_exponent_strategy[block] {
             // Reuse means no exponent payload at all — neither the absolute
@@ -2884,7 +2980,7 @@ fn read_exponents(
             endmant,
         )?;
     }
-    let channel_end_mantissas = state.channel_end_mantissas.clone();
+    let allocation = BlockAllocationInfo::new(&state.channel_end_mantissas);
 
     if lfe_on
         && audio_frame
@@ -2898,9 +2994,7 @@ fn read_exponents(
         }
     }
 
-    Ok(BlockAllocationInfo {
-        channel_end_mantissas,
-    })
+    Ok(allocation)
 }
 
 fn read_bit_allocation_params(
@@ -3123,8 +3217,7 @@ fn consume_block_mantissas(
     } else {
         None
     };
-    for channel in 0..allocation.channel_end_mantissas.len() {
-        let end_mantissa = allocation.channel_end_mantissas[channel];
+    for (channel, &end_mantissa) in allocation.channel_end_mantissas().iter().enumerate() {
         if end_mantissa > 256 {
             return Err(ParseError::InvalidHeader("mantissa-range"));
         }
@@ -3421,6 +3514,7 @@ fn decode_core_pcm_frame_with_state_into(
         block_syntax,
         imdct,
         lfe_imdct,
+        audio_frame,
         ..
     } = state;
     let block_syntax = block_syntax
@@ -3444,13 +3538,19 @@ fn decode_core_pcm_frame_with_state_into(
         *first = true;
     }
 
-    let mut audio_frame = info.audio_frame.clone();
+    let audio_frame = match audio_frame {
+        Some(audio_frame) => {
+            audio_frame.copy_from(&info.audio_frame);
+            audio_frame
+        }
+        None => audio_frame.insert(info.audio_frame.clone()),
+    };
     for block in 0..info.num_blocks as usize {
         decode_block_core_pcm(
             &mut reader,
             block,
             info,
-            &mut audio_frame,
+            audio_frame,
             block_syntax,
             imdct,
             lfe_imdct.as_mut(),
@@ -3561,12 +3661,13 @@ fn decode_block_core_pcm(
     mut side: Option<&mut BlockSideInfo>,
 ) -> Result<(), ParseError> {
     let fullband_count = info.fullband_channels as usize;
-    let mut block_switch = vec![false; fullband_count];
+    let mut block_switch_flags = [false; MAX_FULLBAND_CHANNELS];
+    let block_switch = &mut block_switch_flags[..fullband_count];
 
     bittrace("audblk_start", block, reader.position());
 
     if audio_frame.block_switching_enabled {
-        for flag in &mut block_switch {
+        for flag in block_switch.iter_mut() {
             *flag = reader.read_bit().ok_or(ParseError::ShortPacket)?;
         }
     }
@@ -3723,7 +3824,7 @@ fn decode_block_core_pcm(
         audio_frame,
         state,
         &allocation,
-        &block_switch,
+        block_switch,
         imdct,
         lfe_imdct,
         fullband_channels,
@@ -3768,11 +3869,10 @@ fn decode_block_pcm_mantissas(
     // so in 2/0 mode (exactly two fullband channels) the per-channel transforms
     // are deferred: decode both channels' coeffs into `stereo_coeffs`, rematrix,
     // then IMDCT. Other modes IMDCT each channel immediately (no extra buffer).
-    let stereo = allocation.channel_end_mantissas.len() == 2;
+    let stereo = allocation.channel_end_mantissas().len() == 2;
     let mut stereo_coeffs = [[0.0f32; 256]; 2];
 
-    for channel in 0..allocation.channel_end_mantissas.len() {
-        let end_mantissa = allocation.channel_end_mantissas[channel];
+    for (channel, &end_mantissa) in allocation.channel_end_mantissas().iter().enumerate() {
         if end_mantissa > 256 {
             return Err(ParseError::InvalidHeader("mantissa-range"));
         }
@@ -3983,7 +4083,8 @@ fn apply_rematrixing(
     allocation: &BlockAllocationInfo,
     state: &BlockSyntaxState,
 ) {
-    let end = allocation.channel_end_mantissas[0].min(allocation.channel_end_mantissas[1]);
+    let end_mantissas = allocation.channel_end_mantissas();
+    let end = end_mantissas[0].min(end_mantissas[1]);
     for band in 0..state.num_rematrixing_bands {
         if !state.rematrixing_flags[band] {
             continue;

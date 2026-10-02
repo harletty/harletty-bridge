@@ -531,15 +531,19 @@ fn delay_channel(channel: &[f32], tail: &mut Vec<f32>) -> Vec<f32> {
         tail.resize(JOC_LATENCY_SAMPLES, 0.0);
     }
 
-    let mut joined = Vec::with_capacity(tail.len() + channel.len());
-    joined.extend_from_slice(tail);
-    joined.extend_from_slice(channel);
-
-    let carried = joined.len() - JOC_LATENCY_SAMPLES;
-    tail.clear();
-    tail.extend_from_slice(&joined[carried..]);
-    joined.truncate(channel.len());
-    joined
+    // The output is the first `channel.len()` samples of `tail ++ channel`,
+    // and the new tail the rest; written without building the join.
+    let mut delayed = Vec::with_capacity(channel.len());
+    if let Some(kept) = channel.len().checked_sub(JOC_LATENCY_SAMPLES) {
+        delayed.extend_from_slice(tail);
+        delayed.extend_from_slice(&channel[..kept]);
+        tail.copy_from_slice(&channel[kept..]);
+    } else {
+        delayed.extend_from_slice(&tail[..channel.len()]);
+        tail.drain(..channel.len());
+        tail.extend_from_slice(channel);
+    }
+    delayed
 }
 
 impl Default for ObjectPcmDecoder {

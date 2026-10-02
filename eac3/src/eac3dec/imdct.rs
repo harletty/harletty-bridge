@@ -12,6 +12,9 @@ pub(crate) struct ImdctState {
     intermediate_512: [Complex32; 128],
     intermediate_256_a: [Complex32; 64],
     intermediate_256_b: [Complex32; 64],
+    /// Working space for the FFTs. `Fft::process` allocates its own on every
+    /// call when the plan needs any, which was once per channel per block.
+    scratch: Vec<Complex32>,
 }
 
 impl ImdctState {
@@ -22,6 +25,7 @@ impl ImdctState {
             intermediate_512: [Complex32::new(0.0, 0.0); 128],
             intermediate_256_a: [Complex32::new(0.0, 0.0); 64],
             intermediate_256_b: [Complex32::new(0.0, 0.0); 64],
+            scratch: vec![Complex32::new(0.0, 0.0); imdct_fft_cache().scratch_len],
         }
     }
 
@@ -41,7 +45,7 @@ impl ImdctState {
         }
         imdct_fft_cache()
             .ifft_512
-            .process(&mut self.intermediate_512);
+            .process_with_scratch(&mut self.intermediate_512, &mut self.scratch);
         for (value, coeff) in self.intermediate_512.iter_mut().zip(x.iter().copied()) {
             *value *= coeff;
         }
@@ -76,8 +80,10 @@ impl ImdctState {
         self.prepare_256_intermediates(coeffs);
 
         let fft = imdct_fft_cache();
-        fft.ifft_256.process(&mut self.intermediate_256_a);
-        fft.ifft_256.process(&mut self.intermediate_256_b);
+        fft.ifft_256
+            .process_with_scratch(&mut self.intermediate_256_a, &mut self.scratch);
+        fft.ifft_256
+            .process_with_scratch(&mut self.intermediate_256_b, &mut self.scratch);
         let x = x256();
         for (value, coeff) in self.intermediate_256_a.iter_mut().zip(x.iter().copied()) {
             *value *= coeff;
@@ -138,15 +144,22 @@ impl ImdctState {
 struct ImdctFftCache {
     ifft_512: Arc<dyn Fft<f32>>,
     ifft_256: Arc<dyn Fft<f32>>,
+    scratch_len: usize,
 }
 
 fn imdct_fft_cache() -> &'static ImdctFftCache {
     static CACHE: OnceLock<ImdctFftCache> = OnceLock::new();
     CACHE.get_or_init(|| {
         let mut planner = FftPlanner::<f32>::new();
+        let ifft_512 = planner.plan_fft_inverse(128);
+        let ifft_256 = planner.plan_fft_inverse(64);
+        let scratch_len = ifft_512
+            .get_inplace_scratch_len()
+            .max(ifft_256.get_inplace_scratch_len());
         ImdctFftCache {
-            ifft_512: planner.plan_fft_inverse(128),
-            ifft_256: planner.plan_fft_inverse(64),
+            ifft_512,
+            ifft_256,
+            scratch_len,
         }
     })
 }
