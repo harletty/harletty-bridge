@@ -491,6 +491,39 @@ impl FoldPlan {
         }
         value
     }
+
+    /// [`Self::clean`] over a whole channel: `out[s]` becomes
+    /// `clean(speaker, bed[s], s, sources)` for every sample `s` of `bed`,
+    /// with the same arithmetic in the same order, so the same bits.
+    /// `out` must be at least as long as `bed`.
+    pub fn clean_channel(
+        &self,
+        speaker: usize,
+        bed: &[f32],
+        sources: &[Vec<f32>],
+        out: &mut [f32],
+    ) {
+        let out = &mut out[..bed.len()];
+        out.copy_from_slice(bed);
+        let Some(&used) = self.used.get(speaker) else {
+            return;
+        };
+        for (feed, source) in sources.iter().enumerate().take(self.count) {
+            if used & (1 << feed) == 0 {
+                continue;
+            }
+            let gain = self.gains[speaker][feed];
+            let slope = self.slope[speaker][feed];
+            let n = source.len().min(out.len());
+            for (s, (value, &x)) in out[..n].iter_mut().zip(&source[..n]).enumerate() {
+                *value -= (gain + slope * s as f32) * x;
+            }
+            // Past the end of a short waveform `clean` reads a zero sample.
+            for (s, value) in out.iter_mut().enumerate().skip(n) {
+                *value -= (gain + slope * s as f32) * 0.0;
+            }
+        }
+    }
 }
 
 /// Estimates, from the audio itself, the fold of every waveform whose fold
@@ -1780,6 +1813,47 @@ mod tests {
         }
         .to_adm_cartesian();
         assert!(up[0].abs() < 1e-9 && up[1].abs() < 1e-9 && (up[2] - 0.5).abs() < 1e-9);
+    }
+
+    /// `clean_channel` gives `clean`'s bits on every sample, with ramped
+    /// gains, unused and unknown feeds, waveforms shorter than the bed and a
+    /// speaker past the table.
+    #[test]
+    fn clean_channel_matches_clean_bit_for_bit() {
+        let mut plan = FoldPlan::all_unknown(0);
+        plan.count = 5;
+        let mut state = 99u32;
+        let mut rand = || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((state >> 8) & 0xffff) as f32 / 65_536.0 - 0.5
+        };
+        for speaker in 0..FOLD_SPEAKERS {
+            for feed in 0..plan.count {
+                if (speaker + feed) % 3 != 0 {
+                    plan.gains[speaker][feed] = rand();
+                    plan.slope[speaker][feed] = rand() * 1e-3;
+                    plan.used[speaker] |= 1 << feed;
+                }
+            }
+        }
+        plan.unknown = 1 << 4;
+        let bed: Vec<f32> = (0..512).map(|_| rand()).collect();
+        let sources: Vec<Vec<f32>> = [512, 512, 300, 0, 512, 512]
+            .iter()
+            .map(|&n| (0..n).map(|_| rand()).collect())
+            .collect();
+        for speaker in [0, 1, 5, 15, FOLD_SPEAKERS + 2] {
+            let mut out = vec![0.0f32; bed.len() + 7];
+            plan.clean_channel(speaker, &bed, &sources, &mut out);
+            for (s, &x) in bed.iter().enumerate() {
+                let expected = plan.clean(speaker, x, s, &sources);
+                assert_eq!(
+                    out[s].to_bits(),
+                    expected.to_bits(),
+                    "speaker {speaker} sample {s}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -460,19 +460,21 @@ fn build_hd_frame_with_extensions(
     let object_feeds = presentation.object_feeds();
     let channel_count = active.len() + presentation.feed_count();
 
-    let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * channel_count);
-    for s in 0..sample_count {
-        for (channel, &spkr) in bed.iter().zip(&active) {
-            pcm.push(float_to_pcm_i32(plan.clean(spkr, channel[s], s, feeds)));
-        }
-        for feed in fixed_feeds.clone().chain(object_feeds.clone()) {
-            let sample = match feeds.get(feed) {
-                Some(waveform) if plan.source_is_known(feed) => waveform[s],
-                _ => 0.0,
-            };
-            pcm.push(float_to_pcm_i32(sample));
+    // Channel by channel: each bed channel with its stated feeds removed,
+    // then the feeds, silent when their fold is not stated.
+    let width = bed.len() + fixed_feeds.len() + object_feeds.len();
+    let mut pcm = vec![0i32; sample_count * width];
+    let mut cleaned = vec![0.0f32; sample_count];
+    for (column, (channel, &spkr)) in bed.iter().zip(&active).enumerate() {
+        plan.clean_channel(spkr, channel, feeds, &mut cleaned);
+        write_column(&mut pcm, column, width, &cleaned);
+    }
+    for (column, feed) in (bed.len()..).zip(fixed_feeds.clone().chain(object_feeds.clone())) {
+        if let Some(waveform) = feeds.get(feed).filter(|_| plan.source_is_known(feed)) {
+            write_column(&mut pcm, column, width, &waveform[..sample_count]);
         }
     }
+    let pcm = RVec::from(pcm);
 
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(channel_count);
     for &spkr in &active {
@@ -517,6 +519,14 @@ fn build_hd_frame_with_extensions(
     ))
 }
 
+/// Convert one channel into column `column` of interleaved PCM `width`
+/// channels wide.
+fn write_column(pcm: &mut [i32], column: usize, width: usize, samples: &[f32]) {
+    for (out, &sample) in pcm.iter_mut().skip(column).step_by(width).zip(samples) {
+        *out = float_to_pcm_i32(sample);
+    }
+}
+
 /// A frame with no extension presentation: the lossless bed as decoded.
 fn bed_only_frame(
     hd: &HdFrame,
@@ -524,12 +534,11 @@ fn bed_only_frame(
     bed: &[&[f32]],
     sample_count: usize,
 ) -> RDecodedFrame {
-    let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * active.len());
-    for s in 0..sample_count {
-        for channel in bed {
-            pcm.push(float_to_pcm_i32(channel[s]));
-        }
+    let mut pcm = vec![0i32; sample_count * bed.len()];
+    for (column, channel) in bed.iter().enumerate() {
+        write_column(&mut pcm, column, bed.len(), &channel[..sample_count]);
     }
+    let pcm = RVec::from(pcm);
     let channel_labels: RVec<RChannelLabel> =
         active.iter().map(|&spkr| speaker_to_label(spkr)).collect();
     RDecodedFrame {
@@ -654,15 +663,21 @@ fn build_core_frame(core: &CorePcmFrame) -> RDecodedFrame {
     let sample_count = core.samples_per_channel();
     let total_channel_count = core.total_channels();
 
-    let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * total_channel_count);
-    for s in 0..sample_count {
-        for ch in &core.fullband_channels {
-            pcm.push(float_to_pcm_i32(ch[s]));
-        }
-        if let Some(lfe) = &core.lfe_channel {
-            pcm.push(float_to_pcm_i32(lfe[s]));
-        }
+    let mut pcm = vec![0i32; sample_count * total_channel_count];
+    for (column, channel) in core
+        .fullband_channels
+        .iter()
+        .chain(&core.lfe_channel)
+        .enumerate()
+    {
+        write_column(
+            &mut pcm,
+            column,
+            total_channel_count,
+            &channel[..sample_count],
+        );
     }
+    let pcm = RVec::from(pcm);
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
     for bed in &core.fullband_channel_order {
         channel_labels.push(dca_bed_channel_to_r(*bed));

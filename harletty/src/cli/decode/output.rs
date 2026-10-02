@@ -327,7 +327,14 @@ pub fn float_to_i24(sample: f32) -> i32 {
     if !sample.is_finite() {
         return 0;
     }
-    ((sample.clamp(-1.0, 1.0) * I24_SCALE).round_ties_even() as i32).clamp(I24_MIN, I24_MAX)
+    let scaled = sample.clamp(-1.0, 1.0) * I24_SCALE;
+    // `round_ties_even`, which baseline x86-64 can only do through a libm
+    // call per sample. |scaled| <= 2^23, so moving it 2^23 further from zero
+    // lands where consecutive f32 values are exactly 1 apart: the addition
+    // itself rounds to the nearest integer, ties to even, and the
+    // subtraction is exact. Same result as `round_ties_even` for every f32.
+    let shift = I24_SCALE.copysign(scaled);
+    (((scaled + shift) - shift) as i32).clamp(I24_MIN, I24_MAX)
 }
 
 pub fn create_caf_writer_from_existing_file(file: File) -> Result<CAFWriter<BufWriter<File>>> {
@@ -419,6 +426,35 @@ mod tests {
             I24_MAX,
         ] {
             assert_eq!(float_to_i24(n as f32 / 8_388_608.0), n, "round trip of {n}");
+        }
+    }
+
+    /// The rounding matches `round_ties_even` off the 24-bit grid too: ties,
+    /// near-ties and arbitrary values at every magnitude, past both ends, and
+    /// the non-finite inputs. (Checked against it over all 2^32 f32 inputs
+    /// once; this keeps a strided slice of that sweep.)
+    #[test]
+    fn float_to_i24_rounds_like_round_ties_even() {
+        let reference = |sample: f32| -> i32 {
+            if !sample.is_finite() {
+                return 0;
+            }
+            ((sample.clamp(-1.0, 1.0) * 8_388_608.0).round_ties_even() as i32)
+                .clamp(I24_MIN, I24_MAX)
+        };
+        for n in [
+            0i32, 1, 2, 3, 1000, 4_194_303, 4_194_304, 8_388_606, 8_388_607,
+        ] {
+            for frac in [0.5f32, 0.25, 0.75, 0.499_999_97, 0.500_000_06] {
+                for sign in [1.0f32, -1.0] {
+                    let x = sign * (n as f32 + frac) / 8_388_608.0;
+                    assert_eq!(float_to_i24(x), reference(x), "{x:e}");
+                }
+            }
+        }
+        for bits in (0..=u32::MAX).step_by(65_537) {
+            let x = f32::from_bits(bits);
+            assert_eq!(float_to_i24(x), reference(x), "{x:e} ({bits:#010x})");
         }
     }
 
