@@ -499,7 +499,7 @@ enum Isa {
 impl Isa {
     fn detect() -> Self {
         #[cfg(target_arch = "x86_64")]
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if crate::cpu::has_avx2() {
             return Isa::Avx2;
         }
         Isa::Baseline
