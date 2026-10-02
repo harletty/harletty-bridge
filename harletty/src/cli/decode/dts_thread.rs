@@ -67,12 +67,13 @@ pub fn spawn_dts_decoder_thread(config: DtsDecoderThreadConfig) -> thread::JoinH
         let mut input_reader = InputReader::new(&input_path)?;
         input_reader.process_chunks(64 * 1024, |chunk| {
             state.buffer.extend_from_slice(chunk);
-            drain_frames(&mut state, &pb_clone, &tx)?;
+            drain_frames(&mut state, &pb_clone, &tx, false)?;
             Ok(true)
         })?;
 
-        // A trailing frame can still be complete after EOF.
-        drain_frames(&mut state, &pb_clone, &tx)?;
+        // The final frame has nothing after it, so it is only decodable once
+        // the demux knows no EXSS can follow.
+        drain_frames(&mut state, &pb_clone, &tx, true)?;
         state.auro.finish(&tx);
 
         log::info!("DTS decode complete: {} frames", state.frame_count);
@@ -81,10 +82,15 @@ pub fn spawn_dts_decoder_thread(config: DtsDecoderThreadConfig) -> thread::JoinH
 }
 
 /// Consume every complete frame currently buffered, leaving any partial tail.
+///
+/// `at_eof` says no more input will arrive: a core frame that ends the buffer
+/// (or is followed by fewer bytes than an EXSS syncword) is then complete and
+/// decoded core-only, instead of being held back to look for an EXSS.
 fn drain_frames(
     state: &mut DtsDecodeState,
     pb: &Option<ProgressBar>,
     tx: &mpsc::Sender<Result<DtsFrameMessage>>,
+    at_eof: bool,
 ) -> Result<()> {
     let mut consumed = 0usize;
     loop {
@@ -111,28 +117,35 @@ fn drain_frames(
         };
 
         let core_size = info.frame_size;
-        // Need the core frame plus four bytes to test for a trailing EXSS.
-        if rest.len() < core_size + 4 {
+        // Need the core frame plus four bytes to test for a trailing EXSS,
+        // unless the input has ended: then whatever follows the core is too
+        // short to be one, and the core stands alone.
+        let exss_testable = rest.len() >= core_size + SUBSTREAM_SYNC.len();
+        if !exss_testable && !(at_eof && rest.len() >= core_size) {
             break;
         }
 
         let mut frame_size = core_size;
         let mut exss: Option<&[u8]> = None;
-        if rest[core_size..core_size + 4] == SUBSTREAM_SYNC {
-            let Some(exss_size) = exss_substream_size(&rest[core_size..]) else {
-                break; // EXSS header not fully buffered yet
-            };
-            if rest.len() < core_size + exss_size {
-                break;
-            }
-            frame_size = core_size + exss_size;
-            let candidate = &rest[core_size..core_size + exss_size];
-            // Nothing beyond the core to reconstruct (an XBR-only lossy
-            // extension) means the core, which every such stream still
-            // carries; a lossless asset or a lossy carrier's channel sets go
-            // through the HD decoder.
-            if exss_kind(candidate) != ExssKind::Core {
-                exss = Some(candidate);
+        if exss_testable && rest[core_size..core_size + SUBSTREAM_SYNC.len()] == SUBSTREAM_SYNC {
+            let buffered = exss_substream_size(&rest[core_size..])
+                .filter(|&exss_size| rest.len() >= core_size + exss_size);
+            match buffered {
+                Some(exss_size) => {
+                    frame_size = core_size + exss_size;
+                    let candidate = &rest[core_size..core_size + exss_size];
+                    // Nothing beyond the core to reconstruct (an XBR-only lossy
+                    // extension) means the core, which every such stream still
+                    // carries; a lossless asset or a lossy carrier's channel
+                    // sets go through the HD decoder.
+                    if exss_kind(candidate) != ExssKind::Core {
+                        exss = Some(candidate);
+                    }
+                }
+                // A file cut inside the EXSS: it will never complete, but the
+                // core before it is whole and still plays.
+                None if at_eof => {}
+                None => break, // EXSS not fully buffered yet
             }
         }
 
