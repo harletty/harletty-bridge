@@ -43,14 +43,37 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn bits_left(&self, bits: usize) -> bool {
         self.bit_pos + bits <= self.bit_size
     }
 
+    #[inline]
     pub(crate) fn remaining(&self) -> usize {
         self.bit_size.saturating_sub(self.bit_pos)
     }
 
+    /// The next `bits` (1..=32) bits without consuming them, MSB-first. Bits
+    /// past the end of `data` read as zero; callers check `bits_left` (or the
+    /// decoded length) themselves.
+    #[inline]
+    fn peek_padded(&self, bits: usize) -> u32 {
+        debug_assert!((1..=32).contains(&bits));
+        let byte = self.bit_pos >> 3;
+        let word = match self.data.get(byte..byte + 8) {
+            Some(chunk) => u64::from_be_bytes(chunk.try_into().unwrap()),
+            None => {
+                let mut buf = [0u8; 8];
+                let tail = self.data.get(byte..).unwrap_or(&[]);
+                buf[..tail.len()].copy_from_slice(tail);
+                u64::from_be_bytes(buf)
+            }
+        };
+        // At most 7 + 32 bits are needed, so one 64-bit load always suffices.
+        ((word << (self.bit_pos & 7)) >> (64 - bits)) as u32
+    }
+
+    #[inline]
     pub(crate) fn read_bits(&mut self, bits: usize) -> Option<u32> {
         if bits == 0 {
             return Some(0);
@@ -58,15 +81,23 @@ impl<'a> BitReader<'a> {
         if bits > 32 || !self.bits_left(bits) {
             return None;
         }
-
-        let mut value = 0u32;
-        for _ in 0..bits {
-            let byte_pos = self.bit_pos >> 3;
-            let bit_off = 7 - (self.bit_pos & 7);
-            value = (value << 1) | ((self.data[byte_pos] >> bit_off) & 1) as u32;
-            self.bit_pos += 1;
-        }
+        let value = self.peek_padded(bits);
+        self.bit_pos += bits;
         Some(value)
+    }
+
+    /// Up to 32 bits for a table lookup, zero-padded past the end of the data.
+    /// The caller consumes what it decoded with [`Self::consume`].
+    #[inline]
+    pub(crate) fn peek_lookahead(&self, bits: usize) -> u32 {
+        self.peek_padded(bits)
+    }
+
+    /// Consume `bits` already examined with [`Self::peek_lookahead`]; fails,
+    /// consuming nothing, if fewer remain.
+    #[inline]
+    pub(crate) fn consume(&mut self, bits: usize) -> Option<()> {
+        self.skip_bits(bits)
     }
 
     pub(crate) fn show_bits(&self, bits: usize) -> Option<u32> {
@@ -74,10 +105,12 @@ impl<'a> BitReader<'a> {
         copy.read_bits(bits)
     }
 
+    #[inline]
     pub(crate) fn read_bit(&mut self) -> Option<bool> {
         self.read_bits(1).map(|bit| bit != 0)
     }
 
+    #[inline]
     pub(crate) fn read_signed_bits(&mut self, bits: usize) -> Option<i32> {
         if bits == 0 || bits > 31 {
             return None;
@@ -87,6 +120,7 @@ impl<'a> BitReader<'a> {
         Some((value << shift) >> shift)
     }
 
+    #[inline]
     pub(crate) fn skip_bits(&mut self, bits: usize) -> Option<()> {
         if self.bits_left(bits) {
             self.bit_pos += bits;
@@ -118,14 +152,46 @@ impl<'a> BitReader<'a> {
     /// Count leading 0 bits up to the first 1 (`get_unary(gb, 1, len)`), bounded
     /// by `len`. Consumes the terminating 1 bit (or stops at `len`).
     pub(crate) fn get_unary(&mut self, len: usize) -> usize {
-        for i in 0..len {
-            match self.read_bit() {
-                Some(true) => return i,
-                Some(false) => continue,
-                None => return i,
+        let mut count = 0usize;
+        loop {
+            let avail = (len - count).min(self.remaining());
+            if avail == 0 {
+                return count;
+            }
+            let chunk = avail.min(32);
+            let zeros = (self.peek_padded(chunk) << (32 - chunk)).leading_zeros() as usize;
+            if zeros < chunk {
+                self.bit_pos += zeros + 1;
+                return count + zeros;
+            }
+            self.bit_pos += chunk;
+            count += chunk;
+        }
+    }
+
+    /// A Rice code: a unary quotient (`get_unary(max_quotient)`) then `k`
+    /// remainder bits (`read_bits(k)`), as `(quotient << k) | remainder`.
+    /// `None` when the remainder fails to read (the quotient never fails).
+    #[inline]
+    pub(crate) fn read_rice(&mut self, k: usize, max_quotient: usize) -> Option<u32> {
+        // Common case: quotient, stop bit and remainder all in the next 32
+        // bits, read with one load.
+        if k < 32 && self.remaining() >= 32 {
+            let peek = self.peek_padded(32);
+            let q = peek.leading_zeros() as usize;
+            if q + 1 + k <= 32 && q < max_quotient {
+                let low = if k == 0 {
+                    0
+                } else {
+                    (peek << (q + 1)) >> (32 - k)
+                };
+                self.bit_pos += q + 1 + k;
+                return Some(((q as u32) << k) | low);
             }
         }
-        len
+        let q = self.get_unary(max_quotient) as u32;
+        let low = if k > 0 { self.read_bits(k)? } else { 0 };
+        Some(q.wrapping_shl(k as u32) | low)
     }
 
     /// Skip an arbitrary number of bits (may exceed 32; `skip_bits_long`).
@@ -135,6 +201,112 @@ impl<'a> BitReader<'a> {
             Some(())
         } else {
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BitReader;
+
+    /// The bit-at-a-time reads the word loads replaced, kept as the reference.
+    fn bit(data: &[u8], pos: usize) -> u32 {
+        ((data[pos >> 3] >> (7 - (pos & 7))) & 1) as u32
+    }
+
+    fn read_reference(data: &[u8], limit: usize, pos: &mut usize, bits: usize) -> Option<u32> {
+        if bits == 0 {
+            return Some(0);
+        }
+        if bits > 32 || *pos + bits > limit {
+            return None;
+        }
+        let mut value = 0u32;
+        for _ in 0..bits {
+            value = (value << 1) | bit(data, *pos);
+            *pos += 1;
+        }
+        Some(value)
+    }
+
+    fn unary_reference(data: &[u8], limit: usize, pos: &mut usize, len: usize) -> usize {
+        for i in 0..len {
+            if *pos >= limit {
+                return i;
+            }
+            let b = bit(data, *pos);
+            *pos += 1;
+            if b == 1 {
+                return i;
+            }
+        }
+        len
+    }
+
+    /// Reads of every width, unary runs and Rice codes at every offset, up to and past
+    /// the end of the data and of a limit set below it.
+    #[test]
+    fn word_reads_match_bit_reads() {
+        let mut state = 0x9e37_79b9u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            state >> 8
+        };
+        for round in 0..400 {
+            let len = (next() % 24) as usize;
+            // Sparse ones so unary runs get long.
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    if round % 2 == 0 {
+                        next() as u8
+                    } else {
+                        (next() as u8) & (next() as u8) & (next() as u8)
+                    }
+                })
+                .collect();
+            let limit = (data.len() * 8).saturating_sub((next() % 12) as usize);
+            for start in 0..(data.len() * 8).min(40) {
+                let mut fast = BitReader::with_offset(&data, start);
+                fast.set_limit_bits(limit);
+                let mut pos = start.min(limit);
+                loop {
+                    let op = next() % 4;
+                    if op == 3 {
+                        let k = (next() % 34) as usize;
+                        let max_q = [3usize, 40, 1 << 20][(next() % 3) as usize];
+                        let a = fast.read_rice(k, max_q);
+                        let q = unary_reference(&data, limit, &mut pos, max_q) as u32;
+                        let b = read_reference(&data, limit, &mut pos, k).map(|low| {
+                            if k > 0 {
+                                q.wrapping_shl(k as u32) | low
+                            } else {
+                                q
+                            }
+                        });
+                        assert_eq!(a, b);
+                        if a.is_none() {
+                            // A failed remainder read leaves the quotient consumed.
+                            assert_eq!(fast.position(), pos);
+                            break;
+                        }
+                    } else if op == 2 {
+                        let n = (next() % 70) as usize;
+                        let a = fast.get_unary(n);
+                        let b = unary_reference(&data, limit, &mut pos, n);
+                        assert_eq!(a, b);
+                    } else {
+                        let n = (next() % 34) as usize;
+                        let a = fast.read_bits(n);
+                        let b = read_reference(&data, limit, &mut pos, n);
+                        assert_eq!(a, b);
+                        if a.is_none() && n <= 32 {
+                            assert_eq!(fast.position(), pos);
+                            break;
+                        }
+                    }
+                    assert_eq!(fast.position(), pos);
+                }
+            }
         }
     }
 }

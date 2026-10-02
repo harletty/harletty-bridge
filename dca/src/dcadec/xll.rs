@@ -6,6 +6,7 @@
 // the fixed-point core output. Two frequency bands and embedded hierarchical
 // downmix are not supported (rejected) — they don't occur in 48 kHz 7.1 MA.
 
+use super::buffers::BufferPool;
 use super::core::DCA_SPEAKER_L;
 use super::core::DCA_SPEAKER_LSS;
 use super::core::DCA_SPEAKER_R;
@@ -405,10 +406,42 @@ fn get_linear(gb: &mut BitReader, n: usize) -> R<i32> {
 
 #[inline]
 fn get_rice(gb: &mut BitReader, k: usize) -> R<i32> {
-    let q = gb.get_unary(1 << 20) as u32;
-    let low = if k > 0 { rb(gb, k)? } else { 0 };
-    let v = (q << k) | low;
+    let v = gb.read_rice(k, 1 << 20).ok_or(XllError::Bitstream)?;
     Ok(((v >> 1) ^ (0u32.wrapping_sub(v & 1))) as i32)
+}
+
+/// Inverse adaptive prediction: from sample `order` on, subtract from each
+/// residual the clipped prediction made from the `order` samples before it,
+/// `coeff[order - 1 - k]` weighing `buf[j + k]`. Each prediction reads the
+/// sample just produced, so the work is serial; dispatching on the order
+/// (at most 15) lets each length unroll and keep its taps in registers.
+fn inverse_adaptive_prediction(
+    buf: &mut [i32],
+    coeff: &[i32; DCA_XLL_PRED_ORDER_MAX],
+    order: usize,
+) {
+    macro_rules! orders {
+        ($($n:literal)*) => {
+            match order {
+                $($n => predict_order::<$n>(buf, coeff),)*
+                _ => unreachable!("XLL prediction order is a 4-bit field"),
+            }
+        };
+    }
+    orders!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+}
+
+#[inline(always)]
+fn predict_order<const N: usize>(buf: &mut [i32], coeff: &[i32; DCA_XLL_PRED_ORDER_MAX]) {
+    let taps: [i64; N] = std::array::from_fn(|k| coeff[N - 1 - k] as i64);
+    for j in 0..buf.len() - N {
+        let history: &[i32; N] = buf[j..j + N].try_into().unwrap();
+        let mut err = 0i64;
+        for k in 0..N {
+            err += history[k] as i64 * taps[k];
+        }
+        buf[j + N] = buf[j + N].wrapping_sub(clip23(norm16(err)));
+    }
 }
 
 #[derive(Clone)]
@@ -480,6 +513,46 @@ struct XllChSet {
     header_tail_bits: usize,
 }
 
+impl XllChSet {
+    /// Back to the default state for the next frame's header, handing the
+    /// sample buffers to `pool` and keeping the capacity of its own vectors.
+    fn reset(&mut self, pool: &mut BufferPool) {
+        pool.give_all(&mut self.band.msb);
+        pool.give_all(&mut self.band.lsb);
+        let msb = std::mem::take(&mut self.band.msb);
+        let lsb = std::mem::take(&mut self.band.lsb);
+        let mut dmix_coeff = std::mem::take(&mut self.dmix_coeff);
+        let mut dmix_scale = std::mem::take(&mut self.dmix_scale);
+        let mut dmix_scale_inv = std::mem::take(&mut self.dmix_scale_inv);
+        dmix_coeff.clear();
+        dmix_scale.clear();
+        dmix_scale_inv.clear();
+        *self = XllChSet {
+            dmix_coeff,
+            dmix_scale,
+            dmix_scale_inv,
+            ..XllChSet::default()
+        };
+        self.band.msb = msb;
+        self.band.lsb = lsb;
+    }
+
+    /// One zeroed MSB buffer of `nsamples` per channel, and as many LSB ones
+    /// when the band has an LSB section, drawn from `pool`.
+    fn alloc_band(&mut self, pool: &mut BufferPool, nsamples: usize) {
+        pool.give_all(&mut self.band.msb);
+        pool.give_all(&mut self.band.lsb);
+        for _ in 0..self.nchannels {
+            self.band.msb.push(pool.zeroed(nsamples));
+        }
+        if self.band.lsb_section_size != 0 {
+            for _ in 0..self.nchannels {
+                self.band.lsb.push(pool.zeroed(nsamples));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ChsMappingSyntax {
     Asset {
@@ -504,6 +577,13 @@ pub(crate) struct XllDecoder {
     fixed_lsb_width: usize,
     chset: Vec<XllChSet>,
     navi: Vec<usize>,
+    /// Sample buffers out of use, for the next frame's channels.
+    pool: BufferPool,
+    /// Channel sets kept for the extension decode, which parses its sets
+    /// outside `chset`.
+    x_sets: Vec<XllChSet>,
+    /// Segment sizes of the standard extension set's navigation table.
+    x_navi: Vec<usize>,
     nfreqbands: usize,
     nchannels: usize,
     nactivechsets: usize,
@@ -624,6 +704,9 @@ impl XllDecoder {
     /// rate — mirroring ffmpeg, which parses XLL first and only then filters the
     /// core.
     pub(crate) fn parse(&mut self, data: &[u8], asset: &ExssAsset) -> R<()> {
+        // The previous frame's output is read only between its `filter` and
+        // this call; its buffers carry this frame's channels.
+        self.release_output();
         if self.hd_stream_id != asset.hd_stream_id {
             self.clear_pbr();
             self.hd_stream_id = asset.hd_stream_id;
@@ -646,6 +729,11 @@ impl XllDecoder {
 
     pub(crate) fn filter(&mut self, core: Option<&CoreOutput>) -> R<()> {
         self.filter_frame(core)
+    }
+
+    /// Empty `output`, keeping its buffers for the next frame.
+    pub(crate) fn release_output(&mut self) {
+        self.pool.give_slots(&mut self.output);
     }
 
     fn clear_pbr(&mut self) {
@@ -688,24 +776,21 @@ impl XllDecoder {
                 return Err(XllError::Eagain);
             }
         }
+        // Parsed out of place, then put back with what follows the frame,
+        // so the buffer keeps its allocation.
         let buf = std::mem::take(&mut self.pbr_buffer);
-        let res = self.parse_frame(&buf);
-        match res {
-            Ok(()) => {}
-            Err(e) => {
-                self.clear_pbr();
-                return Err(e);
+        let res = match self.parse_frame(&buf) {
+            Ok(()) if self.frame_size > buf.len() => {
+                Err(XllError::Invalid("xll pbr frame too large"))
             }
-        }
-        if self.frame_size > buf.len() {
+            res => res,
+        };
+        self.pbr_buffer = buf;
+        if let Err(e) = res {
             self.clear_pbr();
-            return Err(XllError::Invalid("xll pbr frame too large"));
+            return Err(e);
         }
-        if self.frame_size == buf.len() {
-            self.clear_pbr();
-        } else {
-            self.pbr_buffer = buf[self.frame_size..].to_vec();
-        }
+        self.pbr_buffer.drain(..self.frame_size);
         Ok(())
     }
 
@@ -730,7 +815,7 @@ impl XllDecoder {
         self.x_imax_syncword_present = false;
         self.x_payload.clear();
         self.x_payload_offset = 0;
-        self.x_output.clear();
+        self.pool.give_all(&mut self.x_output);
         self.x_pcm_bit_res = 0;
         self.x_bits_consumed = 0;
         self.x_decode_error = None;
@@ -791,7 +876,7 @@ impl XllDecoder {
         };
         self.x_payload = payload;
         if let Err(error) = result {
-            self.x_output.clear();
+            self.pool.give_all(&mut self.x_output);
             self.x_decode_error = Some(xll_x_error_kind(&error));
         }
     }
@@ -802,6 +887,24 @@ impl XllDecoder {
     /// CRC16. It deliberately has no one-to-one speaker mapping: the four
     /// decoded waveforms therefore stay separate from the regular bed output.
     fn try_decode_x_extension_audio(&mut self, payload: &[u8]) -> R<()> {
+        let mut chset = self.x_sets.pop().unwrap_or_default();
+        chset.reset(&mut self.pool);
+        let mut navi = std::mem::take(&mut self.x_navi);
+        let result = self.decode_x_set(payload, &mut chset, &mut navi);
+        chset.reset(&mut self.pool);
+        self.x_sets.push(chset);
+        self.x_navi = navi;
+        result
+    }
+
+    /// [`Self::try_decode_x_extension_audio`] on a channel set and a
+    /// navigation buffer the caller keeps for the next frame.
+    fn decode_x_set(
+        &mut self,
+        payload: &[u8],
+        chset: &mut XllChSet,
+        navi: &mut Vec<usize>,
+    ) -> R<()> {
         const X_CHSET_OFFSET: usize = 22;
         const X_CHANNELS: usize = 4;
 
@@ -809,8 +912,7 @@ impl XllDecoder {
             return Err(XllError::Invalid("short XLL-X payload"));
         }
         let mut gb = BitReader::with_offset(payload, X_CHSET_OFFSET * 8);
-        let mut chset = XllChSet::default();
-        self.chs_parse_header(&mut gb, &mut chset, true, true)?;
+        self.chs_parse_header(&mut gb, chset, true, true)?;
         if chset.nchannels != X_CHANNELS {
             return Err(XllError::Invalid("unexpected XLL-X channel count"));
         }
@@ -831,7 +933,7 @@ impl XllDecoder {
             return Err(XllError::Invalid("short XLL-X navigation table"));
         }
         let mut navi_reader = BitReader::with_offset(payload, navi_start * 8);
-        let mut navi = Vec::with_capacity(self.nframesegs);
+        navi.clear();
         for _ in 0..self.nframesegs {
             navi.push(rb(&mut navi_reader, self.seg_size_nbits)? as usize + 1);
         }
@@ -847,17 +949,11 @@ impl XllDecoder {
         }
         seek(&mut gb, data_start * 8)?;
 
-        self.chset.push(chset);
+        self.chset.push(std::mem::take(chset));
         let chset_index = self.chset.len() - 1;
         let decode_result = (|| {
-            let channels = self.chset[chset_index].nchannels;
-            self.chset[chset_index].band.msb = vec![vec![0i32; self.nframesamples]; channels];
-            self.chset[chset_index].band.lsb = if self.chset[chset_index].band.lsb_section_size != 0
-            {
-                vec![vec![0i32; self.nframesamples]; channels]
-            } else {
-                Vec::new()
-            };
+            let nframesamples = self.nframesamples;
+            self.chset[chset_index].alloc_band(&mut self.pool, nframesamples);
 
             let mut band_end = gb.position();
             for (segment, &segment_bytes) in navi.iter().enumerate() {
@@ -871,7 +967,7 @@ impl XllDecoder {
             }
             Ok(())
         })();
-        let chset = self
+        *chset = self
             .chset
             .pop()
             .ok_or(XllError::Invalid("missing temporary XLL-X channel set"))?;
@@ -880,17 +976,13 @@ impl XllDecoder {
         let shift = 24usize
             .checked_sub(chset.pcm_bit_res)
             .ok_or(XllError::Invalid("XLL-X PCM resolution"))?;
-        self.x_output = chset
-            .band
-            .msb
-            .into_iter()
-            .map(|samples| {
-                samples
-                    .into_iter()
-                    .map(|sample| clip23(sample.wrapping_mul(1 << shift)))
-                    .collect()
-            })
-            .collect();
+        self.pool.give_all(&mut self.x_output);
+        for mut samples in chset.band.msb.drain(..) {
+            for sample in &mut samples {
+                *sample = clip23(sample.wrapping_mul(1 << shift));
+            }
+            self.x_output.push(samples);
+        }
         self.x_pcm_bit_res = chset.pcm_bit_res;
         self.x_bits_consumed = gb.position();
         Ok(())
@@ -900,42 +992,72 @@ impl XllDecoder {
     /// profiles. Their controls provide the per-set segment geometry; neither
     /// set inherits the lossless bed's common XLL geometry.
     fn try_decode_alternate_x_extension_audio(&mut self, payload: &[u8]) -> R<()> {
+        let mut first = self.x_sets.pop().unwrap_or_default();
+        let mut second = self.x_sets.pop().unwrap_or_default();
+        first.reset(&mut self.pool);
+        second.reset(&mut self.pool);
+        let result = self.decode_alternate_sets(payload, &mut first, &mut second);
+        for mut set in [first, second] {
+            set.reset(&mut self.pool);
+            self.x_sets.push(set);
+        }
+        result
+    }
+
+    /// [`Self::try_decode_alternate_x_extension_audio`] on two channel sets
+    /// the caller keeps for the next frame.
+    fn decode_alternate_sets(
+        &mut self,
+        payload: &[u8],
+        first: &mut XllChSet,
+        second: &mut XllChSet,
+    ) -> R<()> {
         let layout = alternate_layout(payload)?;
         let first_boundary = layout
             .second
             .map_or(payload.len(), |(header, _)| header.offset);
-        let first = self.decode_alternate_channel_set(
+        let first_bits = self.decode_alternate_channel_set(
             payload,
             layout.first.0,
             layout.first.1,
             first_boundary,
+            first,
         )?;
-        let second = match layout.second {
-            Some((header, geometry)) => {
-                Some(self.decode_alternate_channel_set(payload, header, geometry, payload.len())?)
-            }
+        let second_bits = match layout.second {
+            Some((header, geometry)) => Some(self.decode_alternate_channel_set(
+                payload,
+                header,
+                geometry,
+                payload.len(),
+                second,
+            )?),
             None => None,
         };
-        if second
-            .as_ref()
-            .is_some_and(|second| first.0.pcm_bit_res != second.0.pcm_bit_res)
-        {
+        if second_bits.is_some() && first.pcm_bit_res != second.pcm_bit_res {
             return Err(XllError::Unsupported("mixed alternate XLL PCM resolutions"));
         }
-        let pcm_bit_res = first.0.pcm_bit_res;
+        let pcm_bit_res = first.pcm_bit_res;
         let shift = 24usize
             .checked_sub(pcm_bit_res)
             .ok_or(XllError::Invalid("alternate XLL PCM resolution"))?;
         let scale = 1i32
             .checked_shl(shift as u32)
             .ok_or(XllError::Invalid("alternate XLL PCM scale"))?;
-        let bits_consumed = second.as_ref().map_or(first.1, |second| second.1);
-        let second_channels = second.as_ref().map_or(0, |second| second.0.nchannels);
+        let bits_consumed = second_bits.unwrap_or(first_bits);
+        let second_channels = if second_bits.is_some() {
+            second.nchannels
+        } else {
+            0
+        };
 
-        self.x_output.clear();
-        self.x_output.reserve(first.0.nchannels + second_channels);
-        let second_samples = second.map(|second| second.0.band.msb).unwrap_or_default();
-        for mut samples in first.0.band.msb.into_iter().chain(second_samples) {
+        self.pool.give_all(&mut self.x_output);
+        self.x_output.reserve(first.nchannels + second_channels);
+        let second_samples = if second_bits.is_some() {
+            &mut second.band.msb
+        } else {
+            &mut Vec::new()
+        };
+        for mut samples in first.band.msb.drain(..).chain(second_samples.drain(..)) {
             for sample in &mut samples {
                 *sample = clip23(sample.wrapping_mul(scale));
             }
@@ -955,9 +1077,16 @@ impl XllDecoder {
         header: AlternateHeader,
         geometry: AlternateGeometry,
         boundary: usize,
-    ) -> R<(XllChSet, usize)> {
+        channel_set: &mut XllChSet,
+    ) -> R<usize> {
         let saved = AlternateDecoderState::capture(self);
-        let result = self.decode_alternate_channel_set_inner(payload, header, geometry, boundary);
+        let result = self.decode_alternate_channel_set_inner(
+            payload,
+            header,
+            geometry,
+            boundary,
+            channel_set,
+        );
         saved.restore(self);
         result
     }
@@ -968,7 +1097,8 @@ impl XllDecoder {
         header: AlternateHeader,
         geometry: AlternateGeometry,
         boundary: usize,
-    ) -> R<(XllChSet, usize)> {
+        channel_set: &mut XllChSet,
+    ) -> R<usize> {
         let header_end = header
             .offset
             .checked_add(header.size)
@@ -1005,10 +1135,9 @@ impl XllDecoder {
         self.one_to_one = false;
 
         let mut bits = BitReader::with_offset(payload, header.offset * 8);
-        let mut channel_set = XllChSet::default();
         self.chs_parse_header_with_mapping(
             &mut bits,
-            &mut channel_set,
+            channel_set,
             ChsMappingSyntax::AlternatePrefix(2),
         )?;
         let navi_start = header
@@ -1051,13 +1180,9 @@ impl XllDecoder {
             return Err(XllError::Invalid("alternate XLL interstitial too large"));
         }
 
-        channel_set.band.msb = vec![vec![0i32; XLL_X_ALT_FRAME_SAMPLES]; header.channels];
-        channel_set.band.lsb = if channel_set.band.lsb_section_size != 0 {
-            vec![vec![0i32; XLL_X_ALT_FRAME_SAMPLES]; header.channels]
-        } else {
-            Vec::new()
-        };
-        self.chset.push(channel_set);
+        // `nchannels` was checked equal to `header.channels` above.
+        channel_set.alloc_band(&mut self.pool, XLL_X_ALT_FRAME_SAMPLES);
+        self.chset.push(std::mem::take(channel_set));
         let channel_set_index = self.chset.len() - 1;
         let decode_result = (|| {
             seek(&mut bits, navi_end * 8)?;
@@ -1080,12 +1205,12 @@ impl XllDecoder {
             self.chs_filter_band_data(channel_set_index);
             Ok(())
         })();
-        let channel_set = self
+        *channel_set = self
             .chset
             .pop()
             .ok_or(XllError::Invalid("missing alternate XLL channel set"))?;
         decode_result?;
-        Ok((channel_set, audio_end * 8))
+        Ok(audio_end * 8)
     }
 
     fn parse_common_header(&mut self, gb: &mut BitReader) -> R<()> {
@@ -1128,7 +1253,12 @@ impl XllDecoder {
     }
 
     fn parse_sub_headers(&mut self, gb: &mut BitReader) -> R<()> {
-        self.chset = vec![XllChSet::default(); self.nchsets];
+        // Reset in place: the sets keep their vectors' allocations and hand
+        // their sample buffers to the pool.
+        for c in &mut self.chset {
+            c.reset(&mut self.pool);
+        }
+        self.chset.resize_with(self.nchsets, XllChSet::default);
         self.nfreqbands = 0;
         self.nchannels = 0;
         for i in 0..self.nchsets {
@@ -1470,14 +1600,7 @@ impl XllDecoder {
         // Allocate MSB/LSB buffers for active channel sets.
         for chs in 0..self.nactivechsets {
             let nframesamples = self.nframesamples;
-            let nchannels = self.chset[chs].nchannels;
-            let c = &mut self.chset[chs];
-            c.band.msb = vec![vec![0i32; nframesamples]; nchannels];
-            c.band.lsb = if c.band.lsb_section_size != 0 {
-                vec![vec![0i32; nframesamples]; nchannels]
-            } else {
-                Vec::new()
-            };
+            self.chset[chs].alloc_band(&mut self.pool, nframesamples);
         }
 
         let mut navi_pos = gb.position();
@@ -1638,13 +1761,7 @@ impl XllDecoder {
                     }
                     coeff[j] = rc;
                 }
-                for j in 0..nsamples - order {
-                    let mut err = 0i64;
-                    for k in 0..order {
-                        err += buf[j + k] as i64 * coeff[order - k - 1] as i64;
-                    }
-                    buf[j + order] = buf[j + order].wrapping_sub(clip23(norm16(err)));
-                }
+                inverse_adaptive_prediction(&mut buf[..nsamples], &coeff, order);
             } else {
                 for _ in 0..b.fixed_pred_order[i] {
                     for k in 1..nsamples {
@@ -1667,15 +1784,23 @@ impl XllDecoder {
                     }
                 }
             }
-            // Permute msb so that msb[orig_order[i]] = decoded[i].
-            let decoded = std::mem::take(&mut b.msb);
-            let mut reordered: Vec<Vec<i32>> = vec![Vec::new(); c.nchannels];
-            let mut src = decoded.into_iter();
-            for i in 0..c.nchannels {
-                let v = src.next().unwrap();
-                reordered[b.orig_order[i]] = v;
+            // Permute msb so that msb[orig_order[i]] = decoded[i], in place
+            // one cycle at a time (`orig_order` is checked to be a
+            // permutation when parsed).
+            let mut placed = [false; DCA_XLL_CHANNELS_MAX];
+            for start in 0..c.nchannels {
+                if placed[start] {
+                    continue;
+                }
+                let mut carried = std::mem::take(&mut b.msb[start]);
+                let mut from = start;
+                while !placed[from] {
+                    placed[from] = true;
+                    let to = b.orig_order[from];
+                    carried = std::mem::replace(&mut b.msb[to], carried);
+                    from = to;
+                }
             }
-            b.msb = reordered;
         }
     }
 
@@ -1732,9 +1857,10 @@ impl XllDecoder {
         let nsamples = self.nframesamples;
         let o_nch = self.chset[o_idx].nchannels;
         let o_hier_ofs = self.chset[o_idx].hier_ofs;
-        // Snapshot o's channel buffers (small: 2 channels).
-        let o_msb: Vec<Vec<i32>> = self.chset[o_idx].band.msb.clone();
-        let coeff = self.chset[o_idx].dmix_coeff.clone();
+        // `o` is only read, except when the hierarchy reaches `o` itself (a
+        // malformed stream): `o` then subtracts from itself, and from there on
+        // its contribution is read from a snapshot taken before.
+        let mut o_snapshot: Option<Vec<Vec<i32>>> = None;
 
         let mut coeff_idx = 0usize;
         let mut nchannels = 0usize;
@@ -1745,14 +1871,29 @@ impl XllDecoder {
             let c_nch = self.chset[c_idx].nchannels;
             for j in 0..c_nch {
                 for k in 0..o_nch {
-                    let cf = coeff[coeff_idx];
+                    let cf = self.chset[o_idx].dmix_coeff[coeff_idx];
                     coeff_idx += 1;
-                    if cf != 0 {
-                        let dst = &mut self.chset[c_idx].band.msb[j];
-                        let src = &o_msb[k];
-                        for n in 0..nsamples {
-                            dst[n] = dst[n].wrapping_sub(rmul15(src[n], cf));
+                    if cf == 0 {
+                        continue;
+                    }
+                    if c_idx == o_idx && o_snapshot.is_none() {
+                        o_snapshot = Some(self.chset[o_idx].band.msb.clone());
+                    }
+                    let (dst, src): (&mut Vec<i32>, &Vec<i32>) = match &o_snapshot {
+                        // `o` has started subtracting from itself: read what
+                        // it held before, as every later set must too.
+                        Some(snapshot) => (&mut self.chset[c_idx].band.msb[j], &snapshot[k]),
+                        None if c_idx < o_idx => {
+                            let (head, tail) = self.chset.split_at_mut(o_idx);
+                            (&mut head[c_idx].band.msb[j], &tail[0].band.msb[k])
                         }
+                        None => {
+                            let (head, tail) = self.chset.split_at_mut(c_idx);
+                            (&mut tail[0].band.msb[j], &head[o_idx].band.msb[k])
+                        }
+                    };
+                    for n in 0..nsamples {
+                        dst[n] = dst[n].wrapping_sub(rmul15(src[n], cf));
                     }
                 }
             }
@@ -1777,9 +1918,7 @@ impl XllDecoder {
         // If this set is downmixed into by a following hierarchical dmix set, the
         // core must be un-prescaled before combining (the encoder pre-scaled the
         // embedded core downmix). dmix_scale_inv comes from that following set.
-        let o_scale_inv: Option<Vec<i32>> = self
-            .find_next_hier_dmix_chset(chs)
-            .map(|o| self.chset[o].dmix_scale_inv.clone());
+        let o_idx = self.find_next_hier_dmix_chset(chs);
 
         for ch in 0..nchannels {
             if self.chset[chs].residual_encode & (1 << ch) != 0 {
@@ -1796,13 +1935,14 @@ impl XllDecoder {
             let src = core.samples[spkr]
                 .as_ref()
                 .ok_or(XllError::Invalid("missing core speaker samples"))?;
-            let dst = &mut self.chset[chs].band.msb[ch];
-            if let Some(scale_inv) = &o_scale_inv {
-                let si = scale_inv[hier_ofs + ch];
+            if let Some(o) = o_idx {
+                let si = self.chset[o].dmix_scale_inv[hier_ofs + ch];
+                let dst = &mut self.chset[chs].band.msb[ch];
                 for n in 0..nsamples {
                     dst[n] = dst[n].wrapping_add(clip23((mul16(src[n], si) + round) >> shift));
                 }
             } else {
+                let dst = &mut self.chset[chs].band.msb[ch];
                 for n in 0..nsamples {
                     dst[n] = dst[n].wrapping_add((src[n] + round) >> shift);
                 }
@@ -1812,9 +1952,7 @@ impl XllDecoder {
     }
 
     fn filter_frame(&mut self, core: Option<&CoreOutput>) -> R<()> {
-        for o in self.output.iter_mut() {
-            *o = None;
-        }
+        self.release_output();
         self.output_mask = 0;
 
         let p_freq = self.chset[0].freq;
@@ -1862,23 +2000,32 @@ impl XllDecoder {
             let nchannels = self.chset[chs].nchannels;
             for ch in 0..nchannels {
                 let spkr = self.chset[chs].ch_remap[ch];
-                let buf = std::mem::take(&mut self.chset[chs].band.msb[ch]);
-                let scaled: Vec<i32> = buf
-                    .iter()
-                    .map(|&s| clip23(s.wrapping_mul(1 << shift)))
-                    .collect();
-                self.output[spkr] = Some(scaled);
+                // Scaled in place and handed out: the next frame draws its
+                // buffers back from the pool.
+                let mut buf = std::mem::take(&mut self.chset[chs].band.msb[ch]);
+                for s in &mut buf {
+                    *s = clip23(s.wrapping_mul(1 << shift));
+                }
+                if let Some(old) = self.output[spkr].replace(buf) {
+                    self.pool.give(old);
+                }
             }
         }
         // Normalize side-surround to Ls/Rs slots if present, remembering
         // what the carrier actually named.
         self.coded_mask = self.output_mask;
         if self.output[DCA_SPEAKER_LSS].is_some() {
-            self.output[3] = self.output[DCA_SPEAKER_LSS].take();
+            let lss = self.output[DCA_SPEAKER_LSS].take();
+            if let Some(old) = std::mem::replace(&mut self.output[3], lss) {
+                self.pool.give(old);
+            }
             self.output_mask = (self.output_mask & !(1 << DCA_SPEAKER_LSS)) | (1 << 3);
         }
         if self.output[DCA_SPEAKER_RSS].is_some() {
-            self.output[4] = self.output[DCA_SPEAKER_RSS].take();
+            let rss = self.output[DCA_SPEAKER_RSS].take();
+            if let Some(old) = std::mem::replace(&mut self.output[4], rss) {
+                self.pool.give(old);
+            }
             self.output_mask = (self.output_mask & !(1 << DCA_SPEAKER_RSS)) | (1 << 4);
         }
 

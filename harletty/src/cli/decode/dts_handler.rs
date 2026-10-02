@@ -18,6 +18,17 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
+/// Where one output channel of an HD frame takes its samples from.
+#[derive(Clone, Copy)]
+enum Column<'a> {
+    /// Nothing (a missing channel, or a feed with no stated fold): silence.
+    Silent,
+    /// Written as decoded.
+    Plain(&'a [f32]),
+    /// A bed channel of this DCA speaker, with the folded feeds removed.
+    Bed(usize, &'a [f32]),
+}
+
 pub enum DtsFrameMessage {
     /// A lossless DTS-HD frame, with whatever spatial presentation it carries.
     Hd {
@@ -523,38 +534,51 @@ impl DtsDecodeHandler {
         };
         // A feed whose bed fold is not stated stays in the bed and is muted
         // on its own channel, exactly as the realtime bridge does.
-        let feed_at = |feed: usize, idx: usize| -> f32 {
-            if !plan.source_is_known(feed) {
-                return 0.0;
+        let feed = |feed: usize| -> Column<'_> {
+            match frame.x_samples.get(feed) {
+                Some(samples) if plan.source_is_known(feed) => Column::Plain(samples),
+                _ => Column::Silent,
             }
-            frame
-                .x_samples
-                .get(feed)
-                .and_then(|channel| channel.get(idx).copied())
-                .unwrap_or(0.0)
         };
-        let sample_at = |source: BedSource, idx: usize| -> f32 {
-            match source {
+        let columns = layout
+            .bed_sources
+            .iter()
+            .map(|&source| match source {
                 BedSource::Speaker(position) => active
                     .get(position)
                     .and_then(|&speaker| {
                         frame.samples[speaker]
-                            .as_ref()
-                            .and_then(|channel| channel.get(idx).copied())
-                            .map(|value| plan.clean(speaker, value, idx, &frame.x_samples))
+                            .as_deref()
+                            .map(|samples| Column::Bed(speaker, samples))
                     })
-                    .unwrap_or(0.0),
-                BedSource::Feed(feed) => feed_at(feed, idx),
-            }
-        };
+                    .unwrap_or(Column::Silent),
+                BedSource::Feed(index) => feed(index),
+            })
+            .chain(layout.object_sources.iter().map(|&index| feed(index)));
 
-        let mut interleaved: Vec<i32> = Vec::with_capacity(sample_count * total_channels);
-        for sample_idx in 0..sample_count {
-            for &source in &layout.bed_sources {
-                interleaved.push(float_to_i24(sample_at(source, sample_idx)));
-            }
-            for &feed in &layout.object_sources {
-                interleaved.push(float_to_i24(feed_at(feed, sample_idx)));
+        // Channel by channel rather than sample by sample: each column's
+        // source is resolved once, and the bed fold is removed over the
+        // whole channel with the same per-sample arithmetic.
+        let width = layout.bed_sources.len() + layout.object_sources.len();
+        let mut interleaved = vec![0i32; sample_count * width];
+        let mut cleaned = Vec::new();
+        for (column, source) in columns.enumerate() {
+            let samples = match source {
+                Column::Silent => continue,
+                Column::Plain(samples) => samples,
+                Column::Bed(speaker, bed) => {
+                    cleaned.resize(bed.len(), 0.0);
+                    plan.clean_channel(speaker, bed, &frame.x_samples, &mut cleaned);
+                    &cleaned[..]
+                }
+            };
+            for (out, &sample) in interleaved
+                .iter_mut()
+                .skip(column)
+                .step_by(width)
+                .zip(&samples[..samples.len().min(sample_count)])
+            {
+                *out = float_to_i24(sample);
             }
         }
         writer.write_pcm_samples(&interleaved, total_channels)?;

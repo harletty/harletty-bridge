@@ -354,7 +354,7 @@ pub struct FrameHandlerContext<'a> {
 impl DecodeHandler {
     pub fn handle_decoded_frame(
         &mut self,
-        decoded: truehd::process::decode::DecodedAccessUnit,
+        decoded: &truehd::process::decode::DecodedAccessUnit,
         ctx: &FrameHandlerContext,
     ) -> Result<()> {
         let sample_rate = decoded.sampling_frequency;
@@ -369,7 +369,7 @@ impl DecodeHandler {
         self.au_index += 1;
 
         self.handle_atmos_metadata(
-            &decoded,
+            decoded,
             ctx.base_path,
             ctx.format,
             ctx.state,
@@ -406,9 +406,9 @@ impl DecodeHandler {
 
         if !ctx.no_audio {
             if ctx.bed_conform && self.has_atmos {
-                self.write_audio_samples_bed_conform(&decoded, channel_count)?;
+                self.write_audio_samples_bed_conform(decoded, channel_count)?;
             } else {
-                self.write_audio_samples(&decoded, channel_count)?;
+                self.write_audio_samples(decoded, channel_count)?;
             }
         }
 

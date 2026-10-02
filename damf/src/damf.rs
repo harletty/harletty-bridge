@@ -998,6 +998,17 @@ fn source_codec_labels_are_the_serde_names() {
     );
 }
 
+/// An object audio metadata payload with trim and bed assignments, as `truehd`
+/// carried it for its own tests before the `oamd` crate took them over.
+#[cfg(test)]
+const TEST_DATA_TRIM: &[u8] = &[
+    0x1F, 0x88, 0x4B, 0x80, 0x00, 0xA2, 0x70, 0x00, 0x80, 0x40, 0xE4, 0x0B, 0x40, 0x81, 0xDF, 0x02,
+    0x01, 0x03, 0x80, 0xFC, 0x02, 0x07, 0xD4, 0x5A, 0x04, 0x0F, 0xF0, 0x10, 0x08, 0x1C, 0x0F, 0xA0,
+    0x10, 0x38, 0x00, 0x7C, 0x20, 0x7F, 0x9F, 0x80, 0x40, 0xFF, 0x7D, 0x00, 0x81, 0xFE, 0x03, 0xE1,
+    0x03, 0x81, 0xF7, 0xC2, 0x07, 0xFB, 0xEF, 0x84, 0x0E, 0x00, 0x10, 0x08, 0x1C, 0x00, 0x20, 0x10,
+    0x02, 0xB2, 0x20, 0xCC, 0xE6, 0xAB, 0xEF, 0x0C, 0xED, 0x0D, 0x29, 0x86, 0x85, 0x80,
+];
+
 #[cfg(test)]
 const TEST_TOOL: CreationTool = CreationTool {
     name: "harletty",
@@ -1086,8 +1097,6 @@ presentations:
 
 #[test]
 fn damf() {
-    use truehd::structs::oamd::TEST_DATA_TRIM;
-
     let test_str = format!(
         r#"version: {DAMF_VERSION}
 presentations:
@@ -1156,8 +1165,6 @@ presentations:
 /// Anything else and the DAMF will not open in a DAW.
 #[test]
 fn base_name_survives_yaml_formatting() {
-    use truehd::structs::oamd::TEST_DATA_TRIM;
-
     let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
 
     for base_name in [
@@ -1186,7 +1193,7 @@ fn base_name_survives_yaml_formatting() {
 /// with no way to finalize what it had already written. This affected every version.
 #[test]
 fn unsupported_payload_shapes_are_reported_rather_than_asserted() {
-    use truehd::structs::oamd::{BedAssignment, TEST_DATA_TRIM};
+    use truehd::structs::oamd::BedAssignment;
 
     let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
     assert!(
@@ -1216,8 +1223,6 @@ fn unsupported_payload_shapes_are_reported_rather_than_asserted() {
 /// into an event: the source never had one there.
 #[test]
 fn a_re_asserted_payload_writes_no_event() {
-    use truehd::structs::oamd::TEST_DATA_TRIM;
-
     let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
     let first = Configuration::with_oamd_payload(&oamd, 48000, 0).unwrap();
 
@@ -1247,8 +1252,6 @@ fn a_re_asserted_payload_writes_no_event() {
 /// and moves an object is still an event.
 #[test]
 fn a_re_asserted_payload_still_reports_a_move() {
-    use truehd::structs::oamd::TEST_DATA_TRIM;
-
     let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
     let first = Configuration::with_oamd_payload(&oamd, 48000, 0).unwrap();
 

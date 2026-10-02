@@ -5,8 +5,8 @@ use super::metadata::{JocPayload, MetadataParseState, OamdPayload, ParsedEmdfPay
 use super::qmf::QMF_RECONSTRUCTION_DELAY;
 use super::syncframe::{
     AccessUnitInfo, AuxDataDecodeState, CoreDecodeState, ParseError,
-    decode_core_pcm_frame_with_state, inspect_access_unit_with_metadata_state,
-    inspect_legacy_ac3_access_unit,
+    decode_access_unit_with_metadata_state, decode_core_pcm_frame_with_state,
+    inspect_access_unit_with_metadata_state, inspect_legacy_ac3_access_unit,
 };
 use crate::BedChannel;
 
@@ -38,6 +38,16 @@ pub struct CorePcmFrame {
 }
 
 impl CorePcmFrame {
+    /// A frame with no channels, for a decode to fill.
+    pub(crate) fn empty() -> Self {
+        Self {
+            sample_rate: 0,
+            fullband_channel_order: Vec::new(),
+            fullband_channels: Vec::new(),
+            lfe_channel: None,
+        }
+    }
+
     /// Number of samples carried by each channel in this frame.
     pub fn samples_per_channel(&self) -> usize {
         self.fullband_channels
@@ -111,7 +121,22 @@ pub fn merge_core_with_dependent(
     dependent_frame: &[u8],
 ) -> Option<CorePcmFrame> {
     let dep = dependent_decoder.push_access_unit(dependent_frame).ok()?;
-    overlay_dependent_on_core(core, &dep.pcm, dep.info.dependent_channel_map)
+    merge_core_with_decoded_dependent(core, &dep.pcm, &dep.info)
+}
+
+/// [`merge_core_with_dependent`] for a dependent substream the caller has
+/// already decoded, `info` being what that decode returned with it.
+///
+/// Decoding a dependent is also how its JOC payload is found, so a host that
+/// has to know what the substream carries before it decides what to do with
+/// it can decode first and merge after, where inspecting it and then merging
+/// through the decoder reads its audio blocks twice.
+pub fn merge_core_with_decoded_dependent(
+    core: &CorePcmFrame,
+    dependent: &CorePcmFrame,
+    info: &AccessUnitInfo,
+) -> Option<CorePcmFrame> {
+    overlay_dependent_on_core(core, dependent, info.dependent_channel_map)
 }
 
 /// Overlay a decoded dependent substream onto the core it belongs to.
@@ -293,26 +318,14 @@ impl PcmDecoder {
 
     fn push_access_unit_inner(&mut self, access_unit: &[u8]) -> Result<PcmPushResult, ParseError> {
         self.apply_debug_log_level();
-        let info = inspect_access_unit_with_metadata_state(
+        let mut pcm = CorePcmFrame::empty();
+        let info = decode_access_unit_with_metadata_state(
             access_unit,
             &mut self.metadata_state,
-            Some(&mut self.aux_state),
+            &mut self.aux_state,
+            &mut self.core_state,
+            &mut pcm,
         )?;
-
-        if access_unit.len() < info.frame_size {
-            return Err(ParseError::TruncatedFrame {
-                expected: info.frame_size,
-                available: access_unit.len(),
-            });
-        }
-        if access_unit.len() != info.frame_size {
-            return Err(ParseError::TrailingData {
-                expected: info.frame_size,
-                provided: access_unit.len(),
-            });
-        }
-
-        let pcm = decode_core_pcm_frame_with_state(access_unit, &info, &mut self.core_state)?;
         self.frames_seen += 1;
         Ok(PcmPushResult {
             frames_seen: self.frames_seen,
@@ -533,15 +546,19 @@ fn delay_channel(channel: &[f32], tail: &mut Vec<f32>) -> Vec<f32> {
         tail.resize(JOC_LATENCY_SAMPLES, 0.0);
     }
 
-    let mut joined = Vec::with_capacity(tail.len() + channel.len());
-    joined.extend_from_slice(tail);
-    joined.extend_from_slice(channel);
-
-    let carried = joined.len() - JOC_LATENCY_SAMPLES;
-    tail.clear();
-    tail.extend_from_slice(&joined[carried..]);
-    joined.truncate(channel.len());
-    joined
+    // The output is the first `channel.len()` samples of `tail ++ channel`,
+    // and the new tail the rest; written without building the join.
+    let mut delayed = Vec::with_capacity(channel.len());
+    if let Some(kept) = channel.len().checked_sub(JOC_LATENCY_SAMPLES) {
+        delayed.extend_from_slice(tail);
+        delayed.extend_from_slice(&channel[..kept]);
+        tail.copy_from_slice(&channel[kept..]);
+    } else {
+        delayed.extend_from_slice(&tail[..channel.len()]);
+        tail.drain(..channel.len());
+        tail.extend_from_slice(channel);
+    }
+    delayed
 }
 
 impl Default for ObjectPcmDecoder {
@@ -625,19 +642,7 @@ impl ObjectPcmDecoder {
         let (info, joc) = if continues_joc_sequence(self.joc_sequence, joc.sequence_counter) {
             (info, joc)
         } else {
-            // A cold decoder starting on its first frame is not a splice, and
-            // the level this logs at is the caller's `set_debug_log_level` -
-            // `Warn` or `Error` for the bridge - so announcing every ordinary
-            // start would put a false fault in the player's log. Only a counter
-            // that broke a run it was part of is worth a line.
-            if let Some(previous) = self.joc_sequence {
-                log::log!(
-                    target: "starmine_ad::eac3dec::pcm",
-                    self.debug_log_level,
-                    "joc-splice previous={previous} counter={} - cold starting",
-                    joc.sequence_counter,
-                );
-            }
+            self.log_joc_splice(joc.sequence_counter);
             self.reset_decode_state();
             let info = inspect_access_unit_with_metadata_state(
                 access_unit,
@@ -650,6 +655,21 @@ impl ObjectPcmDecoder {
         };
         self.joc_sequence = Some(joc.sequence_counter);
         Ok((info, joc))
+    }
+
+    fn log_joc_splice(&self, sequence_counter: u16) {
+        // A cold decoder starting on its first frame is not a splice, and
+        // the level this logs at is the caller's `set_debug_log_level` -
+        // `Warn` or `Error` for the bridge - so announcing every ordinary
+        // start would put a false fault in the player's log. Only a counter
+        // that broke a run it was part of is worth a line.
+        if let Some(previous) = self.joc_sequence {
+            log::log!(
+                target: "starmine_ad::eac3dec::pcm",
+                self.debug_log_level,
+                "joc-splice previous={previous} counter={sequence_counter} - cold starting",
+            );
+        }
     }
 
     /// Number of access units accepted since the last reset.
@@ -730,32 +750,41 @@ impl ObjectPcmDecoder {
         access_unit: &[u8],
     ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
         self.apply_debug_log_level();
-        let info = inspect_access_unit_with_metadata_state(
+        // The JOC payload is found in the skip fields, which only a pass over
+        // the blocks reaches, so the core is decoded on that same pass before
+        // it is known whether the frame carries objects at all.
+        let mut joc_input_core = CorePcmFrame::empty();
+        let info = decode_access_unit_with_metadata_state(
             access_unit,
             &mut self.metadata_state,
-            Some(&mut self.aux_state),
+            &mut self.aux_state,
+            &mut self.core_state,
+            &mut joc_input_core,
         )?;
-
-        if access_unit.len() < info.frame_size {
-            return Err(ParseError::TruncatedFrame {
-                expected: info.frame_size,
-                available: access_unit.len(),
-            });
-        }
-        if access_unit.len() != info.frame_size {
-            return Err(ParseError::TrailingData {
-                expected: info.frame_size,
-                provided: access_unit.len(),
-            });
-        }
 
         let Some(joc) = find_joc_payload(&info) else {
             return Ok(None);
         };
-        let (info, joc) = self.joc_payload_for_reconstruction(access_unit, info, joc)?;
+        let (info, joc) = if continues_joc_sequence(self.joc_sequence, joc.sequence_counter) {
+            (info, joc)
+        } else {
+            // A splice: decode the frame again from cleared state, core
+            // included, as `joc_payload_for_reconstruction` explains.
+            self.log_joc_splice(joc.sequence_counter);
+            self.reset_decode_state();
+            let info = decode_access_unit_with_metadata_state(
+                access_unit,
+                &mut self.metadata_state,
+                &mut self.aux_state,
+                &mut self.core_state,
+                &mut joc_input_core,
+            )?;
+            let joc =
+                find_joc_payload(&info).ok_or(ParseError::InvalidHeader("joc-sequence-reparse"))?;
+            (info, joc)
+        };
+        self.joc_sequence = Some(joc.sequence_counter);
 
-        let joc_input_core =
-            decode_core_pcm_frame_with_state(access_unit, &info, &mut self.core_state)?;
         self.reset_history_if_reconfigured(&joc_input_core);
         let object_channels = self.joc_state.decode_frame(&joc_input_core, &joc)?;
         // Only now that the core has been through JOC as input can it be held

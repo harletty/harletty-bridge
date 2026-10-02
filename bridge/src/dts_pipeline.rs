@@ -132,6 +132,11 @@ pub(crate) struct DtsXState {
     parse_failures: u64,
     feed_dropouts: u64,
     bed_extension_dropouts: u64,
+    /// The decoded frame, kept from packet to packet so the decoder refills
+    /// its buffers instead of allocating new ones.
+    frame: HdFrame,
+    /// The same for a frame decoded from the core alone.
+    core_frame: CorePcmFrame,
 }
 
 impl DtsXState {
@@ -216,11 +221,12 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 } else {
                     DtsProfile::Hd
                 };
+                let mut hd = std::mem::take(&mut bridge.dts_x.frame);
                 match bridge
                     .dts_hd_decoder
-                    .decode(&rest[..fs], &rest[fs..fs + es])
+                    .decode_into(&rest[..fs], &rest[fs..fs + es], &mut hd)
                 {
-                    Ok(hd) => {
+                    Ok(()) => {
                         let n = hd_samples(&hd);
                         bridge.dts_surrounds_on_side = hd.surrounds_on_side();
                         if let Some(kind) = hd.xxch_decode_error {
@@ -270,20 +276,22 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                         }
                     }
                 }
+                bridge.dts_x.frame = hd;
             } else {
                 // Nothing the HD decoder reads beyond the core: an XBR-only
                 // DTS-HD HRA layers high-frequency detail on top of an
                 // ordinary DTS core, which is not decoded, so render the
                 // core (5.1) and drop it instead of failing the whole track.
                 bridge.dts_profile = DtsProfile::Hd;
-                match bridge.dts_decoder.push_access_unit(&rest[..fs]) {
-                    Ok(push) => {
+                let pcm = &mut bridge.dts_x.core_frame;
+                match bridge.dts_decoder.decode_into(&rest[..fs], pcm) {
+                    Ok(_) => {
                         bridge.dts_objects_active = false;
                         // A core names its surrounds Ls/Rs only.
                         bridge.dts_surrounds_on_side = false;
                         bridge.dts_auro.not_a_carrier(&mut result.frames);
-                        result.frames.push(build_core_frame(&push.pcm));
-                        bridge.total_samples += push.pcm.samples_per_channel() as u64;
+                        result.frames.push(build_core_frame(pcm));
+                        bridge.total_samples += pcm.samples_per_channel() as u64;
                         bridge.dts_frame_count += 1;
                     }
                     Err(err) => {
@@ -301,13 +309,14 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
             consumed += fs + es;
         } else {
             bridge.dts_profile = DtsProfile::Core;
-            match bridge.dts_decoder.push_access_unit(&rest[..fs]) {
-                Ok(push) => {
-                    let frame = build_core_frame(&push.pcm);
+            let pcm = &mut bridge.dts_x.core_frame;
+            match bridge.dts_decoder.decode_into(&rest[..fs], pcm) {
+                Ok(_) => {
+                    let frame = build_core_frame(pcm);
                     bridge.dts_objects_active = false;
                     bridge.dts_surrounds_on_side = false;
                     bridge.dts_auro.not_a_carrier(&mut result.frames);
-                    bridge.total_samples += push.pcm.samples_per_channel() as u64;
+                    bridge.total_samples += pcm.samples_per_channel() as u64;
                     bridge.dts_frame_count += 1;
                     result.frames.push(frame);
                 }
@@ -460,19 +469,21 @@ fn build_hd_frame_with_extensions(
     let object_feeds = presentation.object_feeds();
     let channel_count = active.len() + presentation.feed_count();
 
-    let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * channel_count);
-    for s in 0..sample_count {
-        for (channel, &spkr) in bed.iter().zip(&active) {
-            pcm.push(float_to_pcm_i32(plan.clean(spkr, channel[s], s, feeds)));
-        }
-        for feed in fixed_feeds.clone().chain(object_feeds.clone()) {
-            let sample = match feeds.get(feed) {
-                Some(waveform) if plan.source_is_known(feed) => waveform[s],
-                _ => 0.0,
-            };
-            pcm.push(float_to_pcm_i32(sample));
+    // Channel by channel: each bed channel with its stated feeds removed,
+    // then the feeds, silent when their fold is not stated.
+    let width = bed.len() + fixed_feeds.len() + object_feeds.len();
+    let mut pcm = vec![0i32; sample_count * width];
+    let mut cleaned = vec![0.0f32; sample_count];
+    for (column, (channel, &spkr)) in bed.iter().zip(&active).enumerate() {
+        plan.clean_channel(spkr, channel, feeds, &mut cleaned);
+        write_column(&mut pcm, column, width, &cleaned);
+    }
+    for (column, feed) in (bed.len()..).zip(fixed_feeds.clone().chain(object_feeds.clone())) {
+        if let Some(waveform) = feeds.get(feed).filter(|_| plan.source_is_known(feed)) {
+            write_column(&mut pcm, column, width, &waveform[..sample_count]);
         }
     }
+    let pcm = RVec::from(pcm);
 
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(channel_count);
     for &spkr in &active {
@@ -517,6 +528,14 @@ fn build_hd_frame_with_extensions(
     ))
 }
 
+/// Convert one channel into column `column` of interleaved PCM `width`
+/// channels wide.
+fn write_column(pcm: &mut [i32], column: usize, width: usize, samples: &[f32]) {
+    for (out, &sample) in pcm.iter_mut().skip(column).step_by(width).zip(samples) {
+        *out = float_to_pcm_i32(sample);
+    }
+}
+
 /// A frame with no extension presentation: the lossless bed as decoded.
 fn bed_only_frame(
     hd: &HdFrame,
@@ -524,12 +543,11 @@ fn bed_only_frame(
     bed: &[&[f32]],
     sample_count: usize,
 ) -> RDecodedFrame {
-    let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * active.len());
-    for s in 0..sample_count {
-        for channel in bed {
-            pcm.push(float_to_pcm_i32(channel[s]));
-        }
+    let mut pcm = vec![0i32; sample_count * bed.len()];
+    for (column, channel) in bed.iter().enumerate() {
+        write_column(&mut pcm, column, bed.len(), &channel[..sample_count]);
     }
+    let pcm = RVec::from(pcm);
     let channel_labels: RVec<RChannelLabel> =
         active.iter().map(|&spkr| speaker_to_label(spkr)).collect();
     RDecodedFrame {
@@ -654,15 +672,21 @@ fn build_core_frame(core: &CorePcmFrame) -> RDecodedFrame {
     let sample_count = core.samples_per_channel();
     let total_channel_count = core.total_channels();
 
-    let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * total_channel_count);
-    for s in 0..sample_count {
-        for ch in &core.fullband_channels {
-            pcm.push(float_to_pcm_i32(ch[s]));
-        }
-        if let Some(lfe) = &core.lfe_channel {
-            pcm.push(float_to_pcm_i32(lfe[s]));
-        }
+    let mut pcm = vec![0i32; sample_count * total_channel_count];
+    for (column, channel) in core
+        .fullband_channels
+        .iter()
+        .chain(&core.lfe_channel)
+        .enumerate()
+    {
+        write_column(
+            &mut pcm,
+            column,
+            total_channel_count,
+            &channel[..sample_count],
+        );
     }
+    let pcm = RVec::from(pcm);
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
     for bed in &core.fullband_channel_order {
         channel_labels.push(dca_bed_channel_to_r(*bed));

@@ -677,7 +677,7 @@ dependencies = [
 [[package]]
 name = "iamf-codecs"
 version = "0.2.0"
-source = "git+https://github.com/baylesj/iamf-rs?rev=01a562dd3a8e7ef29365dec9818da9e8a826cb33#01a562dd3a8e7ef29365dec9818da9e8a826cb33"
+source = "git+https://github.com/harletty/iamf-rs?rev=1f841d2cc7ee39d3e9b9bf1293bda64063aa4972#1f841d2cc7ee39d3e9b9bf1293bda64063aa4972"
 dependencies = [
  "iamf-dec",
  "iamf-obu",
@@ -690,7 +690,7 @@ dependencies = [
 [[package]]
 name = "iamf-dec"
 version = "0.2.0"
-source = "git+https://github.com/baylesj/iamf-rs?rev=01a562dd3a8e7ef29365dec9818da9e8a826cb33#01a562dd3a8e7ef29365dec9818da9e8a826cb33"
+source = "git+https://github.com/harletty/iamf-rs?rev=1f841d2cc7ee39d3e9b9bf1293bda64063aa4972#1f841d2cc7ee39d3e9b9bf1293bda64063aa4972"
 dependencies = [
  "iamf-obu",
 ]
@@ -698,12 +698,12 @@ dependencies = [
 [[package]]
 name = "iamf-obu"
 version = "0.2.0"
-source = "git+https://github.com/baylesj/iamf-rs?rev=01a562dd3a8e7ef29365dec9818da9e8a826cb33#01a562dd3a8e7ef29365dec9818da9e8a826cb33"
+source = "git+https://github.com/harletty/iamf-rs?rev=1f841d2cc7ee39d3e9b9bf1293bda64063aa4972#1f841d2cc7ee39d3e9b9bf1293bda64063aa4972"
 
 [[package]]
 name = "iamf-opus-ffi"
 version = "0.2.0"
-source = "git+https://github.com/baylesj/iamf-rs?rev=01a562dd3a8e7ef29365dec9818da9e8a826cb33#01a562dd3a8e7ef29365dec9818da9e8a826cb33"
+source = "git+https://github.com/harletty/iamf-rs?rev=1f841d2cc7ee39d3e9b9bf1293bda64063aa4972#1f841d2cc7ee39d3e9b9bf1293bda64063aa4972"
 dependencies = [
  "pkg-config",
 ]
@@ -916,6 +916,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "oamd"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76c4b9119cf66c5cdbc555ac0dbb9607a92a71e8fd6409c3217f429c05872f93"
+dependencies = [
+ "anyhow",
+ "bitstream-io",
+ "log",
 ]
 
 [[package]]
@@ -1395,13 +1406,13 @@ dependencies = [
 [[package]]
 name = "truehd"
 version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3670e5f6df01d8518e225c37ada5c9e41fa5d98fb414ef1eed051e71c885da16"
+source = "git+https://github.com/harletty/truehdd?rev=600355da1edb3ba51cc0064f76e9dd57198a0bb4#600355da1edb3ba51cc0064f76e9dd57198a0bb4"
 dependencies = [
  "anyhow",
  "bitstream-io",
  "hmac",
  "log",
+ "oamd",
  "sha2",
  "thiserror",
 ]
