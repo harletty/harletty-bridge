@@ -350,6 +350,17 @@ a plain bed and carries objects later: the bed already written is
 rewritten as the head of the `.atmos.audio`, objects silent, so the
 master set covers the stream from its first sample.
 
+A DTS output keeps one layout the same way. A frame whose extension
+substream is missing or fails to decode comes out of the core as 5.1, and
+is written into the 7.1.4 (+ objects) master set with each channel under
+the speaker it is named for, the heights and objects silent for it; a
+frame with another presentation has its objects placed by rank, and no
+event is written for an object the master set does not name. A plain
+bed head followed by DTS:X is rewritten as the head of the
+`.atmos.audio`, as for E-AC-3. (A frame the core decoder rejects as well
+is dropped, with a warning, rather than replaced with silence: the DTS
+path does not substitute.)
+
 Errors at the *extractor* level — where framing itself is lost and the
 decoder resynchronises — are not compensated this way, because the number
 of access units that went by is unknowable. They remain a possible source
