@@ -15,9 +15,10 @@ use crate::ac3_native::NativeAc3Decoder;
 use crate::auro_pipeline::DtsAuroState;
 use crate::dts_pipeline::{DtsFoldConfig, DtsXState};
 use crate::eac3_pipeline::{
-    Eac3IndependentOutcome, PendingEac3Dependent, build_legacy_ac3_core_failure_silence,
-    decode_eac3_independent, decode_eac3_inspected, diagnose_eac3_frame, eac3_frame_carries_joc,
-    inspect_eac3_frame, is_legacy_ac3_frame, is_temporary_eac3_silence_frame,
+    DecodedDependent, Eac3IndependentOutcome, PendingEac3Dependent,
+    build_legacy_ac3_core_failure_silence, decode_eac3_independent, decode_eac3_inspected,
+    diagnose_eac3_frame, eac3_frame_carries_joc, inspect_eac3_frame, is_legacy_ac3_frame,
+    is_temporary_eac3_silence_frame,
 };
 use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::validate_frame_shape;
@@ -575,17 +576,43 @@ impl AtmosBridge {
         self.eac3_frame_count += 1;
         // A dependent substream belongs to the access unit it immediately
         // follows, so any other kind of unit ends the group in hand. Only a
-        // dependent is inspected in full here: it is held with what the
-        // inspection found, and one whose inspection fails is handled as the
-        // frame of unknown type it then is.
+        // dependent is looked into here. One the presentation in hand can
+        // take is decoded at once and held with its channels and what the
+        // decode found - an inspection used to come first, and the merge then
+        // walked the same blocks again. One the decode rejects, or that has
+        // no presentation to join, is inspected as before: it is held (or
+        // dropped) on what the inspection found, and one whose inspection
+        // fails is handled as the frame of unknown type it then is.
         let header = eac3::parse_header(frame).ok();
         let is_legacy = is_legacy_ac3_frame(frame);
-        let inspection = if is_legacy
-            || header.is_some_and(|header| header.stream_type == eac3::StreamType::Dependent)
+        let is_dependent =
+            header.is_some_and(|header| header.stream_type == eac3::StreamType::Dependent);
+        if is_dependent
+            && !is_legacy
+            && self
+                .pending_eac3_core
+                .as_ref()
+                .is_some_and(|pending| pending.dependents.len() < MAX_EAC3_DEPENDENTS)
         {
+            match self.eac3_dependent_pcm_decoder.push_access_unit(frame) {
+                Ok(push) if push.info.frame_type == FrameType::Dependent => {
+                    return self.push_eac3_dependent(
+                        frame,
+                        push.info,
+                        DecodedDependent::Channels(push.pcm),
+                        result,
+                    );
+                }
+                _ => {}
+            }
+        }
+        let inspection = if is_legacy || is_dependent {
             match inspect_eac3_frame(frame) {
                 Ok(info) if info.frame_type == FrameType::Dependent => {
-                    return self.push_eac3_dependent(frame, info, result);
+                    // Either the decode above rejected it, or it has no
+                    // presentation to join and is dropped before its
+                    // channels are asked for.
+                    return self.push_eac3_dependent(frame, info, DecodedDependent::Failed, result);
                 }
                 inspection => Some(inspection),
             }
@@ -708,6 +735,7 @@ impl AtmosBridge {
         &mut self,
         frame: &[u8],
         info: eac3::AccessUnitInfo,
+        decoded: DecodedDependent,
         result: &mut RPushResult,
     ) -> Result<(), ()> {
         let Some(pending) = self.pending_eac3_core.as_mut() else {
@@ -736,6 +764,7 @@ impl AtmosBridge {
         pending.dependents.push(PendingEac3Dependent {
             access_unit: frame.to_vec(),
             info,
+            decoded,
         });
         // The JOC payload rides in the last dependent, so one that carries
         // it ends the group with no need to wait for the next access unit.
