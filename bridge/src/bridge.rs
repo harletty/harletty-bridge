@@ -938,7 +938,12 @@ impl FormatBridge for AtmosBridge {
 
     fn has_objects(&self) -> bool {
         if self.iamf_active {
-            // Every mix is rendered to a 7.1.4 bed in the bridge.
+            // Channel-based and scene-based elements are rendered to a 7.1.4
+            // bed in the bridge; IAMF v2.0 objects reach the renderer as
+            // objects.
+            #[cfg(feature = "iamf")]
+            return self.iamf.has_objects();
+            #[cfg(not(feature = "iamf"))]
             return false;
         }
         if self.dts_active {
