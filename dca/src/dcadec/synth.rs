@@ -371,8 +371,13 @@ fn imdct_half_64(output: &mut [i32; 64], input: &[i32; 64]) {
 /// Per-channel QMF delay line. Sized for the 64-band (X96) filter bank; the
 /// 32-band path uses only the leading half of each buffer. Both are kept in one
 /// fixed-size struct so switching bank size never allocates.
+///
+/// `hist1` is a circular buffer (512 entries for the 32-band bank, 1024 for
+/// the 64-band one) stored twice back to back: every write lands at `offset`
+/// and `offset + period`, so the window always reads one contiguous run
+/// `hist1[offset..offset + period]` instead of wrapping around the end.
 struct ChannelSynth {
-    hist1: [i32; 1024],
+    hist1: [i32; 2048],
     hist2: [i32; 64],
     offset: usize,
 }
@@ -380,7 +385,7 @@ struct ChannelSynth {
 impl Default for ChannelSynth {
     fn default() -> Self {
         Self {
-            hist1: [0; 1024],
+            hist1: [0; 2048],
             hist2: [0; 64],
             offset: 0,
         }
@@ -393,32 +398,32 @@ impl ChannelSynth {
         imdct_half_32(&mut imdct, input);
         let off = self.offset;
         self.hist1[off..off + 32].copy_from_slice(&imdct);
+        self.hist1[off + 512..off + 544].copy_from_slice(&imdct);
 
-        let h1 = &self.hist1;
+        let h1: &[i32; 512] = self.hist1[off..off + 512].try_into().unwrap();
+        let mut a = [0i64; 16];
+        let mut b = [0i64; 16];
+        let mut c = [0i64; 16];
+        let mut d = [0i64; 16];
         for i in 0..16 {
-            let mut a = self.hist2[i] as i64 * (1i64 << 21);
-            let mut b = self.hist2[i + 16] as i64 * (1i64 << 21);
-            let mut c = 0i64;
-            let mut d = 0i64;
-            let mut j = 0usize;
-            while j < 512 - off {
-                a += window[i + j] as i64 * h1[off + i + j] as i64;
-                b += window[i + j + 16] as i64 * h1[off + 15 - i + j] as i64;
-                c += window[i + j + 32] as i64 * h1[off + 16 + i + j] as i64;
-                d += window[i + j + 48] as i64 * h1[off + 31 - i + j] as i64;
-                j += 64;
+            a[i] = self.hist2[i] as i64 * (1i64 << 21);
+            b[i] = self.hist2[i + 16] as i64 * (1i64 << 21);
+        }
+        for j in (0..512).step_by(64) {
+            let w: &[i32; 64] = window[j..j + 64].try_into().unwrap();
+            let h: &[i32; 32] = h1[j..j + 32].try_into().unwrap();
+            for i in 0..16 {
+                a[i] += w[i] as i64 * h[i] as i64;
+                b[i] += w[i + 16] as i64 * h[15 - i] as i64;
+                c[i] += w[i + 32] as i64 * h[16 + i] as i64;
+                d[i] += w[i + 48] as i64 * h[31 - i] as i64;
             }
-            while j < 512 {
-                a += window[i + j] as i64 * h1[off + i + j - 512] as i64;
-                b += window[i + j + 16] as i64 * h1[off + 15 - i + j - 512] as i64;
-                c += window[i + j + 32] as i64 * h1[off + 16 + i + j - 512] as i64;
-                d += window[i + j + 48] as i64 * h1[off + 31 - i + j - 512] as i64;
-                j += 64;
-            }
-            out[i] = clip23(norm(a, 21));
-            out[i + 16] = clip23(norm(b, 21));
-            self.hist2[i] = norm(c, 21);
-            self.hist2[i + 16] = norm(d, 21);
+        }
+        for i in 0..16 {
+            out[i] = clip23(norm(a[i], 21));
+            out[i + 16] = clip23(norm(b[i], 21));
+            self.hist2[i] = norm(c[i], 21);
+            self.hist2[i + 16] = norm(d[i], 21);
         }
         self.offset = (off.wrapping_sub(32)) & 511;
     }
@@ -431,32 +436,32 @@ impl ChannelSynth {
         imdct_half_64(&mut imdct, input);
         let off = self.offset;
         self.hist1[off..off + 64].copy_from_slice(&imdct);
+        self.hist1[off + 1024..off + 1088].copy_from_slice(&imdct);
 
-        let h1 = &self.hist1;
+        let h1: &[i32; 1024] = self.hist1[off..off + 1024].try_into().unwrap();
+        let mut a = [0i64; 32];
+        let mut b = [0i64; 32];
+        let mut c = [0i64; 32];
+        let mut d = [0i64; 32];
         for i in 0..32 {
-            let mut a = self.hist2[i] as i64 * (1i64 << 20);
-            let mut b = self.hist2[i + 32] as i64 * (1i64 << 20);
-            let mut c = 0i64;
-            let mut d = 0i64;
-            let mut j = 0usize;
-            while j < 1024 - off {
-                a += window[i + j] as i64 * h1[off + i + j] as i64;
-                b += window[i + j + 32] as i64 * h1[off + 31 - i + j] as i64;
-                c += window[i + j + 64] as i64 * h1[off + 32 + i + j] as i64;
-                d += window[i + j + 96] as i64 * h1[off + 63 - i + j] as i64;
-                j += 128;
+            a[i] = self.hist2[i] as i64 * (1i64 << 20);
+            b[i] = self.hist2[i + 32] as i64 * (1i64 << 20);
+        }
+        for j in (0..1024).step_by(128) {
+            let w: &[i32; 128] = window[j..j + 128].try_into().unwrap();
+            let h: &[i32; 64] = h1[j..j + 64].try_into().unwrap();
+            for i in 0..32 {
+                a[i] += w[i] as i64 * h[i] as i64;
+                b[i] += w[i + 32] as i64 * h[31 - i] as i64;
+                c[i] += w[i + 64] as i64 * h[32 + i] as i64;
+                d[i] += w[i + 96] as i64 * h[63 - i] as i64;
             }
-            while j < 1024 {
-                a += window[i + j] as i64 * h1[off + i + j - 1024] as i64;
-                b += window[i + j + 32] as i64 * h1[off + 31 - i + j - 1024] as i64;
-                c += window[i + j + 64] as i64 * h1[off + 32 + i + j - 1024] as i64;
-                d += window[i + j + 96] as i64 * h1[off + 63 - i + j - 1024] as i64;
-                j += 128;
-            }
-            out[i] = clip23(norm(a, 20));
-            out[i + 32] = clip23(norm(b, 20));
-            self.hist2[i] = norm(c, 20);
-            self.hist2[i + 32] = norm(d, 20);
+        }
+        for i in 0..32 {
+            out[i] = clip23(norm(a[i], 20));
+            out[i + 32] = clip23(norm(b[i], 20));
+            self.hist2[i] = norm(c[i], 20);
+            self.hist2[i + 32] = norm(d[i], 20);
         }
         self.offset = (off.wrapping_sub(64)) & 1023;
     }
