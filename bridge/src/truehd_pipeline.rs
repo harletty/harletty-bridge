@@ -90,7 +90,12 @@ impl DrainContext<'_> {
 // TrueHD drain_frames — unchanged.
 // ---------------------------------------------------------------------------
 
-fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<String>) {
+/// `decoded` is where each access unit is decoded: what it held is written over,
+/// and nothing of it is read past the access unit's own samples.
+fn drain_frames(
+    ctx: &mut DrainContext<'_>,
+    decoded: &mut DecodedAccessUnit,
+) -> (Vec<RDecodedFrame>, Option<String>) {
     let mut frames = Vec::new();
     let mut error_msg: Option<String> = None;
 
@@ -210,11 +215,12 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
 
                 #[cfg(feature = "bridge-perf")]
                 let decode_started = Instant::now();
-                let mut decoded = match ctx
-                    .decoder
-                    .decode_presentation(&access_unit, ctx.presentation as usize)
-                {
-                    Ok(d) => d,
+                match ctx.decoder.decode_presentation_into(
+                    &access_unit,
+                    ctx.presentation as usize,
+                    decoded,
+                ) {
+                    Ok(()) => {}
                     Err(e) => {
                         let msg = format!("Decode error at frame {}: {e}", ctx.frame_count);
                         log::error!("{msg}");
@@ -308,7 +314,7 @@ fn drain_frames(ctx: &mut DrainContext<'_>) -> (Vec<RDecodedFrame>, Option<Strin
                 let build_started = Instant::now();
                 frames.push(build_thd_frame(
                     ctx,
-                    &decoded,
+                    decoded,
                     base_sample_pos,
                     drc_gain,
                     drc_ramp_duration,
@@ -479,8 +485,9 @@ pub(crate) fn process_extractor_input(
         };
         #[cfg(feature = "bridge-perf")]
         let drain_started = Instant::now();
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drain_frames(&mut ctx)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drain_frames(&mut ctx, &mut bridge.truehd_decoded)
+        }));
         #[cfg(feature = "bridge-perf")]
         bridge.perf.record_drain(drain_started.elapsed());
         result

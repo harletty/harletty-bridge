@@ -8,6 +8,7 @@ use eac3::{CorePcmFrame, Extractor as Eac3RawExtractor, FrameType, ObjectPcmDeco
 use std::env;
 #[cfg(feature = "bridge-perf")]
 use std::time::Instant;
+use truehd::process::decode::DecodedAccessUnit;
 use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, parse::Parser};
 
 use crate::ac3_native::NativeAc3Decoder;
@@ -196,6 +197,10 @@ pub(crate) struct AtmosBridge {
     pub(crate) extractor: Extractor,
     pub(crate) parser: Box<Parser>,
     pub(crate) decoder: Box<Decoder>,
+    /// The access unit the decoder writes its samples into. Kept from one to the
+    /// next: a new one is 10 KiB to build and copy out for every 1/1200 s of
+    /// audio, most of it rows the access unit does not use.
+    pub(crate) truehd_decoded: Box<DecodedAccessUnit>,
     // ── E-AC3 pipeline ───────────────────────────────────────────────
     pub(crate) eac3_spdif: Eac3SpdifStream,
     /// Raw E-AC3 syncframe extractor (used by the `Raw` transport, e.g. mpv).
@@ -327,6 +332,7 @@ impl AtmosBridge {
             extractor: Extractor::default(),
             parser,
             decoder,
+            truehd_decoded: Box::default(),
             eac3_spdif: Eac3SpdifStream::default(),
             eac3_raw_extractor: Eac3RawExtractor::default(),
             eac3_pcm_decoder: eac3_pcm,
