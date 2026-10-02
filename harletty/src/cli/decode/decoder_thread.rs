@@ -4,13 +4,16 @@ use anyhow::Result;
 use indicatif::ProgressBar;
 use std::sync::mpsc;
 use std::thread;
+use truehd::process::decode::DecodedAccessUnit;
 use truehd::process::{decode::Decoder, extract::Extractor, parse::Parser};
 
 pub struct DecoderThreadConfig {
     pub input_path: std::path::PathBuf,
     pub presentation: u8,
     pub strict_mode: bool,
-    pub tx: mpsc::Sender<Result<truehd::process::decode::DecodedAccessUnit>>,
+    pub tx: mpsc::Sender<Result<Box<DecodedAccessUnit>>>,
+    /// Access units the writer has finished with, to decode the next ones into.
+    pub spare: mpsc::Receiver<Box<DecodedAccessUnit>>,
     pub pb_clone: Option<ProgressBar>,
     pub extractor: Extractor,
     pub parser: Parser,
@@ -25,6 +28,7 @@ pub fn spawn_decoder_thread(config: DecoderThreadConfig) -> thread::JoinHandle<R
             presentation,
             strict_mode,
             tx,
+            spare,
             pb_clone,
             mut extractor,
             mut parser,
@@ -61,6 +65,7 @@ pub fn spawn_decoder_thread(config: DecoderThreadConfig) -> thread::JoinHandle<R
                 presentation,
                 strict_mode,
                 tx: &tx,
+                spare: &spare,
                 pb_clone: &pb_clone,
                 current_substream_info: &mut current_substream_info,
                 current_extended_substream_info: &mut current_extended_substream_info,

@@ -71,6 +71,9 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
 
     // Setup decoder components
     let (tx, rx) = mpsc::channel();
+    // The way back for the access units written out, which the decoder thread
+    // decodes the next ones into.
+    let (spare_tx, spare) = mpsc::channel();
     let pb_clone = pb.clone();
     let strict_mode = cli.strict;
     let presentation = args.presentation;
@@ -103,6 +106,7 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
         presentation,
         strict_mode,
         tx,
+        spare,
         pb_clone,
         extractor,
         parser,
@@ -163,7 +167,9 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
                     bed_conform: args.bed_conform,
                     warp_mode: args.warp_mode,
                 };
-                handler.handle_decoded_frame(decoded, &ctx)?;
+                handler.handle_decoded_frame(&decoded, &ctx)?;
+                // Nobody to hand it back to once the decoder thread is done.
+                let _ = spare_tx.send(decoded);
             }
             Err(e) => {
                 if let Some(pb) = pb {
