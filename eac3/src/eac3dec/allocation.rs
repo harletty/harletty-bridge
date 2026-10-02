@@ -417,6 +417,18 @@ impl AllocationState {
             aht,
         };
 
+        // The tables as arrays of their own: through `self` every store
+        // would have the compiler fetch each `Vec`'s pointer again.
+        let (Ok(psd), Ok(integrated_psd), Ok(excite), Ok(mask), Ok(bap)) = (
+            <&[i32; MAX_ALLOCATION_SIZE]>::try_from(&self.psd[..]),
+            <&[i32; MASK_BANDS]>::try_from(&self.integrated_psd[..]),
+            <&mut [i32; MASK_BANDS]>::try_from(&mut self.excite[..]),
+            <&mut [i32; MASK_BANDS]>::try_from(&mut self.mask[..]),
+            <&mut [u8; MAX_ALLOCATION_SIZE]>::try_from(&mut self.bap[..]),
+        ) else {
+            return Ok(());
+        };
+
         let slow_decay = SLOWDEC[params.slow_decay_code];
         let fast_decay = FASTDEC[params.fast_decay_code];
         let slow_gain = SLOWGAIN[params.slow_gain_code];
@@ -429,27 +441,25 @@ impl AllocationState {
         let mut begin = bnd_start;
 
         if bnd_start == 0 {
-            let mut lowcomp = calc_lowcomp(0, self.integrated_psd[0], self.integrated_psd[1], 0);
-            self.excite[0] = self.integrated_psd[0] - fgain - lowcomp;
-            lowcomp = calc_lowcomp(lowcomp, self.integrated_psd[1], self.integrated_psd[2], 1);
-            self.excite[1] = self.integrated_psd[1] - fgain - lowcomp;
+            let mut lowcomp = calc_lowcomp(0, integrated_psd[0], integrated_psd[1], 0);
+            excite[0] = integrated_psd[0] - fgain - lowcomp;
+            lowcomp = calc_lowcomp(lowcomp, integrated_psd[1], integrated_psd[2], 1);
+            excite[1] = integrated_psd[1] - fgain - lowcomp;
             begin = 7;
 
             for band in 2..7 {
                 if bnd_end != 7 || band != 6 {
                     lowcomp = calc_lowcomp(
                         lowcomp,
-                        self.integrated_psd[band],
-                        self.integrated_psd[band + 1],
+                        integrated_psd[band],
+                        integrated_psd[band + 1],
                         band,
                     );
                 }
-                fast_leak = self.integrated_psd[band] - fgain;
-                slow_leak = self.integrated_psd[band] - slow_gain;
-                self.excite[band] = fast_leak - lowcomp;
-                if (bnd_end != 7 || band != 6)
-                    && self.integrated_psd[band] <= self.integrated_psd[band + 1]
-                {
+                fast_leak = integrated_psd[band] - fgain;
+                slow_leak = integrated_psd[band] - slow_gain;
+                excite[band] = fast_leak - lowcomp;
+                if (bnd_end != 7 || band != 6) && integrated_psd[band] <= integrated_psd[band + 1] {
                     begin = band + 1;
                     break;
                 }
@@ -459,29 +469,29 @@ impl AllocationState {
                 if bnd_end != 7 || band != 6 {
                     lowcomp = calc_lowcomp(
                         lowcomp,
-                        self.integrated_psd[band],
-                        self.integrated_psd[band + 1],
+                        integrated_psd[band],
+                        integrated_psd[band + 1],
                         band,
                     );
                 }
-                fast_leak = (fast_leak - fast_decay).max(self.integrated_psd[band] - fgain);
-                slow_leak = (slow_leak - slow_decay).max(self.integrated_psd[band] - slow_gain);
-                self.excite[band] = (fast_leak - lowcomp).max(slow_leak);
+                fast_leak = (fast_leak - fast_decay).max(integrated_psd[band] - fgain);
+                slow_leak = (slow_leak - slow_decay).max(integrated_psd[band] - slow_gain);
+                excite[band] = (fast_leak - lowcomp).max(slow_leak);
             }
             begin = 22;
         }
 
         for band in begin..bnd_end {
-            fast_leak = (fast_leak - fast_decay).max(self.integrated_psd[band] - fgain);
-            slow_leak = (slow_leak - slow_decay).max(self.integrated_psd[band] - slow_gain);
-            self.excite[band] = fast_leak.max(slow_leak);
+            fast_leak = (fast_leak - fast_decay).max(integrated_psd[band] - fgain);
+            slow_leak = (slow_leak - slow_decay).max(integrated_psd[band] - slow_gain);
+            excite[band] = fast_leak.max(slow_leak);
         }
 
         for band in bnd_start..bnd_end {
-            if self.integrated_psd[band] < dbknee {
-                self.excite[band] += (dbknee - self.integrated_psd[band]) >> 2;
+            if integrated_psd[band] < dbknee {
+                excite[band] += (dbknee - integrated_psd[band]) >> 2;
             }
-            self.mask[band] = self.excite[band].max(HTH[sample_rate_index][band]);
+            mask[band] = excite[band].max(HTH[sample_rate_index][band]);
         }
 
         if matches!(
@@ -505,7 +515,7 @@ impl AllocationState {
                     ((bits as i32) - 4) << 7
                 };
                 for _ in 0..length {
-                    let Some(mask) = self.mask.get_mut(band) else {
+                    let Some(mask) = mask.get_mut(band) else {
                         break;
                     };
                     *mask += delta_mask;
@@ -514,7 +524,9 @@ impl AllocationState {
             }
         } else if delta.mode == DeltaBitAllocationMode::MuteOutput {
             // TODO: Model reserved `MuteOutput` delta allocation the same way as a real decoder.
-            self.clear_bap();
+            bap.fill(0);
+            self.allocated_with = None;
+            self.mantissa_counts = None;
             return Ok(());
         }
 
@@ -523,14 +535,14 @@ impl AllocationState {
         let mut band = bnd_start;
         loop {
             let last_bin = BNDTAB[band].min(end);
-            let mut masked = self.mask[band] - snr_offset - floor;
+            let mut masked = mask[band] - snr_offset - floor;
             if masked < 0 {
                 masked = 0;
             }
             masked = (masked & 0x1fe0) + floor;
             while bin < last_bin {
-                let address = ((self.psd[bin] - masked) >> 5).clamp(0, 63) as usize;
-                self.bap[bin] = bap_tab[address];
+                let address = ((psd[bin] - masked) >> 5).clamp(0, 63) as usize;
+                bap[bin] = bap_tab[address];
                 bin += 1;
             }
             band += 1;
@@ -538,9 +550,7 @@ impl AllocationState {
                 break;
             }
         }
-        for bap in &mut self.bap[bin..] {
-            *bap = 0;
-        }
+        bap[bin..].fill(0);
         self.allocated_with = Some(args);
         Ok(())
     }
