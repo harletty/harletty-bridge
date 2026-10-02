@@ -7,8 +7,9 @@ use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ImdctState {
-    delay: [f32; 256],
-    output: [f32; 512],
+    /// The second half of the previous transform, before its window: the 128
+    /// values the 256 samples it spans are mirrored from.
+    delay: [f32; 128],
     intermediate_512: [Complex32; 128],
     intermediate_256_a: [Complex32; 64],
     intermediate_256_b: [Complex32; 64],
@@ -20,8 +21,7 @@ pub(crate) struct ImdctState {
 impl ImdctState {
     pub(crate) fn new() -> Self {
         Self {
-            delay: [0.0; 256],
-            output: [0.0; 512],
+            delay: [0.0; 128],
             intermediate_512: [Complex32::new(0.0, 0.0); 128],
             intermediate_256_a: [Complex32::new(0.0, 0.0); 64],
             intermediate_256_b: [Complex32::new(0.0, 0.0); 64],
@@ -39,44 +39,21 @@ impl ImdctState {
     }
 
     fn apply_512(&mut self, coeffs: &[f32; 256], output: &mut [f32]) {
-        let x = x512();
-        for (index, slot) in self.intermediate_512.iter_mut().enumerate() {
-            *slot = Complex32::new(coeffs[255 - 2 * index], coeffs[2 * index]) * x[index];
-        }
+        let Ok(output) = <&mut [f32; 256]>::try_from(output) else {
+            return;
+        };
+        let x = &tables().long;
+        kernel::pre_rotate_512(coeffs, x, &mut self.intermediate_512);
         imdct_fft_cache()
             .ifft_512
             .process_with_scratch(&mut self.intermediate_512, &mut self.scratch);
-        for (value, coeff) in self.intermediate_512.iter_mut().zip(x.iter().copied()) {
-            *value *= coeff;
-        }
-
-        for index in 0..64 {
-            const N8: usize = 64;
-            const N4: usize = 128;
-            const N2: usize = 256;
-            self.output[2 * index] = -self.intermediate_512[N8 + index].im * WINDOW[2 * index];
-            self.output[2 * index + 1] =
-                self.intermediate_512[N8 - 1 - index].re * WINDOW[2 * index + 1];
-            self.output[N4 + 2 * index] = -self.intermediate_512[index].re * WINDOW[N4 + 2 * index];
-            self.output[N4 + 1 + 2 * index] =
-                self.intermediate_512[N4 - 1 - index].im * WINDOW[N4 + 1 + 2 * index];
-            self.output[N2 + 2 * index] =
-                -self.intermediate_512[N8 + index].re * WINDOW[N2 - 1 - 2 * index];
-            self.output[N2 + 1 + 2 * index] =
-                self.intermediate_512[N8 - 1 - index].im * WINDOW[N2 - 2 - 2 * index];
-            self.output[3 * N4 + 2 * index] =
-                self.intermediate_512[index].im * WINDOW[N4 - 1 - 2 * index];
-            self.output[3 * N4 + 1 + 2 * index] =
-                -self.intermediate_512[N4 - 1 - index].re * WINDOW[N4 - 2 - 2 * index];
-        }
-
-        for (index, sample) in output.iter_mut().enumerate().take(256) {
-            *sample = 2.0 * (self.output[index] + self.delay[index]);
-        }
-        self.delay.copy_from_slice(&self.output[256..512]);
+        kernel::fold_512(&self.intermediate_512, x, &mut self.delay, output);
     }
 
     fn apply_256(&mut self, coeffs: &[f32; 256], output: &mut [f32]) {
+        let Ok(output) = <&mut [f32; 256]>::try_from(output) else {
+            return;
+        };
         self.prepare_256_intermediates(coeffs);
 
         let fft = imdct_fft_cache();
@@ -84,39 +61,13 @@ impl ImdctState {
             .process_with_scratch(&mut self.intermediate_256_a, &mut self.scratch);
         fft.ifft_256
             .process_with_scratch(&mut self.intermediate_256_b, &mut self.scratch);
-        let x = x256();
-        for (value, coeff) in self.intermediate_256_a.iter_mut().zip(x.iter().copied()) {
-            *value *= coeff;
-        }
-        for (value, coeff) in self.intermediate_256_b.iter_mut().zip(x.iter().copied()) {
-            *value *= coeff;
-        }
-
-        for index in 0..64 {
-            const N8: usize = 64;
-            const N4: usize = 128;
-            const N2: usize = 256;
-            self.output[2 * index] = -self.intermediate_256_a[index].im * WINDOW[2 * index];
-            self.output[2 * index + 1] =
-                self.intermediate_256_a[N8 - 1 - index].re * WINDOW[2 * index + 1];
-            self.output[N4 + 2 * index] =
-                -self.intermediate_256_a[index].re * WINDOW[N4 + 2 * index];
-            self.output[N4 + 1 + 2 * index] =
-                self.intermediate_256_a[N8 - 1 - index].im * WINDOW[N4 + 1 + 2 * index];
-            self.output[N2 + 2 * index] =
-                -self.intermediate_256_b[index].re * WINDOW[N2 - 1 - 2 * index];
-            self.output[N2 + 1 + 2 * index] =
-                self.intermediate_256_b[N8 - 1 - index].im * WINDOW[N2 - 2 - 2 * index];
-            self.output[3 * N4 + 2 * index] =
-                self.intermediate_256_b[index].im * WINDOW[N4 - 1 - 2 * index];
-            self.output[3 * N4 + 1 + 2 * index] =
-                -self.intermediate_256_b[N8 - 1 - index].re * WINDOW[N4 - 2 - 2 * index];
-        }
-
-        for (index, sample) in output.iter_mut().enumerate().take(256) {
-            *sample = 2.0 * (self.output[index] + self.delay[index]);
-        }
-        self.delay.copy_from_slice(&self.output[256..512]);
+        kernel::fold_256(
+            &self.intermediate_256_a,
+            &self.intermediate_256_b,
+            &tables().short,
+            &mut self.delay,
+            output,
+        );
     }
 
     /// Pre-rotation for the two 128-coefficient short transforms.
@@ -163,6 +114,334 @@ fn imdct_fft_cache() -> &'static ImdctFftCache {
         }
     })
 }
+
+/// The rotations around the FFT and the overlap-add, four bins at a time.
+///
+/// The post-rotation goes straight to the samples. A transform's 512 samples
+/// are an odd and an even mirror of 128 values each: `first[255 - n] ==
+/// -first[n]` for the half that overlaps the previous block, `second[255 - n]
+/// == second[n]` for the half kept for the next one. With `w` the window, the
+/// block's samples are `2 * (first[n] * w[n] + delay[n] * w[255 - n])` at `n`
+/// and, by the mirrors, `2 * (delay[n] * w[n] - first[n] * w[255 - n])` at
+/// `255 - n`; `delay` then takes `second`.
+///
+/// Every sample is the same products and the same sum as when the transform's
+/// 512 samples were windowed first and overlapped after.
+#[cfg(target_arch = "x86_64")]
+use sse as kernel;
+
+#[cfg(not(target_arch = "x86_64"))]
+use scalar as kernel;
+
+#[cfg(target_arch = "x86_64")]
+mod sse {
+    use std::arch::x86_64::*;
+
+    use super::{Complex32, Rotation, WINDOW, WINDOW_BACKWARDS};
+
+    /// Bin `k` pairs the coefficient `2k` with `255 - 2k`.
+    pub(super) fn pre_rotate_512(
+        coeffs: &[f32; 256],
+        x: &Rotation<128, 64>,
+        z: &mut [Complex32; 128],
+    ) {
+        let coeffs = coeffs.as_ptr();
+        let z = z.as_mut_ptr().cast::<f32>();
+        for k in (0..128).step_by(4) {
+            // SAFETY: `2k + 8 <= 256` and `248 - 2k >= 0` bound the reads of
+            // `coeffs`, `k + 4 <= 128` those of `x` and the writes of `z`,
+            // whose `Complex32` is two `f32` in a row.
+            unsafe {
+                let rising_0 = _mm_loadu_ps(coeffs.add(2 * k));
+                let rising_1 = _mm_loadu_ps(coeffs.add(2 * k + 4));
+                let falling_0 = _mm_loadu_ps(coeffs.add(248 - 2 * k));
+                let falling_1 = _mm_loadu_ps(coeffs.add(252 - 2 * k));
+                let im = _mm_shuffle_ps::<0b10_00_10_00>(rising_0, rising_1);
+                let re = _mm_shuffle_ps::<0b01_11_01_11>(falling_1, falling_0);
+                let x_re = _mm_loadu_ps(x.re.as_ptr().add(k));
+                let x_im = _mm_loadu_ps(x.im.as_ptr().add(k));
+                let out_re = _mm_sub_ps(_mm_mul_ps(re, x_re), _mm_mul_ps(im, x_im));
+                let out_im = _mm_add_ps(_mm_mul_ps(re, x_im), _mm_mul_ps(im, x_re));
+                _mm_storeu_ps(z.add(2 * k), _mm_unpacklo_ps(out_re, out_im));
+                _mm_storeu_ps(z.add(2 * k + 4), _mm_unpackhi_ps(out_re, out_im));
+            }
+        }
+    }
+
+    /// Four bins from `at` on as their real and their imaginary parts.
+    ///
+    /// SAFETY: `at + 4` bins must be readable from `z`.
+    #[inline(always)]
+    unsafe fn split(z: *const f32, at: usize) -> (__m128, __m128) {
+        unsafe {
+            let low = _mm_loadu_ps(z.add(2 * at));
+            let high = _mm_loadu_ps(z.add(2 * at + 4));
+            (
+                _mm_shuffle_ps::<0b10_00_10_00>(low, high),
+                _mm_shuffle_ps::<0b11_01_11_01>(low, high),
+            )
+        }
+    }
+
+    /// [`split`], last bin first.
+    ///
+    /// SAFETY: `at + 4` bins must be readable from `z`.
+    #[inline(always)]
+    unsafe fn split_backwards(z: *const f32, at: usize) -> (__m128, __m128) {
+        unsafe {
+            let low = _mm_loadu_ps(z.add(2 * at));
+            let high = _mm_loadu_ps(z.add(2 * at + 4));
+            (
+                _mm_shuffle_ps::<0b00_10_00_10>(high, low),
+                _mm_shuffle_ps::<0b01_11_01_11>(high, low),
+            )
+        }
+    }
+
+    /// Window four values of `first` against the delay, write the samples at
+    /// `at` and mirrored from `255 - at`, and keep `second`.
+    ///
+    /// SAFETY: `at + 4 <= 128`.
+    #[inline(always)]
+    unsafe fn overlap_add(
+        delay: *mut f32,
+        output: *mut f32,
+        first: __m128,
+        second: __m128,
+        at: usize,
+    ) {
+        unsafe {
+            let delayed = _mm_loadu_ps(delay.add(at));
+            let rising = _mm_loadu_ps(WINDOW.as_ptr().add(at));
+            let falling = _mm_loadu_ps(WINDOW_BACKWARDS.as_ptr().add(at));
+            let head = _mm_add_ps(_mm_mul_ps(first, rising), _mm_mul_ps(delayed, falling));
+            let tail = _mm_sub_ps(_mm_mul_ps(delayed, rising), _mm_mul_ps(first, falling));
+            _mm_storeu_ps(output.add(at), _mm_add_ps(head, head));
+            let tail = _mm_add_ps(tail, tail);
+            _mm_storeu_ps(
+                output.add(252 - at),
+                _mm_shuffle_ps::<0b00_01_10_11>(tail, tail),
+            );
+            _mm_storeu_ps(delay.add(at), second);
+        }
+    }
+
+    /// The even samples come from bins 64.. and the odd ones from bins ..64
+    /// read backwards.
+    pub(super) fn fold_512(
+        z: &[Complex32; 128],
+        x: &Rotation<128, 64>,
+        delay: &mut [f32; 128],
+        output: &mut [f32; 256],
+    ) {
+        let z = z.as_ptr().cast::<f32>();
+        let delay = delay.as_mut_ptr();
+        let output = output.as_mut_ptr();
+        // SAFETY: with `i + 4 <= 64`, the bins read are below 128, the
+        // factors below their 128 and 64, and `overlap_add` gets `2i + 8 <=
+        // 128`.
+        unsafe {
+            let sign = _mm_set1_ps(-0.0);
+            for i in (0..64).step_by(4) {
+                let (re, im) = split(z, 64 + i);
+                let x_re = _mm_loadu_ps(x.re.as_ptr().add(64 + i));
+                let x_im = _mm_loadu_ps(x.im.as_ptr().add(64 + i));
+                let high_re = _mm_sub_ps(_mm_mul_ps(re, x_re), _mm_mul_ps(im, x_im));
+                let high_im = _mm_add_ps(_mm_mul_ps(re, x_im), _mm_mul_ps(im, x_re));
+                let (re, im) = split_backwards(z, 60 - i);
+                let x_re = _mm_loadu_ps(x.re_backwards.as_ptr().add(i));
+                let x_im = _mm_loadu_ps(x.im_backwards.as_ptr().add(i));
+                let low_re = _mm_sub_ps(_mm_mul_ps(re, x_re), _mm_mul_ps(im, x_im));
+                let low_im = _mm_add_ps(_mm_mul_ps(re, x_im), _mm_mul_ps(im, x_re));
+                let first_even = _mm_xor_ps(high_im, sign);
+                let second_even = _mm_xor_ps(high_re, sign);
+                overlap_add(
+                    delay,
+                    output,
+                    _mm_unpacklo_ps(first_even, low_re),
+                    _mm_unpacklo_ps(second_even, low_im),
+                    2 * i,
+                );
+                overlap_add(
+                    delay,
+                    output,
+                    _mm_unpackhi_ps(first_even, low_re),
+                    _mm_unpackhi_ps(second_even, low_im),
+                    2 * i + 4,
+                );
+            }
+        }
+    }
+
+    /// The first transform gives the half that overlaps the previous block,
+    /// the second the half kept for the next. Only one part of each rotated
+    /// bin is a sample.
+    pub(super) fn fold_256(
+        a: &[Complex32; 64],
+        b: &[Complex32; 64],
+        x: &Rotation<64, 64>,
+        delay: &mut [f32; 128],
+        output: &mut [f32; 256],
+    ) {
+        let a = a.as_ptr().cast::<f32>();
+        let b = b.as_ptr().cast::<f32>();
+        let delay = delay.as_mut_ptr();
+        let output = output.as_mut_ptr();
+        // SAFETY: with `i + 4 <= 64`, the bins and the factors read are
+        // below 64, and `overlap_add` gets `2i + 8 <= 128`.
+        unsafe {
+            let sign = _mm_set1_ps(-0.0);
+            for i in (0..64).step_by(4) {
+                let x_re = _mm_loadu_ps(x.re.as_ptr().add(i));
+                let x_im = _mm_loadu_ps(x.im.as_ptr().add(i));
+                let x_re_back = _mm_loadu_ps(x.re_backwards.as_ptr().add(i));
+                let x_im_back = _mm_loadu_ps(x.im_backwards.as_ptr().add(i));
+                let (re, im) = split(a, i);
+                let a_im = _mm_add_ps(_mm_mul_ps(re, x_im), _mm_mul_ps(im, x_re));
+                let (re, im) = split_backwards(a, 60 - i);
+                let a_re = _mm_sub_ps(_mm_mul_ps(re, x_re_back), _mm_mul_ps(im, x_im_back));
+                let (re, im) = split(b, i);
+                let b_re = _mm_sub_ps(_mm_mul_ps(re, x_re), _mm_mul_ps(im, x_im));
+                let (re, im) = split_backwards(b, 60 - i);
+                let b_im = _mm_add_ps(_mm_mul_ps(re, x_im_back), _mm_mul_ps(im, x_re_back));
+                let first_even = _mm_xor_ps(a_im, sign);
+                let second_even = _mm_xor_ps(b_re, sign);
+                overlap_add(
+                    delay,
+                    output,
+                    _mm_unpacklo_ps(first_even, a_re),
+                    _mm_unpacklo_ps(second_even, b_im),
+                    2 * i,
+                );
+                overlap_add(
+                    delay,
+                    output,
+                    _mm_unpackhi_ps(first_even, a_re),
+                    _mm_unpackhi_ps(second_even, b_im),
+                    2 * i + 4,
+                );
+            }
+        }
+    }
+}
+
+/// The same arithmetic one bin at a time, where there is no vector version;
+/// what the tests hold the vector version to.
+#[cfg(any(test, not(target_arch = "x86_64")))]
+mod scalar {
+    use super::{Complex32, Rotation, WINDOW, WINDOW_BACKWARDS};
+
+    pub(super) fn pre_rotate_512(
+        coeffs: &[f32; 256],
+        x: &Rotation<128, 64>,
+        z: &mut [Complex32; 128],
+    ) {
+        for (k, slot) in z.iter_mut().enumerate() {
+            *slot = Complex32::new(coeffs[255 - 2 * k], coeffs[2 * k])
+                * Complex32::new(x.re[k], x.im[k]);
+        }
+    }
+
+    fn overlap_add(
+        delay: &mut [f32; 128],
+        output: &mut [f32; 256],
+        first: f32,
+        second: f32,
+        at: usize,
+    ) {
+        let delayed = delay[at];
+        let (rising, falling) = (WINDOW[at], WINDOW_BACKWARDS[at]);
+        output[at] = 2.0 * (first * rising + delayed * falling);
+        output[255 - at] = 2.0 * (delayed * rising - first * falling);
+        delay[at] = second;
+    }
+
+    pub(super) fn fold_512(
+        z: &[Complex32; 128],
+        x: &Rotation<128, 64>,
+        delay: &mut [f32; 128],
+        output: &mut [f32; 256],
+    ) {
+        for i in 0..64 {
+            let high = z[64 + i] * Complex32::new(x.re[64 + i], x.im[64 + i]);
+            let low = z[63 - i] * Complex32::new(x.re_backwards[i], x.im_backwards[i]);
+            overlap_add(delay, output, -high.im, -high.re, 2 * i);
+            overlap_add(delay, output, low.re, low.im, 2 * i + 1);
+        }
+    }
+
+    pub(super) fn fold_256(
+        a: &[Complex32; 64],
+        b: &[Complex32; 64],
+        x: &Rotation<64, 64>,
+        delay: &mut [f32; 128],
+        output: &mut [f32; 256],
+    ) {
+        for i in 0..64 {
+            let forward = Complex32::new(x.re[i], x.im[i]);
+            let backward = Complex32::new(x.re_backwards[i], x.im_backwards[i]);
+            overlap_add(
+                delay,
+                output,
+                -(a[i] * forward).im,
+                -(b[i] * forward).re,
+                2 * i,
+            );
+            overlap_add(
+                delay,
+                output,
+                (a[63 - i] * backward).re,
+                (b[63 - i] * backward).im,
+                2 * i + 1,
+            );
+        }
+    }
+}
+
+/// The rotation factors of one transform length, parts apart, and those of
+/// its lower half read backwards (`re_backwards[i] == re[HALF - 1 - i]`).
+struct Rotation<const N: usize, const HALF: usize> {
+    re: [f32; N],
+    im: [f32; N],
+    re_backwards: [f32; HALF],
+    im_backwards: [f32; HALF],
+}
+
+impl<const N: usize, const HALF: usize> Rotation<N, HALF> {
+    fn new(factors: &[Complex32; N]) -> Self {
+        Self {
+            re: std::array::from_fn(|index| factors[index].re),
+            im: std::array::from_fn(|index| factors[index].im),
+            re_backwards: std::array::from_fn(|index| factors[HALF - 1 - index].re),
+            im_backwards: std::array::from_fn(|index| factors[HALF - 1 - index].im),
+        }
+    }
+}
+
+struct Tables {
+    long: Rotation<128, 64>,
+    /// The short transforms mirror their whole length, not a half.
+    short: Rotation<64, 64>,
+}
+
+fn tables() -> &'static Tables {
+    static TABLES: OnceLock<Tables> = OnceLock::new();
+    TABLES.get_or_init(|| Tables {
+        long: Rotation::new(x512()),
+        short: Rotation::new(x256()),
+    })
+}
+
+/// The window read backwards: `WINDOW_BACKWARDS[n] == WINDOW[255 - n]`.
+const WINDOW_BACKWARDS: [f32; 256] = {
+    let mut result = [0.0; 256];
+    let mut index = 0;
+    while index < 256 {
+        result[index] = WINDOW[255 - index];
+        index += 1;
+    }
+    result
+};
 
 fn x512() -> &'static [Complex32; 128] {
     static X512: OnceLock<[Complex32; 128]> = OnceLock::new();
@@ -218,6 +497,50 @@ const WINDOW: [f32; 256] = [
 #[cfg(test)]
 mod tests {
     use super::{Complex32, ImdctState, x256};
+
+    /// The vector kernels do the scalar ones' arithmetic: same bits out, for
+    /// the samples and for what is kept for the next block.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vector_kernels_match_the_scalar_ones_bit_for_bit() {
+        use super::{scalar, sse, tables};
+
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 40) as f32 / 8_388_608.0) - 1.0
+        };
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let tables = tables();
+
+        for _ in 0..16 {
+            let coeffs: [f32; 256] = std::array::from_fn(|_| next());
+            let mut z_scalar = [Complex32::new(0.0, 0.0); 128];
+            let mut z_sse = z_scalar;
+            scalar::pre_rotate_512(&coeffs, &tables.long, &mut z_scalar);
+            sse::pre_rotate_512(&coeffs, &tables.long, &mut z_sse);
+            assert_eq!(z_scalar, z_sse);
+
+            let z: [Complex32; 128] = std::array::from_fn(|_| Complex32::new(next(), next()));
+            let delay: [f32; 128] = std::array::from_fn(|_| next());
+            let (mut delay_scalar, mut delay_sse) = (delay, delay);
+            let (mut out_scalar, mut out_sse) = ([0.0f32; 256], [0.0f32; 256]);
+            scalar::fold_512(&z, &tables.long, &mut delay_scalar, &mut out_scalar);
+            sse::fold_512(&z, &tables.long, &mut delay_sse, &mut out_sse);
+            assert_eq!(bits(&out_scalar), bits(&out_sse));
+            assert_eq!(bits(&delay_scalar), bits(&delay_sse));
+
+            let a: [Complex32; 64] = std::array::from_fn(|_| Complex32::new(next(), next()));
+            let b: [Complex32; 64] = std::array::from_fn(|_| Complex32::new(next(), next()));
+            let (mut delay_scalar, mut delay_sse) = (delay, delay);
+            scalar::fold_256(&a, &b, &tables.short, &mut delay_scalar, &mut out_scalar);
+            sse::fold_256(&a, &b, &tables.short, &mut delay_sse, &mut out_sse);
+            assert_eq!(bits(&out_scalar), bits(&out_sse));
+            assert_eq!(bits(&delay_scalar), bits(&delay_sse));
+        }
+    }
 
     #[test]
     fn zero_coefficients_decode_to_silence() {
