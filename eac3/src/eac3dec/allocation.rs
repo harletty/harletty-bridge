@@ -207,6 +207,13 @@ pub(crate) struct AllocationState {
     allocated_with: Option<AllocationArgs>,
     /// What `count_mantissa_bits` last found in `bap`, while `bap` is unchanged.
     mantissa_counts: Option<MantissaCounts>,
+    /// The mantissas `bap` asks for, sorted by class, while `bap` is
+    /// unchanged. Made by the first channel that decodes some: a walk that
+    /// only counts them, as the inspection's does, never needs it.
+    plan: Option<Box<MantissaPlan>>,
+    /// Whether `bap` is the all-zero one `clear_bap` leaves, which asks for
+    /// no mantissa at all.
+    bap_is_clear: bool,
 }
 
 /// The bins of a `bap` range, sorted into what `count_mantissa_bits` needs:
@@ -276,6 +283,8 @@ impl AllocationState {
             grouped_scratch: Vec::new(),
             allocated_with: None,
             mantissa_counts: None,
+            plan: None,
+            bap_is_clear: true,
         }
     }
 
@@ -283,6 +292,16 @@ impl AllocationState {
         self.bap.fill(0);
         self.allocated_with = None;
         self.mantissa_counts = None;
+        self.forget_plan();
+        self.bap_is_clear = true;
+    }
+
+    /// `bap` is about to change: what was sorted out of it no longer holds.
+    fn forget_plan(&mut self) {
+        if let Some(plan) = &mut self.plan {
+            plan.valid = false;
+        }
+        self.bap_is_clear = false;
     }
 
     pub(crate) fn read_channel_exponents(
@@ -404,6 +423,7 @@ impl AllocationState {
             return Ok(());
         }
         self.mantissa_counts = None;
+        self.forget_plan();
         let args = AllocationArgs {
             start,
             end,
@@ -605,7 +625,79 @@ impl AllocationState {
         bits
     }
 
+    /// Read this channel's mantissas for `start..end` and scale them by their
+    /// exponents into `target`, zero elsewhere.
+    ///
+    /// Which field a mantissa is follows from `bap`, and reading them in
+    /// bitstream order means a jump on `bap` per bin that the processor
+    /// cannot predict - most of what that loop costs, along with the bins
+    /// that have no mantissa at all, walked for nothing. So `bap` is sorted
+    /// first, into a [`MantissaPlan`]: the mantissas of each class with the
+    /// bit their field starts at, in a pass that branches on nothing in
+    /// `bap`. The fields are then read by one tight loop per class. Most
+    /// blocks keep the `bap` of the block before, and its plan with it.
     pub(crate) fn decode_transform_coeffs(
+        &mut self,
+        reader: &mut super::bitstream::BitReader<'_>,
+        target: &mut [f32; MAX_ALLOCATION_SIZE],
+        start: usize,
+        end: usize,
+        state: &mut MantissaDecodeState,
+    ) -> Result<(), ParseError> {
+        let (Some(baps), Ok(shifts)) = (
+            self.bap.get(start..end),
+            <&[u8; MAX_ALLOCATION_SIZE]>::try_from(&self.shifts[..]),
+        ) else {
+            target.fill(0.0);
+            return Ok(());
+        };
+        if self.bap_is_clear {
+            target.fill(0.0);
+            return Ok(());
+        }
+        let phases = state.phases();
+        let plan = self
+            .plan
+            .get_or_insert_with(|| Box::new(MantissaPlan::new()));
+        if !plan.valid || plan.start != start || plan.end != end || plan.phases != phases {
+            plan.build(baps, start, end, phases);
+        }
+        if !plan.fits {
+            return self.decode_mantissas_in_order(reader, target, start, end, state);
+        }
+        let Some(plan) = self.plan.as_deref() else {
+            return Ok(());
+        };
+
+        let position = reader.position();
+        let after = position + plan.bits;
+        if after > reader.limit_bits() {
+            return Err(ParseError::ShortPacket);
+        }
+        // The fields are read as whole words, so a channel that reaches the
+        // last bytes of the data reads a copy of them with zeros after.
+        let data = reader.data();
+        let tail;
+        let (data, base) = if after.div_ceil(8) + 8 <= data.len() {
+            (data, position)
+        } else {
+            let from = (position / 8).min(data.len());
+            let mut copy = [0u8; MAX_ALLOCATION_SIZE * MAX_MANTISSA_BITS / 8 + 16];
+            let kept = (data.len() - from).min(copy.len() - 8);
+            copy[..kept].copy_from_slice(&data[from..from + kept]);
+            tail = copy;
+            (&tail[..], position - from * 8)
+        };
+
+        target.fill(0.0);
+        plan.decode(data, base, shifts, target, state);
+        reader.set_position(after);
+        Ok(())
+    }
+
+    /// The mantissas one after the other, each field deciding where the next
+    /// starts: for a range no plan lists.
+    fn decode_mantissas_in_order(
         &self,
         reader: &mut super::bitstream::BitReader<'_>,
         target: &mut [f32; MAX_ALLOCATION_SIZE],
@@ -867,6 +959,242 @@ impl MantissaDecodeState {
             group2: 2,
             group4: 1,
         }
+    }
+}
+
+impl MantissaDecodeState {
+    /// For each kind of group, the place in it the next mantissa of that
+    /// kind takes: 0 when it starts a new one.
+    fn phases(&self) -> [u8; 4] {
+        [
+            0,
+            ((self.group1 & 3) as u8 + 1) % 3,
+            ((self.group2 & 3) as u8 + 1) % 3,
+            ((self.group4 & 1) as u8 + 1) % 2,
+        ]
+    }
+}
+
+/// What a `bap` reads its mantissa as: nothing, its own asymmetric field, one
+/// of the two ungrouped symmetric fields, or a share of a group of three
+/// (`bap` 1 and 2) or two (`bap` 4).
+const MANTISSA_CLASS: [usize; 16] = [0, 4, 5, 2, 6, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+const ASYMMETRIC: usize = 1;
+const SYMMETRIC3: usize = 2;
+const SYMMETRIC5: usize = 3;
+/// The grouped classes, in the order of [`MantissaDecodeState`]'s groups.
+const GROUPED: [usize; 3] = [4, 5, 6];
+const CLASSES: usize = 8;
+/// Mantissas per group of a class.
+const GROUP_LENGTH: [usize; CLASSES] = [1, 1, 1, 1, 3, 3, 2, 1];
+/// A list has room for every bin a channel can have.
+const LIST: usize = MAX_ALLOCATION_SIZE;
+/// A bin no channel has, where the members a group does not have in this
+/// channel are written, and wiped after.
+const SPARE_BIN: usize = 255;
+/// `8 * class` of a `bap`: where its class's count sits in the counts word,
+/// and, times 32, where its list starts.
+const CLASS_SHIFT: [u8; 16] = {
+    let mut result = [0; 16];
+    let mut bap = 0;
+    while bap < 16 {
+        result[bap] = 8 * MANTISSA_CLASS[bap] as u8;
+        bap += 1;
+    }
+    result
+};
+/// The bits the mantissa at `place` in its class's list reads, by `bap << 8
+/// | place`: its field for one that is not grouped, the group's code for the
+/// first of a group, nothing for the others.
+const FIELD_BITS: [u8; 16 << 8] = {
+    let mut result = [0; 16 << 8];
+    let mut bap = 0;
+    while bap < 16 {
+        let mut place = 0;
+        while place < 256 {
+            if place % GROUP_LENGTH[MANTISSA_CLASS[bap]] == 0 {
+                result[bap << 8 | place] = BAP_BITS[bap] as u8;
+            }
+            place += 1;
+        }
+        bap += 1;
+    }
+    result
+};
+/// The top bits of a word an asymmetric mantissa of each `bap` takes.
+const ASYMMETRIC_FIELD: [u32; 16] = {
+    let mut result = [0; 16];
+    let mut bap = 6;
+    while bap < 16 {
+        result[bap] = !0 << (32 - BAP_BITS[bap]);
+        bap += 1;
+    }
+    result
+};
+
+/// The mantissas a `bap` range asks for, sorted by class: each as `bin | bap
+/// << 8 | bit << 16`, `bit` being where the field it reads starts, counted
+/// from the channel's first. A grouped mantissa that does not start its
+/// group has the bit the channel had reached, which nothing reads.
+///
+/// A grouped class's list is laid out in groups: it starts at the place the
+/// class had reached in its group when the channel began, so the group begun
+/// in an earlier channel fills the first slots and every other group starts
+/// on a multiple of its length. The slots a group does not fill hold the
+/// spare bin. The plan is therefore for those `phases` as well as for `bap`.
+#[derive(Debug, Clone)]
+struct MantissaPlan {
+    valid: bool,
+    start: usize,
+    end: usize,
+    phases: [u8; 4],
+    /// Whether the range is one the lists can hold.
+    fits: bool,
+    /// The bits the channel's mantissas take.
+    bits: usize,
+    /// Where each class's list ends.
+    ends: [usize; CLASSES],
+    lists: [u32; CLASSES * LIST],
+}
+
+impl MantissaPlan {
+    fn new() -> Self {
+        Self {
+            valid: false,
+            start: 0,
+            end: 0,
+            phases: [0; 4],
+            fits: false,
+            bits: 0,
+            ends: [0; CLASSES],
+            lists: [0; CLASSES * LIST],
+        }
+    }
+
+    /// Sort the mantissas of `baps` into their lists. One pass with nothing
+    /// in it that depends on `bap` but the index of a table: where each list
+    /// has got to is a byte of `ends`, and a bin with no mantissa is written
+    /// to a list nothing reads.
+    fn build(&mut self, baps: &[u8], start: usize, end: usize, phases: [u8; 4]) {
+        self.valid = true;
+        self.start = start;
+        self.end = end;
+        self.phases = phases;
+        // Every bin, and every place in a list, below the spare bin.
+        self.fits = end <= SPARE_BIN - 2;
+        if !self.fits {
+            return;
+        }
+        let mut ends = 0u64;
+        for (class, &phase) in GROUPED.iter().zip(&phases[1..]) {
+            ends |= (phase as u64) << (8 * class);
+        }
+        let mut bit = 0usize;
+        for (bin, &bap) in (start..end).zip(baps) {
+            let bap = bap as usize & 15;
+            let shift = CLASS_SHIFT[bap] as usize;
+            let place = (ends >> shift) as usize & 0xff;
+            self.lists[(shift << 5) + place] = (bin | bap << 8 | bit << 16) as u32;
+            ends += 1 << shift;
+            bit += FIELD_BITS[bap << 8 | place] as usize;
+        }
+        self.bits = bit;
+        for (class, end) in self.ends.iter_mut().enumerate() {
+            *end = (ends >> (8 * class)) as usize & 0xff;
+        }
+        for (class, &phase) in GROUPED.iter().zip(&phases[1..]) {
+            let list = &mut self.lists[class * LIST..(class + 1) * LIST];
+            let end = self.ends[*class];
+            list[..phase as usize].fill(SPARE_BIN as u32);
+            list[end..end.next_multiple_of(GROUP_LENGTH[*class])].fill(SPARE_BIN as u32);
+        }
+    }
+
+    /// Decode what the plan lists from `data`, the channel's first mantissa
+    /// bit being bit `base` of it. Every field must be readable as a whole
+    /// word: `data` reaches eight bytes past the channel's last bit.
+    fn decode(
+        &self,
+        data: &[u8],
+        base: usize,
+        shifts: &[u8; MAX_ALLOCATION_SIZE],
+        target: &mut [f32; MAX_ALLOCATION_SIZE],
+        state: &mut MantissaDecodeState,
+    ) {
+        // The bits of an entry's field, at the top of a word.
+        let field = |entry: u32| -> u64 {
+            let offset = base + (entry >> 16) as usize;
+            let word = match data.get(offset / 8..offset / 8 + 8) {
+                Some(word) => u64::from_be_bytes(word.try_into().unwrap()),
+                None => 0,
+            };
+            word << (offset & 7)
+        };
+        let list = |class: usize| &self.lists[class * LIST..class * LIST + self.ends[class]];
+
+        for &entry in list(ASYMMETRIC) {
+            let (bin, bap) = (entry as usize & 0xff, (entry as usize >> 8) & 15);
+            let top = (field(entry) >> 32) as u32;
+            let mantissa = (top & ASYMMETRIC_FIELD[bap]) as i32;
+            target[bin] = scale_int32(mantissa >> shifts[bin]);
+        }
+        for &entry in list(SYMMETRIC3) {
+            let bin = entry as usize & 0xff;
+            let code = (field(entry) >> (64 - BAP_BITS[3])) as usize;
+            target[bin] = (BAP3_TABLE[code] >> shifts[bin]) as f32 * FROM_INT24;
+        }
+        for &entry in list(SYMMETRIC5) {
+            let bin = entry as usize & 0xff;
+            let code = (field(entry) >> (64 - BAP_BITS[5])) as usize;
+            target[bin] = (BAP5_TABLE[code] >> shifts[bin]) as f32 * FROM_INT24;
+        }
+
+        let code = state.group1 >> 2;
+        let (code, place) =
+            self.decode_groups::<3, 5>(0, code, &BAP1_TABLE, &field, shifts, target);
+        state.group1 = code << 2 | place.unwrap_or(state.group1 & 3);
+        let code = state.group2 >> 2;
+        let (code, place) =
+            self.decode_groups::<3, 7>(1, code, &BAP2_TABLE, &field, shifts, target);
+        state.group2 = code << 2 | place.unwrap_or(state.group2 & 3);
+        let code = state.group4 >> 1;
+        let (code, place) =
+            self.decode_groups::<2, 7>(2, code, &BAP4_TABLE, &field, shifts, target);
+        state.group4 = code << 1 | place.unwrap_or(state.group4 & 1);
+        target[SPARE_BIN] = 0.0;
+    }
+
+    /// The mantissas of one grouped class, `LENGTH` to a code of `BITS` bits:
+    /// the group the class was in when the channel began, whose code is
+    /// `carried`, then the channel's own. Returns the code of the group the
+    /// class is left in and the place last taken in it, if the channel has
+    /// any mantissa of the class.
+    #[inline(always)]
+    fn decode_groups<const LENGTH: usize, const BITS: usize>(
+        &self,
+        group: usize,
+        carried: usize,
+        table: &[[i32; LENGTH]],
+        field: &impl Fn(u32) -> u64,
+        shifts: &[u8; MAX_ALLOCATION_SIZE],
+        target: &mut [f32; MAX_ALLOCATION_SIZE],
+    ) -> (usize, Option<usize>) {
+        let class = GROUPED[group];
+        let phase = self.phases[group + 1] as usize;
+        let end = self.ends[class];
+        // Whole groups: the build filled the last one up with the spare bin.
+        let list = &self.lists[class * LIST..class * LIST + end.next_multiple_of(LENGTH)];
+        let mut code = carried & (table.len() - 1);
+        for (index, members) in list.chunks_exact(LENGTH).enumerate() {
+            if index != 0 || phase == 0 {
+                code = (field(members[0]) >> (64 - BITS)) as usize & (table.len() - 1);
+            }
+            for (&member, &value) in members.iter().zip(&table[code]) {
+                let bin = member as usize & 0xff;
+                target[bin] = (value >> shifts[bin]) as f32 * FROM_INT24;
+            }
+        }
+        (code, (end > phase).then(|| (end - 1) % LENGTH))
     }
 }
 
@@ -1318,11 +1646,14 @@ mod tests {
 
     use super::super::bitstream::BitReader;
 
-    /// Two channels of a block, the second inheriting the first's groups,
-    /// over data that ends anywhere from well past the mantissas (whole-word
-    /// reads) to inside them (a short packet), and from every bit offset.
+    /// Channels of a block one after the other, each inheriting the groups
+    /// the one before left open - the same `bap` met at every place in a
+    /// group, and met again at a place it was already planned for - over data
+    /// that ends anywhere from well past the mantissas (whole-word reads) to
+    /// inside them (a short packet), and from every bit offset.
     #[test]
     fn mantissas_match_the_plain_reads() {
+        const CHANNELS: usize = 5;
         let mut rng = Rng(0x0123_4567_89ab_cdef);
         for round in 0..400 {
             let mut allocation = AllocationState::new();
@@ -1330,7 +1661,9 @@ mod tests {
                 0 => (0, 1 + rng.below(253)),
                 1 => (37 + 12 * rng.below(8), 133 + rng.below(120)),
                 2 => (0, 7),
-                _ => (0, 253),
+                // The longest range a channel has, and one past what a plan
+                // lists, which is decoded in order.
+                _ => (0, [253, 256][rng.below(2)]),
             };
             // Runs of one `bap`, as a spectrum has them, with every value in.
             let mut bap = rng.below(16) as u8;
@@ -1346,8 +1679,9 @@ mod tests {
                 allocation.exponents[bin] = rng.below(25) as i32;
                 allocation.shifts[bin] = allocation.exponents[bin] as u8;
             }
+            allocation.forget_plan();
 
-            let needed = 2 * MAX_MANTISSA_BITS * (end - start) / 8 + 2;
+            let needed = CHANNELS * MAX_MANTISSA_BITS * (end - start) / 8 + 2;
             let length = match round % 5 {
                 0 => needed + 600,
                 1 => needed,
@@ -1360,7 +1694,7 @@ mod tests {
             let mut plain = PlainMantissas::new_block();
             let mut reader = BitReader::with_offset(&data, offset);
             let mut state = MantissaDecodeState::new_block();
-            for channel in 0..2 {
+            for channel in 0..CHANNELS {
                 let expected = plain.decode(
                     &mut plain_reader,
                     &allocation.bap[start..end],
@@ -1390,6 +1724,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A channel with no bits allocated reads nothing and leaves the groups
+    /// of the block as they are.
+    #[test]
+    fn a_cleared_allocation_reads_no_mantissa() {
+        let data = [0xa5u8; 64];
+        let mut allocation = AllocationState::new();
+        allocation.bap.fill(7);
+        allocation.forget_plan();
+        let mut reader = BitReader::with_offset(&data, 3);
+        let mut state = MantissaDecodeState::new_block();
+        let mut target = [f32::NAN; MAX_ALLOCATION_SIZE];
+        allocation
+            .decode_transform_coeffs(&mut reader, &mut target, 0, 20, &mut state)
+            .unwrap();
+        assert_eq!(reader.position(), 3 + 20 * BAP_BITS[7]);
+
+        allocation.clear_bap();
+        let before = reader.position();
+        let mut target = [f32::NAN; MAX_ALLOCATION_SIZE];
+        allocation
+            .decode_transform_coeffs(&mut reader, &mut target, 0, 20, &mut state)
+            .unwrap();
+        assert_eq!(reader.position(), before);
+        assert!(target.iter().all(|value| value.to_bits() == 0));
     }
 
     /// Each strategy's runs against the running sum they stand for.
