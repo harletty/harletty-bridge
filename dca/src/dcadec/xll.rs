@@ -411,6 +411,40 @@ fn get_rice(gb: &mut BitReader, k: usize) -> R<i32> {
     Ok(((v >> 1) ^ (0u32.wrapping_sub(v & 1))) as i32)
 }
 
+/// Inverse adaptive prediction: from sample `order` on, subtract from each
+/// residual the clipped prediction made from the `order` samples before it,
+/// `coeff[order - 1 - k]` weighing `buf[j + k]`. Each prediction reads the
+/// sample just produced, so the work is serial; dispatching on the order
+/// (at most 15) lets each length unroll and keep its taps in registers.
+fn inverse_adaptive_prediction(
+    buf: &mut [i32],
+    coeff: &[i32; DCA_XLL_PRED_ORDER_MAX],
+    order: usize,
+) {
+    macro_rules! orders {
+        ($($n:literal)*) => {
+            match order {
+                $($n => predict_order::<$n>(buf, coeff),)*
+                _ => unreachable!("XLL prediction order is a 4-bit field"),
+            }
+        };
+    }
+    orders!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+}
+
+#[inline(always)]
+fn predict_order<const N: usize>(buf: &mut [i32], coeff: &[i32; DCA_XLL_PRED_ORDER_MAX]) {
+    let taps: [i64; N] = std::array::from_fn(|k| coeff[N - 1 - k] as i64);
+    for j in 0..buf.len() - N {
+        let history: &[i32; N] = buf[j..j + N].try_into().unwrap();
+        let mut err = 0i64;
+        for k in 0..N {
+            err += history[k] as i64 * taps[k];
+        }
+        buf[j + N] = buf[j + N].wrapping_sub(clip23(norm16(err)));
+    }
+}
+
 #[derive(Clone)]
 struct XllBand {
     decor_enabled: bool,
@@ -1638,13 +1672,7 @@ impl XllDecoder {
                     }
                     coeff[j] = rc;
                 }
-                for j in 0..nsamples - order {
-                    let mut err = 0i64;
-                    for k in 0..order {
-                        err += buf[j + k] as i64 * coeff[order - k - 1] as i64;
-                    }
-                    buf[j + order] = buf[j + order].wrapping_sub(clip23(norm16(err)));
-                }
+                inverse_adaptive_prediction(&mut buf[..nsamples], &coeff, order);
             } else {
                 for _ in 0..b.fixed_pred_order[i] {
                     for k in 1..nsamples {
