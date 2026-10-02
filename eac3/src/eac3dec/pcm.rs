@@ -121,7 +121,22 @@ pub fn merge_core_with_dependent(
     dependent_frame: &[u8],
 ) -> Option<CorePcmFrame> {
     let dep = dependent_decoder.push_access_unit(dependent_frame).ok()?;
-    overlay_dependent_on_core(core, &dep.pcm, dep.info.dependent_channel_map)
+    merge_core_with_decoded_dependent(core, &dep.pcm, &dep.info)
+}
+
+/// [`merge_core_with_dependent`] for a dependent substream the caller has
+/// already decoded, `info` being what that decode returned with it.
+///
+/// Decoding a dependent is also how its JOC payload is found, so a host that
+/// has to know what the substream carries before it decides what to do with
+/// it can decode first and merge after, where inspecting it and then merging
+/// through the decoder reads its audio blocks twice.
+pub fn merge_core_with_decoded_dependent(
+    core: &CorePcmFrame,
+    dependent: &CorePcmFrame,
+    info: &AccessUnitInfo,
+) -> Option<CorePcmFrame> {
+    overlay_dependent_on_core(core, dependent, info.dependent_channel_map)
 }
 
 /// Overlay a decoded dependent substream onto the core it belongs to.

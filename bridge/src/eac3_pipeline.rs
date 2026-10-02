@@ -37,11 +37,28 @@ pub(crate) fn inspect_eac3_frame(frame: &[u8]) -> Eac3Inspection {
     inspect_access_unit(frame)
 }
 
-/// A dependent access unit held in a pending presentation, with the
-/// inspection that admitted it.
+/// A dependent access unit held in a pending presentation, with what admitted
+/// it: its decode, or the inspection that stood in for one.
 pub(crate) struct PendingEac3Dependent {
     pub(crate) access_unit: Vec<u8>,
     pub(crate) info: AccessUnitInfo,
+    pub(crate) decoded: DecodedDependent,
+}
+
+/// The channels of a held dependent, which the presentation merges onto its
+/// core when it resolves.
+///
+/// A dependent is decoded as it arrives when a presentation can take it:
+/// that one walk over its audio blocks gives both its channels and the
+/// `AccessUnitInfo` that says whether it carries JOC, where an inspection on
+/// arrival and a decode at the merge walked them twice.
+pub(crate) enum DecodedDependent {
+    /// Decoded on arrival.
+    Channels(CorePcmFrame),
+    /// The decode on arrival rejected it. The inspection admitted it all the
+    /// same, as it always could: the merge then has nothing to overlay, and
+    /// must not push the frame through the decoder a second time.
+    Failed,
 }
 
 /// What an independent (or converted AC-3) access unit decoded into.
@@ -295,19 +312,19 @@ fn emit_core_frame(
 
 /// Merge a decoded core (5.1) with its dependent E-AC3 substream — the discrete
 /// surround/back channels of a 7.1 extension — into one bed, via the shared
-/// [`eac3::merge_core_with_dependent`] helper (also used by the harletty CLI).
-/// Returns `None` (caller falls back to the core alone) when the dependent
-/// can't be decoded or doesn't line up.
+/// [`eac3::merge_core_with_decoded_dependent`] helper (also used by the
+/// harletty CLI). Returns `None` (caller falls back to the core alone) when
+/// the dependent could not be decoded or doesn't line up.
 fn merge_eac3_core_with_dependent(
-    bridge: &mut AtmosBridge,
     core: &CorePcmFrame,
-    dependent_frame: &[u8],
+    dependent: &PendingEac3Dependent,
 ) -> Option<CorePcmFrame> {
-    eac3::merge_core_with_dependent(
-        &mut bridge.eac3_dependent_pcm_decoder,
-        core,
-        dependent_frame,
-    )
+    match &dependent.decoded {
+        DecodedDependent::Channels(channels) => {
+            eac3::merge_core_with_decoded_dependent(core, channels, &dependent.info)
+        }
+        DecodedDependent::Failed => None,
+    }
 }
 
 /// Whether ETSI allows this access unit to be followed by dependents.
@@ -355,7 +372,7 @@ pub(crate) fn resolve_eac3_presentation(
     let mut merged_any = false;
     for dependent in dependents {
         emit_eac3_frame_info_diagnostic(bridge, &dependent.info);
-        match merge_eac3_core_with_dependent(bridge, &bed, &dependent.access_unit) {
+        match merge_eac3_core_with_dependent(&bed, dependent) {
             Some(merged) => {
                 bed = merged;
                 merged_any = true;

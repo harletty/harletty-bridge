@@ -18,7 +18,8 @@ pub use metadata::{
 };
 pub use pcm::{
     CorePcmFrame, JOC_LATENCY_SAMPLES, ObjectPcmDecoder, ObjectPcmFrame, ObjectPcmPushResult,
-    PcmDecoder, PcmPushResult, dependent_chanmap_positions, merge_core_with_dependent,
+    PcmDecoder, PcmPushResult, dependent_chanmap_positions, merge_core_with_decoded_dependent,
+    merge_core_with_dependent,
 };
 pub use syncframe::{
     AccessUnitInfo, AudioFrameInfo, AuxParseStatus, BlockDrcInfo, EmdfBlockInfo, EmdfPayloadInfo,
