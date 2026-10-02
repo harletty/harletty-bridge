@@ -59,10 +59,20 @@ pub(crate) struct JocObjectDecoderState {
     inverse_history: Vec<bool>,
     analysis: Vec<QmfSubbands>,
     last_frame_matrices: JocObjectMatrices,
-    /// Tests only: take the baseline build even where AVX2 is available, so
-    /// both are exercised on the same machine.
+    /// Tests only: take a narrower build than the CPU allows, so every build
+    /// is exercised on the same machine.
     #[cfg(all(test, target_arch = "x86_64"))]
-    baseline_only: bool,
+    widest: Option<Isa>,
+}
+
+/// The instruction sets the time-slot loop is compiled for on x86-64, from
+/// the build target's baseline up.
+#[cfg(all(test, target_arch = "x86_64"))]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Isa {
+    Baseline,
+    Avx2,
+    Avx512,
 }
 
 impl JocObjectDecoderState {
@@ -120,9 +130,19 @@ impl JocObjectDecoderState {
         self.analysis.resize(joc.channel_count, QmfSubbands::zero());
 
         // The filter banks and the mixing are plain float loops; built for
-        // AVX2 they run on 256-bit vectors. Same operations in the same order
-        // per element - no FMA is enabled - so the result is bit-identical
-        // either way; only CPUs without AVX2 take the baseline build.
+        // AVX2 they run on 256-bit vectors, for AVX-512 on 512-bit ones. Same
+        // operations in the same order per element - no FMA is enabled - so
+        // the result is bit-identical either way; CPUs without AVX-512 take
+        // the AVX2 build, those without AVX2 the baseline one.
+        #[cfg(target_arch = "x86_64")]
+        if self.use_avx512() {
+            // SAFETY: `use_avx512` is only true on a CPU that supports the
+            // AVX-512 features the function is compiled with.
+            unsafe {
+                self.reconstruct_timeslots_avx512(core, joc, &input_indices, timeslots, objects)
+            };
+            return Ok(());
+        }
         #[cfg(target_arch = "x86_64")]
         if self.use_avx2() {
             // SAFETY: `use_avx2` is only true on a CPU that supports AVX2.
@@ -136,12 +156,38 @@ impl JocObjectDecoderState {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn use_avx2(&self) -> bool {
+    fn use_avx512(&self) -> bool {
         #[cfg(test)]
-        if self.baseline_only {
+        if self.widest.is_some_and(|widest| widest < Isa::Avx512) {
             return false;
         }
         std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512dq")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn use_avx2(&self) -> bool {
+        #[cfg(test)]
+        if self.widest.is_some_and(|widest| widest < Isa::Avx2) {
+            return false;
+        }
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,avx512f,avx512bw,avx512dq,avx512vl")]
+    fn reconstruct_timeslots_avx512(
+        &mut self,
+        core: &CorePcmFrame,
+        joc: &JocPayload,
+        input_indices: &[usize],
+        timeslots: usize,
+        objects: &mut [Vec<f32>],
+    ) {
+        self.reconstruct_timeslots(core, joc, input_indices, timeslots, objects);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1364,8 +1410,8 @@ mod tests {
     /// a joint gain that is not unity.
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn the_avx2_reconstruction_matches_the_baseline_bit_for_bit() {
-        use super::{JOC_INPUT_BASE, JocObjectDecoderState, JocPayload};
+    fn the_wider_reconstructions_match_the_baseline_bit_for_bit() {
+        use super::{Isa, JOC_INPUT_BASE, JocObjectDecoderState, JocPayload};
 
         let mut seed = 0x1234_5678u32;
         let mut noise = move || {
@@ -1386,7 +1432,11 @@ mod tests {
             }),
         };
         let mut baseline = JocObjectDecoderState {
-            baseline_only: true,
+            widest: Some(Isa::Baseline),
+            ..Default::default()
+        };
+        let mut avx2 = JocObjectDecoderState {
+            widest: Some(Isa::Avx2),
             ..Default::default()
         };
         let mut dispatched = JocObjectDecoderState::default();
@@ -1420,13 +1470,13 @@ mod tests {
                 ],
             };
             let expected = baseline.decode_frame(&core, &joc).expect("baseline decode");
-            let actual = dispatched
-                .decode_frame(&core, &joc)
-                .expect("dispatched decode");
             assert!(expected.iter().flatten().any(|sample| *sample != 0.0));
-            for (expected, actual) in expected.iter().zip(&actual) {
-                for (e, a) in expected.iter().zip(actual) {
-                    assert_eq!(e.to_bits(), a.to_bits(), "frame {frame}");
+            for (name, state) in [("avx2", &mut avx2), ("dispatched", &mut dispatched)] {
+                let actual = state.decode_frame(&core, &joc).expect("decode");
+                for (expected, actual) in expected.iter().zip(&actual) {
+                    for (e, a) in expected.iter().zip(actual) {
+                        assert_eq!(e.to_bits(), a.to_bits(), "{name}, frame {frame}");
+                    }
                 }
             }
         }
