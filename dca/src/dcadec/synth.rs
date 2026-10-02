@@ -6,6 +6,7 @@
 // the transform is fully defined here (no opaque av_tx IMDCT). Output is the
 // 24-bit fixed PCM ffmpeg emits as S32P/24, converted to f32 by /2^23.
 
+use super::buffers::BufferPool;
 use super::core::{
     CoreDecoder, DCA_LFE_HISTORY, DCA_SPEAKER_COUNT, DCA_SPEAKER_LFE1, DCA_SUBBANDS,
 };
@@ -680,6 +681,9 @@ impl SynthState {
 }
 
 /// Fixed-point core output indexed by DCA speaker — the residual base for XLL.
+/// Kept by the caller from frame to frame: each synthesis hands the previous
+/// frame's buffers back to `pool` and draws its own from there.
+#[derive(Default)]
 pub(crate) struct CoreOutput {
     /// `samples[spkr]` = Some(int32 24-bit PCM) for active speakers.
     pub(crate) samples: Vec<Option<Vec<i32>>>,
@@ -691,6 +695,9 @@ pub(crate) struct CoreOutput {
     pub(crate) ch_mask: u32,
     /// `ch_mask` under the carrier's own speaker names (`CoreDecoder::coded_mask`).
     pub(crate) coded_mask: u32,
+    pool: BufferPool,
+    /// The LFE at the core rate, before its 96 kHz expansion.
+    lfe_base: Vec<i32>,
 }
 
 impl SynthState {
@@ -702,11 +709,13 @@ impl SynthState {
     /// subbands are fed zeros: there is no X96 payload here, the oversampling
     /// exists purely so a 48 kHz core can serve as the residual base for a
     /// 96 kHz XLL channel set (ffmpeg's `ff_dca_core_filter_fixed` special case).
+    /// The result replaces the previous contents of `out`.
     pub(crate) fn synthesize_fixed_by_speaker(
         &mut self,
         dec: &mut CoreDecoder,
         x96_synth: bool,
-    ) -> CoreOutput {
+        out: &mut CoreOutput,
+    ) {
         let nch = dec.nchannels();
         let npcmblocks = dec.npcmblocks();
         let nsamples = if x96_synth {
@@ -724,56 +733,60 @@ impl SynthState {
             &FIR_32BANDS_NONPERFECT_FIXED
         };
 
-        let mut samples: Vec<Option<Vec<i32>>> = (0..DCA_SPEAKER_COUNT).map(|_| None).collect();
-        let mut extension: Vec<Vec<i32>> = Vec::with_capacity(dec.extension_channels().len());
+        out.pool.give_slots(&mut out.samples);
+        out.samples.resize_with(DCA_SPEAKER_COUNT, || None);
+        out.pool.give_all(&mut out.extension);
 
         for ch in 0..nch {
             let mut subs: [&[i32]; DCA_SUBBANDS] = [&[]; DCA_SUBBANDS];
             for (band, s) in subs.iter_mut().enumerate() {
                 *s = dec.subband(ch, band);
             }
-            let mut dst = vec![0i32; nsamples];
+            let mut dst = out.pool.zeroed(nsamples);
             if x96_synth {
                 bank_64(self.isa, &mut self.channels[ch], &subs, &mut dst);
             } else {
                 bank_32(self.isa, &mut self.channels[ch], window, &subs, &mut dst);
             }
             match dec.speaker_for(ch) {
-                Some(spkr) => samples[spkr] = Some(dst),
-                None => extension.push(dst),
+                Some(spkr) => {
+                    if let Some(old) = out.samples[spkr].replace(dst) {
+                        out.pool.give(old);
+                    }
+                }
+                None => out.extension.push(dst),
             }
         }
 
         if dec.lfe_present() == 2 {
-            let lfe = if x96_synth {
+            let mut lfe = out.pool.zeroed(nsamples);
+            if x96_synth {
                 // Interpolate at the core rate, then expand to 96 kHz through the
                 // image-rejection filter.
-                let base = lfe_synth_fixed(dec, nsamples / 2);
-                let mut out = vec![0i32; nsamples];
-                lfe_x96_fixed(&mut out, &base, &mut self.lfe_x96_hist);
-                out
+                out.lfe_base.clear();
+                out.lfe_base.resize(nsamples / 2, 0);
+                lfe_synth_fixed(dec, &mut out.lfe_base);
+                lfe_x96_fixed(&mut lfe, &out.lfe_base, &mut self.lfe_x96_hist);
             } else {
-                lfe_synth_fixed(dec, nsamples)
-            };
-            samples[DCA_SPEAKER_LFE1] = Some(lfe);
+                lfe_synth_fixed(dec, &mut lfe);
+            }
+            if let Some(old) = out.samples[DCA_SPEAKER_LFE1].replace(lfe) {
+                out.pool.give(old);
+            }
         }
 
         // An XXCH encoder's fold of its channels into the core comes out
         // here, after every channel is synthesized (`ff_dca_core_filter_fixed`).
-        dec.undo_xxch_dmix(&mut samples);
+        dec.undo_xxch_dmix(&mut out.samples);
 
-        CoreOutput {
-            samples,
-            extension,
-            npcmsamples: nsamples,
-            output_rate: if x96_synth {
-                dec.sample_rate() * 2
-            } else {
-                dec.sample_rate()
-            },
-            ch_mask: dec.ch_mask(),
-            coded_mask: dec.coded_mask(),
-        }
+        out.npcmsamples = nsamples;
+        out.output_rate = if x96_synth {
+            dec.sample_rate() * 2
+        } else {
+            dec.sample_rate()
+        };
+        out.ch_mask = dec.ch_mask();
+        out.coded_mask = dec.coded_mask();
     }
 }
 
@@ -793,10 +806,10 @@ fn lfe_x96_fixed(dst: &mut [i32], src: &[i32], hist: &mut i32) {
 
 /// `lfe_fir_fixed` (int32) — fixed-point LFE interpolation, for the XLL residual
 /// base (ffmpeg's residual combine reads the fixed core, not the float one).
-fn lfe_synth_fixed(dec: &mut CoreDecoder, nsamples: usize) -> Vec<i32> {
+/// `pcm` (one output sample per slot, zeroed) receives the interpolated LFE.
+fn lfe_synth_fixed(dec: &mut CoreDecoder, pcm: &mut [i32]) {
     let npcmblocks = dec.npcmblocks();
     let nlfesamples = npcmblocks >> 1;
-    let mut pcm = vec![0i32; nsamples];
     let coeff = &LFE_FIR_64_FIXED;
     {
         let lfe = dec.lfe();
@@ -818,7 +831,6 @@ fn lfe_synth_fixed(dec: &mut CoreDecoder, nsamples: usize) -> Vec<i32> {
         }
     }
     dec.shift_lfe_history(nlfesamples);
-    pcm
 }
 
 /// `lfe_fir_float` over the persistent LFE history buffer, then shift history.
