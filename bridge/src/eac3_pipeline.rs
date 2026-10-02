@@ -44,33 +44,200 @@ pub(crate) struct PendingEac3Dependent {
     pub(crate) info: AccessUnitInfo,
 }
 
+/// What an independent (or converted AC-3) access unit decoded into.
+pub(crate) enum Eac3IndependentOutcome {
+    /// A frame to emit now (or the error it came to).
+    Emit(Result<RDecodedFrame, String>),
+    /// A plain core to hold until the next access unit says whether a
+    /// dependent belongs to it.
+    Hold(eac3::PcmPushResult),
+}
+
+/// Decode a non-dependent E-AC-3 access unit and say what to do with it.
+///
+/// The routing rule is the one the bridge always applied: an independent
+/// frame whose JOC payload its own channels satisfy is a complete object
+/// presentation and is emitted at once; any other independent frame is a
+/// core that may still be extended, so it is held; a frame that cannot carry
+/// dependents (a converted AC-3 frame) goes through the object decoder and
+/// is emitted. What changed is how it is learned. The rule needs the frame's
+/// EMDF, which sits in a block's skip field, so it used to cost a stateless
+/// inspection walking every audio block before the decoder walked them again.
+/// Now the frame goes straight to the decoder the previous independent frame
+/// of the stream called for - streams do not switch between the two shapes
+/// from one frame to the next - and that decode's own `AccessUnitInfo`
+/// confirms the choice. When it does not (the first frame of a stream, or a
+/// switch), the frame is decoded again by the other decoder, so what comes
+/// out of the frame is what the rule says.
+pub(crate) fn decode_eac3_independent(
+    bridge: &mut AtmosBridge,
+    frame: &[u8],
+    can_carry_dependents: bool,
+) -> Eac3IndependentOutcome {
+    if can_carry_dependents && !bridge.eac3_expect_self_contained_joc {
+        match bridge.eac3_pcm_decoder.push_access_unit(frame) {
+            Ok(push) if !carries_self_contained_joc(&push.info) => {
+                emit_eac3_frame_info_diagnostic(bridge, &push.info);
+                update_eac3_dialogue_level(bridge, &push.info);
+                return Eac3IndependentOutcome::Hold(push);
+            }
+            Ok(push) => {
+                bridge.eac3_expect_self_contained_joc = true;
+                emit_eac3_frame_info_diagnostic(bridge, &push.info);
+                return Eac3IndependentOutcome::Emit(decode_eac3_objects(
+                    bridge,
+                    frame,
+                    Some(push),
+                ));
+            }
+            Err(err) => {
+                // Replay the rule on a stateless inspection, as it used to run.
+                let inspection = inspect_eac3_frame(frame);
+                if eac3_frame_can_carry_dependents(&inspection)
+                    && !eac3_frame_carries_self_contained_joc(&inspection)
+                {
+                    return Eac3IndependentOutcome::Emit(Err(format!(
+                        "E-AC3 core decode error: {err}"
+                    )));
+                }
+                emit_eac3_frame_diagnostic(bridge, frame, &inspection);
+                return Eac3IndependentOutcome::Emit(decode_eac3_objects(bridge, frame, None));
+            }
+        }
+    }
+
+    match bridge.eac3_object_decoder.push_access_unit(frame) {
+        Ok(Some(result)) if !can_carry_dependents || carries_self_contained_joc(&result.info) => {
+            bridge.eac3_expect_self_contained_joc = true;
+            emit_eac3_frame_info_diagnostic(bridge, &result.info);
+            Eac3IndependentOutcome::Emit(Ok(build_object_frame(bridge, frame, result)))
+        }
+        // An independent whose JOC declares a wider downmix than it carries:
+        // held for its dependents like any other core.
+        Ok(Some(_)) => {
+            bridge.eac3_expect_self_contained_joc = false;
+            hold_or_emit_core(bridge, frame, can_carry_dependents)
+        }
+        Ok(None) | Err(_) => {
+            bridge.eac3_expect_self_contained_joc = false;
+            hold_or_emit_core(bridge, frame, can_carry_dependents)
+        }
+    }
+}
+
+/// Route a non-dependent access unit that was inspected anyway (its header
+/// said dependent, its inspection said otherwise) the way every frame used to
+/// be routed: on the inspection.
+pub(crate) fn decode_eac3_inspected(
+    bridge: &mut AtmosBridge,
+    frame: &[u8],
+    inspection: &Eac3Inspection,
+) -> Eac3IndependentOutcome {
+    if eac3_frame_can_carry_dependents(inspection)
+        && !eac3_frame_carries_self_contained_joc(inspection)
+    {
+        return match bridge.eac3_pcm_decoder.push_access_unit(frame) {
+            Ok(push) => {
+                emit_eac3_frame_diagnostic(bridge, frame, inspection);
+                note_eac3_dialogue_level(bridge, &push.info);
+                Eac3IndependentOutcome::Hold(push)
+            }
+            Err(err) => {
+                Eac3IndependentOutcome::Emit(Err(format!("E-AC3 core decode error: {err}")))
+            }
+        };
+    }
+    emit_eac3_frame_diagnostic(bridge, frame, inspection);
+    Eac3IndependentOutcome::Emit(decode_eac3_objects(bridge, frame, None))
+}
+
+/// The objects of a frame already known to carry them, falling back to its
+/// core when the object decoder finds none; `decoded` is the core already
+/// decoded for it, if any, so it is not decoded twice.
+fn decode_eac3_objects(
+    bridge: &mut AtmosBridge,
+    frame: &[u8],
+    decoded: Option<eac3::PcmPushResult>,
+) -> Result<RDecodedFrame, String> {
+    if let Ok(Some(result)) = bridge.eac3_object_decoder.push_access_unit(frame) {
+        return Ok(build_object_frame(bridge, frame, result));
+    }
+    let push = match decoded {
+        Some(push) => Ok(push),
+        None => bridge.eac3_pcm_decoder.push_access_unit(frame),
+    };
+    emit_core_frame(bridge, frame, push)
+}
+
+/// The core of a frame that turned out to carry no self-contained objects:
+/// held when it can still be extended, emitted otherwise.
+fn hold_or_emit_core(
+    bridge: &mut AtmosBridge,
+    frame: &[u8],
+    can_carry_dependents: bool,
+) -> Eac3IndependentOutcome {
+    match bridge.eac3_pcm_decoder.push_access_unit(frame) {
+        Ok(push) => {
+            emit_eac3_frame_info_diagnostic(bridge, &push.info);
+            if can_carry_dependents && !carries_self_contained_joc(&push.info) {
+                update_eac3_dialogue_level(bridge, &push.info);
+                Eac3IndependentOutcome::Hold(push)
+            } else {
+                Eac3IndependentOutcome::Emit(emit_core_frame(bridge, frame, Ok(push)))
+            }
+        }
+        Err(err) => {
+            let inspection = inspect_eac3_frame(frame);
+            if eac3_frame_can_carry_dependents(&inspection)
+                && !eac3_frame_carries_self_contained_joc(&inspection)
+            {
+                return Eac3IndependentOutcome::Emit(Err(format!(
+                    "E-AC3 core decode error: {err}"
+                )));
+            }
+            emit_eac3_frame_diagnostic(bridge, frame, &inspection);
+            Eac3IndependentOutcome::Emit(emit_core_frame(bridge, frame, Err(err)))
+        }
+    }
+}
+
+fn build_object_frame(
+    bridge: &mut AtmosBridge,
+    frame: &[u8],
+    result: ObjectPcmPushResult,
+) -> RDecodedFrame {
+    update_eac3_dialogue_level(bridge, &result.info);
+    let sample_count = result.pcm.samples_per_channel();
+    let base_sample_pos = bridge.eac3_total_samples;
+    bridge.eac3_total_samples += sample_count as u64;
+    let rf = build_eac3_frame_from_object(result, base_sample_pos, bridge);
+    bridge.perf.maybe_report(bridge.eac3_frame_count);
+    maybe_dump_ok_frame(frame, "obj");
+    rf
+}
+
 /// Process a raw E-AC3 access unit (one complete syncframe).
 ///
 /// Attempts object-level decode first (JOC + OAMD), then falls back to
 /// core PCM decode.  Converts the result into one [`RDecodedFrame`].
+#[cfg(test)]
 pub(crate) fn process_eac3_frame(
     bridge: &mut AtmosBridge,
     frame: &[u8],
     inspection: &Eac3Inspection,
 ) -> Result<RDecodedFrame, String> {
     emit_eac3_frame_diagnostic(bridge, frame, inspection);
+    decode_eac3_objects(bridge, frame, None)
+}
 
-    match bridge.eac3_object_decoder.push_access_unit(frame) {
-        Ok(Some(result)) => {
-            update_eac3_dialogue_level(bridge, &result.info);
-            let sample_count = result.pcm.samples_per_channel();
-            let base_sample_pos = bridge.eac3_total_samples;
-            bridge.eac3_total_samples += sample_count as u64;
-            let rf = build_eac3_frame_from_object(result, base_sample_pos, bridge);
-            bridge.perf.maybe_report(bridge.eac3_frame_count);
-            maybe_dump_ok_frame(frame, "obj");
-            return Ok(rf);
-        }
-        Ok(None) => {}
-        Err(_) => {}
-    }
-
-    match bridge.eac3_pcm_decoder.push_access_unit(frame) {
+/// Emit a decoded core as a frame, or stand in silence for the decode errors
+/// that are known to recover.
+fn emit_core_frame(
+    bridge: &mut AtmosBridge,
+    frame: &[u8],
+    push: Result<eac3::PcmPushResult, AccessUnitParseError>,
+) -> Result<RDecodedFrame, String> {
+    match push {
         Ok(result) => {
             let info = result.info;
             update_eac3_dialogue_level(bridge, &info);
@@ -341,9 +508,10 @@ pub(crate) fn eac3_frame_carries_joc(info: &AccessUnitInfo) -> bool {
 /// is the worse of the two, and reconstructing from the independent's own
 /// payload is machinery for a stream shape the specification forbids.
 pub(crate) fn eac3_frame_carries_self_contained_joc(inspection: &Eac3Inspection) -> bool {
-    let Ok(info) = inspection else {
-        return false;
-    };
+    inspection.as_ref().is_ok_and(carries_self_contained_joc)
+}
+
+fn carries_self_contained_joc(info: &AccessUnitInfo) -> bool {
     info.payloads().any(|payload| match &payload.parsed {
         ParsedEmdfPayloadData::Joc(joc) => usize::from(info.fullband_channels) >= joc.channel_count,
         _ => false,
@@ -822,23 +990,35 @@ fn build_eac3_object_output_pcm_and_labels(
 /// Interleave planar channels into the bridge's PCM, `sample_count` samples
 /// of each, in the order given.
 ///
-/// Written into a zeroed buffer frame by frame rather than pushed sample by
-/// sample, so the inner loop is a plain store per channel with no capacity
-/// check; each channel is cut to `sample_count` once, not bounds-checked per
-/// sample.
+/// Written into a zeroed buffer rather than pushed sample by sample, and each
+/// channel is cut to `sample_count` once, not bounds-checked per sample.
 fn interleave_pcm(channels: &[&[f32]], sample_count: usize) -> RVec<i32> {
+    const BLOCK: usize = 64;
     let stride = channels.len();
     let mut pcm = vec![0i32; sample_count * stride];
-    if stride == 0 {
-        return pcm.into();
-    }
     let channels: Vec<&[f32]> = channels
         .iter()
         .map(|channel| &channel[..sample_count])
         .collect();
-    for (s, frame) in pcm.chunks_exact_mut(stride).enumerate() {
-        for (slot, channel) in frame.iter_mut().zip(&channels) {
-            *slot = float_to_pcm_i32(channel[s]);
+    // A block of each channel is converted in one contiguous pass, then
+    // scattered into its slots. Converting while scattering read every
+    // channel at the same offset and wrote one interleaved row at a time, a
+    // pattern whose speed swung threefold with where the allocator happened
+    // to place the buffers.
+    let mut converted = [0i32; BLOCK];
+    for (block, frames) in pcm.chunks_mut(BLOCK * stride.max(1)).enumerate() {
+        let start = block * BLOCK;
+        let len = frames.len() / stride.max(1);
+        for (channel_index, channel) in channels.iter().enumerate() {
+            for (slot, &sample) in converted[..len]
+                .iter_mut()
+                .zip(&channel[start..start + len])
+            {
+                *slot = float_to_pcm_i32(sample);
+            }
+            for (frame, &value) in frames.chunks_exact_mut(stride).zip(&converted[..len]) {
+                frame[channel_index] = value;
+            }
         }
     }
     pcm.into()
