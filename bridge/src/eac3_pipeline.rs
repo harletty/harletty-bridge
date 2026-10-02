@@ -787,17 +787,13 @@ fn build_eac3_object_output_pcm_and_labels(
     // Build interleaved PCM: LFE bed first, then dynamic-object channels.
     // JOC output is dynamic-only and does not carry LFE. The fullband core bed
     // is used as JOC input, so exposing it here would double-count the final mix.
-    let pcm_capacity = sample_count * total_channel_count;
-    let mut pcm: RVec<i32> = RVec::with_capacity(pcm_capacity);
-
-    for s in 0..sample_count {
-        if let Some(lfe) = &core.lfe_channel {
-            pcm.push(float_to_pcm_i32(lfe[s]));
-        }
-        for obj_ch in &pcm_frame.object_channels {
-            pcm.push(float_to_pcm_i32(obj_ch[s]));
-        }
-    }
+    let channels: Vec<&[f32]> = core
+        .lfe_channel
+        .iter()
+        .chain(&pcm_frame.object_channels)
+        .map(Vec::as_slice)
+        .collect();
+    let pcm = interleave_pcm(&channels, sample_count);
 
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
     if core.lfe_channel.is_some() {
@@ -823,6 +819,42 @@ fn build_eac3_object_output_pcm_and_labels(
     (pcm, channel_labels)
 }
 
+/// Interleave planar channels into the bridge's PCM, `sample_count` samples
+/// of each, in the order given.
+///
+/// Written into a zeroed buffer frame by frame rather than pushed sample by
+/// sample, so the inner loop is a plain store per channel with no capacity
+/// check; each channel is cut to `sample_count` once, not bounds-checked per
+/// sample.
+fn interleave_pcm(channels: &[&[f32]], sample_count: usize) -> RVec<i32> {
+    let stride = channels.len();
+    let mut pcm = vec![0i32; sample_count * stride];
+    if stride == 0 {
+        return pcm.into();
+    }
+    let channels: Vec<&[f32]> = channels
+        .iter()
+        .map(|channel| &channel[..sample_count])
+        .collect();
+    for (s, frame) in pcm.chunks_exact_mut(stride).enumerate() {
+        for (slot, channel) in frame.iter_mut().zip(&channels) {
+            *slot = float_to_pcm_i32(channel[s]);
+        }
+    }
+    pcm.into()
+}
+
+/// A decoded core interleaved fullband channels first, LFE last.
+fn interleave_core_pcm(core: &CorePcmFrame, sample_count: usize) -> RVec<i32> {
+    let channels: Vec<&[f32]> = core
+        .fullband_channels
+        .iter()
+        .chain(&core.lfe_channel)
+        .map(Vec::as_slice)
+        .collect();
+    interleave_pcm(&channels, sample_count)
+}
+
 /// Build an [`RDecodedFrame`] from a core-PCM-only E-AC3 decode result.
 pub(crate) fn build_eac3_frame_from_core(
     core: &CorePcmFrame,
@@ -834,18 +866,7 @@ pub(crate) fn build_eac3_frame_from_core(
     let sample_count = core.samples_per_channel();
     let total_channel_count = core.total_channels();
 
-    // Build interleaved PCM.
-    let pcm_capacity = sample_count * total_channel_count;
-    let mut pcm: RVec<i32> = RVec::with_capacity(pcm_capacity);
-
-    for s in 0..sample_count {
-        for ch in &core.fullband_channels {
-            pcm.push(float_to_pcm_i32(ch[s]));
-        }
-        if let Some(lfe) = &core.lfe_channel {
-            pcm.push(float_to_pcm_i32(lfe[s]));
-        }
-    }
+    let pcm = interleave_core_pcm(core, sample_count);
 
     // Channel labels.
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
@@ -916,15 +937,7 @@ fn build_eac3_channel_bed_frame(
     let sample_count = core.samples_per_channel();
     let total_channel_count = core.total_channels();
 
-    let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * total_channel_count);
-    for s in 0..sample_count {
-        for ch in &core.fullband_channels {
-            pcm.push(float_to_pcm_i32(ch[s]));
-        }
-        if let Some(lfe) = &core.lfe_channel {
-            pcm.push(float_to_pcm_i32(lfe[s]));
-        }
-    }
+    let pcm = interleave_core_pcm(core, sample_count);
 
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
     for bed in &core.fullband_channel_order {
