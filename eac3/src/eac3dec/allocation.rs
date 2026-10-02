@@ -765,21 +765,12 @@ impl AllocationState {
             *psd = 3072 - (exponent << 7);
         }
 
-        let mut bin = start_mantissa;
-        let mut band = MASKTAB[start_mantissa];
-        loop {
-            let last_bin = BNDTAB[band].min(end_mantissa);
-            self.integrated_psd[band] = self.psd[bin];
-            bin += 1;
-            while bin < last_bin {
-                self.integrated_psd[band] = log_add(self.integrated_psd[band], self.psd[bin]);
-                bin += 1;
-            }
-            band += 1;
-            if end_mantissa <= last_bin {
-                break;
-            }
-        }
+        integrate_psd(
+            &self.psd,
+            &mut self.integrated_psd,
+            start_mantissa,
+            end_mantissa,
+        );
 
         Ok(())
     }
@@ -857,6 +848,119 @@ fn exp_strategy_index(strategy: ExpStrategy) -> Option<usize> {
     }
 }
 
+/// The bands of more than one bin, as runs of bands of one width:
+/// `(first band, first bin, bins per band, bands)`.
+const BAND_RUNS: [(usize, usize, usize, usize); 4] = [
+    (28, 28, 3, 7),
+    (35, 49, 6, 6),
+    (41, 85, 12, 4),
+    (45, 133, 24, 5),
+];
+
+/// Sum the power of `start..end` into its bands (A/52 7.2.2.2). A band's sum
+/// is a chain of `log_add`s, one bin after the other, and each step waits for
+/// the one before; but no band waits for another, so bands of one width are
+/// summed side by side.
+fn integrate_psd(psd: &[i32], integrated: &mut [i32], start: usize, end: usize) {
+    let (Ok(psd), Ok(integrated)) = (
+        <&[i32; MAX_ALLOCATION_SIZE]>::try_from(psd),
+        <&mut [i32; MASK_BANDS]>::try_from(integrated),
+    ) else {
+        return;
+    };
+    if end <= start || end > 253 {
+        // A range no stream should carry: the plain walk, band by band.
+        let mut bin = start;
+        let mut band = MASKTAB[start];
+        while let (Some(&band_end), Some(&power)) = (BNDTAB.get(band), psd.get(bin)) {
+            let last_bin = band_end.min(end);
+            let mut sum = power;
+            bin += 1;
+            while bin < last_bin {
+                sum = log_add(sum, psd[bin]);
+                bin += 1;
+            }
+            integrated[band] = sum;
+            band += 1;
+            if end <= last_bin {
+                break;
+            }
+        }
+        return;
+    }
+
+    // One bin per band below 28.
+    let single_end = end.min(28);
+    if start < single_end {
+        integrated[start..single_end].copy_from_slice(&psd[start..single_end]);
+    }
+    for (first_band, first_bin, width, bands) in BAND_RUNS {
+        let run_end = first_bin + width * bands;
+        if end <= first_bin || start >= run_end {
+            continue;
+        }
+        // Whole bands of the run inside the range, then the cut ones.
+        let first_whole = if start <= first_bin {
+            0
+        } else {
+            (start - first_bin).div_ceil(width)
+        };
+        let whole_end = (end.min(run_end) - first_bin) / width;
+        let mut next = first_whole;
+        while next < whole_end {
+            let base = first_bin + next * width;
+            let target = &mut integrated[first_band + next..];
+            next += match whole_end - next {
+                1 => break,
+                2 => sum_bands::<2>(psd, base, width, target),
+                3 => sum_bands::<3>(psd, base, width, target),
+                4 => sum_bands::<4>(psd, base, width, target),
+                5 => sum_bands::<5>(psd, base, width, target),
+                6 => sum_bands::<6>(psd, base, width, target),
+                _ => sum_bands::<7>(psd, base, width, target),
+            };
+        }
+        // What is left: the bands the range cuts, and a whole one on its own.
+        for band in (0..first_whole).chain(next..bands) {
+            let low = (first_bin + band * width).max(start);
+            let high = (first_bin + (band + 1) * width).min(end);
+            if low >= high {
+                continue;
+            }
+            let mut sum = psd[low];
+            for &power in &psd[low + 1..high] {
+                sum = log_add(sum, power);
+            }
+            integrated[first_band + band] = sum;
+        }
+    }
+}
+
+/// Sum `LANES` bands of `width` bins from `base` on, side by side.
+#[inline(always)]
+fn sum_bands<const LANES: usize>(
+    psd: &[i32; MAX_ALLOCATION_SIZE],
+    base: usize,
+    width: usize,
+    integrated: &mut [i32],
+) -> usize {
+    let (Some(psd), Some(integrated)) = (
+        psd.get(base..base + LANES * width),
+        integrated.get_mut(..LANES),
+    ) else {
+        return LANES;
+    };
+    let mut sums: [i32; LANES] = std::array::from_fn(|lane| psd[lane * width]);
+    for offset in 1..width {
+        for (lane, sum) in sums.iter_mut().enumerate() {
+            *sum = log_add(*sum, psd[lane * width + offset]);
+        }
+    }
+    integrated.copy_from_slice(&sums);
+    LANES
+}
+
+#[inline(always)]
 fn log_add(a: i32, b: i32) -> i32 {
     let delta = a - b;
     let address = (delta.abs() >> 1).min((LATAB.len() - 1) as i32) as usize;
@@ -1013,6 +1117,57 @@ mod tests {
             generate_grouped_quantization::<2>(11, BAP_BITS[4])
         );
         assert_eq!(BAP5_TABLE.to_vec(), generate_quantization(15));
+    }
+
+    /// xorshift64, for inputs that only have to be varied.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> usize {
+            ((self.next() >> 20) % bound) as usize
+        }
+    }
+
+    /// Every range a channel or the coupling channel can have, against the
+    /// walk the standard describes: one band after the other.
+    #[test]
+    fn band_sums_match_the_plain_walk() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..4 {
+            let psd: Vec<i32> = (0..MAX_ALLOCATION_SIZE)
+                .map(|_| 3072 - ((rng.below(25) as i32) << 7))
+                .collect();
+            for start in 0..253 {
+                for end in start + 1..=253 {
+                    let mut plain = [i32::MIN; MASK_BANDS];
+                    let mut bin = start;
+                    let mut band = MASKTAB[start];
+                    loop {
+                        let last_bin = BNDTAB[band].min(end);
+                        plain[band] = psd[bin];
+                        bin += 1;
+                        while bin < last_bin {
+                            plain[band] = log_add(plain[band], psd[bin]);
+                            bin += 1;
+                        }
+                        band += 1;
+                        if end <= last_bin {
+                            break;
+                        }
+                    }
+                    let mut summed = [i32::MIN; MASK_BANDS];
+                    integrate_psd(&psd, &mut summed, start, end);
+                    assert_eq!(summed, plain, "start={start} end={end}");
+                }
+            }
+        }
     }
 
     #[test]
