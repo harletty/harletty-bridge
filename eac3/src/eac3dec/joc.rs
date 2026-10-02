@@ -59,6 +59,10 @@ pub(crate) struct JocObjectDecoderState {
     inverse_history: Vec<bool>,
     analysis: Vec<QmfSubbands>,
     last_frame_matrices: JocObjectMatrices,
+    /// Tests only: take the baseline build even where AVX2 is available, so
+    /// both are exercised on the same machine.
+    #[cfg(all(test, target_arch = "x86_64"))]
+    baseline_only: bool,
 }
 
 impl JocObjectDecoderState {
@@ -114,6 +118,56 @@ impl JocObjectDecoderState {
         self.build_frame_matrices(joc, timeslots)?;
         prepare_object_output_buffers(objects, joc.object_count, samples);
         self.analysis.resize(joc.channel_count, QmfSubbands::zero());
+
+        // The filter banks and the mixing are plain float loops; built for
+        // AVX2 they run on 256-bit vectors. Same operations in the same order
+        // per element - no FMA is enabled - so the result is bit-identical
+        // either way; only CPUs without AVX2 take the baseline build.
+        #[cfg(target_arch = "x86_64")]
+        if self.use_avx2() {
+            // SAFETY: `use_avx2` is only true on a CPU that supports AVX2.
+            unsafe {
+                self.reconstruct_timeslots_avx2(core, joc, &input_indices, timeslots, objects)
+            };
+            return Ok(());
+        }
+        self.reconstruct_timeslots(core, joc, &input_indices, timeslots, objects);
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn use_avx2(&self) -> bool {
+        #[cfg(test)]
+        if self.baseline_only {
+            return false;
+        }
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    fn reconstruct_timeslots_avx2(
+        &mut self,
+        core: &CorePcmFrame,
+        joc: &JocPayload,
+        input_indices: &[usize],
+        timeslots: usize,
+        objects: &mut [Vec<f32>],
+    ) {
+        self.reconstruct_timeslots(core, joc, input_indices, timeslots, objects);
+    }
+
+    /// Analyse the core into subbands, mix each object's subbands from them
+    /// and synthesise the objects, one QMF slot at a time.
+    #[inline(always)]
+    fn reconstruct_timeslots(
+        &mut self,
+        core: &CorePcmFrame,
+        joc: &JocPayload,
+        input_indices: &[usize],
+        timeslots: usize,
+        objects: &mut [Vec<f32>],
+    ) {
         let analysis = &mut self.analysis[..joc.channel_count];
 
         for timeslot in 0..timeslots {
@@ -156,8 +210,6 @@ impl JocObjectDecoderState {
                 }
             }
         }
-
-        Ok(())
     }
 
     pub fn last_frame_matrices(&self) -> &JocObjectMatrices {
@@ -1236,12 +1288,16 @@ mod tests {
         assert!(output[0][0].iter().all(|value| *value == 1.0));
         assert!(output[1][0].iter().all(|value| *value == 0.0));
         assert!(output[2][0].iter().all(|value| *value == 0.0));
-        assert!(output[3][0]
-            .iter()
-            .all(|value| (*value - COARSE_STEP).abs() < 1e-6));
-        assert!(prev_matrix[0]
-            .iter()
-            .all(|value| (*value - COARSE_STEP).abs() < 1e-6));
+        assert!(
+            output[3][0]
+                .iter()
+                .all(|value| (*value - COARSE_STEP).abs() < 1e-6)
+        );
+        assert!(
+            prev_matrix[0]
+                .iter()
+                .all(|value| (*value - COARSE_STEP).abs() < 1e-6)
+        );
     }
 
     #[test]
@@ -1300,5 +1356,79 @@ mod tests {
         assert!(output[2][0].iter().all(|value| *value == 0.0));
         assert!(output[3][0].iter().all(|value| *value == 0.0));
         assert!(prev_matrix[0].iter().all(|value| *value == 0.0));
+    }
+
+    /// The AVX2 build of the slot loop and the baseline one compute the same
+    /// operations in the same order, so they agree to the bit. Three frames of
+    /// noise through two objects, with matrices that move between frames, and
+    /// a joint gain that is not unity.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_avx2_reconstruction_matches_the_baseline_bit_for_bit() {
+        use super::{JOC_INPUT_BASE, JocObjectDecoderState, JocPayload};
+
+        let mut seed = 0x1234_5678u32;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let object = |values: Vec<Vec<u16>>| JocObject {
+            active: true,
+            bands_index: Some(7),
+            bands: 23,
+            sparse_coded: false,
+            quantization_table: Some(1),
+            steep_slope: false,
+            data_points: 1,
+            timeslot_offsets: Vec::new(),
+            data: Some(JocObjectData::Dense {
+                matrices: vec![values],
+            }),
+        };
+        let mut baseline = JocObjectDecoderState {
+            baseline_only: true,
+            ..Default::default()
+        };
+        let mut dispatched = JocObjectDecoderState::default();
+        for frame in 0..3u8 {
+            let core = CorePcmFrame {
+                sample_rate: 48_000,
+                fullband_channel_order: JOC_INPUT_BASE.to_vec(),
+                fullband_channels: (0..5)
+                    .map(|_| (0..1536).map(|_| noise()).collect())
+                    .collect(),
+                lfe_channel: None,
+            };
+            let matrix = |shift: u16| {
+                (0..5)
+                    .map(|channel| {
+                        (0..23)
+                            .map(|band| (band * 3 + channel * 7 + shift) % 29)
+                            .collect()
+                    })
+                    .collect()
+            };
+            let joc = JocPayload {
+                downmix_config: 0,
+                channel_count: 5,
+                object_count: 2,
+                gain: 0.75,
+                sequence_counter: u16::from(frame) + 1,
+                objects: vec![
+                    object(matrix(u16::from(frame))),
+                    object(matrix(u16::from(frame) + 11)),
+                ],
+            };
+            let expected = baseline.decode_frame(&core, &joc).expect("baseline decode");
+            let actual = dispatched
+                .decode_frame(&core, &joc)
+                .expect("dispatched decode");
+            assert!(expected.iter().flatten().any(|sample| *sample != 0.0));
+            for (expected, actual) in expected.iter().zip(&actual) {
+                for (e, a) in expected.iter().zip(actual) {
+                    assert_eq!(e.to_bits(), a.to_bits(), "frame {frame}");
+                }
+            }
+        }
     }
 }

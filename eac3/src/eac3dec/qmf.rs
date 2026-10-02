@@ -68,6 +68,7 @@ impl QuadratureMirrorFilterBank {
         }
     }
 
+    #[inline(always)]
     pub fn process_forward(&mut self, input: &[f32]) -> QmfSubbands {
         debug_assert_eq!(input.len(), QMF_SUBBANDS);
 
@@ -113,6 +114,7 @@ impl QuadratureMirrorFilterBank {
         result
     }
 
+    #[inline(always)]
     pub fn process_inverse(&mut self, input: &QmfSubbands, output: &mut [f32]) {
         debug_assert_eq!(output.len(), QMF_SUBBANDS);
 
@@ -173,6 +175,7 @@ impl Default for QuadratureMirrorFilterBank {
 /// gate and will not switch a 32-bit ARM build onto the intrinsics; ARMv7
 /// Advanced SIMD is not IEEE-754 conformant for `f32`, so the autovectoriser
 /// declines there as well and the fallbacks are all that runs.
+#[inline(always)]
 fn compute_forward_grouping(window: &[f32], grouping: &mut [f32; QMF_DOUBLE_LENGTH]) {
     debug_assert_eq!(window.len(), QMF_FORWARD_RING_LEN);
     #[cfg(target_arch = "aarch64")]
@@ -186,6 +189,7 @@ fn compute_forward_grouping(window: &[f32], grouping: &mut [f32; QMF_DOUBLE_LENG
 }
 
 #[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
 fn compute_forward_grouping_scalar(window: &[f32], grouping: &mut [f32; QMF_DOUBLE_LENGTH]) {
     for sample in 0..QMF_DOUBLE_LENGTH {
         grouping[sample] = window[sample] * QMF_COEFFS[sample]
@@ -196,6 +200,7 @@ fn compute_forward_grouping_scalar(window: &[f32], grouping: &mut [f32; QMF_DOUB
     }
 }
 
+#[inline(always)]
 fn compute_inverse_output(window: &[f32], output: &mut [f32]) {
     debug_assert_eq!(window.len(), QMF_INVERSE_RING_LEN);
     debug_assert_eq!(output.len(), QMF_SUBBANDS);
@@ -210,6 +215,7 @@ fn compute_inverse_output(window: &[f32], output: &mut [f32]) {
 }
 
 #[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
 fn compute_inverse_output_scalar(window: &[f32], output: &mut [f32]) {
     for sample in 0..QMF_SUBBANDS {
         let mut value = window[sample] * QMF_COEFFS[sample]
@@ -226,7 +232,7 @@ fn compute_inverse_output_scalar(window: &[f32], output: &mut [f32]) {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn wrap_ring_head(head: usize, step: usize, len: usize) -> usize {
     if head >= step {
         head - step
