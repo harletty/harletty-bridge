@@ -410,6 +410,33 @@ fn get_rice(gb: &mut BitReader, k: usize) -> R<i32> {
     Ok(((v >> 1) ^ (0u32.wrapping_sub(v & 1))) as i32)
 }
 
+/// `get_rice` for every sample of `out`.
+fn get_rice_run(gb: &mut BitReader, k: usize, out: &mut [i32]) -> R<()> {
+    gb.read_rice_run(k, out).ok_or(XllError::Bitstream)
+}
+
+/// `get_linear` for every sample of `out`.
+fn get_linear_run(gb: &mut BitReader, n: usize, out: &mut [i32]) -> R<()> {
+    let raw: &mut [u32] = raw_fields(out);
+    gb.read_bits_run(n, raw).ok_or(XllError::Bitstream)?;
+    for v in raw {
+        *v = (*v >> 1) ^ 0u32.wrapping_sub(*v & 1);
+    }
+    Ok(())
+}
+
+/// `get_bits` for every sample of `out`.
+fn get_bits_run(gb: &mut BitReader, n: usize, out: &mut [i32]) -> R<()> {
+    gb.read_bits_run(n, raw_fields(out))
+        .ok_or(XllError::Bitstream)
+}
+
+/// A sample buffer as the raw fields read into it.
+fn raw_fields(samples: &mut [i32]) -> &mut [u32] {
+    // SAFETY: `i32` and `u32` have the same size, alignment and validity.
+    unsafe { std::slice::from_raw_parts_mut(samples.as_mut_ptr().cast(), samples.len()) }
+}
+
 /// Inverse adaptive prediction: from sample `order` on, subtract from each
 /// residual the clipped prediction made from the `order` samples before it,
 /// `coeff[order - 1 - k]` weighing `buf[j + k]`. Each prediction reads the
@@ -1680,16 +1707,11 @@ impl XllDecoder {
             let buf = &mut c.band.msb[i];
 
             if !c.rice_code_flag[k] {
-                for s in 0..na {
-                    buf[seg_base + s] = get_linear(gb, c.bitalloc_part_a[k])?;
-                }
-                for s in 0..nb {
-                    buf[seg_base + na + s] = get_linear(gb, c.bitalloc_part_b[k])?;
-                }
+                let (part_a, part_b) = buf[seg_base..seg_base + nsegsamples].split_at_mut(na);
+                get_linear_run(gb, c.bitalloc_part_a[k], part_a)?;
+                get_linear_run(gb, c.bitalloc_part_b[k], part_b)?;
             } else {
-                for s in 0..na {
-                    buf[seg_base + s] = get_rice(gb, c.bitalloc_part_a[k])?;
-                }
+                get_rice_run(gb, c.bitalloc_part_a[k], &mut buf[seg_base..seg_base + na])?;
                 if c.bitalloc_hybrid_linear[k] != 0 {
                     let niso = rb(gb, nsegsamples_log2)? as usize;
                     for s in 0..nb {
@@ -1710,9 +1732,8 @@ impl XllDecoder {
                         }
                     }
                 } else {
-                    for s in 0..nb {
-                        buf[seg_base + na + s] = get_rice(gb, c.bitalloc_part_b[k])?;
-                    }
+                    let part_b = &mut buf[seg_base + na..seg_base + nsegsamples];
+                    get_rice_run(gb, c.bitalloc_part_b[k], part_b)?;
                 }
             }
         }
@@ -1731,9 +1752,7 @@ impl XllDecoder {
                 if w != 0 {
                     let seg_base = seg * nsegsamples;
                     let lbuf = &mut c.band.lsb[i];
-                    for s in 0..nsegsamples {
-                        lbuf[seg_base + s] = rb(gb, w)? as i32;
-                    }
+                    get_bits_run(gb, w, &mut lbuf[seg_base..seg_base + nsegsamples])?;
                 }
             }
         }
