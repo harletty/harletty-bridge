@@ -14,3 +14,10 @@ inherits = "release"
 lto = "thin"
 strip = "symbols"
 
+# The TrueHD decoder is built from our fork of the `truehd` crate, pinned to a
+# commit: upstream's unreleased main plus the decode-speed series, which
+# decodes in a quarter of the time of 0.7.2 with the same output. The crates
+# keep asking for the crates.io version, so dropping this section goes back
+# to it. Move the pin only to a commit that stays reachable on the fork.
+[patch.crates-io]
+truehd = { git = "https://github.com/harletty/truehdd", rev = "600355da1edb3ba51cc0064f76e9dd57198a0bb4" }
