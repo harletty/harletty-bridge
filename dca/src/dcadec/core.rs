@@ -1170,21 +1170,19 @@ impl CoreDecoder {
 /// Bed-channel label for each primary channel, in DCA decode order
 /// (`prm_ch_to_spkr_map`). The renderer places beds by label, so this order
 /// (not WAV order) is what the synthesized `fullband_channels` follow.
-pub(crate) fn primary_bed_layout(mode: AudioMode) -> Vec<BedChannel> {
+pub(crate) fn primary_bed_layout(mode: AudioMode) -> &'static [BedChannel] {
     use crate::types::BedChannel::*;
     match mode {
-        AudioMode::Mono => vec![Center],
+        AudioMode::Mono => &[Center],
         AudioMode::MonoDual
         | AudioMode::Stereo
         | AudioMode::StereoSumDiff
-        | AudioMode::StereoTotal => vec![FrontLeft, FrontRight],
-        AudioMode::ThreeF => vec![Center, FrontLeft, FrontRight],
-        AudioMode::TwoF1R => vec![FrontLeft, FrontRight, RearCenter],
-        AudioMode::ThreeF1R => vec![Center, FrontLeft, FrontRight, RearCenter],
-        AudioMode::TwoF2R => vec![FrontLeft, FrontRight, SurroundLeft, SurroundRight],
-        AudioMode::ThreeF2R => {
-            vec![Center, FrontLeft, FrontRight, SurroundLeft, SurroundRight]
-        }
+        | AudioMode::StereoTotal => &[FrontLeft, FrontRight],
+        AudioMode::ThreeF => &[Center, FrontLeft, FrontRight],
+        AudioMode::TwoF1R => &[FrontLeft, FrontRight, RearCenter],
+        AudioMode::ThreeF1R => &[Center, FrontLeft, FrontRight, RearCenter],
+        AudioMode::TwoF2R => &[FrontLeft, FrontRight, SurroundLeft, SurroundRight],
+        AudioMode::ThreeF2R => &[Center, FrontLeft, FrontRight, SurroundLeft, SurroundRight],
     }
 }
 

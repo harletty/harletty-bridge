@@ -32,7 +32,7 @@ impl From<CoreError> for DecodeError {
 /// Decoded core-channel PCM for one access unit. Layout matches
 /// `eac3::CorePcmFrame`. `fullband_channels` are in DCA primary-channel order,
 /// each paired with its `fullband_channel_order` bed label.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CorePcmFrame {
     pub sample_rate: u32,
     pub fullband_channel_order: Vec<BedChannel>,
@@ -67,7 +67,7 @@ pub struct PcmPushResult {
 /// callers that want the canonical layout; the decode path uses
 /// `core::primary_bed_layout` to match synthesized channel order.
 pub fn bed_layout(mode: AudioMode) -> Vec<BedChannel> {
-    primary_bed_layout(mode)
+    primary_bed_layout(mode).to_vec()
 }
 
 #[derive(Default)]
@@ -94,21 +94,38 @@ impl PcmDecoder {
 
     /// Decode one core access unit into PCM.
     pub fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<PcmPushResult, DecodeError> {
-        let info = parse_header(access_unit)?;
-        self.core.decode_frame(&info, access_unit)?;
-        let (fullband_channels, lfe_channel) = self.synth.synthesize(&mut self.core);
-        self.frames_seen += 1;
-
+        let mut pcm = CorePcmFrame::default();
+        let info = self.decode_into(access_unit, &mut pcm)?;
         Ok(PcmPushResult {
             frames_seen: self.frames_seen,
             info,
-            pcm: CorePcmFrame {
-                sample_rate: info.sample_rate,
-                fullband_channel_order: primary_bed_layout(info.audio_mode),
-                fullband_channels,
-                lfe_channel,
-                decoded: true,
-            },
+            pcm,
         })
+    }
+
+    /// [`Self::push_access_unit`] into a frame the caller keeps from one call
+    /// to the next: its channel buffers are refilled, so a stream whose
+    /// layout holds decodes without allocating. Returns the frame header.
+    /// On error `pcm` is left as it was.
+    pub fn decode_into(
+        &mut self,
+        access_unit: &[u8],
+        pcm: &mut CorePcmFrame,
+    ) -> Result<FrameInfo, DecodeError> {
+        let info = parse_header(access_unit)?;
+        self.core.decode_frame(&info, access_unit)?;
+        self.synth.synthesize(
+            &mut self.core,
+            &mut pcm.fullband_channels,
+            &mut pcm.lfe_channel,
+        );
+        self.frames_seen += 1;
+
+        pcm.sample_rate = info.sample_rate;
+        pcm.fullband_channel_order.clear();
+        pcm.fullband_channel_order
+            .extend_from_slice(primary_bed_layout(info.audio_mode));
+        pcm.decoded = true;
+        Ok(info)
     }
 }
