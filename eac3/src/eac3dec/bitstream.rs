@@ -28,6 +28,20 @@ impl<'a> BitReader<'a> {
         self.bit_pos
     }
 
+    /// Move to `bit_pos`, for a caller that read [`Self::data`] itself and
+    /// has checked where it stopped against [`Self::limit_bits`].
+    pub(crate) fn set_position(&mut self, bit_pos: usize) {
+        self.bit_pos = bit_pos.min(self.bit_size);
+    }
+
+    pub(crate) fn limit_bits(&self) -> usize {
+        self.bit_size
+    }
+
+    pub(crate) fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
     pub(crate) fn set_limit_bits(&mut self, bit_size: usize) {
         self.bit_size = bit_size.min(self.data.len() * 8);
         if self.bit_pos > self.bit_size {
