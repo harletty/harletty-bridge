@@ -2,8 +2,6 @@
 
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
-use std::sync::OnceLock;
-
 use super::syncframe::{ExpStrategy, ParseError};
 
 pub(crate) const LFE_END_MANTISSA: usize = 7;
@@ -565,9 +563,18 @@ impl AllocationState {
         state: &mut MantissaDecodeState,
     ) -> Result<(), ParseError> {
         target.fill(0.0);
+        let (Some(baps), Some(exponents), Some(target)) = (
+            self.bap.get(start..end),
+            self.exponents.get(start..end),
+            target.get_mut(start..end),
+        ) else {
+            return Ok(());
+        };
 
-        for bin in start..end {
-            target[bin] = match self.bap[bin] {
+        // Codes index tables sized to their field width, so the masks change
+        // nothing; they let the compiler drop the bounds checks.
+        for ((slot, &bap), &exponent) in target.iter_mut().zip(baps).zip(exponents) {
+            *slot = match bap {
                 0 => 0.0,
                 1 => {
                     state.bap1_pos += 1;
@@ -576,14 +583,10 @@ impl AllocationState {
                             .read_bits(BAP_BITS[1])
                             .ok_or(ParseError::ShortPacket)?
                             as usize;
-                        state.bap1_next.copy_from_slice(
-                            bap1_table()
-                                .get(code)
-                                .ok_or(ParseError::InvalidHeader("bap1"))?,
-                        );
+                        state.bap1_next = BAP1_TABLE[code & (BAP1_TABLE.len() - 1)];
                         state.bap1_pos = 0;
                     }
-                    scale_int24(state.bap1_next[state.bap1_pos], self.exponents[bin])
+                    scale_int24(state.bap1_next[state.bap1_pos], exponent)
                 }
                 2 => {
                     state.bap2_pos += 1;
@@ -592,25 +595,16 @@ impl AllocationState {
                             .read_bits(BAP_BITS[2])
                             .ok_or(ParseError::ShortPacket)?
                             as usize;
-                        state.bap2_next.copy_from_slice(
-                            bap2_table()
-                                .get(code)
-                                .ok_or(ParseError::InvalidHeader("bap2"))?,
-                        );
+                        state.bap2_next = BAP2_TABLE[code & (BAP2_TABLE.len() - 1)];
                         state.bap2_pos = 0;
                     }
-                    scale_int24(state.bap2_next[state.bap2_pos], self.exponents[bin])
+                    scale_int24(state.bap2_next[state.bap2_pos], exponent)
                 }
                 3 => {
                     let code = reader
                         .read_bits(BAP_BITS[3])
                         .ok_or(ParseError::ShortPacket)? as usize;
-                    scale_int24(
-                        *bap3_table()
-                            .get(code)
-                            .ok_or(ParseError::InvalidHeader("bap3"))?,
-                        self.exponents[bin],
-                    )
+                    scale_int24(BAP3_TABLE[code & (BAP3_TABLE.len() - 1)], exponent)
                 }
                 4 => {
                     state.bap4_pos += 1;
@@ -619,31 +613,22 @@ impl AllocationState {
                             .read_bits(BAP_BITS[4])
                             .ok_or(ParseError::ShortPacket)?
                             as usize;
-                        state.bap4_next.copy_from_slice(
-                            bap4_table()
-                                .get(code)
-                                .ok_or(ParseError::InvalidHeader("bap4"))?,
-                        );
+                        state.bap4_next = BAP4_TABLE[code & (BAP4_TABLE.len() - 1)];
                         state.bap4_pos = 0;
                     }
-                    scale_int24(state.bap4_next[state.bap4_pos], self.exponents[bin])
+                    scale_int24(state.bap4_next[state.bap4_pos], exponent)
                 }
                 5 => {
                     let code = reader
                         .read_bits(BAP_BITS[5])
                         .ok_or(ParseError::ShortPacket)? as usize;
-                    scale_int24(
-                        *bap5_table()
-                            .get(code)
-                            .ok_or(ParseError::InvalidHeader("bap5"))?,
-                        self.exponents[bin],
-                    )
+                    scale_int24(BAP5_TABLE[code & (BAP5_TABLE.len() - 1)], exponent)
                 }
                 bap => {
-                    let bits = BAP_BITS[bap as usize];
+                    let bits = BAP_BITS[bap as usize & (BAP_BITS.len() - 1)];
                     let raw = reader.read_bits(bits).ok_or(ParseError::ShortPacket)? as i32;
                     let signed = raw << (32 - bits);
-                    scale_int32(shift_right_signed(signed, self.exponents[bin]))
+                    scale_int32(shift_right_signed(signed, exponent))
                 }
             };
         }
@@ -713,38 +698,35 @@ impl AllocationState {
 
         let mut current_exponent = absolute_exponent;
         self.exponents[start_mantissa] = current_exponent;
-        let mut mantissa = exponent_offset;
-        for &group in grouped {
-            current_exponent += group / 25 - 2;
-            for _ in 0..group_size {
-                if mantissa >= MAX_ALLOCATION_SIZE {
-                    return Err(ParseError::InvalidHeader("expmant"));
-                }
-                self.exponents[mantissa] = current_exponent;
-                mantissa += 1;
-            }
-
-            current_exponent += (group % 25) / 5 - 2;
-            for _ in 0..group_size {
-                if mantissa >= MAX_ALLOCATION_SIZE {
-                    return Err(ParseError::InvalidHeader("expmant"));
-                }
-                self.exponents[mantissa] = current_exponent;
-                mantissa += 1;
-            }
-
-            current_exponent += group % 5 - 2;
-            for _ in 0..group_size {
-                if mantissa >= MAX_ALLOCATION_SIZE {
-                    return Err(ParseError::InvalidHeader("expmant"));
-                }
-                self.exponents[mantissa] = current_exponent;
-                mantissa += 1;
+        // Each group sets three runs of `group_size` exponents. A group list
+        // that would run past the last bin is rejected before any of it is
+        // written; the state it would have half-filled is dropped with the
+        // error either way.
+        let written = grouped.len() * 3 * group_size;
+        let Some(exponents) = self
+            .exponents
+            .get_mut(exponent_offset..exponent_offset + written)
+        else {
+            return Err(ParseError::InvalidHeader("expmant"));
+        };
+        for (&group, runs) in grouped
+            .iter()
+            .zip(exponents.chunks_exact_mut(3 * group_size))
+        {
+            let deltas = EXPONENT_GROUP_DELTAS[group as usize & 127];
+            for (delta, run) in deltas.into_iter().zip(runs.chunks_exact_mut(group_size)) {
+                current_exponent += delta;
+                run.fill(current_exponent);
             }
         }
 
-        for bin in start_mantissa..end_mantissa {
-            self.psd[bin] = 3072 - (self.exponents[bin] << 7);
+        // An end below the start (a corrupt coupling range) writes nothing.
+        let psd_end = end_mantissa.max(start_mantissa);
+        for (psd, &exponent) in self.psd[start_mantissa..psd_end]
+            .iter_mut()
+            .zip(&self.exponents[start_mantissa..psd_end])
+        {
+            *psd = 3072 - (exponent << 7);
         }
 
         let mut bin = start_mantissa;
@@ -890,55 +872,120 @@ fn shift_right_signed(value: i32, bits: i32) -> i32 {
     }
 }
 
-fn generate_quantization(levels: i32) -> Vec<i32> {
-    let mut result = vec![0; levels as usize + 1];
-    let mut numerator = -1 - levels;
-    for value in result.iter_mut().take(levels as usize) {
-        numerator += 2;
-        *value = (((1 << 23) - 1) * numerator) / levels;
+/// The `levels` symmetric quantizer values of A/52 table 7.19-7.23, in 24-bit
+/// fixed point, followed by zeros: `(2^23 - 1) * (2i + 1 - levels) / levels`.
+const fn quantization<const LEN: usize>(levels: i32) -> [i32; LEN] {
+    let mut result = [0; LEN];
+    let mut index = 0;
+    while index < levels as usize && index < LEN {
+        result[index] = (((1 << 23) - 1) * (2 * index as i32 + 1 - levels)) / levels;
+        index += 1;
     }
     result
 }
 
-fn generate_grouped_quantization<const GROUPS: usize>(
+/// A grouped mantissa code split into its `GROUPS` quantizer values, most
+/// significant first, for every code the field width can carry (codes past
+/// `levels^GROUPS` included: they decode the way the arithmetic says).
+const fn grouped_quantization<const GROUPS: usize, const LEN: usize>(
     levels: i32,
-    group_bits: usize,
-) -> Vec<[i32; GROUPS]> {
-    let source = generate_quantization(levels);
-    let mut result = Vec::with_capacity(1 << group_bits);
-    for code in 0..(1 << group_bits) {
-        let mut entry = [0; GROUPS];
+) -> [[i32; GROUPS]; LEN] {
+    let source = quantization::<16>(levels);
+    let mut result = [[0; GROUPS]; LEN];
+    let mut code = 0;
+    while code < LEN {
         let mut grouped = code;
-        for slot in entry.iter_mut().rev() {
-            *slot = source[grouped % levels as usize];
+        let mut slot = GROUPS;
+        while slot > 0 {
+            slot -= 1;
+            result[code][slot] = source[grouped % levels as usize];
             grouped /= levels as usize;
         }
-        result.push(entry);
+        code += 1;
     }
     result
 }
 
-fn bap1_table() -> &'static Vec<[i32; 3]> {
-    static TABLE: OnceLock<Vec<[i32; 3]>> = OnceLock::new();
-    TABLE.get_or_init(|| generate_grouped_quantization::<3>(3, BAP_BITS[1]))
-}
+const BAP1_TABLE: [[i32; 3]; 1 << BAP_BITS[1]] = grouped_quantization(3);
+const BAP2_TABLE: [[i32; 3]; 1 << BAP_BITS[2]] = grouped_quantization(5);
+const BAP3_TABLE: [i32; 1 << BAP_BITS[3]] = quantization(7);
+const BAP4_TABLE: [[i32; 2]; 1 << BAP_BITS[4]] = grouped_quantization(11);
+const BAP5_TABLE: [i32; 1 << BAP_BITS[5]] = quantization(15);
 
-fn bap2_table() -> &'static Vec<[i32; 3]> {
-    static TABLE: OnceLock<Vec<[i32; 3]>> = OnceLock::new();
-    TABLE.get_or_init(|| generate_grouped_quantization::<3>(5, BAP_BITS[2]))
-}
+/// Exponent deltas of a 7-bit group, `[g / 25 - 2, (g % 25) / 5 - 2, g % 5 - 2]`
+/// (A/52 7.1.3), for every value the field can carry.
+const EXPONENT_GROUP_DELTAS: [[i32; 3]; 128] = {
+    let mut result = [[0; 3]; 128];
+    let mut group = 0;
+    while group < 128 {
+        result[group] = [
+            group as i32 / 25 - 2,
+            (group as i32 % 25) / 5 - 2,
+            group as i32 % 5 - 2,
+        ];
+        group += 1;
+    }
+    result
+};
 
-fn bap3_table() -> &'static Vec<i32> {
-    static TABLE: OnceLock<Vec<i32>> = OnceLock::new();
-    TABLE.get_or_init(|| generate_quantization(7))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn bap4_table() -> &'static Vec<[i32; 2]> {
-    static TABLE: OnceLock<Vec<[i32; 2]>> = OnceLock::new();
-    TABLE.get_or_init(|| generate_grouped_quantization::<2>(11, BAP_BITS[4]))
-}
+    fn generate_quantization(levels: i32) -> Vec<i32> {
+        let mut result = vec![0; levels as usize + 1];
+        let mut numerator = -1 - levels;
+        for value in result.iter_mut().take(levels as usize) {
+            numerator += 2;
+            *value = (((1 << 23) - 1) * numerator) / levels;
+        }
+        result
+    }
 
-fn bap5_table() -> &'static Vec<i32> {
-    static TABLE: OnceLock<Vec<i32>> = OnceLock::new();
-    TABLE.get_or_init(|| generate_quantization(15))
+    fn generate_grouped_quantization<const GROUPS: usize>(
+        levels: i32,
+        group_bits: usize,
+    ) -> Vec<[i32; GROUPS]> {
+        let source = generate_quantization(levels);
+        let mut result = Vec::with_capacity(1 << group_bits);
+        for code in 0..(1 << group_bits) {
+            let mut entry = [0; GROUPS];
+            let mut grouped = code;
+            for slot in entry.iter_mut().rev() {
+                *slot = source[grouped % levels as usize];
+                grouped /= levels as usize;
+            }
+            result.push(entry);
+        }
+        result
+    }
+
+    /// The const tables against the runtime generators they replaced.
+    #[test]
+    fn const_quantization_tables_match_the_generated_ones() {
+        assert_eq!(
+            BAP1_TABLE.to_vec(),
+            generate_grouped_quantization::<3>(3, BAP_BITS[1])
+        );
+        assert_eq!(
+            BAP2_TABLE.to_vec(),
+            generate_grouped_quantization::<3>(5, BAP_BITS[2])
+        );
+        assert_eq!(BAP3_TABLE.to_vec(), generate_quantization(7));
+        assert_eq!(
+            BAP4_TABLE.to_vec(),
+            generate_grouped_quantization::<2>(11, BAP_BITS[4])
+        );
+        assert_eq!(BAP5_TABLE.to_vec(), generate_quantization(15));
+    }
+
+    #[test]
+    fn exponent_group_deltas_match_the_arithmetic() {
+        for group in 0..128i32 {
+            assert_eq!(
+                EXPONENT_GROUP_DELTAS[group as usize],
+                [group / 25 - 2, (group % 25) / 5 - 2, group % 5 - 2]
+            );
+        }
+    }
 }
