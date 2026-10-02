@@ -895,11 +895,19 @@ pub fn inspect_legacy_ac3_access_unit(data: &[u8]) -> Result<AccessUnitInfo, Par
     })
 }
 
-pub(crate) fn inspect_access_unit_with_metadata_state(
-    data: &[u8],
-    metadata_state: &mut MetadataParseState,
-    mut aux_state: Option<&mut AuxDataDecodeState>,
-) -> Result<AccessUnitInfo, ParseError> {
+/// Everything in an E-AC-3 access unit up to its audio blocks: the
+/// syncinfo, bit stream information and audio frame fields, and the trailing
+/// aux data located from the end of the frame. Reading it costs a few hundred
+/// bits; the blocks behind it are what a walk or a decode then goes through.
+struct AccessUnitPrefix<'a> {
+    frame: &'a [u8],
+    info: AccessUnitInfo,
+    sample_rate_index: usize,
+    block_start_bit_offsets: Option<Vec<usize>>,
+    trailing_aux_data: TrailingAuxDataInfo,
+}
+
+fn parse_access_unit_prefix(data: &[u8]) -> Result<AccessUnitPrefix<'_>, ParseError> {
     if data.len() < 7 {
         return Err(ParseError::ShortPacket);
     }
@@ -1048,11 +1056,75 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
     )?;
 
     let trailing_aux_data = extract_trailing_aux_data(frame);
+
+    Ok(AccessUnitPrefix {
+        frame,
+        info: AccessUnitInfo {
+            frame_size,
+            bitstream_id,
+            frame_type,
+            substreamid,
+            sample_rate,
+            num_blocks,
+            channel_mode,
+            channels,
+            fullband_channels,
+            lfe_on,
+            dependent_channel_map,
+            dialogue_normalization,
+            heavy_compression_exists,
+            heavy_compression_word,
+            addbsi_present,
+            extension_type_a,
+            complexity_index_type_a,
+            mixing_metadata_present,
+            informational_metadata_present,
+            addbsi_bytes,
+            body_start_bit_offset,
+            audio_frame: audio_frame.info,
+            block_drc: Vec::new(),
+            skip_fields: Vec::new(),
+            trailing_aux_data: Vec::new(),
+            aux_data: Vec::new(),
+            aux_parse_status: AuxParseStatus::Disabled,
+            emdf_source: EmdfSource::None,
+            emdf_blocks: Vec::new(),
+            emdf_block_count: 0,
+            first_emdf_sync_offset: None,
+        },
+        sample_rate_index,
+        block_start_bit_offsets: audio_frame.block_start_bit_offsets,
+        trailing_aux_data,
+    })
+}
+
+pub(crate) fn inspect_access_unit_with_metadata_state(
+    data: &[u8],
+    metadata_state: &mut MetadataParseState,
+    mut aux_state: Option<&mut AuxDataDecodeState>,
+) -> Result<AccessUnitInfo, ParseError> {
+    let AccessUnitPrefix {
+        frame,
+        mut info,
+        sample_rate_index,
+        block_start_bit_offsets,
+        trailing_aux_data,
+    } = parse_access_unit_prefix(data)?;
+    let AccessUnitInfo {
+        frame_type,
+        num_blocks,
+        channel_mode,
+        fullband_channels,
+        lfe_on,
+        ..
+    } = info;
+    let audio_frame = &info.audio_frame;
+
     let mut block_drc = Vec::with_capacity(num_blocks as usize);
     let mut skip_fields = Vec::new();
     let mut aux_parse_status = AuxParseStatus::Disabled;
-    if audio_frame.info.skip_field_syntax_enabled {
-        if num_blocks == 1 || audio_frame.block_start_bit_offsets.is_some() {
+    if audio_frame.skip_field_syntax_enabled {
+        if num_blocks == 1 || block_start_bit_offsets.is_some() {
             match collect_skip_fields(
                 frame,
                 frame_type,
@@ -1060,8 +1132,8 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                 channel_mode,
                 fullband_channels as usize,
                 lfe_on,
-                &audio_frame.info,
-                audio_frame.block_start_bit_offsets.as_deref(),
+                audio_frame,
+                block_start_bit_offsets.as_deref(),
                 trailing_aux_data.start_bit_offset,
                 sample_rate_index,
                 &mut block_drc,
@@ -1112,7 +1184,7 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                 channel_mode,
                 fullband_channels as usize,
                 lfe_on,
-                &audio_frame.info,
+                audio_frame,
                 trailing_aux_data.start_bit_offset,
                 &mut walk_state,
                 &mut block_drc,
@@ -1165,8 +1237,8 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
             channel_mode,
             fullband_channels as usize,
             lfe_on,
-            &audio_frame.info,
-            audio_frame.block_start_bit_offsets.as_deref(),
+            audio_frame,
+            block_start_bit_offsets.as_deref(),
             trailing_aux_data.start_bit_offset,
             sample_rate_index,
             &mut block_drc,
@@ -1178,8 +1250,24 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
         }
     }
 
+    info.block_drc = block_drc;
+    info.skip_fields = skip_fields;
+    info.aux_parse_status = aux_parse_status;
+    finish_access_unit_info(&mut info, frame, trailing_aux_data, metadata_state);
+    Ok(info)
+}
+
+/// Gather the aux data the skip fields and the frame's tail carry and parse
+/// the EMDF in it, completing `info` once its blocks have been read.
+fn finish_access_unit_info(
+    info: &mut AccessUnitInfo,
+    frame: &[u8],
+    trailing_aux_data: TrailingAuxDataInfo,
+    metadata_state: &mut MetadataParseState,
+) {
+    let skip_fields = &info.skip_fields;
     let mut aux_data = Vec::new();
-    for field in &skip_fields {
+    for field in skip_fields {
         aux_data.extend_from_slice(&field.bytes);
     }
     aux_data.extend_from_slice(&trailing_aux_data.bytes);
@@ -1196,39 +1284,12 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
     };
     let first_emdf_sync_offset = emdf_blocks.first().map(|block| block.sync_offset);
 
-    Ok(AccessUnitInfo {
-        frame_size,
-        bitstream_id,
-        frame_type,
-        substreamid,
-        sample_rate,
-        num_blocks,
-        channel_mode,
-        channels,
-        fullband_channels,
-        lfe_on,
-        dependent_channel_map,
-        dialogue_normalization,
-        heavy_compression_exists,
-        heavy_compression_word,
-        addbsi_present,
-        extension_type_a,
-        complexity_index_type_a,
-        mixing_metadata_present,
-        informational_metadata_present,
-        addbsi_bytes,
-        body_start_bit_offset,
-        audio_frame: audio_frame.info,
-        block_drc,
-        skip_fields,
-        trailing_aux_data: trailing_aux_data.bytes,
-        aux_data,
-        aux_parse_status,
-        emdf_source,
-        emdf_block_count: emdf_blocks.len(),
-        first_emdf_sync_offset,
-        emdf_blocks,
-    })
+    info.trailing_aux_data = trailing_aux_data.bytes;
+    info.aux_data = aux_data;
+    info.emdf_source = emdf_source;
+    info.emdf_block_count = emdf_blocks.len();
+    info.first_emdf_sync_offset = first_emdf_sync_offset;
+    info.emdf_blocks = emdf_blocks;
 }
 
 /// Frame size of a legacy AC-3 syncframe; one table for the whole crate (the
@@ -3232,21 +3293,100 @@ pub(crate) fn decode_core_pcm_frame_with_state(
     info: &AccessUnitInfo,
     state: &mut CoreDecodeState,
 ) -> Result<CorePcmFrame, ParseError> {
-    let mut pcm = CorePcmFrame {
-        sample_rate: 0,
-        fullband_channel_order: Vec::new(),
-        fullband_channels: Vec::new(),
-        lfe_channel: None,
-    };
-    decode_core_pcm_frame_with_state_into(frame, info, state, &mut pcm)?;
+    let mut pcm = CorePcmFrame::empty();
+    decode_core_pcm_frame_with_state_into(frame, info, state, &mut pcm, None)?;
     Ok(pcm)
 }
 
-pub(crate) fn decode_core_pcm_frame_with_state_into(
+/// What the inspection walk reads out of the audio blocks, recorded by a
+/// decode that goes through the same syntax anyway.
+#[derive(Debug, Default)]
+struct BlockSideInfo {
+    block_drc: Vec<BlockDrcInfo>,
+    skip_fields: Vec<SkipFieldInfo>,
+}
+
+/// Decode one E-AC-3 access unit and describe it, reading its audio blocks
+/// once.
+///
+/// [`inspect_access_unit_with_metadata_state`] walks every block - exponents,
+/// bit allocation, mantissa bit counts - to find the skip fields that carry
+/// the EMDF (and the per-block DRC words), and a decode then reads the same
+/// blocks again. Here the decode records both on its way through, so the
+/// result is the inspection's `AccessUnitInfo` plus the PCM for one pass over
+/// the blocks instead of two.
+///
+/// Frames the decode does not walk the way the inspection does - a single
+/// block or block start offsets (the inspection reads each block from its
+/// declared start), or a buffer that is not exactly one frame (the inspection
+/// reports its errors first) - take the two-pass path, which is what this
+/// replaces and so gives the same result by construction.
+pub(crate) fn decode_access_unit_with_metadata_state(
+    data: &[u8],
+    metadata_state: &mut MetadataParseState,
+    aux_state: &mut AuxDataDecodeState,
+    core_state: &mut CoreDecodeState,
+    pcm: &mut CorePcmFrame,
+) -> Result<AccessUnitInfo, ParseError> {
+    let prefix = parse_access_unit_prefix(data)?;
+    if data.len() != prefix.info.frame_size
+        || prefix.info.num_blocks == 1
+        || prefix.block_start_bit_offsets.is_some()
+    {
+        let info = inspect_access_unit_with_metadata_state(data, metadata_state, Some(aux_state))?;
+        check_access_unit_size(data, &info)?;
+        decode_core_pcm_frame_with_state_into(data, &info, core_state, pcm, None)?;
+        return Ok(info);
+    }
+
+    let AccessUnitPrefix {
+        frame,
+        mut info,
+        trailing_aux_data,
+        ..
+    } = prefix;
+    let mut side = BlockSideInfo {
+        block_drc: Vec::with_capacity(info.num_blocks as usize),
+        skip_fields: Vec::new(),
+    };
+    decode_core_pcm_frame_with_state_into(frame, &info, core_state, pcm, Some(&mut side))?;
+    info.aux_parse_status = if info.audio_frame.skip_field_syntax_enabled {
+        AuxParseStatus::Extracted
+    } else {
+        AuxParseStatus::Disabled
+    };
+    info.block_drc = side.block_drc;
+    info.skip_fields = side.skip_fields;
+    finish_access_unit_info(&mut info, frame, trailing_aux_data, metadata_state);
+    Ok(info)
+}
+
+/// The decoders take exactly one syncframe per access unit.
+pub(crate) fn check_access_unit_size(
+    access_unit: &[u8],
+    info: &AccessUnitInfo,
+) -> Result<(), ParseError> {
+    if access_unit.len() < info.frame_size {
+        return Err(ParseError::TruncatedFrame {
+            expected: info.frame_size,
+            available: access_unit.len(),
+        });
+    }
+    if access_unit.len() != info.frame_size {
+        return Err(ParseError::TrailingData {
+            expected: info.frame_size,
+            provided: access_unit.len(),
+        });
+    }
+    Ok(())
+}
+
+fn decode_core_pcm_frame_with_state_into(
     frame: &[u8],
     info: &AccessUnitInfo,
     state: &mut CoreDecodeState,
     pcm: &mut CorePcmFrame,
+    mut side: Option<&mut BlockSideInfo>,
 ) -> Result<(), ParseError> {
     // Dependent substreams are decoded here too (4 coded channels for a 7.1
     // extension); the caller remaps them to their real speaker positions via the
@@ -3316,6 +3456,7 @@ pub(crate) fn decode_core_pcm_frame_with_state_into(
             lfe_imdct.as_mut(),
             &mut pcm.fullband_channels,
             pcm.lfe_channel.as_mut(),
+            side.as_deref_mut(),
         )?;
     }
 
@@ -3417,6 +3558,7 @@ fn decode_block_core_pcm(
     lfe_imdct: Option<&mut ImdctState>,
     fullband_channels: &mut [Vec<f32>],
     lfe_channel: Option<&mut Vec<f32>>,
+    mut side: Option<&mut BlockSideInfo>,
 ) -> Result<(), ParseError> {
     let fullband_count = info.fullband_channels as usize;
     let mut block_switch = vec![false; fullband_count];
@@ -3435,9 +3577,17 @@ fn decode_block_core_pcm(
         }
     }
 
-    skip_conditional_bits(reader, 8)?;
-    if info.channel_mode == 0 {
-        skip_conditional_bits(reader, 8)?;
+    let mut drc_info = BlockDrcInfo::default();
+    for program in 0..if info.channel_mode == 0 { 2 } else { 1 } {
+        drc_info.dynamic_range_exists[program] =
+            reader.read_bit().ok_or(ParseError::ShortPacket)?;
+        if drc_info.dynamic_range_exists[program] {
+            drc_info.dynamic_range_word[program] =
+                reader.read_bits(8).ok_or(ParseError::ShortPacket)? as u8;
+        }
+    }
+    if let Some(side) = side.as_deref_mut() {
+        side.block_drc.push(drc_info);
     }
     bittrace("after_dynrng", block, reader.position());
 
@@ -3546,9 +3696,21 @@ fn decode_block_core_pcm(
 
     if audio_frame.skip_field_syntax_enabled && reader.read_bit().ok_or(ParseError::ShortPacket)? {
         let skip_length = reader.read_bits(9).ok_or(ParseError::ShortPacket)? as usize;
-        reader
-            .skip_bits(skip_length * 8)
-            .ok_or(ParseError::ShortPacket)?;
+        if let Some(side) = side {
+            let bit_offset = reader.position();
+            let bytes = reader
+                .read_bytes(skip_length)
+                .ok_or(ParseError::ShortPacket)?;
+            side.skip_fields.push(SkipFieldInfo {
+                block_index: Some(block),
+                bit_offset,
+                bytes,
+            });
+        } else {
+            reader
+                .skip_bits(skip_length * 8)
+                .ok_or(ParseError::ShortPacket)?;
+        }
     }
     bittrace("after_skip", block, reader.position());
 
@@ -4557,6 +4719,7 @@ mod tests {
             &mut imdct,
             None,
             &mut channels,
+            None,
             None,
         )
         .expect("coupling PCM block should decode");

@@ -1,56 +1,34 @@
 use bridge_api::RDecodedFrame;
 
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct PcmStats {
-    pub(crate) max_abs: i32,
-    pub(crate) near_clip_count: usize,
-}
-
-impl PcmStats {
-    pub(crate) fn from_frame(frame: &RDecodedFrame) -> Result<Self, String> {
-        if frame.sample_count == 0 {
-            return Err("sample_count_zero".to_string());
-        }
-        if frame.sampling_frequency == 0 {
-            return Err("sample_rate_zero".to_string());
-        }
-        if frame.channel_count == 0 {
-            return Err("channel_count_zero".to_string());
-        }
-
-        let expected = frame.sample_count as usize * frame.channel_count as usize;
-        if frame.pcm.len() != expected {
-            return Err(format!(
-                "pcm_len_mismatch expected={} actual={}",
-                expected,
-                frame.pcm.len()
-            ));
-        }
-
-        let near_clip_threshold = (i32::MAX as f32 * 0.999) as i32;
-        let mut max_abs = 0i32;
-        let mut near_clip_count = 0usize;
-        for &sample in &frame.pcm {
-            let abs = sample.saturating_abs();
-            max_abs = max_abs.max(abs);
-            if abs >= near_clip_threshold {
-                near_clip_count += 1;
-            }
-        }
-
-        if near_clip_count > expected / 16 {
-            return Err(format!(
-                "too_many_near_clip_samples near_clip={} total={} max_abs={}",
-                near_clip_count, expected, max_abs
-            ));
-        }
-
-        Ok(Self {
-            max_abs,
-            near_clip_count,
-        })
+/// Check that a decoded frame is shaped the way the host reads it: a sample
+/// rate, samples and channels, and exactly `sample_count * channel_count`
+/// interleaved samples.
+///
+/// It used to scan every sample as well, rejecting a frame with more than one
+/// in sixteen within 0.1 % of `i32::MAX`. Bridge PCM is 24-bit in an `i32`
+/// (`float_to_pcm_i32` clamps to +/-2^23), so no sample comes within a factor
+/// of 256 of that threshold: the scan could never reject anything, and it cost
+/// a tenth of the realtime E-AC-3 path.
+pub(crate) fn validate_frame_shape(frame: &RDecodedFrame) -> Result<(), String> {
+    if frame.sample_count == 0 {
+        return Err("sample_count_zero".to_string());
     }
+    if frame.sampling_frequency == 0 {
+        return Err("sample_rate_zero".to_string());
+    }
+    if frame.channel_count == 0 {
+        return Err("channel_count_zero".to_string());
+    }
+
+    let expected = frame.sample_count as usize * frame.channel_count as usize;
+    if frame.pcm.len() != expected {
+        return Err(format!(
+            "pcm_len_mismatch expected={} actual={}",
+            expected,
+            frame.pcm.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Convert a floating-point PCM sample to the bridge's i32 PCM convention
@@ -81,7 +59,7 @@ pub(crate) fn float_to_pcm_i32(sample: f32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{PcmStats, float_to_pcm_i32};
+    use super::{float_to_pcm_i32, validate_frame_shape};
     use abi_stable::std_types::RVec;
     use bridge_api::{RChannelLabel, RDecodedFrame};
 
@@ -104,25 +82,26 @@ mod tests {
     }
 
     #[test]
-    fn pcm_stats_accepts_matching_frame() {
+    fn frame_shape_accepts_matching_frame() {
         let frame = decoded_frame(2, 2, vec![0, 10, -20, 30]);
-        let stats = PcmStats::from_frame(&frame).expect("frame should be valid");
-        assert_eq!(stats.max_abs, 30);
-        assert_eq!(stats.near_clip_count, 0);
+        validate_frame_shape(&frame).expect("frame should be valid");
     }
 
     #[test]
-    fn pcm_stats_rejects_length_mismatch() {
+    fn frame_shape_rejects_length_mismatch() {
         let frame = decoded_frame(2, 2, vec![0, 10, -20]);
-        let err = PcmStats::from_frame(&frame).expect_err("frame should be rejected");
+        let err = validate_frame_shape(&frame).expect_err("frame should be rejected");
         assert!(err.starts_with("pcm_len_mismatch"));
     }
 
+    /// Full scale is accepted, both ends of it: nothing about a loud frame is
+    /// malformed.
     #[test]
-    fn pcm_stats_rejects_many_clipped_samples() {
-        let frame = decoded_frame(16, 2, vec![i32::MAX; 32]);
-        let err = PcmStats::from_frame(&frame).expect_err("frame should be rejected");
-        assert!(err.starts_with("too_many_near_clip_samples"));
+    fn frame_shape_accepts_full_scale_samples() {
+        let frame = decoded_frame(16, 2, vec![8_388_607; 32]);
+        validate_frame_shape(&frame).expect("frame should be valid");
+        let frame = decoded_frame(16, 2, vec![-8_388_608; 32]);
+        validate_frame_shape(&frame).expect("frame should be valid");
     }
 
     /// The output boundary must map non-finite decoder output to silence and

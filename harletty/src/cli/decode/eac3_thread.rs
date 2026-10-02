@@ -2,8 +2,8 @@ use super::eac3_handler::Eac3FrameMessage;
 use crate::input::InputReader;
 use anyhow::Result;
 use eac3::{
-    AccessUnitParseError, ExtractError, Extractor, Frame, FrameType, ObjectPcmDecoder, PcmDecoder,
-    PcmPushResult, inspect_access_unit, merge_core_with_dependent,
+    AccessUnitParseError, ExtractError, Extractor, Frame, ObjectPcmDecoder, PcmDecoder,
+    PcmPushResult, StreamType, inspect_access_unit, merge_core_with_dependent,
 };
 use indicatif::ProgressBar;
 use std::path::PathBuf;
@@ -140,15 +140,21 @@ fn handle_frame(
     tx: &mpsc::Sender<Result<Eac3FrameMessage>>,
 ) -> Result<()> {
     let bytes = frame.as_bytes();
+    let header = frame.info();
 
-    // `inspect_access_unit` rejects legacy AC-3 syncframes (bsid <= 10) with
-    // `NotEac3` — that rejection IS the legacy detection.
-    let (frame_type, is_legacy_ac3) = match inspect_access_unit(bytes) {
-        Ok(info) => (Some(info.frame_type), false),
-        Err(AccessUnitParseError::NotEac3) => (None, true),
-        Err(_) => (None, false),
+    // The extractor has already read the header, and routing needs nothing
+    // more: a legacy AC-3 syncframe is `bsid <= 10`, a dependent substream
+    // says so in `strmtyp`. Only a dependent is inspected in full, once, for
+    // its JOC payload - and one whose inspection fails is handled as the
+    // independent frame it is not, as it always has been: its decode fails
+    // and stands in silence after the buffered frame is flushed.
+    let is_legacy_ac3 = header.bitstream_id <= 10;
+    let dependent_info = if header.stream_type == StreamType::Dependent && !is_legacy_ac3 {
+        inspect_access_unit(bytes).ok()
+    } else {
+        None
     };
-    let is_dependent = matches!(frame_type, Some(FrameType::Dependent));
+    let is_dependent = dependent_info.is_some();
 
     // A buffered frame is only ever paired with an *immediately* following
     // dependent access unit. Any other frame type means the buffered frame had
@@ -181,10 +187,10 @@ fn handle_frame(
         }
     }
 
-    if is_dependent {
+    if let Some(dep_info) = dependent_info {
         // Pair a buffered legacy AC-3 core with this dependent substream.
         if let Some(core_result) = state.pending_ac3_core.take() {
-            return handle_core_pair(core_result, frame, state, pb, strict_mode, tx);
+            return handle_core_pair(core_result, frame, dep_info, state, pb, strict_mode, tx);
         }
 
         // Pair the buffered independent E-AC-3 frame with this dependent
@@ -192,7 +198,7 @@ fn handle_frame(
         if let Some(pending) = state.pending_independent.take() {
             return match pending {
                 PendingIndependent::UnsentCore(core_msg) => {
-                    handle_core_pair(core_msg, frame, state, pb, strict_mode, tx)
+                    handle_core_pair(core_msg, frame, dep_info, state, pb, strict_mode, tx)
                 }
                 PendingIndependent::EmittedObject { joc_input } => {
                     handle_emitted_object_pair(joc_input, frame, state, pb, strict_mode, tx)
@@ -255,18 +261,13 @@ fn handle_frame(
 fn handle_core_pair(
     core_result: PcmPushResult,
     frame: &Frame,
+    dep_info: eac3::AccessUnitInfo,
     state: &mut DecoderState,
     pb: &Option<ProgressBar>,
     strict_mode: bool,
     tx: &mpsc::Sender<Result<Eac3FrameMessage>>,
 ) -> Result<()> {
     let bytes = frame.as_bytes();
-    let dep_info = match inspect_access_unit(bytes) {
-        Ok(info) => info,
-        Err(err) => {
-            return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());
-        }
-    };
 
     if dep_info.joc_payload_count() > 0 {
         match state
