@@ -52,7 +52,7 @@ pub(crate) struct QuadratureMirrorFilterBank {
     input_stream_forward_head: usize,
     input_stream_inverse: [f32; QMF_INVERSE_STORAGE_LEN],
     input_stream_inverse_head: usize,
-    fft_buffer: [Complex32; QMF_DOUBLE_LENGTH],
+    fft_buffer: [Complex32; QMF_SUBBANDS],
     fft_scratch: Vec<Complex32>,
 }
 
@@ -63,7 +63,7 @@ impl QuadratureMirrorFilterBank {
             input_stream_forward_head: 0,
             input_stream_inverse: [0.0; QMF_INVERSE_STORAGE_LEN],
             input_stream_inverse_head: 0,
-            fft_buffer: [Complex32::new(0.0, 0.0); QMF_DOUBLE_LENGTH],
+            fft_buffer: [Complex32::new(0.0, 0.0); QMF_SUBBANDS],
             fft_scratch: vec![Complex32::new(0.0, 0.0); qmf_transforms().scratch_len],
         }
     }
@@ -87,23 +87,26 @@ impl QuadratureMirrorFilterBank {
         let mut grouping = [0.0f32; QMF_DOUBLE_LENGTH];
         compute_forward_grouping(window, &mut grouping);
 
-        // X[k] = sum_n g[n] e^{i pi (k + 1/2)(n - 1/2) / 64}: a 128-point DFT
-        // of the pre-twiddled grouping, of which the first 64 bins are kept.
+        // X[k] = sum_n g[n] e^{i pi (k + 1/2)(n - 1/2) / 64}. Splitting n into
+        // even and odd, X[k] = conj(psi_k) A[k] + psi_k B[k] with
+        // psi_k = e^{i pi (2k + 1) / 256}, where A and B are 64-point DFTs of
+        // g[2m] e^{i pi m / 64} and g[2m+1] e^{i pi m / 64}. Both are taken at
+        // once as the DFT Z of (g[2m] + i g[2m+1]) e^{i pi m / 64}; because
+        // A[63 - k] = conj(A[k]) (and the same for B), Z[k] and
+        // conj(Z[63 - k]) separate them again: X[k] = alpha_k Z[k]
+        // + beta_k conj(Z[63 - k]).
         let transforms = qmf_transforms();
-        for ((slot, value), twiddle) in self
-            .fft_buffer
-            .iter_mut()
-            .zip(grouping)
-            .zip(&transforms.forward_pre)
-        {
-            *slot = *twiddle * value;
+        for (m, (slot, twiddle)) in self.fft_buffer.iter_mut().zip(&transforms.pack).enumerate() {
+            *slot = *twiddle * Complex32::new(grouping[2 * m], grouping[2 * m + 1]);
         }
         transforms
             .fft
             .process_with_scratch(&mut self.fft_buffer, &mut self.fft_scratch);
         let mut result = QmfSubbands::zero();
-        for (subband, twiddle) in transforms.forward_post.iter().enumerate() {
-            let value = self.fft_buffer[subband] * *twiddle;
+        for subband in 0..QMF_SUBBANDS {
+            let value = transforms.forward_a[subband] * self.fft_buffer[subband]
+                + transforms.forward_b[subband]
+                    * self.fft_buffer[QMF_SUBBANDS - 1 - subband].conj();
             result.real[subband] = value.re;
             result.imaginary[subband] = value.im;
         }
@@ -119,25 +122,32 @@ impl QuadratureMirrorFilterBank {
             QMF_INVERSE_RING_LEN,
         );
 
-        // v[s] = sum_k re[k] cos(phi) - im[k] sin(phi), phi = pi (k + 1/2)(s - 127.5) / 64,
-        // scaled by 1/64: the real part of a 128-point DFT of the pre-twiddled
-        // subbands, zero-padded past the 64th.
+        // v[s] = (1/64) sum_k re[k] cos(phi) - im[k] sin(phi), with
+        // phi = pi (k + 1/2)(s - 127.5) / 64, is the real-linear transpose of
+        // the analysis above (shifted by one sample and conjugated), so it
+        // runs the same steps backwards: the separation's transpose, the same
+        // 64-point DFT, and the packing's transpose, which hands back the
+        // even and odd samples as the real and imaginary parts.
         let transforms = qmf_transforms();
-        for (subband, twiddle) in transforms.inverse_pre.iter().enumerate() {
-            self.fft_buffer[subband] =
-                *twiddle * Complex32::new(input.real[subband], input.imaginary[subband]);
+        for subband in 0..QMF_SUBBANDS {
+            let mirror = QMF_SUBBANDS - 1 - subband;
+            let value = Complex32::new(input.real[subband], input.imaginary[subband]);
+            let mirrored = Complex32::new(input.real[mirror], input.imaginary[mirror]);
+            self.fft_buffer[subband] = transforms.inverse_a[subband] * value
+                + (transforms.inverse_b[mirror] * mirrored).conj();
         }
-        self.fft_buffer[QMF_SUBBANDS..].fill(Complex32::new(0.0, 0.0));
         transforms
             .fft
             .process_with_scratch(&mut self.fft_buffer, &mut self.fft_scratch);
         let mut values = [0.0f32; QMF_DOUBLE_LENGTH];
-        for ((slot, value), twiddle) in values
-            .iter_mut()
+        for ((pair, value), twiddle) in values
+            .chunks_exact_mut(2)
             .zip(&self.fft_buffer)
-            .zip(&transforms.inverse_post)
+            .zip(&transforms.unpack)
         {
-            *slot = value.re * twiddle.re - value.im * twiddle.im;
+            let value = *value * *twiddle;
+            pair[0] = value.re;
+            pair[1] = -value.im;
         }
         let head = self.input_stream_inverse_head;
         self.input_stream_inverse[head..head + QMF_DOUBLE_LENGTH].copy_from_slice(&values);
@@ -225,39 +235,82 @@ fn wrap_ring_head(head: usize, step: usize, len: usize) -> usize {
     }
 }
 
-/// The 128-point DFT both directions are computed with, and the twiddles that
-/// turn it into the bank's complex modulation. Twiddles are evaluated in `f64`
-/// so the phases (up to ~400 rad for the direct matrix) lose nothing to `f32`.
+/// The 64-point DFT both directions are computed with, and the twiddles that
+/// turn it into the bank's complex modulation (see `process_forward` and
+/// `process_inverse`). Twiddles are evaluated in `f64` so the phases lose
+/// nothing to `f32`.
 struct QmfTransforms {
     fft: Arc<dyn Fft<f32>>,
     scratch_len: usize,
-    /// `e^{i pi n / 128}`
-    forward_pre: [Complex32; QMF_DOUBLE_LENGTH],
-    /// `e^{-i pi (k + 1/2) / 128}`
-    forward_post: [Complex32; QMF_SUBBANDS],
-    /// `e^{i pi k / 128}`
-    inverse_pre: [Complex32; QMF_SUBBANDS],
-    /// `-e^{i pi (s + 1/2) / 128} / 64`
-    inverse_post: [Complex32; QMF_DOUBLE_LENGTH],
+    /// `e^{i pi m / 64}`, applied to the even/odd sample pairs.
+    pack: [Complex32; QMF_SUBBANDS],
+    /// `alpha_k = (conj(psi_k) - i psi_k) / 2`, `psi_k = e^{i pi (2k + 1) / 256}`
+    forward_a: [Complex32; QMF_SUBBANDS],
+    /// `beta_k = (conj(psi_k) + i psi_k) / 2`
+    forward_b: [Complex32; QMF_SUBBANDS],
+    /// `psi_k^2 alpha_k`
+    inverse_a: [Complex32; QMF_SUBBANDS],
+    /// `psi_k^2 beta_k`
+    inverse_b: [Complex32; QMF_SUBBANDS],
+    /// `-e^{i pi m / 64} / 64`
+    unpack: [Complex32; QMF_SUBBANDS],
 }
 
 fn qmf_transforms() -> &'static QmfTransforms {
     static TRANSFORMS: OnceLock<QmfTransforms> = OnceLock::new();
     TRANSFORMS.get_or_init(|| {
-        let fft = FftPlanner::<f32>::new().plan_fft_inverse(QMF_DOUBLE_LENGTH);
+        let fft = FftPlanner::<f32>::new().plan_fft_inverse(QMF_SUBBANDS);
         let scratch_len = fft.get_inplace_scratch_len();
-        let unit = |phase: f64, scale: f64| {
-            Complex32::new((phase.cos() * scale) as f32, (phase.sin() * scale) as f32)
+        let pi = std::f64::consts::PI;
+        let c = |re: f64, im: f64| Complex32::new(re as f32, im as f32);
+        // psi_k, then alpha_k / beta_k, as (re, im) in f64.
+        let psi = |k: usize| {
+            let phase = pi * (2 * k + 1) as f64 / 256.0;
+            (phase.cos(), phase.sin())
         };
-        let step = std::f64::consts::PI / QMF_DOUBLE_LENGTH as f64;
+        let alpha = |k: usize| {
+            let (re, im) = psi(k);
+            // conj(psi) - i psi = (re - i im) - i (re + i im) = (re + im) - i (im + re)
+            ((re + im) / 2.0, -(re + im) / 2.0)
+        };
+        let beta = |k: usize| {
+            let (re, im) = psi(k);
+            // conj(psi) + i psi = (re - i im) + i (re + i im) = (re - im) + i (re - im)
+            ((re - im) / 2.0, (re - im) / 2.0)
+        };
+        let times_psi_squared = |k: usize, (re, im): (f64, f64)| {
+            let phase = pi * (2 * k + 1) as f64 / 128.0;
+            let (pr, pi_) = (phase.cos(), phase.sin());
+            (re * pr - im * pi_, re * pi_ + im * pr)
+        };
+        let step = pi / QMF_SUBBANDS as f64;
         QmfTransforms {
             fft,
             scratch_len,
-            forward_pre: std::array::from_fn(|n| unit(step * n as f64, 1.0)),
-            forward_post: std::array::from_fn(|k| unit(-step * (k as f64 + 0.5), 1.0)),
-            inverse_pre: std::array::from_fn(|k| unit(step * k as f64, 1.0)),
-            inverse_post: std::array::from_fn(|s| {
-                unit(step * (s as f64 + 0.5), -1.0 / QMF_SUBBANDS as f64)
+            pack: std::array::from_fn(|m| {
+                let phase = step * m as f64;
+                c(phase.cos(), phase.sin())
+            }),
+            forward_a: std::array::from_fn(|k| {
+                let (re, im) = alpha(k);
+                c(re, im)
+            }),
+            forward_b: std::array::from_fn(|k| {
+                let (re, im) = beta(k);
+                c(re, im)
+            }),
+            inverse_a: std::array::from_fn(|k| {
+                let (re, im) = times_psi_squared(k, alpha(k));
+                c(re, im)
+            }),
+            inverse_b: std::array::from_fn(|k| {
+                let (re, im) = times_psi_squared(k, beta(k));
+                c(re, im)
+            }),
+            unpack: std::array::from_fn(|m| {
+                let phase = step * m as f64;
+                let scale = -1.0 / QMF_SUBBANDS as f64;
+                c(phase.cos() * scale, phase.sin() * scale)
             }),
         }
     })
