@@ -1,8 +1,8 @@
 use abi_stable::std_types::RVec;
 use bridge_api::{RChannelLabel, RDecodedFrame, RMetadataFrame};
 use eac3::{
-    AccessUnitInfo, BedChannel, CorePcmFrame, FrameType, OamdPayload, ObjectPcmPushResult,
-    ParsedEmdfPayloadData, inspect_access_unit,
+    AccessUnitInfo, AccessUnitParseError, BedChannel, CorePcmFrame, FrameType, OamdPayload,
+    ObjectPcmPushResult, ParsedEmdfPayloadData, inspect_access_unit,
 };
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -21,6 +21,29 @@ const AC3_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
 const EAC3_BLOCKS: [u32; 4] = [1, 2, 3, 6];
 const EAC3_SAMPLE_RATES: [u32; 3] = [48_000, 44_100, 32_000];
 
+/// An access unit's stateless inspection, taken once when it arrives.
+///
+/// Every routing question below - is it a dependent, can it carry
+/// dependents, does it carry JOC and does its own core satisfy it - and the
+/// per-frame diagnostics read the same `AccessUnitInfo`, and an inspection
+/// is not a header read: reaching the skip fields that carry a DD+ Atmos
+/// stream's EMDF means walking every audio block, exponents and bit
+/// allocation included. Asked separately, each question paid for that walk
+/// again, four times for an independent frame before its decoder walked it
+/// once more.
+pub(crate) type Eac3Inspection = Result<AccessUnitInfo, AccessUnitParseError>;
+
+pub(crate) fn inspect_eac3_frame(frame: &[u8]) -> Eac3Inspection {
+    inspect_access_unit(frame)
+}
+
+/// A dependent access unit held in a pending presentation, with the
+/// inspection that admitted it.
+pub(crate) struct PendingEac3Dependent {
+    pub(crate) access_unit: Vec<u8>,
+    pub(crate) info: AccessUnitInfo,
+}
+
 /// Process a raw E-AC3 access unit (one complete syncframe).
 ///
 /// Attempts object-level decode first (JOC + OAMD), then falls back to
@@ -28,8 +51,9 @@ const EAC3_SAMPLE_RATES: [u32; 3] = [48_000, 44_100, 32_000];
 pub(crate) fn process_eac3_frame(
     bridge: &mut AtmosBridge,
     frame: &[u8],
+    inspection: &Eac3Inspection,
 ) -> Result<RDecodedFrame, String> {
-    emit_eac3_frame_diagnostic(bridge, frame);
+    emit_eac3_frame_diagnostic(bridge, frame, inspection);
 
     match bridge.eac3_object_decoder.push_access_unit(frame) {
         Ok(Some(result)) => {
@@ -124,10 +148,10 @@ fn merge_eac3_core_with_dependent(
 /// Only a true independent substream may carry them; a converted-AC-3 frame
 /// (type 2) may not, so holding one back would add latency waiting for a
 /// partner that cannot arrive.
-pub(crate) fn eac3_frame_can_carry_dependents(frame: &[u8]) -> bool {
-    inspect_access_unit(frame)
-        .map(|info| info.frame_type == FrameType::Independent)
-        .unwrap_or(false)
+pub(crate) fn eac3_frame_can_carry_dependents(inspection: &Eac3Inspection) -> bool {
+    inspection
+        .as_ref()
+        .is_ok_and(|info| info.frame_type == FrameType::Independent)
 }
 
 /// Record the dialogue level of an access unit the bridge is holding rather
@@ -158,13 +182,13 @@ pub(crate) fn build_buffered_core_frame(
 pub(crate) fn resolve_eac3_presentation(
     bridge: &mut AtmosBridge,
     core: CorePcmFrame,
-    dependents: &[Vec<u8>],
+    dependents: &[PendingEac3Dependent],
 ) -> Result<RDecodedFrame, String> {
     let mut bed = core;
     let mut merged_any = false;
     for dependent in dependents {
-        emit_eac3_frame_diagnostic(bridge, dependent);
-        match merge_eac3_core_with_dependent(bridge, &bed, dependent) {
+        emit_eac3_frame_info_diagnostic(bridge, &dependent.info);
+        match merge_eac3_core_with_dependent(bridge, &bed, &dependent.access_unit) {
             Some(merged) => {
                 bed = merged;
                 merged_any = true;
@@ -185,7 +209,8 @@ pub(crate) fn resolve_eac3_presentation(
     let Some(last) = dependents.last() else {
         return Err("presentation resolved with no dependents".to_owned());
     };
-    let dep_info = inspect_access_unit(last).map_err(|e| format!("{e}"))?;
+    let dep_info = last.info.clone();
+    let last = last.access_unit.as_slice();
     update_eac3_dialogue_level(bridge, &dep_info);
 
     if dep_info.joc_payload_count() == 0 {
@@ -283,10 +308,8 @@ pub(crate) fn is_legacy_ac3_frame(frame: &[u8]) -> bool {
 ///
 /// The payload rides in the last access unit of a presentation, so one that
 /// carries it ends the group.
-pub(crate) fn eac3_frame_carries_joc(frame: &[u8]) -> bool {
-    inspect_access_unit(frame)
-        .map(|info| info.joc_payload_count() > 0)
-        .unwrap_or(false)
+pub(crate) fn eac3_frame_carries_joc(info: &AccessUnitInfo) -> bool {
+    info.joc_payload_count() > 0
 }
 
 /// Whether this access unit carries a JOC payload its own channels satisfy.
@@ -317,8 +340,8 @@ pub(crate) fn eac3_frame_carries_joc(frame: &[u8]) -> bool {
 /// dependents with no core to attach to and lose the channels as well, which
 /// is the worse of the two, and reconstructing from the independent's own
 /// payload is machinery for a stream shape the specification forbids.
-pub(crate) fn eac3_frame_carries_self_contained_joc(frame: &[u8]) -> bool {
-    let Ok(info) = inspect_access_unit(frame) else {
+pub(crate) fn eac3_frame_carries_self_contained_joc(inspection: &Eac3Inspection) -> bool {
+    let Ok(info) = inspection else {
         return false;
     };
     info.payloads().any(|payload| match &payload.parsed {
@@ -327,40 +350,39 @@ pub(crate) fn eac3_frame_carries_self_contained_joc(frame: &[u8]) -> bool {
     })
 }
 
-pub(crate) fn is_dependent_eac3_frame(frame: &[u8]) -> bool {
-    inspect_access_unit(frame)
-        .map(|info| info.frame_type == FrameType::Dependent)
-        .unwrap_or(false)
+pub(crate) fn diagnose_eac3_frame(
+    bridge: &mut AtmosBridge,
+    frame: &[u8],
+    inspection: &Eac3Inspection,
+) {
+    emit_eac3_frame_diagnostic(bridge, frame, inspection);
 }
 
-pub(crate) fn diagnose_eac3_frame(bridge: &mut AtmosBridge, frame: &[u8]) {
-    emit_eac3_frame_diagnostic(bridge, frame);
-}
-
-fn emit_eac3_frame_diagnostic(bridge: &mut AtmosBridge, frame: &[u8]) {
-    bridge.eac3_diag_stats.total_frames += 1;
-
-    match inspect_access_unit(frame) {
-        Ok(info) => {
-            match info.frame_type {
-                FrameType::LegacyAc3 => bridge.eac3_diag_stats.legacy_ac3_frames += 1,
-                FrameType::Independent => bridge.eac3_diag_stats.independent_frames += 1,
-                FrameType::Dependent => bridge.eac3_diag_stats.dependent_frames += 1,
-                FrameType::Ac3Convert => bridge.eac3_diag_stats.ac3_convert_frames += 1,
-            }
-            if info.joc_payload_count() > 0 {
-                bridge.eac3_diag_stats.joc_frames += 1;
-            }
-            if info.oamd_payload_count() > 0 {
-                bridge.eac3_diag_stats.oamd_frames += 1;
-            }
-        }
-        Err(err) if format!("{err}") == "not-eac3" => {
-            if legacy_ac3_info(frame).is_some() {
+fn emit_eac3_frame_diagnostic(bridge: &mut AtmosBridge, frame: &[u8], inspection: &Eac3Inspection) {
+    match inspection {
+        Ok(info) => emit_eac3_frame_info_diagnostic(bridge, info),
+        Err(err) => {
+            bridge.eac3_diag_stats.total_frames += 1;
+            if format!("{err}") == "not-eac3" && legacy_ac3_info(frame).is_some() {
                 bridge.eac3_diag_stats.legacy_ac3_frames += 1;
             }
         }
-        Err(_) => {}
+    }
+}
+
+fn emit_eac3_frame_info_diagnostic(bridge: &mut AtmosBridge, info: &AccessUnitInfo) {
+    bridge.eac3_diag_stats.total_frames += 1;
+    match info.frame_type {
+        FrameType::LegacyAc3 => bridge.eac3_diag_stats.legacy_ac3_frames += 1,
+        FrameType::Independent => bridge.eac3_diag_stats.independent_frames += 1,
+        FrameType::Dependent => bridge.eac3_diag_stats.dependent_frames += 1,
+        FrameType::Ac3Convert => bridge.eac3_diag_stats.ac3_convert_frames += 1,
+    }
+    if info.joc_payload_count() > 0 {
+        bridge.eac3_diag_stats.joc_frames += 1;
+    }
+    if info.oamd_payload_count() > 0 {
+        bridge.eac3_diag_stats.oamd_frames += 1;
     }
 }
 
@@ -1361,7 +1383,8 @@ mod tests {
         let mut frame = vec![0u8; 1234];
         frame[..8].copy_from_slice(&[0x0B, 0x77, 0x2A, 0x68, 0x22, 0x30, 0xE1, 0xFF]);
 
-        let decoded = process_eac3_frame(&mut bridge, &frame).expect("legacy AC-3 silence frame");
+        let decoded = process_eac3_frame(&mut bridge, &frame, &inspect_eac3_frame(&frame))
+            .expect("legacy AC-3 silence frame");
 
         assert_eq!(bridge.eac3_diag_stats.total_frames, 1);
         assert_eq!(bridge.eac3_diag_stats.legacy_ac3_frames, 1);
