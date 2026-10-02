@@ -629,10 +629,14 @@ impl SynthState {
     /// Synthesize PCM for all primary channels + LFE of the decoded core frame.
     /// Returns `(fullband_channels, lfe)` as f32 in [-1, 1], in DCA primary
     /// channel order (caller maps to bed labels via `core::primary_bed_layout`).
+    /// The result replaces the contents of `fullband` and `lfe`, refilling
+    /// the buffers they hold.
     pub(crate) fn synthesize(
         &mut self,
         dec: &mut CoreDecoder,
-    ) -> (Vec<Vec<f32>>, Option<Vec<f32>>) {
+        fullband: &mut Vec<Vec<f32>>,
+        lfe: &mut Option<Vec<f32>>,
+    ) {
         let nch = dec.nchannels();
         let npcmblocks = dec.npcmblocks();
         let nsamples = npcmblocks * 32;
@@ -647,7 +651,7 @@ impl SynthState {
             &FIR_32BANDS_NONPERFECT_FIXED
         };
 
-        let mut fullband = vec![vec![0f32; nsamples]; nch];
+        fullband.resize_with(nch, Vec::new);
         self.scratch.resize(nsamples, 0);
         for ch in 0..nch {
             // Gather subband samples [band][block] into the per-block input.
@@ -662,21 +666,22 @@ impl SynthState {
                 &subs,
                 &mut self.scratch,
             );
-            for (d, &x) in fullband[ch].iter_mut().zip(&self.scratch) {
-                *d = x as f32 / PCM_SCALE;
-            }
+            let out = &mut fullband[ch];
+            out.clear();
+            out.extend(self.scratch.iter().map(|&x| x as f32 / PCM_SCALE));
         }
 
         // LFE. lfe_present==2 (DCA_LFE_FLAG_64) uses the 64-tap interpolator,
         // which is what BluRay DTS streams carry. ==1 (128x) is not supported by
         // the fixed path (matches ffmpeg's ff_dca_core_filter_fixed).
-        let lfe = if dec.lfe_present() == 2 {
-            Some(lfe_synth(dec, nsamples))
+        if dec.lfe_present() == 2 {
+            let out = lfe.get_or_insert_with(Vec::new);
+            out.clear();
+            out.resize(nsamples, 0.0);
+            lfe_synth(dec, out);
         } else {
-            None
-        };
-
-        (fullband, lfe)
+            *lfe = None;
+        }
     }
 }
 
@@ -836,10 +841,10 @@ fn lfe_synth_fixed(dec: &mut CoreDecoder, pcm: &mut [i32]) {
 /// `lfe_fir_float` over the persistent LFE history buffer, then shift history.
 /// Uses the float interpolation filter (matching ffmpeg's float output path);
 /// the float LFE coefficients already embed the 1/2^23 scale.
-fn lfe_synth(dec: &mut CoreDecoder, nsamples: usize) -> Vec<f32> {
+/// `pcm` (one output sample per slot, zeroed) receives the interpolated LFE.
+fn lfe_synth(dec: &mut CoreDecoder, pcm: &mut [f32]) {
     let npcmblocks = dec.npcmblocks();
     let nlfesamples = npcmblocks >> 1;
-    let mut pcm = vec![0f32; nsamples];
     let coeff = &LFE_FIR_64_FLOAT;
     {
         let lfe = dec.lfe(); // DCA_LFE_HISTORY history + data
@@ -864,7 +869,6 @@ fn lfe_synth(dec: &mut CoreDecoder, nsamples: usize) -> Vec<f32> {
     // Update LFE history: move the last DCA_LFE_HISTORY decimated samples to the
     // front (mirrors the post-filter shift in ff_dca_core_filter_fixed).
     dec.shift_lfe_history(nlfesamples);
-    pcm
 }
 
 #[cfg(test)]

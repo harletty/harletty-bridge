@@ -135,6 +135,8 @@ pub(crate) struct DtsXState {
     /// The decoded frame, kept from packet to packet so the decoder refills
     /// its buffers instead of allocating new ones.
     frame: HdFrame,
+    /// The same for a frame decoded from the core alone.
+    core_frame: CorePcmFrame,
 }
 
 impl DtsXState {
@@ -281,14 +283,15 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 // ordinary DTS core, which is not decoded, so render the
                 // core (5.1) and drop it instead of failing the whole track.
                 bridge.dts_profile = DtsProfile::Hd;
-                match bridge.dts_decoder.push_access_unit(&rest[..fs]) {
-                    Ok(push) => {
+                let pcm = &mut bridge.dts_x.core_frame;
+                match bridge.dts_decoder.decode_into(&rest[..fs], pcm) {
+                    Ok(_) => {
                         bridge.dts_objects_active = false;
                         // A core names its surrounds Ls/Rs only.
                         bridge.dts_surrounds_on_side = false;
                         bridge.dts_auro.not_a_carrier(&mut result.frames);
-                        result.frames.push(build_core_frame(&push.pcm));
-                        bridge.total_samples += push.pcm.samples_per_channel() as u64;
+                        result.frames.push(build_core_frame(pcm));
+                        bridge.total_samples += pcm.samples_per_channel() as u64;
                         bridge.dts_frame_count += 1;
                     }
                     Err(err) => {
@@ -306,13 +309,14 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
             consumed += fs + es;
         } else {
             bridge.dts_profile = DtsProfile::Core;
-            match bridge.dts_decoder.push_access_unit(&rest[..fs]) {
-                Ok(push) => {
-                    let frame = build_core_frame(&push.pcm);
+            let pcm = &mut bridge.dts_x.core_frame;
+            match bridge.dts_decoder.decode_into(&rest[..fs], pcm) {
+                Ok(_) => {
+                    let frame = build_core_frame(pcm);
                     bridge.dts_objects_active = false;
                     bridge.dts_surrounds_on_side = false;
                     bridge.dts_auro.not_a_carrier(&mut result.frames);
-                    bridge.total_samples += push.pcm.samples_per_channel() as u64;
+                    bridge.total_samples += pcm.samples_per_channel() as u64;
                     bridge.dts_frame_count += 1;
                     result.frames.push(frame);
                 }
