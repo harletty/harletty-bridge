@@ -919,6 +919,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "oamd"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76c4b9119cf66c5cdbc555ac0dbb9607a92a71e8fd6409c3217f429c05872f93"
+dependencies = [
+ "anyhow",
+ "bitstream-io",
+ "log",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1395,13 +1406,13 @@ dependencies = [
 [[package]]
 name = "truehd"
 version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3670e5f6df01d8518e225c37ada5c9e41fa5d98fb414ef1eed051e71c885da16"
+source = "git+https://github.com/harletty/truehdd?rev=600355da1edb3ba51cc0064f76e9dd57198a0bb4#600355da1edb3ba51cc0064f76e9dd57198a0bb4"
 dependencies = [
  "anyhow",
  "bitstream-io",
  "hmac",
  "log",
+ "oamd",
  "sha2",
  "thiserror",
 ]
