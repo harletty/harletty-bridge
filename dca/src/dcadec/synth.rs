@@ -16,47 +16,52 @@ use super::tables::{
 
 const PCM_SCALE: f32 = 8_388_608.0; // 2^23
 
-#[inline]
+#[inline(always)]
 fn clip23(a: i32) -> i32 {
     a.clamp(-(1 << 23), (1 << 23) - 1)
 }
-#[inline]
+#[inline(always)]
 fn norm(a: i64, bits: u32) -> i32 {
     ((a + (1i64 << (bits - 1))) >> bits) as i32
 }
-#[inline]
+#[inline(always)]
 fn norm23(a: i64) -> i32 {
     norm(a, 23)
 }
-#[inline]
+#[inline(always)]
 fn mul23(a: i32, b: i32) -> i32 {
     norm(a as i64 * b as i64, 23)
 }
 
 // ───────────────────────── imdct_half_32 (dcadct.c) ───────────────────────
 
+#[inline(always)]
 fn sum_a(input: &[i32], output: &mut [i32], len: usize) {
     for i in 0..len {
         output[i] = input[2 * i] + input[2 * i + 1];
     }
 }
+#[inline(always)]
 fn sum_b(input: &[i32], output: &mut [i32], len: usize) {
     output[0] = input[0];
     for i in 1..len {
         output[i] = input[2 * i] + input[2 * i - 1];
     }
 }
+#[inline(always)]
 fn sum_c(input: &[i32], output: &mut [i32], len: usize) {
     for i in 0..len {
         output[i] = input[2 * i];
     }
 }
+#[inline(always)]
 fn sum_d(input: &[i32], output: &mut [i32], len: usize) {
     output[0] = input[1];
     for i in 1..len {
         output[i] = input[2 * i - 1] + input[2 * i + 1];
     }
 }
+#[inline(always)]
 fn clp_v(buf: &mut [i32], len: usize) {
     for x in buf.iter_mut().take(len) {
         *x = clip23(*x);
@@ -102,6 +107,7 @@ const MOD_C: [i32; 32] = [
     -2913561, -3342802,  -3931480,  -4785806, -6133390, -8566050, -14253820, -42727120,
 ];
 
+#[inline(always)]
 fn dct_a(input: &[i32], output: &mut [i32]) {
     for i in 0..8 {
         let mut res = 0i64;
@@ -111,6 +117,7 @@ fn dct_a(input: &[i32], output: &mut [i32]) {
         output[i] = norm23(res);
     }
 }
+#[inline(always)]
 fn dct_b(input: &[i32], output: &mut [i32]) {
     for i in 0..8 {
         let mut res = input[0] as i64 * (1i64 << 23);
@@ -120,6 +127,7 @@ fn dct_b(input: &[i32], output: &mut [i32]) {
         output[i] = norm23(res);
     }
 }
+#[inline(always)]
 fn mod_a(input: &[i32], output: &mut [i32]) {
     for i in 0..8 {
         output[i] = mul23(MOD_A[i], input[i] + input[8 + i]);
@@ -130,6 +138,7 @@ fn mod_a(input: &[i32], output: &mut [i32]) {
         k = k.wrapping_sub(1);
     }
 }
+#[inline(always)]
 fn mod_b(input: &mut [i32], output: &mut [i32]) {
     for i in 0..8 {
         input[8 + i] = mul23(MOD_B[i], input[8 + i]);
@@ -143,6 +152,7 @@ fn mod_b(input: &mut [i32], output: &mut [i32]) {
         k = k.wrapping_sub(1);
     }
 }
+#[inline(always)]
 fn mod_c(input: &[i32], output: &mut [i32]) {
     for i in 0..16 {
         output[i] = mul23(MOD_C[i], input[i] + input[16 + i]);
@@ -154,6 +164,7 @@ fn mod_c(input: &[i32], output: &mut [i32]) {
     }
 }
 
+#[inline(always)]
 fn imdct_half_32(output: &mut [i32; 32], input: &[i32; 32]) {
     let mut buf_a = [0i32; 32];
     let mut buf_b = [0i32; 32];
@@ -250,6 +261,7 @@ const MOD64_C: [i32; 64] = [
     -8641940, -12091426, -20144284, -60420720,
 ];
 
+#[inline(always)]
 fn mod64_a(input: &[i32], output: &mut [i32]) {
     for i in 0..16 {
         output[i] = mul23(MOD64_A[i], input[i] + input[16 + i]);
@@ -261,6 +273,7 @@ fn mod64_a(input: &[i32], output: &mut [i32]) {
     }
 }
 
+#[inline(always)]
 fn mod64_b(input: &mut [i32], output: &mut [i32]) {
     for i in 0..16 {
         input[16 + i] = mul23(MOD64_B[i], input[16 + i]);
@@ -275,6 +288,7 @@ fn mod64_b(input: &mut [i32], output: &mut [i32]) {
     }
 }
 
+#[inline(always)]
 fn mod64_c(input: &[i32], output: &mut [i32]) {
     for i in 0..32 {
         output[i] = mul23(MOD64_C[i], input[i] + input[32 + i]);
@@ -286,6 +300,7 @@ fn mod64_c(input: &[i32], output: &mut [i32]) {
     }
 }
 
+#[inline(always)]
 fn imdct_half_64(output: &mut [i32; 64], input: &[i32; 64]) {
     let mut buf_a = [0i32; 64];
     let mut buf_b = [0i32; 64];
@@ -393,6 +408,7 @@ impl Default for ChannelSynth {
 }
 
 impl ChannelSynth {
+    #[inline(always)]
     fn synth_filter(&mut self, window: &[i32; 512], out: &mut [i32; 32], input: &[i32; 32]) {
         let mut imdct = [0i32; 32];
         imdct_half_32(&mut imdct, input);
@@ -431,6 +447,7 @@ impl ChannelSynth {
     /// `synth_filter_fixed_64` — 64-band bank used for X96 synthesis. One
     /// subband sample per band produces 64 interpolated PCM samples, i.e. twice
     /// the output rate of the 32-band path.
+    #[inline(always)]
     fn synth_filter_64(&mut self, window: &[i32; 1024], out: &mut [i32; 64], input: &[i32; 64]) {
         let mut imdct = [0i32; 64];
         imdct_half_64(&mut imdct, input);
@@ -467,10 +484,110 @@ impl ChannelSynth {
     }
 }
 
+/// Which build of the filter-bank loops runs: the baseline one, or the same
+/// code compiled for AVX2 when the CPU has it. The arithmetic is integer, so
+/// both produce identical samples; AVX2 vectorizes the 23-bit clips and the
+/// window products the baseline x86-64 target has no instructions for.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Isa {
+    Baseline,
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+}
+
+impl Isa {
+    fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return Isa::Avx2;
+        }
+        Isa::Baseline
+    }
+}
+
+/// Run one channel's subbands through the 32-band bank, one block of 32 PCM
+/// samples per subband sample: `subs[band][block]` in, `dst[block * 32 + n]`
+/// out (`dst.len() / 32` blocks).
+fn bank_32(
+    isa: Isa,
+    synth: &mut ChannelSynth,
+    window: &[i32; 512],
+    subs: &[&[i32]; DCA_SUBBANDS],
+    dst: &mut [i32],
+) {
+    match isa {
+        Isa::Baseline => bank_32_body(synth, window, subs, dst),
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `Isa::Avx2` is only chosen when the CPU reports AVX2.
+        Isa::Avx2 => unsafe { bank_32_avx2(synth, window, subs, dst) },
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn bank_32_avx2(
+    synth: &mut ChannelSynth,
+    window: &[i32; 512],
+    subs: &[&[i32]; DCA_SUBBANDS],
+    dst: &mut [i32],
+) {
+    bank_32_body(synth, window, subs, dst)
+}
+
+#[inline(always)]
+fn bank_32_body(
+    synth: &mut ChannelSynth,
+    window: &[i32; 512],
+    subs: &[&[i32]; DCA_SUBBANDS],
+    dst: &mut [i32],
+) {
+    let mut input = [0i32; 32];
+    let mut out = [0i32; 32];
+    for (j, block) in dst.chunks_exact_mut(32).enumerate() {
+        for (x, s) in input.iter_mut().zip(subs) {
+            *x = s[j];
+        }
+        synth.synth_filter(window, &mut out, &input);
+        block.copy_from_slice(&out);
+    }
+}
+
+/// The 64-band (X96) counterpart of [`bank_32`], driven by the 32 base
+/// subbands only (the upper 32 stay zero): `dst.len() / 64` blocks.
+fn bank_64(isa: Isa, synth: &mut ChannelSynth, subs: &[&[i32]; DCA_SUBBANDS], dst: &mut [i32]) {
+    match isa {
+        Isa::Baseline => bank_64_body(synth, subs, dst),
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `Isa::Avx2` is only chosen when the CPU reports AVX2.
+        Isa::Avx2 => unsafe { bank_64_avx2(synth, subs, dst) },
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn bank_64_avx2(synth: &mut ChannelSynth, subs: &[&[i32]; DCA_SUBBANDS], dst: &mut [i32]) {
+    bank_64_body(synth, subs, dst)
+}
+
+#[inline(always)]
+fn bank_64_body(synth: &mut ChannelSynth, subs: &[&[i32]; DCA_SUBBANDS], dst: &mut [i32]) {
+    let mut input = [0i32; 64];
+    let mut out = [0i32; 64];
+    for (j, block) in dst.chunks_exact_mut(64).enumerate() {
+        for (x, s) in input.iter_mut().zip(subs) {
+            *x = s[j];
+        }
+        synth.synth_filter_64(&FIR_64BANDS_FIXED, &mut out, &input);
+        block.copy_from_slice(&out);
+    }
+}
+
 /// Per-channel QMF synthesis state, persisted across frames.
-#[derive(Default)]
 pub(crate) struct SynthState {
     channels: Vec<ChannelSynth>,
+    isa: Isa,
+    /// One channel's fixed-point output, reused by the float path.
+    scratch: Vec<i32>,
     /// Whether the delay lines currently hold 64-band (X96) history. Switching
     /// bank size invalidates them, so they are erased on change — this mirrors
     /// ffmpeg's `set_filter_mode` / `erase_dsp_history`.
@@ -478,6 +595,18 @@ pub(crate) struct SynthState {
     /// One-sample history for the 96 kHz LFE image-rejection filter
     /// (`output_history_lfe_fixed`).
     lfe_x96_hist: i32,
+}
+
+impl Default for SynthState {
+    fn default() -> Self {
+        Self {
+            channels: Vec::new(),
+            isa: Isa::detect(),
+            scratch: Vec::new(),
+            x96_mode: false,
+            lfe_x96_hist: 0,
+        }
+    }
 }
 
 impl SynthState {
@@ -518,23 +647,22 @@ impl SynthState {
         };
 
         let mut fullband = vec![vec![0f32; nsamples]; nch];
+        self.scratch.resize(nsamples, 0);
         for ch in 0..nch {
             // Gather subband samples [band][block] into the per-block input.
             let mut subs: [&[i32]; DCA_SUBBANDS] = [&[]; DCA_SUBBANDS];
             for (band, s) in subs.iter_mut().enumerate() {
                 *s = dec.subband(ch, band);
             }
-            let mut out = [0i32; 32];
-            let mut input = [0i32; 32];
-            let dst = &mut fullband[ch];
-            for j in 0..npcmblocks {
-                for i in 0..32 {
-                    input[i] = subs[i][j];
-                }
-                self.channels[ch].synth_filter(window, &mut out, &input);
-                for i in 0..32 {
-                    dst[j * 32 + i] = out[i] as f32 / PCM_SCALE;
-                }
+            bank_32(
+                self.isa,
+                &mut self.channels[ch],
+                window,
+                &subs,
+                &mut self.scratch,
+            );
+            for (d, &x) in fullband[ch].iter_mut().zip(&self.scratch) {
+                *d = x as f32 / PCM_SCALE;
             }
         }
 
@@ -606,26 +734,9 @@ impl SynthState {
             }
             let mut dst = vec![0i32; nsamples];
             if x96_synth {
-                // input[32..64] stays zero: only the base 32 subbands exist.
-                let mut out = [0i32; 64];
-                let mut input = [0i32; 64];
-                for j in 0..npcmblocks {
-                    for i in 0..32 {
-                        input[i] = subs[i][j];
-                    }
-                    self.channels[ch].synth_filter_64(&FIR_64BANDS_FIXED, &mut out, &input);
-                    dst[j * 64..j * 64 + 64].copy_from_slice(&out);
-                }
+                bank_64(self.isa, &mut self.channels[ch], &subs, &mut dst);
             } else {
-                let mut out = [0i32; 32];
-                let mut input = [0i32; 32];
-                for j in 0..npcmblocks {
-                    for i in 0..32 {
-                        input[i] = subs[i][j];
-                    }
-                    self.channels[ch].synth_filter(window, &mut out, &input);
-                    dst[j * 32..j * 32 + 32].copy_from_slice(&out);
-                }
+                bank_32(self.isa, &mut self.channels[ch], window, &subs, &mut dst);
             }
             match dec.speaker_for(ch) {
                 Some(spkr) => samples[spkr] = Some(dst),
@@ -847,6 +958,51 @@ mod tests {
             let expected = &GOLDEN_QMF64[block * 64..block * 64 + 64];
             assert_eq!(&out[..], expected, "mismatch in block {block}");
         }
+    }
+
+    /// Both builds of the bank loops produce the same samples, on both banks
+    /// and across delay-line wraps, including inputs loud enough to clip.
+    #[test]
+    fn every_isa_matches_the_baseline() {
+        let mut state = 777u32;
+        let subs_data: Vec<Vec<i32>> = (0..DCA_SUBBANDS)
+            .map(|band| {
+                (0..48)
+                    .map(|_| {
+                        state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        let x = (((state >> 8) & 0x1f_ffff) as i32) - 0x10_0000;
+                        if band % 5 == 0 { x << 3 } else { x }
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut subs: [&[i32]; DCA_SUBBANDS] = [&[]; DCA_SUBBANDS];
+        for (s, d) in subs.iter_mut().zip(&subs_data) {
+            *s = d;
+        }
+        let run = |isa: Isa| {
+            let mut synth = ChannelSynth::default();
+            let mut out32 = vec![0i32; 48 * 32];
+            bank_32(
+                isa,
+                &mut synth,
+                &FIR_32BANDS_PERFECT_FIXED,
+                &subs,
+                &mut out32,
+            );
+            let mut synth = ChannelSynth::default();
+            let mut out64 = vec![0i32; 48 * 64];
+            bank_64(isa, &mut synth, &subs, &mut out64);
+            (out32, out64)
+        };
+        let baseline = run(Isa::Baseline);
+        assert!(
+            baseline
+                .0
+                .iter()
+                .any(|&x| x == (1 << 23) - 1 || x == -(1 << 23))
+        );
+        assert_eq!(run(Isa::detect()), baseline);
     }
 
     /// The 96 kHz LFE image-rejection filter (`lfe_x96_fixed`), which doubles
