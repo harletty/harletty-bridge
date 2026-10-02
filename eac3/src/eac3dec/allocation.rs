@@ -132,6 +132,19 @@ impl Default for DeltaBitAllocationState {
 }
 
 impl DeltaBitAllocationState {
+    /// Equality, without handing empty `Vec`s to `memcmp`: glibc's AVX-512
+    /// `bcmp` issues a masked load even for zero bytes, and from an empty
+    /// `Vec`'s dangling pointer that takes a microcode assist costing more
+    /// than the whole bit allocation it was meant to skip.
+    fn same_as(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.offsets.len() == other.offsets.len()
+            && (self.offsets.is_empty()
+                || (self.offsets == other.offsets
+                    && self.lengths == other.lengths
+                    && self.bit_allocation == other.bit_allocation))
+    }
+
     pub(crate) fn read_segments(
         &mut self,
         reader: &mut super::bitstream::BitReader<'_>,
@@ -155,7 +168,7 @@ impl DeltaBitAllocationState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct BitAllocationParams {
     pub(crate) slow_decay_code: usize,
     pub(crate) fast_decay_code: usize,
@@ -185,6 +198,53 @@ pub(crate) struct AllocationState {
     excite: Vec<i32>,
     mask: Vec<i32>,
     grouped_scratch: Vec<i32>,
+    /// The arguments `bap` was last computed from, while the exponents it was
+    /// computed from are still the current ones. `allocate` is a pure function
+    /// of the exponents and these, so a block that reuses its exponents and
+    /// repeats them has its `bap` already (FFmpeg's `bit_alloc_stages`).
+    allocated_with: Option<AllocationArgs>,
+}
+
+#[derive(Debug, Clone)]
+struct AllocationArgs {
+    start: usize,
+    end: usize,
+    fgain_code: u8,
+    snr_offset: i32,
+    params: BitAllocationParams,
+    sample_rate_index: usize,
+    delta: DeltaBitAllocationState,
+    fast_leak: i32,
+    slow_leak: i32,
+    aht: bool,
+}
+
+impl AllocationArgs {
+    #[allow(clippy::too_many_arguments)]
+    fn matches(
+        &self,
+        start: usize,
+        end: usize,
+        fgain_code: u8,
+        snr_offset: i32,
+        params: BitAllocationParams,
+        sample_rate_index: usize,
+        delta: &DeltaBitAllocationState,
+        fast_leak: i32,
+        slow_leak: i32,
+        aht: bool,
+    ) -> bool {
+        self.start == start
+            && self.end == end
+            && self.fgain_code == fgain_code
+            && self.snr_offset == snr_offset
+            && self.params == params
+            && self.sample_rate_index == sample_rate_index
+            && self.fast_leak == fast_leak
+            && self.slow_leak == slow_leak
+            && self.aht == aht
+            && self.delta.same_as(delta)
+    }
 }
 
 impl AllocationState {
@@ -197,11 +257,13 @@ impl AllocationState {
             excite: vec![0; MASK_BANDS],
             mask: vec![0; MASK_BANDS],
             grouped_scratch: Vec::new(),
+            allocated_with: None,
         }
     }
 
     pub(crate) fn clear_bap(&mut self) {
         self.bap.fill(0);
+        self.allocated_with = None;
     }
 
     pub(crate) fn read_channel_exponents(
@@ -306,6 +368,34 @@ impl AllocationState {
             self.clear_bap();
             return Ok(());
         }
+        if self.allocated_with.as_ref().is_some_and(|args| {
+            args.matches(
+                start,
+                end,
+                fgain_code,
+                snr_offset,
+                params,
+                sample_rate_index,
+                delta,
+                fast_leak,
+                slow_leak,
+                aht,
+            )
+        }) {
+            return Ok(());
+        }
+        let args = AllocationArgs {
+            start,
+            end,
+            fgain_code,
+            snr_offset,
+            params,
+            sample_rate_index,
+            delta: delta.clone(),
+            fast_leak,
+            slow_leak,
+            aht,
+        };
 
         let slow_decay = SLOWDEC[params.slow_decay_code];
         let fast_decay = FASTDEC[params.fast_decay_code];
@@ -431,6 +521,7 @@ impl AllocationState {
         for bap in &mut self.bap[bin..] {
             *bap = 0;
         }
+        self.allocated_with = Some(args);
         Ok(())
     }
 
@@ -618,6 +709,7 @@ impl AllocationState {
             ExpStrategy::D25 => 2,
             ExpStrategy::D45 => 4,
         };
+        self.allocated_with = None;
 
         let mut current_exponent = absolute_exponent;
         self.exponents[start_mantissa] = current_exponent;
