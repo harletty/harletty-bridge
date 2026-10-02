@@ -10,6 +10,10 @@
 #   TrueHD   harletty presentation 2 (else the widest below it) against FFmpeg,
 #            which never decodes past substream 2. On a stream with a
 #            presentation 3, harletty decoding it is shown as an extra.
+#            Like the CLI, harletty parses only the substreams its
+#            presentation is made of; FFmpeg reads every substream up to the
+#            one it decodes, so on a stream whose 7.1 has its own substreams
+#            the stereo one is work only FFmpeg does.
 #   AC-3 /   harletty's bed (core + dependent channel extension) against
 #   E-AC-3   FFmpeg with drc_scale=0 (harletty applies no DRC). On a JOC
 #            stream, harletty reconstructing the objects is shown as an extra.

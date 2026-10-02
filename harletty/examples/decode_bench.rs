@@ -8,7 +8,11 @@
 //!
 //! The decode loops mirror the CLI's decoder threads (`processor.rs`,
 //! `eac3_thread.rs`, `dts_thread.rs`) minus what is not decoding: no channel
-//! to a writer, no Auro-Codec stage, no DTS:X metadata parse.
+//! to a writer, no Auro-Codec stage, no DTS:X metadata parse. Like the CLI,
+//! the TrueHD loop parses only the substreams its presentation is made of,
+//! where FFmpeg reads every substream up to the one it decodes: on a stream
+//! whose 7.1 stands on its own substreams, the stereo one is work FFmpeg
+//! does and harletty does not.
 //!
 //! Usage:
 //!     cargo run --release -p harletty --example decode_bench -- \
@@ -136,7 +140,9 @@ fn main() -> ExitCode {
 
 // ---------------------------------------------------------------- TrueHD
 
+use truehd::process::decode::DecodedAccessUnit;
 use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, parse::Parser};
+use truehd::structs::access_unit::AccessUnit;
 use truehd::utils::errors::ExtractError;
 
 /// FFmpeg decodes at most substream 2 (`mlpdec.c`: `FFMIN(num_substreams - 1,
@@ -159,27 +165,38 @@ fn truehd_pass(data: &[u8], presentation: usize) -> Tally {
     let mut decoder = Decoder::default();
     parser.set_fail_level(log::Level::Error);
     decoder.set_fail_level(log::Level::Error);
-    // As the CLI: every presentation up to the one decoded is required.
+    // As the CLI outside strict mode: the presentation decoded, alone, and
+    // the parser works out which substreams that takes.
     let mut required = [false; MAX_PRESENTATIONS];
-    required[..=presentation].iter_mut().for_each(|p| *p = true);
+    required[presentation] = true;
     parser.set_required_presentations(&required);
 
     let mut tally = Tally::default();
+    // As the CLI: every frame is parsed into one access unit that is kept, and
+    // decoded into one that is kept, not into new ones.
+    let mut access_unit = AccessUnit::default();
+    let mut decoded = Box::<DecodedAccessUnit>::default();
     let mut drain = |extractor: &mut Extractor, tally: &mut Tally| {
         loop {
             match extractor.next() {
-                Some(Ok(frame)) => match parser.parse(&frame) {
-                    Ok(au) => match decoder.decode_presentation(&au, presentation) {
-                        Ok(decoded) => {
-                            black_box(&decoded.pcm_data);
-                            tally.frame(
-                                decoded.sample_length,
-                                decoded.channel_count,
-                                decoded.sampling_frequency,
-                            );
+                Some(Ok(frame)) => match parser.parse_into(&frame, &mut access_unit) {
+                    Ok(()) => {
+                        match decoder.decode_presentation_into(
+                            &access_unit,
+                            presentation,
+                            &mut decoded,
+                        ) {
+                            Ok(()) => {
+                                black_box(&decoded.pcm_data);
+                                tally.frame(
+                                    decoded.sample_length,
+                                    decoded.channel_count,
+                                    decoded.sampling_frequency,
+                                );
+                            }
+                            Err(_) => tally.errors += 1,
                         }
-                        Err(_) => tally.errors += 1,
-                    },
+                    }
                     Err(_) => tally.errors += 1,
                 },
                 Some(Err(ExtractError::InsufficientData)) | None => break,
