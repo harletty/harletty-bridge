@@ -1090,11 +1090,6 @@ impl CoreDecoder {
         None
     }
 
-    /// Channels of the bare extension set decoded this frame, if any.
-    pub(crate) fn extension_channels(&self) -> std::ops::Range<usize> {
-        self.extension_base..self.nchannels
-    }
-
     /// Decoded samples for channel `ch`, band `band` (npcmblocks long).
     pub(crate) fn subband(&self, ch: usize, band: usize) -> &[i32] {
         &self.bands[ch].sub[band][DCA_ADPCM_COEFFS..DCA_ADPCM_COEFFS + self.npcmblocks]

@@ -13,7 +13,7 @@
 
 use crate::dcadec::core::{CoreDecoder, CoreError, DCA_SPEAKER_LSS, DCA_SPEAKER_RSS};
 use crate::dcadec::exss::ExssParser;
-use crate::dcadec::synth::SynthState;
+use crate::dcadec::synth::{CoreOutput, SynthState};
 use crate::dcadec::xll::{DCA_SYNCWORD_XLL_X, XllDecoder, XllError, crc16_ccitt};
 use crate::dcadec::xmeta::FIXED_HEIGHT_COUNT;
 use crate::parser::{ParseError, parse_header};
@@ -209,6 +209,8 @@ pub struct HdDecoder {
     core: CoreDecoder,
     synth: SynthState,
     xll: XllDecoder,
+    /// The core as synthesized for the current frame, kept for its buffers.
+    core_out: CoreOutput,
 }
 
 impl HdDecoder {
@@ -217,6 +219,7 @@ impl HdDecoder {
             core: CoreDecoder::default(),
             synth: SynthState::default(),
             xll: XllDecoder::new(),
+            core_out: CoreOutput::default(),
         }
     }
 
@@ -241,6 +244,21 @@ impl HdDecoder {
 
     /// Decode one DTS-HD frame from its core access unit + EXSS substream bytes.
     pub fn decode(&mut self, core_au: &[u8], exss: &[u8]) -> Result<HdFrame, HdError> {
+        let mut frame = HdFrame::default();
+        self.decode_into(core_au, exss, &mut frame)?;
+        Ok(frame)
+    }
+
+    /// [`Self::decode`] into a frame the caller keeps from one call to the
+    /// next: the frame's sample and payload buffers are reused, so a stream
+    /// whose layout holds decodes without allocating once they are sized.
+    /// On error `frame` is left as it was.
+    pub fn decode_into(
+        &mut self,
+        core_au: &[u8],
+        exss: &[u8],
+        frame: &mut HdFrame,
+    ) -> Result<(), HdError> {
         // 1) Core bitstream decode (the residual base).
         let info = parse_header(core_au)?;
         self.core
@@ -248,9 +266,10 @@ impl HdDecoder {
             .map_err(|_| HdError::Core)?;
 
         // 2) EXSS → locate the XLL asset, or take the lossy route without one.
-        let mut exssp = ExssParser::parse(exss).map_err(|_| HdError::Exss)?;
+        let exssp = ExssParser::parse(exss).map_err(|_| HdError::Exss)?;
         if !exssp.has_xll() {
-            return Ok(self.decode_lossy(exss, &exssp));
+            self.decode_lossy(exss, &exssp, frame);
+            return Ok(());
         }
 
         // 3) Parse XLL before synthesizing the core: the core must be rendered at
@@ -266,45 +285,40 @@ impl HdDecoder {
         // is no X96 payload involved — this is pure oversampling of the core.
         let x96_synth =
             self.xll.primary_freq() == Some(96_000) && self.core.sample_rate() == 48_000;
-        let core_out = self
-            .synth
-            .synthesize_fixed_by_speaker(&mut self.core, x96_synth);
+        self.synth
+            .synthesize_fixed_by_speaker(&mut self.core, x96_synth, &mut self.core_out);
 
         // 5) Combine the lossless XLL bands with the core residual.
-        match self.xll.filter(Some(&core_out)) {
+        match self.xll.filter(Some(&self.core_out)) {
             Ok(()) => {}
             Err(XllError::Eagain) => return Err(HdError::Pending),
             Err(e) => return Err(HdError::Xll(format!("{e:?}"))),
         }
 
-        // 4) Convert 24-bit lossless ints to f32 by speaker.
-        let samples = self
-            .xll
-            .output
-            .iter()
-            .map(|opt| {
-                opt.as_ref()
-                    .map(|v| v.iter().map(|&s| s as f32 / PCM_SCALE).collect())
-            })
-            .collect();
-        let x_samples = std::mem::take(&mut self.xll.x_output)
-            .into_iter()
-            .map(|channel| {
-                channel
-                    .into_iter()
-                    .map(|sample| sample as f32 / PCM_SCALE)
-                    .collect()
-            })
-            .collect();
+        // 6) Convert 24-bit lossless ints to f32 by speaker, into the frame's
+        // own buffers.
+        let mut samples = std::mem::take(&mut frame.samples);
+        fill_speakers(&mut samples, &self.xll.output);
+        let mut x_samples = std::mem::take(&mut frame.x_samples);
+        fill_channels(&mut x_samples, &self.xll.x_output);
+        // The payload changes hands: the frame's previous buffer is the one
+        // the decoder fills next.
+        let mut x_payload = std::mem::take(&mut frame.x_payload);
+        std::mem::swap(&mut x_payload, &mut self.xll.x_payload);
+        self.xll.x_payload.clear();
+        let mut exss_descriptor_tail = std::mem::take(&mut frame.exss_descriptor_tail);
+        exssp
+            .asset
+            .copy_descriptor_tail(exss, &mut exss_descriptor_tail);
 
-        Ok(HdFrame {
+        *frame = HdFrame {
             sample_rate: self.xll.sample_rate,
             output_mask: self.xll.output_mask,
             coded_mask: self.xll.coded_mask,
             samples,
             x_present: self.xll.x_syncword_present,
             x_imax: self.xll.x_imax_syncword_present,
-            x_payload: std::mem::take(&mut self.xll.x_payload),
+            x_payload,
             x_payload_offset: self.xll.x_payload_offset,
             x_samples,
             x_pcm_bit_res: self.xll.x_pcm_bit_res,
@@ -316,14 +330,15 @@ impl HdDecoder {
             xll_segment_size_bits: self.xll.seg_size_nbits,
             xll_band_crc_present: self.xll.band_crc_present,
             xll_scalable_lsbs: self.xll.scalable_lsbs,
-            exss_descriptor_tail: std::mem::take(&mut exssp.asset.descriptor_tail),
+            exss_descriptor_tail,
             exss_descriptor_tail_bits: exssp.asset.descriptor_tail_bits,
             x_descriptor_offset: exssp.asset.xll_x_offset,
             x_descriptor_size: exssp.asset.xll_x_size,
             x_descriptor_navigation_used: self.xll.x_descriptor_navigation_used,
             lossless: true,
             xxch_decode_error: None,
-        })
+        };
+        Ok(())
     }
 
     /// The lossy route: the core (already decoded) plus the asset's XXCH
@@ -331,12 +346,10 @@ impl HdDecoder {
     /// is the standard profile's, makes the four height feeds. A failing
     /// component degrades to the bed without it, recorded in the frame,
     /// never to a dropped frame.
-    fn decode_lossy(&mut self, exss: &[u8], exssp: &ExssParser) -> HdFrame {
+    fn decode_lossy(&mut self, exss: &[u8], exssp: &ExssParser, frame: &mut HdFrame) {
         // The lossless decoder's output is not this frame's: a reader of the
         // integer tap must see nothing.
-        for slot in &mut self.xll.output {
-            *slot = None;
-        }
+        self.xll.release_output();
 
         let asset = &exssp.asset;
         let mut xxch_decode_error = None;
@@ -353,7 +366,8 @@ impl HdDecoder {
 
         let mut x_present = false;
         let mut x_imax = false;
-        let mut x_payload = Vec::new();
+        let mut x_payload = std::mem::take(&mut frame.x_payload);
+        x_payload.clear();
         let mut x_payload_offset = 0;
         let mut x_bits_consumed = 0;
         let mut x_decode_error = None;
@@ -363,7 +377,7 @@ impl HdDecoder {
             let marker = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]);
             x_present = marker == DCA_SYNCWORD_XLL_X;
             x_imax = !x_present;
-            x_payload = blob.to_vec();
+            x_payload.extend_from_slice(blob);
             x_payload_offset = start;
             if x_present {
                 match lossy_extension_set(blob) {
@@ -378,32 +392,19 @@ impl HdDecoder {
             }
         }
 
-        let core_out = self
-            .synth
-            .synthesize_fixed_by_speaker(&mut self.core, false);
-        let samples = core_out
-            .samples
-            .iter()
-            .map(|opt| {
-                opt.as_ref()
-                    .map(|v| v.iter().map(|&s| s as f32 / PCM_SCALE).collect())
-            })
-            .collect();
-        let x_samples = core_out
-            .extension
-            .into_iter()
-            .map(|channel| {
-                channel
-                    .into_iter()
-                    .map(|sample| sample as f32 / PCM_SCALE)
-                    .collect()
-            })
-            .collect();
+        self.synth
+            .synthesize_fixed_by_speaker(&mut self.core, false, &mut self.core_out);
+        let mut samples = std::mem::take(&mut frame.samples);
+        fill_speakers(&mut samples, &self.core_out.samples);
+        let mut x_samples = std::mem::take(&mut frame.x_samples);
+        fill_channels(&mut x_samples, &self.core_out.extension);
+        let mut exss_descriptor_tail = std::mem::take(&mut frame.exss_descriptor_tail);
+        exss_descriptor_tail.clear();
 
-        HdFrame {
-            sample_rate: core_out.output_rate,
-            output_mask: core_out.ch_mask,
-            coded_mask: core_out.coded_mask,
+        *frame = HdFrame {
+            sample_rate: self.core_out.output_rate,
+            output_mask: self.core_out.ch_mask,
+            coded_mask: self.core_out.coded_mask,
             samples,
             lossless: false,
             xxch_decode_error,
@@ -415,9 +416,36 @@ impl HdDecoder {
             x_pcm_bit_res: 24,
             x_bits_consumed,
             x_decode_error,
+            exss_descriptor_tail,
             ..HdFrame::default()
+        };
+    }
+}
+
+/// `dst` takes the shape of the speaker-indexed `src`, each active speaker
+/// converted to f32 in [-1, 1] in the buffer `dst` already holds for it.
+fn fill_speakers(dst: &mut Vec<Option<Vec<f32>>>, src: &[Option<Vec<i32>>]) {
+    dst.resize_with(src.len(), || None);
+    for (out, channel) in dst.iter_mut().zip(src) {
+        match channel {
+            Some(channel) => convert(out.get_or_insert_with(Vec::new), channel),
+            None => *out = None,
         }
     }
+}
+
+/// `dst` takes the shape of `src`, each channel converted to f32 in [-1, 1]
+/// in the buffer `dst` already holds at its index.
+fn fill_channels(dst: &mut Vec<Vec<f32>>, src: &[Vec<i32>]) {
+    dst.resize_with(src.len(), Vec::new);
+    for (out, channel) in dst.iter_mut().zip(src) {
+        convert(out, channel);
+    }
+}
+
+fn convert(out: &mut Vec<f32>, channel: &[i32]) {
+    out.clear();
+    out.extend(channel.iter().map(|&s| s as f32 / PCM_SCALE));
 }
 
 #[cfg(test)]

@@ -142,7 +142,9 @@ pub(crate) struct ExssAsset {
     pub(crate) hd_stream_id: u32,
     /// Unspecified tail of the audio asset descriptor. Newer profiles can put
     /// metadata here while legacy decoders skip to `nuAssetDescriptFsize`.
-    pub(crate) descriptor_tail: Vec<u8>,
+    /// Bit position of the descriptor tail in the EXSS substream, read back
+    /// with [`ExssAsset::copy_descriptor_tail`].
+    pub(crate) descriptor_tail_pos: usize,
     pub(crate) descriptor_tail_bits: usize,
     pub(crate) decode_in_secondary: bool,
     pub(crate) drc_rev2_present: bool,
@@ -465,21 +467,17 @@ impl ExssParser {
             seek(gb, tail_fields_start)?;
         }
 
-        // Capture the remaining descriptor tail (reserved/profile-specific
+        // Locate the remaining descriptor tail (reserved/profile-specific
         // metadata) for XLL assets only — it is where the XLL-X navigation
-        // word lives. Byte-at-a-time: this runs per frame.
+        // word lives. Read into a stack buffer: this runs per frame, and the
+        // whole descriptor is at most 512 bytes.
         if a.extension_mask & DCA_EXSS_XLL != 0 {
+            a.descriptor_tail_pos = gb.position();
             a.descriptor_tail_bits = descr_end - gb.position();
-            a.descriptor_tail = vec![0; a.descriptor_tail_bits.div_ceil(8)];
-            let full_bytes = a.descriptor_tail_bits / 8;
-            for byte in a.descriptor_tail.iter_mut().take(full_bytes) {
-                *byte = rb(gb, 8)? as u8;
-            }
-            let rest_bits = a.descriptor_tail_bits % 8;
-            if rest_bits > 0 {
-                a.descriptor_tail[full_bytes] = (rb(gb, rest_bits)? as u8) << (8 - rest_bits);
-            }
-            if let Some((offset, size)) = parse_xll_x_navigation(&a.descriptor_tail) {
+            let mut tail = [0u8; DESCRIPTOR_MAX_BYTES];
+            let tail = &mut tail[..a.descriptor_tail_bits.div_ceil(8)];
+            read_tail(gb, a.descriptor_tail_bits, tail)?;
+            if let Some((offset, size)) = parse_xll_x_navigation(tail) {
                 a.xll_x_offset = Some(offset);
                 a.xll_x_size = Some(size);
             }
@@ -561,6 +559,35 @@ impl ExssParser {
 /// Observed syntax across the corpus:
 ///   8-bit marker, 11-bit `offset / 4`, 13 zero bits,
 ///   16-bit marker, 10-bit `(size - 24) / 4`, 6 zero bits.
+/// The largest asset descriptor (a 9-bit size field, in bytes, plus one).
+const DESCRIPTOR_MAX_BYTES: usize = 512;
+
+/// `bits` bits from `gb` into `out` (`bits.div_ceil(8)` bytes), MSB-first,
+/// a final partial byte left-aligned.
+fn read_tail(gb: &mut BitReader, bits: usize, out: &mut [u8]) -> R<()> {
+    let full_bytes = bits / 8;
+    for byte in out.iter_mut().take(full_bytes) {
+        *byte = rb(gb, 8)? as u8;
+    }
+    let rest_bits = bits % 8;
+    if rest_bits > 0 {
+        out[full_bytes] = (rb(gb, rest_bits)? as u8) << (8 - rest_bits);
+    }
+    Ok(())
+}
+
+impl ExssAsset {
+    /// The descriptor tail, read back from `exss` (the substream this asset
+    /// was parsed from) into `out`, replacing its contents.
+    pub(crate) fn copy_descriptor_tail(&self, exss: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        out.resize(self.descriptor_tail_bits.div_ceil(8), 0);
+        let mut gb = BitReader::with_offset(exss, self.descriptor_tail_pos);
+        // The parse read these same bits, so they are there.
+        let _ = read_tail(&mut gb, self.descriptor_tail_bits, out);
+    }
+}
+
 fn parse_xll_x_navigation(tail: &[u8]) -> Option<(usize, usize)> {
     let bytes: [u8; 8] = tail.get(..8)?.try_into().ok()?;
     let word = u64::from_be_bytes(bytes);
