@@ -180,15 +180,6 @@ fn dequantize(output: &mut [i32], input: &[i32], step_size: i32, scale: i32) {
 
 // ───────────────────────── decoder state ──────────────────────────────────
 
-/// Per-channel subband storage: `[band]` -> buffer of `DCA_ADPCM_COEFFS`
-/// history words followed by `npcmblocks` decoded samples. Persists across
-/// frames for ADPCM history.
-#[derive(Default, Clone)]
-struct ChannelBands {
-    /// `sub[band]`, each `DCA_ADPCM_COEFFS + npcmblocks` long.
-    sub: Vec<Vec<i32>>,
-}
-
 #[derive(Default)]
 pub(crate) struct CoreDecoder {
     npcmblocks: usize,
@@ -239,8 +230,14 @@ pub(crate) struct CoreDecoder {
     joint_scale_factors: [[i32; DCA_SUBBANDS]; DCA_CHANNELS],
 
     // persistent sample buffers
-    bands: Vec<ChannelBands>, // [ch]
-    lfe_samples: Vec<i32>,    // DCA_LFE_HISTORY + npcmblocks/2
+    /// Subband samples, one row per channel and band (`[ch][band]`, see
+    /// `band_range`): `DCA_ADPCM_COEFFS` history words followed by the
+    /// frame's `npcmblocks` decoded samples. The history persists across
+    /// frames for ADPCM.
+    bands: Vec<i32>,
+    /// Length of a row of `bands`.
+    band_len: usize,
+    lfe_samples: Vec<i32>, // DCA_LFE_HISTORY + npcmblocks/2
 }
 
 #[derive(Debug)]
@@ -267,33 +264,45 @@ fn rsb(gb: &mut BitReader, n: usize) -> R<i32> {
 
 impl CoreDecoder {
     pub(crate) fn reset(&mut self) {
-        for ch in &mut self.bands {
-            for b in &mut ch.sub {
-                b.iter_mut().for_each(|x| *x = 0);
-            }
-        }
+        self.bands.fill(0);
         self.lfe_samples.iter_mut().for_each(|x| *x = 0);
+    }
+
+    /// Where the row of channel `ch`, band `band` lies in `bands`.
+    #[inline(always)]
+    fn band_range(&self, ch: usize, band: usize) -> std::ops::Range<usize> {
+        let start = (ch * DCA_SUBBANDS + band) * self.band_len;
+        start..start + self.band_len
+    }
+
+    /// The rows of `band` in two distinct channels: `src` to read, `dst`
+    /// to write.
+    #[inline(always)]
+    fn band_pair(&mut self, src_ch: usize, dst_ch: usize, band: usize) -> (&[i32], &mut [i32]) {
+        debug_assert_ne!(src_ch, dst_ch);
+        let (src, dst) = (self.band_range(src_ch, band), self.band_range(dst_ch, band));
+        if src.start < dst.start {
+            let (head, tail) = self.bands.split_at_mut(dst.start);
+            (&head[src], &mut tail[..dst.len()])
+        } else {
+            let (head, tail) = self.bands.split_at_mut(src.start);
+            (&tail[..src.len()], &mut head[dst])
+        }
     }
 
     fn alloc_buffers(&mut self) {
         let band_len = DCA_ADPCM_COEFFS + self.npcmblocks;
-        if self.bands.len() != DCA_CHANNELS {
-            self.bands = vec![ChannelBands::default(); DCA_CHANNELS];
-        }
-        for ch in &mut self.bands {
-            if ch.sub.len() != DCA_SUBBANDS || ch.sub[0].len() != band_len {
-                ch.sub = vec![vec![0i32; band_len]; DCA_SUBBANDS];
-            }
+        if self.band_len != band_len || self.bands.len() != DCA_CHANNELS * DCA_SUBBANDS * band_len {
+            self.bands = vec![0i32; DCA_CHANNELS * DCA_SUBBANDS * band_len];
+            self.band_len = band_len;
         }
         let lfe_len = DCA_LFE_HISTORY + self.npcmblocks / 2;
         if self.lfe_samples.len() != lfe_len {
             self.lfe_samples = vec![0i32; lfe_len];
         }
         if !self.predictor_history {
-            for ch in &mut self.bands {
-                for b in &mut ch.sub {
-                    b[..DCA_ADPCM_COEFFS].iter_mut().for_each(|x| *x = 0);
-                }
+            for row in self.bands.chunks_exact_mut(band_len) {
+                row[..DCA_ADPCM_COEFFS].fill(0);
             }
         }
     }
@@ -798,7 +807,8 @@ impl CoreDecoder {
                         scale = clip23((adj * scale as i64 >> 22) as i32);
                     }
                     let base = DCA_ADPCM_COEFFS + ofs;
-                    let buf = &mut self.bands[ch].sub[band][base..base + DCA_SUBBAND_SAMPLES];
+                    let row = self.band_range(ch, band);
+                    let buf = &mut self.bands[row][base..base + DCA_SUBBAND_SAMPLES];
                     dequantize(buf, &audio, step_size, scale);
                 }
             }
@@ -831,9 +841,10 @@ impl CoreDecoder {
             let coeff = &HIGH_FREQ_VQ[vq_index[i] as usize];
             let scale = self.scale_factors[ch][i][0];
             let base = DCA_ADPCM_COEFFS + ofs;
-            for j in 0..len {
-                self.bands[ch].sub[i][base + j] =
-                    clip23(((coeff[j] as i32 * scale) + (1 << 3)) >> 4);
+            let row = self.band_range(ch, i);
+            let buf = &mut self.bands[row][base..base + len];
+            for (x, &c) in buf.iter_mut().zip(&coeff[..len]) {
+                *x = clip23(((c as i32 * scale) + (1 << 3)) >> 4);
             }
         }
     }
@@ -842,7 +853,8 @@ impl CoreDecoder {
         for band in 0..self.nsubbands[ch] {
             if self.prediction_mode[ch][band] {
                 let pred_id = self.prediction_vq_index[ch][band];
-                let buf = &mut self.bands[ch].sub[band];
+                let row = self.band_range(ch, band);
+                let buf = &mut self.bands[row];
                 for j in 0..len {
                     // input window = buf[sub_pos+j .. sub_pos+j+4]
                     let win = [
@@ -863,9 +875,9 @@ impl CoreDecoder {
         for band in self.nsubbands[ch]..self.nsubbands[src_ch] {
             let scale = self.joint_scale_factors[ch][band];
             let base = DCA_ADPCM_COEFFS + ofs;
-            for j in 0..len {
-                let src = self.bands[src_ch].sub[band][base + j];
-                self.bands[ch].sub[band][base + j] = clip23(mul(src, scale, 17));
+            let (src, dst) = self.band_pair(src_ch, ch, band);
+            for (d, &s) in dst[base..base + len].iter_mut().zip(&src[base..base + len]) {
+                *d = clip23(mul(s, scale, 17));
             }
         }
     }
@@ -901,15 +913,13 @@ impl CoreDecoder {
                 nsubbands = nsubbands.max(self.nsubbands[self.joint_intensity_index[ch] - 1]);
             }
             for band in 0..nsubbands {
-                let buf = &mut self.bands[ch].sub[band];
+                let row = self.band_range(ch, band);
+                let buf = &mut self.bands[row];
                 // history (first 4) = last 4 decoded samples
-                for k in 0..DCA_ADPCM_COEFFS {
-                    buf[k] = buf[self.npcmblocks + k];
-                }
+                buf.copy_within(self.npcmblocks..self.npcmblocks + DCA_ADPCM_COEFFS, 0);
             }
-            for band in nsubbands..DCA_SUBBANDS {
-                self.bands[ch].sub[band].iter_mut().for_each(|x| *x = 0);
-            }
+            let inactive = self.band_range(ch, nsubbands).start..self.band_range(ch + 1, 0).start;
+            self.bands[inactive].fill(0);
         }
         Ok(())
     }
@@ -986,11 +996,9 @@ impl CoreDecoder {
             Err(e) => {
                 self.nchannels = base;
                 self.extension_base = base;
-                for ch in base..base + nchannels {
-                    for band in &mut self.bands[ch].sub {
-                        band.iter_mut().for_each(|x| *x = 0);
-                    }
-                }
+                let dropped =
+                    self.band_range(base, 0).start..self.band_range(base + nchannels, 0).start;
+                self.bands[dropped].fill(0);
                 Err(e)
             }
         }
@@ -1091,7 +1099,7 @@ impl CoreDecoder {
 
     /// Decoded samples for channel `ch`, band `band` (npcmblocks long).
     pub(crate) fn subband(&self, ch: usize, band: usize) -> &[i32] {
-        &self.bands[ch].sub[band][DCA_ADPCM_COEFFS..DCA_ADPCM_COEFFS + self.npcmblocks]
+        &self.bands[self.band_range(ch, band)][DCA_ADPCM_COEFFS..]
     }
 
     pub(crate) fn lfe(&self) -> &[i32] {
