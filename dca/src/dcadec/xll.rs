@@ -395,6 +395,70 @@ fn rmul15(a: i32, b: i32) -> i32 {
     (((a as i64 * b as i64) + (1 << 14)) >> 15) as i32
 }
 
+sample_loop! {
+    /// Add the core to a residual channel: `dst += (src + round) >> shift`.
+    fn add_core(dst: &mut [i32], src: &[i32], round: i32, shift: usize) {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = d.wrapping_add((s + round) >> shift);
+        }
+    }
+}
+
+sample_loop! {
+    /// Add the core to a residual channel an embedded downmix scaled:
+    /// `dst += clip23((mul16(src, scale) + round) >> shift)`.
+    fn add_scaled_core(dst: &mut [i32], src: &[i32], scale: i32, round: i32, shift: usize) {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = d.wrapping_add(clip23((mul16(s, scale) + round) >> shift));
+        }
+    }
+}
+
+sample_loop! {
+    /// Take a downmixed channel out: `dst -= rmul15(src, coeff)`.
+    fn sub_scaled(dst: &mut [i32], src: &[i32], coeff: i32) {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = d.wrapping_sub(rmul15(s, coeff));
+        }
+    }
+}
+
+sample_loop! {
+    /// Undo a pairwise decorrelation: `dst += (src * coeff + 4) >> 3`.
+    fn add_decorrelated(dst: &mut [i32], src: &[i32], coeff: i32) {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = d.wrapping_add((s.wrapping_mul(coeff) + (1 << 2)) >> 3);
+        }
+    }
+}
+
+sample_loop! {
+    /// `samples <<= shift`, clipped to 24 bits.
+    fn shift_clip(samples: &mut [i32], shift: usize) {
+        for s in samples {
+            *s = clip23(s.wrapping_mul(1 << shift));
+        }
+    }
+}
+
+sample_loop! {
+    /// `msb = (msb << shift) + (lsb << adjust)`.
+    fn join_lsb(msb: &mut [i32], lsb: &[i32], shift: usize, adjust: usize) {
+        for (m, &l) in msb.iter_mut().zip(lsb) {
+            *m = m.wrapping_mul(1 << shift) + (l << adjust);
+        }
+    }
+}
+
+sample_loop! {
+    /// `samples <<= shift`.
+    fn shift_up(samples: &mut [i32], shift: usize) {
+        for s in samples {
+            *s = s.wrapping_mul(1 << shift);
+        }
+    }
+}
+
 #[inline]
 fn get_linear(gb: &mut BitReader, n: usize) -> R<i32> {
     if n == 0 {
@@ -1842,11 +1906,8 @@ impl XllDecoder {
                 let coeff = b.decor_coeff[i];
                 if coeff != 0 {
                     // dst = msb[2i+1], src = msb[2i]
-                    for n in 0..nsamples {
-                        let s = b.msb[i * 2][n];
-                        b.msb[i * 2 + 1][n] = b.msb[i * 2 + 1][n]
-                            .wrapping_add((s.wrapping_mul(coeff) + (1 << 2)) >> 3);
-                    }
+                    let (src, dst) = b.msb[i * 2..i * 2 + 2].split_at_mut(1);
+                    add_decorrelated(&mut dst[0][..nsamples], &src[0][..nsamples], coeff);
                 }
             }
             // Permute msb so that msb[orig_order[i]] = decoded[i], in place
@@ -1893,16 +1954,11 @@ impl XllDecoder {
             let c = &mut self.chset[chs];
             let has_lsb = c.band.nscalablelsbs[ch] != 0;
             let adj = c.band.bit_width_adjust[ch];
+            let msb = &mut c.band.msb[ch][..nsamples];
             if has_lsb {
-                for n in 0..nsamples {
-                    let msb = c.band.msb[ch][n];
-                    let lsb = c.band.lsb[ch][n];
-                    c.band.msb[ch][n] = msb.wrapping_mul(1 << shift) + (lsb << adj);
-                }
+                join_lsb(msb, &c.band.lsb[ch][..nsamples], shift, adj);
             } else {
-                for n in 0..nsamples {
-                    c.band.msb[ch][n] = c.band.msb[ch][n].wrapping_mul(1 << shift);
-                }
+                shift_up(msb, shift);
             }
         }
     }
@@ -1957,9 +2013,7 @@ impl XllDecoder {
                             (&mut tail[0].band.msb[j], &head[o_idx].band.msb[k])
                         }
                     };
-                    for n in 0..nsamples {
-                        dst[n] = dst[n].wrapping_sub(rmul15(src[n], cf));
-                    }
+                    sub_scaled(&mut dst[..nsamples], &src[..nsamples], cf);
                 }
             }
             nchannels += c_nch;
@@ -2000,17 +2054,14 @@ impl XllDecoder {
             let src = core.samples[spkr]
                 .as_ref()
                 .ok_or(XllError::Invalid("missing core speaker samples"))?;
+            let src = &src[..nsamples];
             if let Some(o) = o_idx {
                 let si = self.chset[o].dmix_scale_inv[hier_ofs + ch];
-                let dst = &mut self.chset[chs].band.msb[ch];
-                for n in 0..nsamples {
-                    dst[n] = dst[n].wrapping_add(clip23((mul16(src[n], si) + round) >> shift));
-                }
+                let dst = &mut self.chset[chs].band.msb[ch][..nsamples];
+                add_scaled_core(dst, src, si, round, shift);
             } else {
-                let dst = &mut self.chset[chs].band.msb[ch];
-                for n in 0..nsamples {
-                    dst[n] = dst[n].wrapping_add((src[n] + round) >> shift);
-                }
+                let dst = &mut self.chset[chs].band.msb[ch][..nsamples];
+                add_core(dst, src, round, shift);
             }
         }
         Ok(())
@@ -2068,9 +2119,7 @@ impl XllDecoder {
                 // Scaled in place and handed out: the next frame draws its
                 // buffers back from the pool.
                 let mut buf = std::mem::take(&mut self.chset[chs].band.msb[ch]);
-                for s in &mut buf {
-                    *s = clip23(s.wrapping_mul(1 << shift));
-                }
+                shift_clip(&mut buf, shift);
                 if let Some(old) = self.output[spkr].replace(buf) {
                     self.pool.give(old);
                 }
