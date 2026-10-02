@@ -203,9 +203,19 @@ fn truehd_pass(data: &[u8], presentation: usize) -> Tally {
 /// which is what FFmpeg decodes.
 fn eac3_pass(data: &[u8], objects: bool) -> Tally {
     use eac3::{
-        AccessUnitParseError, CorePcmFrame, FrameType, ObjectPcmDecoder, PcmDecoder,
-        inspect_access_unit, merge_core_with_dependent,
+        AccessUnitInfo, CorePcmFrame, ObjectPcmDecoder, PcmDecoder, PcmPushResult,
+        inspect_access_unit, merge_core_with_decoded_dependent, merge_core_with_dependent,
     };
+
+    /// As the CLI's `read_dependent`: a dependent expected to be a channel
+    /// extension is decoded at once, a JOC one is inspected.
+    enum Dependent {
+        Inspected {
+            info: AccessUnitInfo,
+            decode_failed: bool,
+        },
+        Decoded(PcmPushResult),
+    }
 
     enum Pending {
         Core(CorePcmFrame),
@@ -229,15 +239,42 @@ fn eac3_pass(data: &[u8], objects: bool) -> Tally {
     let mut ac3_decoder = PcmDecoder::new();
     let mut dependent_decoder = PcmDecoder::new();
     let mut pending: Option<Pending> = None;
+    let mut dependents_carry_joc = false;
     let mut tally = Tally::default();
 
-    let mut handle = |bytes: &[u8], pending: &mut Option<Pending>, tally: &mut Tally| {
-        let (frame_type, legacy) = match inspect_access_unit(bytes) {
-            Ok(info) => (Some(info.frame_type), false),
-            Err(AccessUnitParseError::NotEac3) => (None, true),
-            Err(_) => (None, false),
+    let mut handle = |frame: &eac3::Frame, pending: &mut Option<Pending>, tally: &mut Tally| {
+        let bytes = frame.as_bytes();
+        // As the CLI: route on the extractor's header, and look into a
+        // dependent only, once, for its JOC payload.
+        let header = frame.info();
+        let legacy = header.bitstream_id <= 10;
+        let dependent_read = if header.stream_type == eac3::StreamType::Dependent && !legacy {
+            let core_waits = matches!(pending, Some(Pending::Core(_)));
+            let mut decode_failed = false;
+            let mut read = None;
+            if core_waits && !dependents_carry_joc {
+                match dependent_decoder.push_access_unit(bytes) {
+                    Ok(push) => {
+                        dependents_carry_joc = push.info.joc_payload_count() > 0;
+                        read = Some(Dependent::Decoded(push));
+                    }
+                    Err(_) => decode_failed = true,
+                }
+            }
+            if read.is_none() {
+                read = inspect_access_unit(bytes).ok().map(|info| {
+                    dependents_carry_joc = info.joc_payload_count() > 0;
+                    Dependent::Inspected {
+                        info,
+                        decode_failed,
+                    }
+                });
+            }
+            read
+        } else {
+            None
         };
-        let dependent = matches!(frame_type, Some(FrameType::Dependent));
+        let dependent = dependent_read.is_some();
         if !dependent {
             if let Some(Pending::Core(core)) = pending.take() {
                 object_decoder.note_non_joc_presentation();
@@ -251,11 +288,14 @@ fn eac3_pass(data: &[u8], objects: bool) -> Tally {
             }
             return;
         }
-        if dependent {
+        if let Some(dependent_read) = dependent_read {
             match pending.take() {
                 Some(Pending::Core(core)) => {
-                    let joc = objects
-                        && inspect_access_unit(bytes).is_ok_and(|i| i.joc_payload_count() > 0);
+                    let info = match &dependent_read {
+                        Dependent::Inspected { info, .. } => info,
+                        Dependent::Decoded(push) => &push.info,
+                    };
+                    let joc = objects && info.joc_payload_count() > 0;
                     if joc {
                         if let Ok(Some(obj)) =
                             object_decoder.push_access_unit_with_core(bytes, core.clone())
@@ -265,8 +305,19 @@ fn eac3_pass(data: &[u8], objects: bool) -> Tally {
                         }
                     }
                     object_decoder.note_non_joc_presentation();
-                    let bed = merge_core_with_dependent(&mut dependent_decoder, &core, bytes)
-                        .unwrap_or(core);
+                    let merged = match dependent_read {
+                        Dependent::Decoded(push) => {
+                            merge_core_with_decoded_dependent(&core, &push.pcm, &push.info)
+                        }
+                        Dependent::Inspected {
+                            decode_failed: true,
+                            ..
+                        } => None,
+                        Dependent::Inspected { .. } => {
+                            merge_core_with_dependent(&mut dependent_decoder, &core, bytes)
+                        }
+                    };
+                    let bed = merged.unwrap_or(core);
                     count_core(tally, &bed);
                 }
                 Some(Pending::Object(Some(joc_input))) => {
@@ -304,7 +355,7 @@ fn eac3_pass(data: &[u8], objects: bool) -> Tally {
         extractor.push_bytes(chunk);
         loop {
             match extractor.next_frame() {
-                Ok(Some(frame)) => handle(frame.as_bytes(), &mut pending, &mut tally),
+                Ok(Some(frame)) => handle(&frame, &mut pending, &mut tally),
                 Ok(None) => break,
                 Err(_) => tally.errors += 1,
             }
