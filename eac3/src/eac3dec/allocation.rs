@@ -8,6 +8,8 @@ pub(crate) const LFE_END_MANTISSA: usize = 7;
 const MAX_ALLOCATION_SIZE: usize = 256;
 const MASK_BANDS: usize = 50;
 const BAP_BITS: [usize; 16] = [0, 5, 7, 3, 7, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16];
+/// The widest field one mantissa can read.
+const MAX_MANTISSA_BITS: usize = 16;
 const GROUP_ADD: [isize; 3] = [-1, 2, 8];
 const GROUP_DIV: [usize; 3] = [3, 6, 12];
 const SLOWDEC: [i32; 4] = [0x0f, 0x11, 0x13, 0x15];
@@ -190,6 +192,8 @@ impl Default for BitAllocationParams {
 #[derive(Debug, Clone)]
 pub(crate) struct AllocationState {
     exponents: Vec<i32>,
+    /// The exponents as the shift a mantissa takes: clamped to an `i32`'s.
+    shifts: Vec<u8>,
     psd: Vec<i32>,
     integrated_psd: Vec<i32>,
     bap: Vec<u8>,
@@ -263,6 +267,7 @@ impl AllocationState {
     pub(crate) fn new() -> Self {
         Self {
             exponents: vec![0; MAX_ALLOCATION_SIZE],
+            shifts: vec![0; MAX_ALLOCATION_SIZE],
             psd: vec![0; MAX_ALLOCATION_SIZE],
             integrated_psd: vec![0; MASK_BANDS],
             bap: vec![0; MAX_ALLOCATION_SIZE],
@@ -412,6 +417,18 @@ impl AllocationState {
             aht,
         };
 
+        // The tables as arrays of their own: through `self` every store
+        // would have the compiler fetch each `Vec`'s pointer again.
+        let (Ok(psd), Ok(integrated_psd), Ok(excite), Ok(mask), Ok(bap)) = (
+            <&[i32; MAX_ALLOCATION_SIZE]>::try_from(&self.psd[..]),
+            <&[i32; MASK_BANDS]>::try_from(&self.integrated_psd[..]),
+            <&mut [i32; MASK_BANDS]>::try_from(&mut self.excite[..]),
+            <&mut [i32; MASK_BANDS]>::try_from(&mut self.mask[..]),
+            <&mut [u8; MAX_ALLOCATION_SIZE]>::try_from(&mut self.bap[..]),
+        ) else {
+            return Ok(());
+        };
+
         let slow_decay = SLOWDEC[params.slow_decay_code];
         let fast_decay = FASTDEC[params.fast_decay_code];
         let slow_gain = SLOWGAIN[params.slow_gain_code];
@@ -424,27 +441,25 @@ impl AllocationState {
         let mut begin = bnd_start;
 
         if bnd_start == 0 {
-            let mut lowcomp = calc_lowcomp(0, self.integrated_psd[0], self.integrated_psd[1], 0);
-            self.excite[0] = self.integrated_psd[0] - fgain - lowcomp;
-            lowcomp = calc_lowcomp(lowcomp, self.integrated_psd[1], self.integrated_psd[2], 1);
-            self.excite[1] = self.integrated_psd[1] - fgain - lowcomp;
+            let mut lowcomp = calc_lowcomp(0, integrated_psd[0], integrated_psd[1], 0);
+            excite[0] = integrated_psd[0] - fgain - lowcomp;
+            lowcomp = calc_lowcomp(lowcomp, integrated_psd[1], integrated_psd[2], 1);
+            excite[1] = integrated_psd[1] - fgain - lowcomp;
             begin = 7;
 
             for band in 2..7 {
                 if bnd_end != 7 || band != 6 {
                     lowcomp = calc_lowcomp(
                         lowcomp,
-                        self.integrated_psd[band],
-                        self.integrated_psd[band + 1],
+                        integrated_psd[band],
+                        integrated_psd[band + 1],
                         band,
                     );
                 }
-                fast_leak = self.integrated_psd[band] - fgain;
-                slow_leak = self.integrated_psd[band] - slow_gain;
-                self.excite[band] = fast_leak - lowcomp;
-                if (bnd_end != 7 || band != 6)
-                    && self.integrated_psd[band] <= self.integrated_psd[band + 1]
-                {
+                fast_leak = integrated_psd[band] - fgain;
+                slow_leak = integrated_psd[band] - slow_gain;
+                excite[band] = fast_leak - lowcomp;
+                if (bnd_end != 7 || band != 6) && integrated_psd[band] <= integrated_psd[band + 1] {
                     begin = band + 1;
                     break;
                 }
@@ -454,29 +469,29 @@ impl AllocationState {
                 if bnd_end != 7 || band != 6 {
                     lowcomp = calc_lowcomp(
                         lowcomp,
-                        self.integrated_psd[band],
-                        self.integrated_psd[band + 1],
+                        integrated_psd[band],
+                        integrated_psd[band + 1],
                         band,
                     );
                 }
-                fast_leak = (fast_leak - fast_decay).max(self.integrated_psd[band] - fgain);
-                slow_leak = (slow_leak - slow_decay).max(self.integrated_psd[band] - slow_gain);
-                self.excite[band] = (fast_leak - lowcomp).max(slow_leak);
+                fast_leak = (fast_leak - fast_decay).max(integrated_psd[band] - fgain);
+                slow_leak = (slow_leak - slow_decay).max(integrated_psd[band] - slow_gain);
+                excite[band] = (fast_leak - lowcomp).max(slow_leak);
             }
             begin = 22;
         }
 
         for band in begin..bnd_end {
-            fast_leak = (fast_leak - fast_decay).max(self.integrated_psd[band] - fgain);
-            slow_leak = (slow_leak - slow_decay).max(self.integrated_psd[band] - slow_gain);
-            self.excite[band] = fast_leak.max(slow_leak);
+            fast_leak = (fast_leak - fast_decay).max(integrated_psd[band] - fgain);
+            slow_leak = (slow_leak - slow_decay).max(integrated_psd[band] - slow_gain);
+            excite[band] = fast_leak.max(slow_leak);
         }
 
         for band in bnd_start..bnd_end {
-            if self.integrated_psd[band] < dbknee {
-                self.excite[band] += (dbknee - self.integrated_psd[band]) >> 2;
+            if integrated_psd[band] < dbknee {
+                excite[band] += (dbknee - integrated_psd[band]) >> 2;
             }
-            self.mask[band] = self.excite[band].max(HTH[sample_rate_index][band]);
+            mask[band] = excite[band].max(HTH[sample_rate_index][band]);
         }
 
         if matches!(
@@ -500,7 +515,7 @@ impl AllocationState {
                     ((bits as i32) - 4) << 7
                 };
                 for _ in 0..length {
-                    let Some(mask) = self.mask.get_mut(band) else {
+                    let Some(mask) = mask.get_mut(band) else {
                         break;
                     };
                     *mask += delta_mask;
@@ -509,7 +524,9 @@ impl AllocationState {
             }
         } else if delta.mode == DeltaBitAllocationMode::MuteOutput {
             // TODO: Model reserved `MuteOutput` delta allocation the same way as a real decoder.
-            self.clear_bap();
+            bap.fill(0);
+            self.allocated_with = None;
+            self.mantissa_counts = None;
             return Ok(());
         }
 
@@ -518,14 +535,14 @@ impl AllocationState {
         let mut band = bnd_start;
         loop {
             let last_bin = BNDTAB[band].min(end);
-            let mut masked = self.mask[band] - snr_offset - floor;
+            let mut masked = mask[band] - snr_offset - floor;
             if masked < 0 {
                 masked = 0;
             }
             masked = (masked & 0x1fe0) + floor;
             while bin < last_bin {
-                let address = ((self.psd[bin] - masked) >> 5).clamp(0, 63) as usize;
-                self.bap[bin] = bap_tab[address];
+                let address = ((psd[bin] - masked) >> 5).clamp(0, 63) as usize;
+                bap[bin] = bap_tab[address];
                 bin += 1;
             }
             band += 1;
@@ -533,9 +550,7 @@ impl AllocationState {
                 break;
             }
         }
-        for bap in &mut self.bap[bin..] {
-            *bap = 0;
-        }
+        bap[bin..].fill(0);
         self.allocated_with = Some(args);
         Ok(())
     }
@@ -598,77 +613,105 @@ impl AllocationState {
         end: usize,
         state: &mut MantissaDecodeState,
     ) -> Result<(), ParseError> {
-        target.fill(0.0);
-        let (Some(baps), Some(exponents), Some(target)) = (
-            self.bap.get(start..end),
-            self.exponents.get(start..end),
-            target.get_mut(start..end),
-        ) else {
+        let (Some(baps), Some(shifts)) = (self.bap.get(start..end), self.shifts.get(start..end))
+        else {
+            target.fill(0.0);
             return Ok(());
         };
+        target[..start].fill(0.0);
+        target[end..].fill(0.0);
+        let target = &mut target[start..end];
 
-        // Codes index tables sized to their field width, so the masks change
-        // nothing; they let the compiler drop the bounds checks.
-        for ((slot, &bap), &exponent) in target.iter_mut().zip(baps).zip(exponents) {
-            *slot = match bap {
-                0 => 0.0,
-                1 => {
-                    state.bap1_pos += 1;
-                    if state.bap1_pos == 3 {
-                        let code = reader
-                            .read_bits(BAP_BITS[1])
-                            .ok_or(ParseError::ShortPacket)?
-                            as usize;
-                        state.bap1_next = BAP1_TABLE[code & (BAP1_TABLE.len() - 1)];
-                        state.bap1_pos = 0;
-                    }
-                    scale_int24(state.bap1_next[state.bap1_pos], exponent)
-                }
-                2 => {
-                    state.bap2_pos += 1;
-                    if state.bap2_pos == 3 {
-                        let code = reader
-                            .read_bits(BAP_BITS[2])
-                            .ok_or(ParseError::ShortPacket)?
-                            as usize;
-                        state.bap2_next = BAP2_TABLE[code & (BAP2_TABLE.len() - 1)];
-                        state.bap2_pos = 0;
-                    }
-                    scale_int24(state.bap2_next[state.bap2_pos], exponent)
-                }
-                3 => {
-                    let code = reader
-                        .read_bits(BAP_BITS[3])
-                        .ok_or(ParseError::ShortPacket)? as usize;
-                    scale_int24(BAP3_TABLE[code & (BAP3_TABLE.len() - 1)], exponent)
-                }
-                4 => {
-                    state.bap4_pos += 1;
-                    if state.bap4_pos == 2 {
-                        let code = reader
-                            .read_bits(BAP_BITS[4])
-                            .ok_or(ParseError::ShortPacket)?
-                            as usize;
-                        state.bap4_next = BAP4_TABLE[code & (BAP4_TABLE.len() - 1)];
-                        state.bap4_pos = 0;
-                    }
-                    scale_int24(state.bap4_next[state.bap4_pos], exponent)
-                }
-                5 => {
-                    let code = reader
-                        .read_bits(BAP_BITS[5])
-                        .ok_or(ParseError::ShortPacket)? as usize;
-                    scale_int24(BAP5_TABLE[code & (BAP5_TABLE.len() - 1)], exponent)
-                }
-                bap => {
-                    let bits = BAP_BITS[bap as usize & (BAP_BITS.len() - 1)];
-                    let raw = reader.read_bits(bits).ok_or(ParseError::ShortPacket)? as i32;
-                    let signed = raw << (32 - bits);
-                    scale_int32(shift_right_signed(signed, exponent))
-                }
-            };
+        // The position and the groups in flight stay in registers over the
+        // channel: nothing in the loop calls out, and nothing in it can fail.
+        // The reads are whole words, so a channel that could reach the last
+        // bytes of the data reads a copy of them with zeros after; the
+        // position is checked against the limit once, at the end.
+        let data = reader.data();
+        let position = reader.position();
+        let reach = (position + MAX_MANTISSA_BITS * baps.len()) / 8 + 9;
+        let tail;
+        let (data, base) = if reach <= data.len() {
+            (data, 0)
+        } else {
+            let from = (position / 8).min(data.len());
+            let mut copy = [0u8; MAX_ALLOCATION_SIZE * MAX_MANTISSA_BITS / 8 + 16];
+            let kept = (data.len() - from).min(copy.len() - 8);
+            copy[..kept].copy_from_slice(&data[from..from + kept]);
+            tail = copy;
+            (&tail[..], from * 8)
+        };
+        let mut position = position - base;
+        let MantissaDecodeState {
+            mut group1,
+            mut group2,
+            mut group4,
+        } = *state;
+        let mut overrun = false;
+        macro_rules! read {
+            ($bits:expr) => {{
+                let bits: usize = $bits;
+                let Some(word) = data.get(position / 8..position / 8 + 8) else {
+                    overrun = true;
+                    break;
+                };
+                let word = u64::from_be_bytes(word.try_into().unwrap()) << (position & 7);
+                position += bits;
+                (word >> (64 - bits)) as usize
+            }};
         }
 
+        // A group is its code and how far into it the channel is, as the
+        // index of the value in the flat table: the code times the row
+        // length, plus the position. Codes index tables sized to their field
+        // width, so the masks change nothing; they let the compiler drop the
+        // bounds checks.
+        for ((slot, &bap), &shift) in target.iter_mut().zip(baps).zip(shifts) {
+            let symmetric = match bap {
+                0 => 0,
+                1 => {
+                    group1 += 1;
+                    if group1 & 3 == 3 {
+                        group1 = read!(BAP_BITS[1]) << 2;
+                    }
+                    BAP1_VALUES[group1 & (BAP1_VALUES.len() - 1)]
+                }
+                2 => {
+                    group2 += 1;
+                    if group2 & 3 == 3 {
+                        group2 = read!(BAP_BITS[2]) << 2;
+                    }
+                    BAP2_VALUES[group2 & (BAP2_VALUES.len() - 1)]
+                }
+                3 => BAP3_TABLE[read!(BAP_BITS[3]) & (BAP3_TABLE.len() - 1)],
+                4 => {
+                    group4 += 1;
+                    if group4 & 1 == 0 {
+                        group4 = read!(BAP_BITS[4]) << 1;
+                    }
+                    BAP4_VALUES[group4 & (BAP4_VALUES.len() - 1)]
+                }
+                5 => BAP5_TABLE[read!(BAP_BITS[5]) & (BAP5_TABLE.len() - 1)],
+                bap => {
+                    let bits = BAP_BITS[bap as usize & (BAP_BITS.len() - 1)];
+                    let raw = read!(bits) as i32;
+                    *slot = scale_int32((raw << (32 - bits)) >> shift);
+                    continue;
+                }
+            };
+            *slot = (symmetric >> shift) as f32 * FROM_INT24;
+        }
+
+        let position = base + position;
+        if overrun || position > reader.limit_bits() {
+            return Err(ParseError::ShortPacket);
+        }
+        reader.set_position(position);
+        *state = MantissaDecodeState {
+            group1,
+            group2,
+            group4,
+        };
         Ok(())
     }
 
@@ -745,15 +788,29 @@ impl AllocationState {
         else {
             return Err(ParseError::InvalidHeader("expmant"));
         };
-        for (&group, runs) in grouped
-            .iter()
-            .zip(exponents.chunks_exact_mut(3 * group_size))
-        {
-            let deltas = EXPONENT_GROUP_DELTAS[group as usize & 127];
-            for (delta, run) in deltas.into_iter().zip(runs.chunks_exact_mut(group_size)) {
-                current_exponent += delta;
-                run.fill(current_exponent);
-            }
+        // One loop per group size, so each run is plain stores and not a
+        // fill of a length only known when it runs.
+        macro_rules! expand {
+            ($size:literal) => {
+                for (&group, runs) in grouped.iter().zip(exponents.chunks_exact_mut(3 * $size)) {
+                    let runs: &mut [i32; 3 * $size] = runs.try_into().unwrap();
+                    let deltas = EXPONENT_GROUP_DELTAS[group as usize & 127];
+                    for (delta, run) in deltas.into_iter().zip(runs.chunks_exact_mut($size)) {
+                        current_exponent += delta;
+                        let run: &mut [i32; $size] = run.try_into().unwrap();
+                        *run = [current_exponent; $size];
+                    }
+                }
+            };
+        }
+        match group_size {
+            1 => expand!(1),
+            2 => expand!(2),
+            _ => expand!(4),
+        }
+
+        for (shift, &exponent) in self.shifts.iter_mut().zip(&self.exponents) {
+            *shift = exponent.clamp(0, 31) as u8;
         }
 
         // An end below the start (a corrupt coupling range) writes nothing.
@@ -765,21 +822,12 @@ impl AllocationState {
             *psd = 3072 - (exponent << 7);
         }
 
-        let mut bin = start_mantissa;
-        let mut band = MASKTAB[start_mantissa];
-        loop {
-            let last_bin = BNDTAB[band].min(end_mantissa);
-            self.integrated_psd[band] = self.psd[bin];
-            bin += 1;
-            while bin < last_bin {
-                self.integrated_psd[band] = log_add(self.integrated_psd[band], self.psd[bin]);
-                bin += 1;
-            }
-            band += 1;
-            if end_mantissa <= last_bin {
-                break;
-            }
-        }
+        integrate_psd(
+            &self.psd,
+            &mut self.integrated_psd,
+            start_mantissa,
+            end_mantissa,
+        );
 
         Ok(())
     }
@@ -802,25 +850,22 @@ impl MantissaGroupState {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Where the mantissa groups stand between two channels of a block: for each
+/// grouped `bap`, the index in its flat table of the value last taken.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct MantissaDecodeState {
-    bap1_pos: usize,
-    bap2_pos: usize,
-    bap4_pos: usize,
-    bap1_next: [i32; 3],
-    bap2_next: [i32; 3],
-    bap4_next: [i32; 2],
+    group1: usize,
+    group2: usize,
+    group4: usize,
 }
 
 impl MantissaDecodeState {
+    /// Every group used up, so the first mantissa of each kind reads a code.
     pub(crate) fn new_block() -> Self {
         Self {
-            bap1_pos: 2,
-            bap2_pos: 2,
-            bap4_pos: 1,
-            bap1_next: [0; 3],
-            bap2_next: [0; 3],
-            bap4_next: [0; 2],
+            group1: 2,
+            group2: 2,
+            group4: 1,
         }
     }
 }
@@ -857,6 +902,119 @@ fn exp_strategy_index(strategy: ExpStrategy) -> Option<usize> {
     }
 }
 
+/// The bands of more than one bin, as runs of bands of one width:
+/// `(first band, first bin, bins per band, bands)`.
+const BAND_RUNS: [(usize, usize, usize, usize); 4] = [
+    (28, 28, 3, 7),
+    (35, 49, 6, 6),
+    (41, 85, 12, 4),
+    (45, 133, 24, 5),
+];
+
+/// Sum the power of `start..end` into its bands (A/52 7.2.2.2). A band's sum
+/// is a chain of `log_add`s, one bin after the other, and each step waits for
+/// the one before; but no band waits for another, so bands of one width are
+/// summed side by side.
+fn integrate_psd(psd: &[i32], integrated: &mut [i32], start: usize, end: usize) {
+    let (Ok(psd), Ok(integrated)) = (
+        <&[i32; MAX_ALLOCATION_SIZE]>::try_from(psd),
+        <&mut [i32; MASK_BANDS]>::try_from(integrated),
+    ) else {
+        return;
+    };
+    if end <= start || end > 253 {
+        // A range no stream should carry: the plain walk, band by band.
+        let mut bin = start;
+        let mut band = MASKTAB[start];
+        while let (Some(&band_end), Some(&power)) = (BNDTAB.get(band), psd.get(bin)) {
+            let last_bin = band_end.min(end);
+            let mut sum = power;
+            bin += 1;
+            while bin < last_bin {
+                sum = log_add(sum, psd[bin]);
+                bin += 1;
+            }
+            integrated[band] = sum;
+            band += 1;
+            if end <= last_bin {
+                break;
+            }
+        }
+        return;
+    }
+
+    // One bin per band below 28.
+    let single_end = end.min(28);
+    if start < single_end {
+        integrated[start..single_end].copy_from_slice(&psd[start..single_end]);
+    }
+    for (first_band, first_bin, width, bands) in BAND_RUNS {
+        let run_end = first_bin + width * bands;
+        if end <= first_bin || start >= run_end {
+            continue;
+        }
+        // Whole bands of the run inside the range, then the cut ones.
+        let first_whole = if start <= first_bin {
+            0
+        } else {
+            (start - first_bin).div_ceil(width)
+        };
+        let whole_end = (end.min(run_end) - first_bin) / width;
+        let mut next = first_whole;
+        while next < whole_end {
+            let base = first_bin + next * width;
+            let target = &mut integrated[first_band + next..];
+            next += match whole_end - next {
+                1 => break,
+                2 => sum_bands::<2>(psd, base, width, target),
+                3 => sum_bands::<3>(psd, base, width, target),
+                4 => sum_bands::<4>(psd, base, width, target),
+                5 => sum_bands::<5>(psd, base, width, target),
+                6 => sum_bands::<6>(psd, base, width, target),
+                _ => sum_bands::<7>(psd, base, width, target),
+            };
+        }
+        // What is left: the bands the range cuts, and a whole one on its own.
+        for band in (0..first_whole).chain(next..bands) {
+            let low = (first_bin + band * width).max(start);
+            let high = (first_bin + (band + 1) * width).min(end);
+            if low >= high {
+                continue;
+            }
+            let mut sum = psd[low];
+            for &power in &psd[low + 1..high] {
+                sum = log_add(sum, power);
+            }
+            integrated[first_band + band] = sum;
+        }
+    }
+}
+
+/// Sum `LANES` bands of `width` bins from `base` on, side by side.
+#[inline(always)]
+fn sum_bands<const LANES: usize>(
+    psd: &[i32; MAX_ALLOCATION_SIZE],
+    base: usize,
+    width: usize,
+    integrated: &mut [i32],
+) -> usize {
+    let (Some(psd), Some(integrated)) = (
+        psd.get(base..base + LANES * width),
+        integrated.get_mut(..LANES),
+    ) else {
+        return LANES;
+    };
+    let mut sums: [i32; LANES] = std::array::from_fn(|lane| psd[lane * width]);
+    for offset in 1..width {
+        for (lane, sum) in sums.iter_mut().enumerate() {
+            *sum = log_add(*sum, psd[lane * width + offset]);
+        }
+    }
+    integrated.copy_from_slice(&sums);
+    LANES
+}
+
+#[inline(always)]
 fn log_add(a: i32, b: i32) -> i32 {
     let delta = a - b;
     let address = (delta.abs() >> 1).min((LATAB.len() - 1) as i32) as usize;
@@ -945,6 +1103,28 @@ const fn grouped_quantization<const GROUPS: usize, const LEN: usize>(
 const BAP1_TABLE: [[i32; 3]; 1 << BAP_BITS[1]] = grouped_quantization(3);
 const BAP2_TABLE: [[i32; 3]; 1 << BAP_BITS[2]] = grouped_quantization(5);
 const BAP3_TABLE: [i32; 1 << BAP_BITS[3]] = quantization(7);
+/// The grouped tables flat, a group of three in a row of four: the value at
+/// `position` of the group `code` is at `code * row + position`.
+const BAP1_VALUES: [i32; 4 << BAP_BITS[1]] = flat_rows(BAP1_TABLE);
+const BAP2_VALUES: [i32; 4 << BAP_BITS[2]] = flat_rows(BAP2_TABLE);
+const BAP4_VALUES: [i32; 2 << BAP_BITS[4]] = flat_rows(BAP4_TABLE);
+
+const fn flat_rows<const GROUPS: usize, const LEN: usize, const FLAT: usize>(
+    table: [[i32; GROUPS]; LEN],
+) -> [i32; FLAT] {
+    let row = FLAT / LEN;
+    let mut result = [0; FLAT];
+    let mut code = 0;
+    while code < LEN {
+        let mut position = 0;
+        while position < GROUPS {
+            result[code * row + position] = table[code][position];
+            position += 1;
+        }
+        code += 1;
+    }
+    result
+}
 const BAP4_TABLE: [[i32; 2]; 1 << BAP_BITS[4]] = grouped_quantization(11);
 const BAP5_TABLE: [i32; 1 << BAP_BITS[5]] = quantization(15);
 
@@ -1013,6 +1193,237 @@ mod tests {
             generate_grouped_quantization::<2>(11, BAP_BITS[4])
         );
         assert_eq!(BAP5_TABLE.to_vec(), generate_quantization(15));
+    }
+
+    /// xorshift64, for inputs that only have to be varied.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: u64) -> usize {
+            ((self.next() >> 20) % bound) as usize
+        }
+    }
+
+    /// Every range a channel or the coupling channel can have, against the
+    /// walk the standard describes: one band after the other.
+    #[test]
+    fn band_sums_match_the_plain_walk() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..4 {
+            let psd: Vec<i32> = (0..MAX_ALLOCATION_SIZE)
+                .map(|_| 3072 - ((rng.below(25) as i32) << 7))
+                .collect();
+            for start in 0..253 {
+                for end in start + 1..=253 {
+                    let mut plain = [i32::MIN; MASK_BANDS];
+                    let mut bin = start;
+                    let mut band = MASKTAB[start];
+                    loop {
+                        let last_bin = BNDTAB[band].min(end);
+                        plain[band] = psd[bin];
+                        bin += 1;
+                        while bin < last_bin {
+                            plain[band] = log_add(plain[band], psd[bin]);
+                            bin += 1;
+                        }
+                        band += 1;
+                        if end <= last_bin {
+                            break;
+                        }
+                    }
+                    let mut summed = [i32::MIN; MASK_BANDS];
+                    integrate_psd(&psd, &mut summed, start, end);
+                    assert_eq!(summed, plain, "start={start} end={end}");
+                }
+            }
+        }
+    }
+
+    /// The mantissa loop as it was first written: one checked read per field,
+    /// the groups unpacked into their values.
+    struct PlainMantissas {
+        bap1_pos: usize,
+        bap2_pos: usize,
+        bap4_pos: usize,
+        bap1_next: [i32; 3],
+        bap2_next: [i32; 3],
+        bap4_next: [i32; 2],
+    }
+
+    impl PlainMantissas {
+        fn new_block() -> Self {
+            Self {
+                bap1_pos: 2,
+                bap2_pos: 2,
+                bap4_pos: 1,
+                bap1_next: [0; 3],
+                bap2_next: [0; 3],
+                bap4_next: [0; 2],
+            }
+        }
+
+        fn decode(
+            &mut self,
+            reader: &mut BitReader<'_>,
+            baps: &[u8],
+            exponents: &[i32],
+        ) -> Option<Vec<f32>> {
+            let mut result = Vec::with_capacity(baps.len());
+            for (&bap, &exponent) in baps.iter().zip(exponents) {
+                result.push(match bap {
+                    0 => 0.0,
+                    1 => {
+                        self.bap1_pos += 1;
+                        if self.bap1_pos == 3 {
+                            self.bap1_next = BAP1_TABLE[reader.read_bits(5)? as usize];
+                            self.bap1_pos = 0;
+                        }
+                        scale_int24(self.bap1_next[self.bap1_pos], exponent)
+                    }
+                    2 => {
+                        self.bap2_pos += 1;
+                        if self.bap2_pos == 3 {
+                            self.bap2_next = BAP2_TABLE[reader.read_bits(7)? as usize];
+                            self.bap2_pos = 0;
+                        }
+                        scale_int24(self.bap2_next[self.bap2_pos], exponent)
+                    }
+                    3 => scale_int24(BAP3_TABLE[reader.read_bits(3)? as usize], exponent),
+                    4 => {
+                        self.bap4_pos += 1;
+                        if self.bap4_pos == 2 {
+                            self.bap4_next = BAP4_TABLE[reader.read_bits(7)? as usize];
+                            self.bap4_pos = 0;
+                        }
+                        scale_int24(self.bap4_next[self.bap4_pos], exponent)
+                    }
+                    5 => scale_int24(BAP5_TABLE[reader.read_bits(4)? as usize], exponent),
+                    bap => {
+                        let bits = BAP_BITS[bap as usize];
+                        let raw = reader.read_bits(bits)? as i32;
+                        scale_int32(shift_right_signed(raw << (32 - bits), exponent))
+                    }
+                });
+            }
+            Some(result)
+        }
+    }
+
+    use super::super::bitstream::BitReader;
+
+    /// Two channels of a block, the second inheriting the first's groups,
+    /// over data that ends anywhere from well past the mantissas (whole-word
+    /// reads) to inside them (a short packet), and from every bit offset.
+    #[test]
+    fn mantissas_match_the_plain_reads() {
+        let mut rng = Rng(0x0123_4567_89ab_cdef);
+        for round in 0..400 {
+            let mut allocation = AllocationState::new();
+            let (start, end) = match round % 4 {
+                0 => (0, 1 + rng.below(253)),
+                1 => (37 + 12 * rng.below(8), 133 + rng.below(120)),
+                2 => (0, 7),
+                _ => (0, 253),
+            };
+            // Runs of one `bap`, as a spectrum has them, with every value in.
+            let mut bap = rng.below(16) as u8;
+            for bin in 0..MAX_ALLOCATION_SIZE {
+                if rng.below(3) == 0 {
+                    bap = match rng.below(4) {
+                        0 => 0,
+                        1 => 1 + rng.below(5) as u8,
+                        _ => rng.below(16) as u8,
+                    };
+                }
+                allocation.bap[bin] = bap;
+                allocation.exponents[bin] = rng.below(25) as i32;
+                allocation.shifts[bin] = allocation.exponents[bin] as u8;
+            }
+
+            let needed = 2 * MAX_MANTISSA_BITS * (end - start) / 8 + 2;
+            let length = match round % 5 {
+                0 => needed + 600,
+                1 => needed,
+                _ => 1 + rng.below(needed as u64),
+            };
+            let data: Vec<u8> = (0..length).map(|_| rng.next() as u8).collect();
+            let offset = rng.below(8).min(length * 8);
+
+            let mut plain_reader = BitReader::with_offset(&data, offset);
+            let mut plain = PlainMantissas::new_block();
+            let mut reader = BitReader::with_offset(&data, offset);
+            let mut state = MantissaDecodeState::new_block();
+            for channel in 0..2 {
+                let expected = plain.decode(
+                    &mut plain_reader,
+                    &allocation.bap[start..end],
+                    &allocation.exponents[start..end],
+                );
+                let mut target = [f32::NAN; MAX_ALLOCATION_SIZE];
+                let decoded = allocation.decode_transform_coeffs(
+                    &mut reader,
+                    &mut target,
+                    start,
+                    end,
+                    &mut state,
+                );
+                let Some(expected) = expected else {
+                    assert!(decoded.is_err(), "round {round} channel {channel}");
+                    break;
+                };
+                assert!(decoded.is_ok(), "round {round} channel {channel}");
+                assert_eq!(reader.position(), plain_reader.position(), "round {round}");
+                let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&target[start..end]), bits(&expected), "round {round}");
+                assert!(
+                    target[..start]
+                        .iter()
+                        .chain(&target[end..])
+                        .all(|v| v.to_bits() == 0)
+                );
+            }
+        }
+    }
+
+    /// Each strategy's runs against the running sum they stand for.
+    #[test]
+    fn exponent_groups_expand_to_their_runs() {
+        let mut rng = Rng(0xfeed_face_cafe_beef);
+        for (strategy, size) in [
+            (ExpStrategy::D15, 1),
+            (ExpStrategy::D25, 2),
+            (ExpStrategy::D45, 4),
+        ] {
+            for _ in 0..50 {
+                let groups: Vec<i32> = (0..1 + rng.below(20))
+                    .map(|_| rng.below(125) as i32)
+                    .collect();
+                let end = 1 + groups.len() * 3 * size;
+                let mut allocation = AllocationState::new();
+                allocation
+                    .decode_grouped_exponents(strategy, 0, 1, end, 12, &groups)
+                    .unwrap();
+                let mut expected = vec![12];
+                let mut current = 12;
+                for group in &groups {
+                    for delta in [group / 25 - 2, (group % 25) / 5 - 2, group % 5 - 2] {
+                        current += delta;
+                        expected.extend(std::iter::repeat_n(current, size));
+                    }
+                }
+                assert_eq!(&allocation.exponents[..end], &expected[..]);
+                for (shift, exponent) in allocation.shifts[..end].iter().zip(&expected) {
+                    assert_eq!(*shift as i32, (*exponent).clamp(0, 31));
+                }
+            }
+        }
     }
 
     #[test]
