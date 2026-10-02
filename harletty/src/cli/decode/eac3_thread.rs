@@ -40,6 +40,9 @@ struct DecoderState {
     /// Whether the last dependent substream looked at carried JOC: a guess at
     /// what the next one is, which [`read_dependent`] acts on and corrects.
     dependents_carry_joc: bool,
+    /// Whether the last independent frame went out as objects: a guess at
+    /// what the next one is, which `handle_frame` acts on and corrects.
+    independents_carry_joc: bool,
     frame_count: u64,
 }
 
@@ -282,9 +285,40 @@ fn handle_frame(
         return Ok(());
     }
 
-    // Try object decode first (independent frame with JOC).
+    // An independent frame is objects if it carries JOC and a plain core if
+    // not, and which it is shows only in an EMDF payload the decode reaches.
+    // The object decoder used to be asked first, every time: it decodes the
+    // core to find out, hands nothing back when there is no JOC, and the
+    // core was then decoded again here - a stream without JOC was decoded
+    // twice. Streams do not switch from one frame to the next, so the frame
+    // before stands in: after a plain one the core is decoded first, and it
+    // is the answer unless it turns out to carry JOC. A stream whose JOC
+    // rides in its dependents keeps the old order, the object decoder
+    // seeing every frame.
+    let mut core = None;
+    if !state.independents_carry_joc && !state.dependents_carry_joc {
+        match state.pcm_decoder.push_access_unit(bytes) {
+            Ok(result) if result.info.joc_payload_count() == 0 => {
+                // Not sent yet: see below.
+                state.pending_independent = Some(PendingIndependent::UnsentCore(result));
+                return Ok(());
+            }
+            // JOC after all, or a frame the core decoder rejects: over to
+            // the object decoder as before, this decode kept for when it
+            // finds no objects - the frame is not decoded here a second time.
+            decoded => core = Some(decoded),
+        }
+    }
+
     match state.object_decoder.push_access_unit(bytes) {
         Ok(Some(obj)) => {
+            state.independents_carry_joc = true;
+            if core.is_some() {
+                // The core decoder was given a frame that went out as
+                // objects. Its overlap would carry that frame into the next
+                // plain core, whenever that comes: start it clean instead.
+                state.pcm_decoder.reset();
+            }
             state.frame_count += 1;
             tick_progress(pb);
             // A following dependent JOC substream needs the core the
@@ -300,13 +334,14 @@ fn handle_frame(
         }
         Ok(None) => {
             // No JOC — fall through to core PCM decode.
+            state.independents_carry_joc = false;
         }
         Err(err) => {
             return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());
         }
     }
 
-    match state.pcm_decoder.push_access_unit(bytes) {
+    match core.unwrap_or_else(|| state.pcm_decoder.push_access_unit(bytes)) {
         Ok(result) => {
             // Not sent yet: the next access unit decides whether this frame
             // stands alone (sent as-is) or is one half of a pair — in which
