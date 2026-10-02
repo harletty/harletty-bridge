@@ -840,9 +840,18 @@ impl AllocationState {
     ) {
         target.fill(0.0);
         let end = end.min(pre_mantissas.len()).min(MAX_ALLOCATION_SIZE);
-        for bin in start..end {
-            let pre = pre_mantissas[bin].get(block).copied().unwrap_or(0);
-            target[bin] = scale_int24(pre, self.exponents[bin]);
+        let (Some(target), Some(pre_mantissas), Some(shifts)) = (
+            target.get_mut(start..end),
+            pre_mantissas.get(start..end),
+            self.shifts.get(start..end),
+        ) else {
+            return;
+        };
+        if block >= 6 {
+            return;
+        }
+        for ((slot, pre), &shift) in target.iter_mut().zip(pre_mantissas).zip(shifts) {
+            *slot = (pre[block] >> shift) as f32 * FROM_INT24;
         }
     }
 
@@ -1376,6 +1385,9 @@ fn calc_lowcomp(previous: i32, current: i32, next: i32, band: usize) -> i32 {
 
 const FASTGAIN: [i32; 8] = [0x080, 0x100, 0x180, 0x200, 0x280, 0x300, 0x380, 0x400];
 
+/// A symmetric mantissa scaled by its exponent as first written, which the
+/// tests hold the shift counts to.
+#[cfg(test)]
 fn scale_int24(value: i32, exponent: i32) -> f32 {
     shift_right_signed(value, exponent) as f32 * FROM_INT24
 }
@@ -1384,6 +1396,7 @@ fn scale_int32(value: i32) -> f32 {
     value as f32 * FROM_INT32
 }
 
+#[cfg(test)]
 fn shift_right_signed(value: i32, bits: i32) -> i32 {
     if bits <= 0 {
         value
