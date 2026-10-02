@@ -9,7 +9,10 @@
 use std::arch::x86_64::*;
 
 use super::synth::{DCT_A, DCT_B, MOD_A, MOD_B, MOD_C, MOD64_A, MOD64_B, MOD64_C};
-use super::tables::{FIR_32BANDS_NONPERFECT_FIXED, FIR_32BANDS_PERFECT_FIXED, FIR_64BANDS_FIXED};
+use super::tables::{
+    FIR_32BANDS_NONPERFECT_FIXED, FIR_32BANDS_PERFECT_FIXED, FIR_64BANDS_FIXED, LFE_FIR_64_FIXED,
+    LFE_FIR_64_FLOAT,
+};
 
 /// The window coefficients of one bank, in the order `window` walks them.
 ///
@@ -698,6 +701,108 @@ pub(super) fn bank_64(
     dst: &mut [i32],
 ) {
     bank::<64>(history, hist2, work, &PLAN_64.0, 20, subs, dst);
+}
+
+/// The LFE interpolation filter by tap: `[half][k][j]` is the weight sample
+/// `k` (counted back from the newest) carries into output `j` of the first
+/// or second half of the 64 outputs an LFE sample expands to.
+#[repr(C, align(32))]
+struct LfeTaps<T>([[[T; 32]; 8]; 2]);
+
+static LFE_TAPS_FIXED: LfeTaps<i64> = {
+    let mut taps = [[[0i64; 32]; 8]; 2];
+    let mut k = 0;
+    while k < 8 {
+        let mut j = 0;
+        while j < 32 {
+            taps[0][k][j] = LFE_FIR_64_FIXED[j * 8 + k] as i64;
+            taps[1][k][j] = LFE_FIR_64_FIXED[255 - j * 8 - k] as i64;
+            j += 1;
+        }
+        k += 1;
+    }
+    LfeTaps(taps)
+};
+
+static LFE_TAPS_FLOAT: LfeTaps<f32> = {
+    let mut taps = [[[0f32; 32]; 8]; 2];
+    let mut k = 0;
+    while k < 8 {
+        let mut j = 0;
+        while j < 32 {
+            taps[0][k][j] = LFE_FIR_64_FLOAT[j * 8 + k];
+            taps[1][k][j] = LFE_FIR_64_FLOAT[255 - j * 8 - k];
+            j += 1;
+        }
+        k += 1;
+    }
+    LfeTaps(taps)
+};
+
+/// `lfe_fir_fixed`: `lfe` holds 8 samples of history then one sample per 64
+/// of `pcm`; each expands to 64 outputs, a weighted sum of it and the 7
+/// before it.
+#[target_feature(enable = "avx2")]
+pub(super) fn lfe_fixed(lfe: &[i32], pcm: &mut [i32]) {
+    assert!(pcm.len() % 64 == 0 && lfe.len() >= 8 + pcm.len() / 64);
+    for (i, out) in pcm.chunks_exact_mut(64).enumerate() {
+        // Sample `k` back from the newest, in every lane.
+        let mut past = [_mm256_setzero_si256(); 8];
+        for (k, past) in past.iter_mut().enumerate() {
+            *past = _mm256_set1_epi32(lfe[8 + i - k]);
+        }
+        for (half, taps) in LFE_TAPS_FIXED.0.iter().enumerate() {
+            // Eight outputs at a time, as two vectors of four 64-bit sums.
+            for j in (0..32).step_by(8) {
+                let mut low = _mm256_setzero_si256();
+                let mut high = _mm256_setzero_si256();
+                for (taps, &past) in taps.iter().zip(&past) {
+                    // SAFETY: `j + 8 <= 32`, the length of a row of taps.
+                    let (wl, wh) = unsafe {
+                        (
+                            _mm256_load_si256(taps.as_ptr().add(j).cast()),
+                            _mm256_loadu_si256(taps.as_ptr().add(j + 4).cast()),
+                        )
+                    };
+                    low = _mm256_add_epi64(low, _mm256_mul_epi32(past, wl));
+                    high = _mm256_add_epi64(high, _mm256_mul_epi32(past, wh));
+                }
+                let at = half * 32 + j;
+                // SAFETY: `at + 8 <= 64`, the length of `out`.
+                unsafe {
+                    _mm256_storeu_si256(
+                        out.as_mut_ptr().add(at).cast(),
+                        clip23(norm23_pack(low, high)),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `lfe_fir_float`, as [`lfe_fixed`] but in single precision: each output
+/// is summed tap by tap in the scalar order, so the samples are the same.
+#[target_feature(enable = "avx2")]
+pub(super) fn lfe_float(lfe: &[i32], pcm: &mut [f32]) {
+    assert!(pcm.len() % 64 == 0 && lfe.len() >= 8 + pcm.len() / 64);
+    for (i, out) in pcm.chunks_exact_mut(64).enumerate() {
+        let mut past = [_mm256_setzero_ps(); 8];
+        for (k, past) in past.iter_mut().enumerate() {
+            *past = _mm256_set1_ps(lfe[8 + i - k] as f32);
+        }
+        for (half, taps) in LFE_TAPS_FLOAT.0.iter().enumerate() {
+            for j in (0..32).step_by(8) {
+                let mut sum = _mm256_setzero_ps();
+                for (taps, &past) in taps.iter().zip(&past) {
+                    // SAFETY: `j + 8 <= 32`, the length of a row of taps.
+                    let weights = unsafe { _mm256_load_ps(taps.as_ptr().add(j)) };
+                    sum = _mm256_add_ps(sum, _mm256_mul_ps(weights, past));
+                }
+                // SAFETY: `half * 32 + j + 8 <= 64`, the length of `out`.
+                unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(half * 32 + j), sum) };
+            }
+        }
+    }
 }
 
 #[cfg(test)]

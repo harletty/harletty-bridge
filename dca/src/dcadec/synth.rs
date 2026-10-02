@@ -685,7 +685,7 @@ impl SynthState {
             let out = lfe.get_or_insert_with(Vec::new);
             out.clear();
             out.resize(nsamples, 0.0);
-            lfe_synth(dec, out);
+            lfe_synth(self.isa, dec, out);
         } else {
             *lfe = None;
         }
@@ -786,10 +786,10 @@ impl SynthState {
                 // image-rejection filter.
                 out.lfe_base.clear();
                 out.lfe_base.resize(nsamples / 2, 0);
-                lfe_synth_fixed(dec, &mut out.lfe_base);
+                lfe_synth_fixed(self.isa, dec, &mut out.lfe_base);
                 lfe_x96_fixed(&mut lfe, &out.lfe_base, &mut self.lfe_x96_hist);
             } else {
-                lfe_synth_fixed(dec, &mut lfe);
+                lfe_synth_fixed(self.isa, dec, &mut lfe);
             }
             if let Some(old) = out.samples[DCA_SPEAKER_LFE1].replace(lfe) {
                 out.pool.give(old);
@@ -828,63 +828,74 @@ fn lfe_x96_fixed(dst: &mut [i32], src: &[i32], hist: &mut i32) {
 /// `lfe_fir_fixed` (int32) — fixed-point LFE interpolation, for the XLL residual
 /// base (ffmpeg's residual combine reads the fixed core, not the float one).
 /// `pcm` (one output sample per slot, zeroed) receives the interpolated LFE.
-fn lfe_synth_fixed(dec: &mut CoreDecoder, pcm: &mut [i32]) {
-    let npcmblocks = dec.npcmblocks();
-    let nlfesamples = npcmblocks >> 1;
-    let coeff = &LFE_FIR_64_FIXED;
-    {
-        let lfe = dec.lfe();
-        let mut out_pos = 0usize;
-        for i in 0..nlfesamples {
-            let center = DCA_LFE_HISTORY + i;
-            for j in 0..32 {
-                let mut a = 0i64;
-                let mut b = 0i64;
-                for k in 0..8 {
-                    let s = lfe[center - k] as i64;
-                    a += coeff[j * 8 + k] as i64 * s;
-                    b += coeff[255 - j * 8 - k] as i64 * s;
-                }
-                pcm[out_pos + j] = clip23(norm23(a));
-                pcm[out_pos + 32 + j] = clip23(norm23(b));
-            }
-            out_pos += 64;
-        }
+fn lfe_synth_fixed(isa: Isa, dec: &mut CoreDecoder, pcm: &mut [i32]) {
+    let nlfesamples = dec.npcmblocks() >> 1;
+    let pcm = &mut pcm[..nlfesamples * 64];
+    match isa {
+        Isa::Baseline => lfe_fir_fixed(dec.lfe(), pcm),
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `Isa::Avx2` is only chosen when the CPU reports AVX2.
+        Isa::Avx2 => unsafe { super::synth_avx2::lfe_fixed(dec.lfe(), pcm) },
     }
     dec.shift_lfe_history(nlfesamples);
+}
+
+/// `lfe` holds `DCA_LFE_HISTORY` samples of history, then one sample per
+/// 64 of `pcm`.
+fn lfe_fir_fixed(lfe: &[i32], pcm: &mut [i32]) {
+    let coeff = &LFE_FIR_64_FIXED;
+    for (i, out) in pcm.chunks_exact_mut(64).enumerate() {
+        let center = DCA_LFE_HISTORY + i;
+        for j in 0..32 {
+            let mut a = 0i64;
+            let mut b = 0i64;
+            for k in 0..8 {
+                let s = lfe[center - k] as i64;
+                a += coeff[j * 8 + k] as i64 * s;
+                b += coeff[255 - j * 8 - k] as i64 * s;
+            }
+            out[j] = clip23(norm23(a));
+            out[32 + j] = clip23(norm23(b));
+        }
+    }
 }
 
 /// `lfe_fir_float` over the persistent LFE history buffer, then shift history.
 /// Uses the float interpolation filter (matching ffmpeg's float output path);
 /// the float LFE coefficients already embed the 1/2^23 scale.
 /// `pcm` (one output sample per slot, zeroed) receives the interpolated LFE.
-fn lfe_synth(dec: &mut CoreDecoder, pcm: &mut [f32]) {
-    let npcmblocks = dec.npcmblocks();
-    let nlfesamples = npcmblocks >> 1;
-    let coeff = &LFE_FIR_64_FLOAT;
-    {
-        let lfe = dec.lfe(); // DCA_LFE_HISTORY history + data
-        let mut out_pos = 0usize;
-        for i in 0..nlfesamples {
-            // lfe_samples pointer starts at DCA_LFE_HISTORY + i; reads [-k].
-            let center = DCA_LFE_HISTORY + i;
-            for j in 0..32 {
-                let mut a = 0f32;
-                let mut b = 0f32;
-                for k in 0..8 {
-                    let s = lfe[center - k] as f32;
-                    a += coeff[j * 8 + k] * s;
-                    b += coeff[255 - j * 8 - k] * s;
-                }
-                pcm[out_pos + j] = a;
-                pcm[out_pos + 32 + j] = b;
-            }
-            out_pos += 64;
-        }
+fn lfe_synth(isa: Isa, dec: &mut CoreDecoder, pcm: &mut [f32]) {
+    let nlfesamples = dec.npcmblocks() >> 1;
+    let pcm = &mut pcm[..nlfesamples * 64];
+    match isa {
+        Isa::Baseline => lfe_fir_float(dec.lfe(), pcm),
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `Isa::Avx2` is only chosen when the CPU reports AVX2.
+        Isa::Avx2 => unsafe { super::synth_avx2::lfe_float(dec.lfe(), pcm) },
     }
     // Update LFE history: move the last DCA_LFE_HISTORY decimated samples to the
     // front (mirrors the post-filter shift in ff_dca_core_filter_fixed).
     dec.shift_lfe_history(nlfesamples);
+}
+
+/// As [`lfe_fir_fixed`], in single precision.
+fn lfe_fir_float(lfe: &[i32], pcm: &mut [f32]) {
+    let coeff = &LFE_FIR_64_FLOAT;
+    for (i, out) in pcm.chunks_exact_mut(64).enumerate() {
+        // lfe_samples pointer starts at DCA_LFE_HISTORY + i; reads [-k].
+        let center = DCA_LFE_HISTORY + i;
+        for j in 0..32 {
+            let mut a = 0f32;
+            let mut b = 0f32;
+            for k in 0..8 {
+                let s = lfe[center - k] as f32;
+                a += coeff[j * 8 + k] * s;
+                b += coeff[255 - j * 8 - k] * s;
+            }
+            out[j] = a;
+            out[32 + j] = b;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1047,6 +1058,42 @@ mod tests {
             );
             assert!(run(Isa::detect(), perfect) == baseline);
         }
+    }
+
+    /// The vector LFE filters against the scalar ones: same samples, in
+    /// fixed point and, summed in the same order, in single precision.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn lfe_filters_match_the_scalar_ones() {
+        if !crate::cpu::has_avx2() {
+            return;
+        }
+        let mut state = 31u32;
+        let lfe: Vec<i32> = (0..DCA_LFE_HISTORY + 40)
+            .map(|i| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let x = ((state >> 6) & 0xff_ffff) as i32 - 0x80_0000;
+                if i % 3 == 0 { x >> 9 } else { x }
+            })
+            .collect();
+        let mut expected = vec![0i32; 40 * 64];
+        let mut out = vec![0i32; 40 * 64];
+        lfe_fir_fixed(&lfe, &mut expected);
+        // SAFETY: AVX2 was detected above.
+        unsafe { super::super::synth_avx2::lfe_fixed(&lfe, &mut out) };
+        assert!(out == expected);
+
+        let mut expected = vec![0f32; 40 * 64];
+        let mut out = vec![0f32; 40 * 64];
+        lfe_fir_float(&lfe, &mut expected);
+        // SAFETY: AVX2 was detected above.
+        unsafe { super::super::synth_avx2::lfe_float(&lfe, &mut out) };
+        assert!(
+            out.iter()
+                .map(|x| x.to_bits())
+                .eq(expected.iter().map(|x| x.to_bits())),
+            "single-precision LFE differs"
+        );
     }
 
     /// The 96 kHz LFE image-rejection filter (`lfe_x96_fixed`), which doubles
