@@ -3,7 +3,8 @@ use crate::input::InputReader;
 use anyhow::Result;
 use eac3::{
     AccessUnitParseError, ExtractError, Extractor, Frame, ObjectPcmDecoder, PcmDecoder,
-    PcmPushResult, StreamType, inspect_access_unit, merge_core_with_dependent,
+    PcmPushResult, StreamType, inspect_access_unit, merge_core_with_decoded_dependent,
+    merge_core_with_dependent,
 };
 use indicatif::ProgressBar;
 use std::path::PathBuf;
@@ -36,7 +37,75 @@ struct DecoderState {
     /// Decoded legacy AC-3 core (bsid <= 10) buffered — not yet emitted —
     /// until we see whether the next access unit is its dependent partner.
     pending_ac3_core: Option<PcmPushResult>,
+    /// Whether the last dependent substream looked at carried JOC: a guess at
+    /// what the next one is, which [`read_dependent`] acts on and corrects.
+    dependents_carry_joc: bool,
     frame_count: u64,
+}
+
+/// A dependent substream and how it was learned what it carries.
+///
+/// Its JOC payload sits in a block's skip field, so finding out takes a walk
+/// over every audio block either way: an inspection, which stops there, or a
+/// decode, which also has the channels a plain extension is merged for.
+enum Dependent {
+    /// Inspected only. `decode_failed` says a decode was tried first and
+    /// rejected the frame, so the merge has nothing to add and must not
+    /// push it through the decoder a second time.
+    Inspected {
+        info: eac3::AccessUnitInfo,
+        decode_failed: bool,
+    },
+    /// Decoded: its channels and its description from the one walk.
+    Decoded(PcmPushResult),
+}
+
+impl Dependent {
+    fn info(&self) -> &eac3::AccessUnitInfo {
+        match self {
+            Dependent::Inspected { info, .. } => info,
+            Dependent::Decoded(push) => &push.info,
+        }
+    }
+}
+
+/// Learn what a dependent substream carries, reading its blocks once where
+/// that is enough.
+///
+/// A channel extension is decoded and merged onto the core that waits for
+/// it; a JOC dependent is inspected and handed to the object decoder, which
+/// has no use for its channels. Which it is shows only in the frame, so the
+/// one before it stands in: streams do not switch between the two from one
+/// frame to the next. A dependent expected to be an extension, with a core
+/// to merge it onto, is decoded straight away - the inspection used to come
+/// first and the decode walked the same blocks again. When the guess is
+/// wrong (the first JOC dependent of a stream) the object decoder gets the
+/// frame as it always did, and the next dependent is inspected.
+///
+/// `None` is a frame the inspection rejects, which is then not handled as a
+/// dependent at all, as before.
+fn read_dependent(bytes: &[u8], state: &mut DecoderState) -> Option<Dependent> {
+    let core_waits = state.pending_ac3_core.is_some()
+        || matches!(
+            state.pending_independent,
+            Some(PendingIndependent::UnsentCore(_))
+        );
+    let mut decode_failed = false;
+    if core_waits && !state.dependents_carry_joc {
+        match state.dependent_pcm_decoder.push_access_unit(bytes) {
+            Ok(push) => {
+                state.dependents_carry_joc = push.info.joc_payload_count() > 0;
+                return Some(Dependent::Decoded(push));
+            }
+            Err(_) => decode_failed = true,
+        }
+    }
+    let info = inspect_access_unit(bytes).ok()?;
+    state.dependents_carry_joc = info.joc_payload_count() > 0;
+    Some(Dependent::Inspected {
+        info,
+        decode_failed,
+    })
 }
 
 /// An E-AC-3 program larger than 5.1 is carried as an independent frame (the
@@ -144,17 +213,17 @@ fn handle_frame(
 
     // The extractor has already read the header, and routing needs nothing
     // more: a legacy AC-3 syncframe is `bsid <= 10`, a dependent substream
-    // says so in `strmtyp`. Only a dependent is inspected in full, once, for
-    // its JOC payload - and one whose inspection fails is handled as the
+    // says so in `strmtyp`. Only a dependent is looked into, once, for its
+    // JOC payload - and one whose inspection fails is handled as the
     // independent frame it is not, as it always has been: its decode fails
     // and stands in silence after the buffered frame is flushed.
     let is_legacy_ac3 = header.bitstream_id <= 10;
-    let dependent_info = if header.stream_type == StreamType::Dependent && !is_legacy_ac3 {
-        inspect_access_unit(bytes).ok()
+    let dependent = if header.stream_type == StreamType::Dependent && !is_legacy_ac3 {
+        read_dependent(bytes, state)
     } else {
         None
     };
-    let is_dependent = dependent_info.is_some();
+    let is_dependent = dependent.is_some();
 
     // A buffered frame is only ever paired with an *immediately* following
     // dependent access unit. Any other frame type means the buffered frame had
@@ -187,10 +256,10 @@ fn handle_frame(
         }
     }
 
-    if let Some(dep_info) = dependent_info {
+    if let Some(dependent) = dependent {
         // Pair a buffered legacy AC-3 core with this dependent substream.
         if let Some(core_result) = state.pending_ac3_core.take() {
-            return handle_core_pair(core_result, frame, dep_info, state, pb, strict_mode, tx);
+            return handle_core_pair(core_result, frame, dependent, state, pb, strict_mode, tx);
         }
 
         // Pair the buffered independent E-AC-3 frame with this dependent
@@ -198,7 +267,7 @@ fn handle_frame(
         if let Some(pending) = state.pending_independent.take() {
             return match pending {
                 PendingIndependent::UnsentCore(core_msg) => {
-                    handle_core_pair(core_msg, frame, dep_info, state, pb, strict_mode, tx)
+                    handle_core_pair(core_msg, frame, dependent, state, pb, strict_mode, tx)
                 }
                 PendingIndependent::EmittedObject { joc_input } => {
                     handle_emitted_object_pair(joc_input, frame, state, pb, strict_mode, tx)
@@ -261,7 +330,7 @@ fn handle_frame(
 fn handle_core_pair(
     core_result: PcmPushResult,
     frame: &Frame,
-    dep_info: eac3::AccessUnitInfo,
+    dependent: Dependent,
     state: &mut DecoderState,
     pb: &Option<ProgressBar>,
     strict_mode: bool,
@@ -269,7 +338,7 @@ fn handle_core_pair(
 ) -> Result<()> {
     let bytes = frame.as_bytes();
 
-    if dep_info.joc_payload_count() > 0 {
+    if dependent.info().joc_payload_count() > 0 {
         match state
             .object_decoder
             .push_access_unit_with_core(bytes, core_result.pcm.clone())
@@ -292,8 +361,24 @@ fn handle_core_pair(
     // Resolved the other way: the pair is complete and neither half produced
     // objects, so this presentation carried no JOC either.
     state.object_decoder.note_non_joc_presentation();
-    let bed = merge_core_with_dependent(&mut state.dependent_pcm_decoder, &core_result.pcm, bytes)
-        .unwrap_or(core_result.pcm);
+    let (merged, dep_info) = match dependent {
+        Dependent::Decoded(push) => (
+            merge_core_with_decoded_dependent(&core_result.pcm, &push.pcm, &push.info),
+            push.info,
+        ),
+        Dependent::Inspected {
+            info,
+            decode_failed: true,
+        } => (None, info),
+        Dependent::Inspected {
+            info,
+            decode_failed: false,
+        } => (
+            merge_core_with_dependent(&mut state.dependent_pcm_decoder, &core_result.pcm, bytes),
+            info,
+        ),
+    };
+    let bed = merged.unwrap_or(core_result.pcm);
     state.frame_count += 1;
     tick_progress(pb);
     let push = PcmPushResult {
