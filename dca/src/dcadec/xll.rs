@@ -442,7 +442,7 @@ fn raw_fields(samples: &mut [i32]) -> &mut [u32] {
 /// `coeff[order - 1 - k]` weighing `buf[j + k]`. Each prediction reads the
 /// sample just produced, so the work is serial; dispatching on the order
 /// (at most 15) lets each length unroll and keep its taps in registers.
-fn inverse_adaptive_prediction(
+pub(super) fn inverse_adaptive_prediction(
     buf: &mut [i32],
     coeff: &[i32; DCA_XLL_PRED_ORDER_MAX],
     order: usize,
@@ -649,6 +649,9 @@ pub(crate) struct XllDecoder {
     x_descriptor_offset: Option<usize>,
     x_descriptor_size: Option<usize>,
     pub(crate) x_descriptor_navigation_used: bool,
+    /// Scratch of the vector prediction.
+    #[cfg(target_arch = "x86_64")]
+    prediction: super::xll_avx2::Scratch,
 }
 
 #[derive(Clone, Copy)]
@@ -1765,11 +1768,14 @@ impl XllDecoder {
         let b = &mut c.band;
 
         // Inverse adaptive or fixed prediction.
+        let mut coeffs = [[0i32; DCA_XLL_PRED_ORDER_MAX]; DCA_XLL_CHANNELS_MAX];
+        // The adaptively predicted channels not yet run, `pending` of them.
+        let mut adaptive = [0usize; DCA_XLL_CHANNELS_MAX];
+        let mut pending = 0;
         for i in 0..c.nchannels {
             let order = b.adapt_pred_order[i];
-            let buf = &mut b.msb[i];
             if order > 0 {
-                let mut coeff = [0i32; DCA_XLL_PRED_ORDER_MAX];
+                let coeff = &mut coeffs[i];
                 for j in 0..order {
                     let rc = b.adapt_refl_coeff[i][j];
                     for k in 0..(j + 1) / 2 {
@@ -1780,14 +1786,54 @@ impl XllDecoder {
                     }
                     coeff[j] = rc;
                 }
-                inverse_adaptive_prediction(&mut buf[..nsamples], &coeff, order);
+                adaptive[pending] = i;
+                pending += 1;
             } else {
+                let buf = &mut b.msb[i];
                 for _ in 0..b.fixed_pred_order[i] {
                     for k in 1..nsamples {
                         buf[k] = buf[k].wrapping_add(buf[k - 1]);
                     }
                 }
             }
+        }
+        // Four channels at a time where the CPU can; a channel left alone
+        // gains nothing from it.
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::has_avx2() {
+            use super::xll_avx2::{Group, predict_group};
+            let whole = adaptive[..pending]
+                .iter()
+                .all(|&i| b.adapt_pred_order[i] < nsamples && b.msb[i].len() >= nsamples);
+            while whole && pending >= 2 {
+                let count = pending.min(4);
+                let channels = &adaptive[pending - count..pending];
+                pending -= count;
+                let mut taken: [Vec<i32>; 4] = Default::default();
+                for (taken, &i) in taken.iter_mut().zip(channels) {
+                    *taken = std::mem::take(&mut b.msb[i]);
+                }
+                let mut group = Group {
+                    samples: Default::default(),
+                    coeff: [&coeffs[0]; 4],
+                    order: [0; 4],
+                    count,
+                };
+                for (lane, (taken, &i)) in taken.iter_mut().zip(channels).enumerate() {
+                    group.samples[lane] = &mut taken[..nsamples];
+                    group.coeff[lane] = &coeffs[i];
+                    group.order[lane] = b.adapt_pred_order[i];
+                }
+                // SAFETY: AVX2 was detected above.
+                unsafe { predict_group(group, &mut self.prediction, inverse_adaptive_prediction) };
+                for (taken, &i) in taken.into_iter().zip(channels) {
+                    b.msb[i] = taken;
+                }
+            }
+        }
+        for &i in &adaptive[..pending] {
+            let order = b.adapt_pred_order[i];
+            inverse_adaptive_prediction(&mut b.msb[i][..nsamples], &coeffs[i], order);
         }
 
         // Inverse pairwise channel decorrelation + reorder to original order.

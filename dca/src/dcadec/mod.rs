@@ -12,4 +12,6 @@ pub(crate) mod synth;
 mod synth_avx2;
 pub(crate) mod tables;
 pub(crate) mod xll;
+#[cfg(target_arch = "x86_64")]
+mod xll_avx2;
 pub(crate) mod xmeta;
