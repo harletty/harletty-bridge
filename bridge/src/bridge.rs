@@ -10,6 +10,7 @@ use std::env;
 use std::time::Instant;
 use truehd::process::decode::DecodedAccessUnit;
 use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, parse::Parser};
+use truehd::structs::access_unit::AccessUnit;
 
 use crate::ac3_native::NativeAc3Decoder;
 use crate::auro_pipeline::DtsAuroState;
@@ -197,6 +198,10 @@ pub(crate) struct AtmosBridge {
     pub(crate) mat_stream: MatStream,
     pub(crate) extractor: Extractor,
     pub(crate) parser: Box<Parser>,
+    /// The access unit every frame is parsed into. Kept from one to the next: a
+    /// new one allocates the blocks of each substream and the sample rows of
+    /// each block, to free them as soon as the frame is decoded.
+    pub(crate) truehd_access_unit: Box<AccessUnit>,
     pub(crate) decoder: Box<Decoder>,
     /// The access unit the decoder writes its samples into. Kept from one to the
     /// next: a new one is 10 KiB to build and copy out for every 1/1200 s of
@@ -332,6 +337,7 @@ impl AtmosBridge {
             mat_stream: MatStream::default(),
             extractor: Extractor::default(),
             parser,
+            truehd_access_unit: Box::default(),
             decoder,
             truehd_decoded: Box::default(),
             eac3_spdif: Eac3SpdifStream::default(),
