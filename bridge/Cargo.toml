@@ -40,10 +40,11 @@ log = "0.4"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml_ng = "0.10"
-# iamf-rs is not on crates.io: pinned to a reviewed commit.
-iamf-obu = { git = "https://github.com/baylesj/iamf-rs", rev = "01a562dd3a8e7ef29365dec9818da9e8a826cb33", optional = true }
-iamf-dec = { git = "https://github.com/baylesj/iamf-rs", rev = "01a562dd3a8e7ef29365dec9818da9e8a826cb33", default-features = false, optional = true }
-iamf-codecs = { git = "https://github.com/baylesj/iamf-rs", rev = "01a562dd3a8e7ef29365dec9818da9e8a826cb33", default-features = false, features = ["pcm", "flac", "aac", "opus-ffi"], optional = true }
+# iamf-rs is not on crates.io: pinned to a reviewed commit. Object passthrough
+# (IAMF v2.0) is harletty's fork until baylesj/iamf-rs#15 is merged.
+iamf-obu = { git = "https://github.com/harletty/iamf-rs", rev = "1f841d2cc7ee39d3e9b9bf1293bda64063aa4972", optional = true }
+iamf-dec = { git = "https://github.com/harletty/iamf-rs", rev = "1f841d2cc7ee39d3e9b9bf1293bda64063aa4972", default-features = false, optional = true }
+iamf-codecs = { git = "https://github.com/harletty/iamf-rs", rev = "1f841d2cc7ee39d3e9b9bf1293bda64063aa4972", default-features = false, features = ["pcm", "flac", "aac", "opus-ffi"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
