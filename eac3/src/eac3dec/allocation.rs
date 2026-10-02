@@ -788,15 +788,25 @@ impl AllocationState {
         else {
             return Err(ParseError::InvalidHeader("expmant"));
         };
-        for (&group, runs) in grouped
-            .iter()
-            .zip(exponents.chunks_exact_mut(3 * group_size))
-        {
-            let deltas = EXPONENT_GROUP_DELTAS[group as usize & 127];
-            for (delta, run) in deltas.into_iter().zip(runs.chunks_exact_mut(group_size)) {
-                current_exponent += delta;
-                run.fill(current_exponent);
-            }
+        // One loop per group size, so each run is plain stores and not a
+        // fill of a length only known when it runs.
+        macro_rules! expand {
+            ($size:literal) => {
+                for (&group, runs) in grouped.iter().zip(exponents.chunks_exact_mut(3 * $size)) {
+                    let runs: &mut [i32; 3 * $size] = runs.try_into().unwrap();
+                    let deltas = EXPONENT_GROUP_DELTAS[group as usize & 127];
+                    for (delta, run) in deltas.into_iter().zip(runs.chunks_exact_mut($size)) {
+                        current_exponent += delta;
+                        let run: &mut [i32; $size] = run.try_into().unwrap();
+                        *run = [current_exponent; $size];
+                    }
+                }
+            };
+        }
+        match group_size {
+            1 => expand!(1),
+            2 => expand!(2),
+            _ => expand!(4),
         }
 
         for (shift, &exponent) in self.shifts.iter_mut().zip(&self.exponents) {
@@ -1378,6 +1388,40 @@ mod tests {
                         .chain(&target[end..])
                         .all(|v| v.to_bits() == 0)
                 );
+            }
+        }
+    }
+
+    /// Each strategy's runs against the running sum they stand for.
+    #[test]
+    fn exponent_groups_expand_to_their_runs() {
+        let mut rng = Rng(0xfeed_face_cafe_beef);
+        for (strategy, size) in [
+            (ExpStrategy::D15, 1),
+            (ExpStrategy::D25, 2),
+            (ExpStrategy::D45, 4),
+        ] {
+            for _ in 0..50 {
+                let groups: Vec<i32> = (0..1 + rng.below(20))
+                    .map(|_| rng.below(125) as i32)
+                    .collect();
+                let end = 1 + groups.len() * 3 * size;
+                let mut allocation = AllocationState::new();
+                allocation
+                    .decode_grouped_exponents(strategy, 0, 1, end, 12, &groups)
+                    .unwrap();
+                let mut expected = vec![12];
+                let mut current = 12;
+                for group in &groups {
+                    for delta in [group / 25 - 2, (group % 25) / 5 - 2, group % 5 - 2] {
+                        current += delta;
+                        expected.extend(std::iter::repeat_n(current, size));
+                    }
+                }
+                assert_eq!(&allocation.exponents[..end], &expected[..]);
+                for (shift, exponent) in allocation.shifts[..end].iter().zip(&expected) {
+                    assert_eq!(*shift as i32, (*exponent).clamp(0, 31));
+                }
             }
         }
     }
