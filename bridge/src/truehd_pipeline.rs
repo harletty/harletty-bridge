@@ -22,7 +22,12 @@ use crate::perf::PerfStats;
 /// reset, and parse recovery — and each one used to re-apply the settings itself. A
 /// setting applied in two of the three is a setting that silently reverts at the third,
 /// so they all come from here.
-pub(crate) fn configure_parser(parser: &mut Parser, fail_level: log::Level, presentation: u8) {
+pub(crate) fn configure_parser(
+    parser: &mut Parser,
+    fail_level: log::Level,
+    presentation: u8,
+    drc_mode: DrcMode,
+) {
     parser.set_fail_level(fail_level);
 
     // The byte-domain FIFO depth model answers whether a stream is legal to author on a
@@ -30,12 +35,35 @@ pub(crate) fn configure_parser(parser: &mut Parser, fail_level: log::Level, pres
     // the model otherwise accounts every access unit for an answer nothing reads.
     parser.set_check_fifo(false);
 
-    // Require all presentations up to and including the requested one.
-    let mut required_presentations = [false; MAX_PRESENTATIONS];
-    required_presentations[..=presentation as usize]
-        .iter_mut()
-        .for_each(|p| *p = true);
-    parser.set_required_presentations(&required_presentations);
+    parser.set_required_presentations(&required_presentations(presentation, drc_mode));
+}
+
+/// The presentations the parser is asked for, which decide the substreams it
+/// reads.
+///
+/// The one that is decoded, and the parser works out which substreams that
+/// takes: a 7.1 presentation often stands on its own substreams, next to those
+/// of a stereo one that nothing here listens to.
+///
+/// Heavy DRC takes every presentation below it as well. Its gain is looked for
+/// from the decoded presentation down, and is stated in a substream's restart
+/// header, which is only read with the substream. The standard gain is stated
+/// in the directory of the access unit, which is read whole whatever is asked
+/// for.
+pub(crate) fn required_presentations(
+    presentation: u8,
+    drc_mode: DrcMode,
+) -> [bool; MAX_PRESENTATIONS] {
+    let mut required = [false; MAX_PRESENTATIONS];
+
+    // The DRC log prints the heavy gain of every substream.
+    if drc_mode == DrcMode::Heavy || drc_diag_log_enabled() {
+        required[..=presentation as usize].fill(true);
+    } else {
+        required[presentation as usize] = true;
+    }
+
+    required
 }
 
 /// How many branch points the parser may hold before the list is dropped.
@@ -59,6 +87,8 @@ struct DrainContext<'a> {
     current_dialogue_level: &'a mut Option<i8>,
     recovering_until_major_sync: &'a mut bool,
     drc_mode: DrcMode,
+    /// See [`AtmosBridge::truehd_presentations_stale`].
+    presentations_stale: &'a mut bool,
     total_samples: &'a mut u64,
     declared_object_channels: &'a mut Option<RVec<bridge_api::RObjectChannel>>,
     spatial_labels: &'a mut Option<RVec<RChannelLabel>>,
@@ -76,7 +106,8 @@ impl DrainContext<'_> {
         *self.parser = Parser::default();
         *self.decoder = Decoder::default();
         self.decoder.set_fail_level(fail_level);
-        configure_parser(self.parser, fail_level, self.presentation);
+        configure_parser(self.parser, fail_level, self.presentation, self.drc_mode);
+        *self.presentations_stale = false;
 
         *self.current_substream_info = None;
         *self.current_extended_substream_info = None;
@@ -123,6 +154,18 @@ fn drain_frames(
                         ctx.frame_count
                     );
                     *ctx.recovering_until_major_sync = false;
+                }
+
+                // A substream the parser takes up in mid-stream is read without the
+                // restart header it started from. A major sync brings one for
+                // every substream.
+                if *ctx.presentations_stale && raw_frame.is_major_sync() {
+                    ctx.parser
+                        .set_required_presentations(&required_presentations(
+                            ctx.presentation,
+                            ctx.drc_mode,
+                        ));
+                    *ctx.presentations_stale = false;
                 }
 
                 #[cfg(feature = "bridge-perf")]
@@ -481,6 +524,7 @@ pub(crate) fn process_extractor_input(
             current_dialogue_level: &mut bridge.current_dialogue_level,
             recovering_until_major_sync: &mut bridge.recovering_until_major_sync,
             drc_mode: bridge.drc_mode,
+            presentations_stale: &mut bridge.truehd_presentations_stale,
             total_samples: &mut bridge.total_samples,
             declared_object_channels: &mut bridge.declared_object_channels,
             spatial_labels: &mut bridge.truehd_spatial_labels,
