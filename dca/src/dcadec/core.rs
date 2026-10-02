@@ -94,14 +94,14 @@ fn prm_ch_to_spkr(mode: AudioMode, ch: usize) -> usize {
 
 // ───────────────────────── fixed-point helpers (dcamath.h) ─────────────────
 
-#[inline]
+#[inline(always)]
 fn clip23(a: i32) -> i32 {
     let lo = -(1 << 23);
     let hi = (1 << 23) - 1;
     a.clamp(lo, hi)
 }
 
-#[inline]
+#[inline(always)]
 fn norm(a: i64, bits: u32) -> i32 {
     if bits > 0 {
         ((a + (1i64 << (bits - 1))) >> bits) as i32
@@ -110,7 +110,7 @@ fn norm(a: i64, bits: u32) -> i32 {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn mul(a: i32, b: i32, bits: u32) -> i32 {
     norm(a as i64 * b as i64, bits)
 }
@@ -134,7 +134,7 @@ sample_loop! {
 }
 
 /// `ff_dcaadpcm_predict`.
-#[inline]
+#[inline(always)]
 fn adpcm_predict(pred_vq_index: usize, input: &[i32]) -> i32 {
     let coeff = &ADPCM_VB[pred_vq_index];
     let mut pred = 0i64;
@@ -184,6 +184,7 @@ enum Header {
 }
 
 /// `ff_dca_core_dequantize` (residual=false).
+#[inline(always)]
 fn dequantize(output: &mut [i32], input: &[i32], step_size: i32, scale: i32) {
     let mut step_scale = step_size as i64 * scale as i64;
     let mut shift = 0u32;
@@ -720,6 +721,7 @@ impl CoreDecoder {
     }
 
     /// `extract_audio` — returns (huffman_used, samples[8]).
+    #[inline(always)]
     fn extract_audio(&self, gb: &mut BitReader, abits: i32, ch: usize) -> R<(bool, [i32; 8])> {
         let mut audio = [0i32; 8];
         if abits == 0 {
@@ -746,6 +748,7 @@ impl CoreDecoder {
         Ok((false, audio))
     }
 
+    #[inline(always)]
     fn parse_block_codes(&self, gb: &mut BitReader, audio: &mut [i32; 8], abits: i32) -> R<()> {
         let nbits = BLOCK_CODE_NBITS[abits as usize - 1] as usize;
         let code1 = rb(gb, nbits)?;
@@ -756,6 +759,7 @@ impl CoreDecoder {
         Ok(())
     }
 
+    #[inline(always)]
     fn parse_subframe_audio(
         &mut self,
         gb: &mut BitReader,
@@ -854,6 +858,7 @@ impl CoreDecoder {
         Ok(())
     }
 
+    #[inline(always)]
     fn decode_hf(&mut self, ch: usize, vq_index: &[i32], ofs: usize, len: usize) {
         for i in self.subband_vq_start[ch]..self.nsubbands[ch] {
             let coeff = &HIGH_FREQ_VQ[vq_index[i] as usize];
@@ -867,6 +872,7 @@ impl CoreDecoder {
         }
     }
 
+    #[inline(always)]
     fn inverse_adpcm(&mut self, ch: usize, sub_pos: usize, len: usize) {
         for band in 0..self.nsubbands[ch] {
             if self.prediction_mode[ch][band] {
@@ -889,6 +895,7 @@ impl CoreDecoder {
         }
     }
 
+    #[inline(always)]
     fn decode_joint(&mut self, ch: usize, src_ch: usize, ofs: usize, len: usize) {
         for band in self.nsubbands[ch]..self.nsubbands[src_ch] {
             let scale = self.joint_scale_factors[ch][band];
@@ -904,6 +911,38 @@ impl CoreDecoder {
     /// header, or an extension set whose channels start at `xch_base` — and
     /// decode its subband samples for the frame.
     fn parse_frame_data(
+        &mut self,
+        gb: &mut BitReader,
+        data: &[u8],
+        header: Header,
+        xch_base: usize,
+    ) -> R<()> {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::has_avx2() {
+            // SAFETY: `has_avx2` covers the features the function is
+            // compiled for.
+            return unsafe { self.parse_frame_data_avx2(gb, data, header, xch_base) };
+        }
+        self.parse_frame_data_body(gb, data, header, xch_base)
+    }
+
+    /// `parse_frame_data_body` compiled for AVX2: the same code, whose
+    /// dequantization, vector-quantized bands and joint bands then use the
+    /// 24-bit clips and 64-bit products the baseline target lacks.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+    fn parse_frame_data_avx2(
+        &mut self,
+        gb: &mut BitReader,
+        data: &[u8],
+        header: Header,
+        xch_base: usize,
+    ) -> R<()> {
+        self.parse_frame_data_body(gb, data, header, xch_base)
+    }
+
+    #[inline(always)]
+    fn parse_frame_data_body(
         &mut self,
         gb: &mut BitReader,
         data: &[u8],
@@ -1264,7 +1303,7 @@ static BLOCK_CODE_PAIRS: [[i8; 2]; BLOCK_CODE_PAIR_COUNT] = block_codes().1;
 
 /// `decode_blockcodes`: the eight samples of two block codes. False when a
 /// code holds more than its four digits.
-#[inline]
+#[inline(always)]
 fn decode_blockcodes(code1: u32, code2: u32, abits: usize, audio: &mut [i32; 8]) -> bool {
     let BlockCode {
         square,
