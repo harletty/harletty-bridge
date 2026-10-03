@@ -8,6 +8,13 @@
 members = ["bridge", "harletty", "eac3", "dca", "damf", "auro"]
 resolver = "2"
 
+# What release.yml and build_bridge.sh ship. Thin LTO is the one setting that
+# measured no slower on any decoder, and the E-AC-3 object path gains a few
+# percent. Fat LTO or a single codegen unit sped TrueHD up but slowed DTS and
+# the JOC path by up to 13%, so check every codec before changing this.
+[profile.release]
+lto = "thin"
+
 # Kept from the pre-workspace root package: the CLI ships under this profile.
 [profile.release-deploy]
 inherits = "release"
