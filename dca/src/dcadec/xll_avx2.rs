@@ -11,6 +11,8 @@
 
 use std::arch::x86_64::*;
 
+use super::xll::Group;
+
 /// Mirrors `DCA_XLL_PRED_ORDER_MAX`.
 const ORDER_MAX: usize = 16;
 
@@ -28,23 +30,15 @@ pub(super) struct Scratch {
     spare: Vec<i32>,
 }
 
-/// Two to four channels predicted together: the first `count` entries of
-/// each array are a channel's samples, prediction coefficients and order.
-pub(super) struct Group<'a> {
-    pub(super) samples: [&'a mut [i32]; 4],
-    pub(super) coeff: [&'a [i32; ORDER_MAX]; 4],
-    pub(super) order: [usize; 4],
-    pub(super) count: usize,
-}
-
-/// `inverse_adaptive_prediction` on the channels of a group: all of the same
-/// length, each of an order from 1 to 16 that its samples outnumber.
+/// `inverse_adaptive_prediction` on the two to four channels of a group:
+/// all of the same length, each of an order from 1 to 16 that its samples
+/// outnumber.
 ///
 /// `prelude` is the scalar prediction: it runs each channel up to the highest
 /// order of the group, from where every channel has a full history.
 #[target_feature(enable = "avx2")]
 pub(super) fn predict_group(
-    group: Group<'_>,
+    group: Group<'_, 4>,
     scratch: &mut Scratch,
     prelude: fn(&mut [i32], &[i32; ORDER_MAX], usize),
 ) {
