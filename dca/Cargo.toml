@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Independent DTS Coherent Acoustics (DCA) bitstream parser and decoder"
 repository = "https://github.com/harletty/harletty-bridge"
-rust-version = "1.87.0"
+rust-version = "1.89.0"
 
 [lib]
 name = "dca"
@@ -16,10 +16,13 @@ log = "0.4"
 thiserror = "2.0"
 rustfft = "6.4"
 
-# `--cfg dca_force_scalar` keeps the decoder on its portable code (see
-# `src/cpu.rs`).
+# `--cfg dca_force_scalar` keeps the decoder on its portable code and
+# `--cfg dca_force_avx2` off its AVX-512 code (see `src/cpu.rs`).
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(dca_force_scalar)'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(dca_force_scalar)',
+    'cfg(dca_force_avx2)',
+] }
 
 # Keep the offline parser's synthetic corruption tests in the normal CI suite.
 [[example]]

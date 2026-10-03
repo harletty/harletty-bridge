@@ -3,11 +3,12 @@
 // DCA core decoder internals: generated tables, Huffman VLCs, and the subband
 // DSP decode (ported incrementally from ffmpeg's dca_core.c / dcadsp.c).
 
-/// Define an elementwise loop over sample buffers that runs as AVX2 code
-/// where the CPU has it: the same loop compiled twice. The arithmetic is
-/// integer, so both give the same samples; the baseline x86-64 target has no
-/// instructions for the 24-bit clips and the 64-bit products these loops
-/// are made of.
+/// Define an elementwise loop over sample buffers that runs as AVX-512 or
+/// AVX2 code where the CPU has it: the same loop compiled three times. The
+/// arithmetic is integer, so all give the same samples; the baseline x86-64
+/// target has no instructions for the 24-bit clips and the 64-bit products
+/// these loops are made of, and AVX2 none for the 64-bit arithmetic shifts
+/// and full 64-bit products that AVX-512 (DQ) adds on twice the width.
 macro_rules! sample_loop {
     ($(#[$doc:meta])* fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $body:block) => {
         $(#[$doc])*
@@ -16,9 +17,17 @@ macro_rules! sample_loop {
             fn body($($arg: $ty),*) $body
             #[cfg(target_arch = "x86_64")]
             {
+                #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,avx512f,avx512bw,avx512dq,avx512vl")]
+                fn avx512($($arg: $ty),*) {
+                    body($($arg),*)
+                }
                 #[target_feature(enable = "avx2")]
                 fn avx2($($arg: $ty),*) {
                     body($($arg),*)
+                }
+                if $crate::cpu::has_avx512() {
+                    // SAFETY: `has_avx512` covers the features enabled above.
+                    return unsafe { avx512($($arg),*) };
                 }
                 if $crate::cpu::has_avx2() {
                     // SAFETY: AVX2 was just detected.

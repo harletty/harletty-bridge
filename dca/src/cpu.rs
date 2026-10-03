@@ -19,3 +19,23 @@ pub(crate) fn has_avx2() -> bool {
         && std::arch::is_x86_feature_detected!("bmi2")
         && std::arch::is_x86_feature_detected!("lzcnt")
 }
+
+/// Whether the CPU runs the code compiled a third time for AVX-512: the
+/// foundation set plus the byte/word, doubleword/quadword and vector-length
+/// extensions, which every AVX-512 CPU since Skylake-SP has together. Those
+/// builds enable `avx512f,avx512bw,avx512dq,avx512vl` on top of the AVX2
+/// set, so this implies [`has_avx2`].
+///
+/// `--cfg dca_force_avx2` answers no, so a machine with AVX-512 can run the
+/// tests and the reference decodes on the AVX2 code as well; `--cfg
+/// dca_force_scalar` answers no too.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn has_avx512() -> bool {
+    !cfg!(dca_force_avx2)
+        && has_avx2()
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512dq")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+}
