@@ -625,6 +625,11 @@ struct BlockSyntaxState {
     aht_channel_pre_mantissas: Vec<Vec<[i32; 6]>>,
     aht_coupling_pre_mantissas: Vec<[i32; 6]>,
     aht_lfe_pre_mantissas: Vec<[i32; 6]>,
+    /// The transform coefficients of the block being decoded, kept between
+    /// blocks so no block starts by zeroing them (every decoder writes its
+    /// whole target). Taken out for the length of a block; a clone of the
+    /// state starts without it.
+    coefficients: CoefficientScratch,
     bit_allocation_params: BitAllocationParams,
     /// Per-channel end mantissa, refreshed only when a channel transmits new
     /// exponents and reused across `Reuse` blocks (FFmpeg `end_freq`).
@@ -683,12 +688,50 @@ struct BlockSyntaxState {
     spx_signal_blend: Vec<Vec<f32>>,
 }
 
+/// One block's transform coefficients: a fullband channel's (two in 2/0
+/// mode, where rematrixing needs both before either is transformed; the LFE
+/// takes the first once the fullband channels are done) and the coupling
+/// channel's.
+#[derive(Debug, Default)]
+struct CoefficientScratch(Option<Box<BlockCoefficients>>);
+
+#[derive(Debug)]
+struct BlockCoefficients {
+    channel: [[f32; 256]; 2],
+    coupling: [f32; 256],
+}
+
+impl CoefficientScratch {
+    /// The buffers, allocated the first time they are asked for. Their
+    /// content is whatever the last block left: a decoder writes all of its
+    /// target before anything reads it.
+    fn take(&mut self) -> Box<BlockCoefficients> {
+        self.0.take().unwrap_or_else(|| {
+            Box::new(BlockCoefficients {
+                channel: [[0.0; 256]; 2],
+                coupling: [0.0; 256],
+            })
+        })
+    }
+
+    fn put_back(&mut self, coefficients: Box<BlockCoefficients>) {
+        self.0 = Some(coefficients);
+    }
+}
+
+impl Clone for CoefficientScratch {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
 impl BlockSyntaxState {
     fn new(fullband_channels: usize, lfe_on: bool, sample_rate_index: usize) -> Self {
         Self {
             aht_channel_pre_mantissas: vec![Vec::new(); fullband_channels],
             aht_coupling_pre_mantissas: Vec::new(),
             aht_lfe_pre_mantissas: Vec::new(),
+            coefficients: CoefficientScratch::default(),
             bit_allocation_params: BitAllocationParams::default(),
             channel_end_mantissas: vec![0; fullband_channels],
             coupling_allocation: AllocationState::new(),
@@ -3849,8 +3892,48 @@ fn decode_block_pcm_mantissas(
     fullband_channels: &mut [Vec<f32>],
     lfe_channel: Option<&mut Vec<f32>>,
 ) -> Result<(), ParseError> {
+    // The coefficient buffers leave the state for the block, so a channel's
+    // decoder (a borrow of the state) can write them; back on every exit.
+    let mut coefficients = state.coefficients.take();
+    let decoded = decode_block_pcm_mantissas_into(
+        reader,
+        block,
+        block_offset,
+        lfe_on,
+        audio_frame,
+        state,
+        allocation,
+        block_switch,
+        imdct,
+        lfe_imdct,
+        fullband_channels,
+        lfe_channel,
+        &mut coefficients,
+    );
+    state.coefficients.put_back(coefficients);
+    decoded
+}
+
+fn decode_block_pcm_mantissas_into(
+    reader: &mut BitReader<'_>,
+    block: usize,
+    block_offset: usize,
+    lfe_on: bool,
+    audio_frame: &AudioFrameInfo,
+    state: &mut BlockSyntaxState,
+    allocation: &BlockAllocationInfo,
+    block_switch: &[bool],
+    imdct: &mut [ImdctState],
+    lfe_imdct: Option<&mut ImdctState>,
+    fullband_channels: &mut [Vec<f32>],
+    lfe_channel: Option<&mut Vec<f32>>,
+    coefficients: &mut BlockCoefficients,
+) -> Result<(), ParseError> {
     let mut mantissa_state = MantissaDecodeState::new_block();
-    let mut coupling_coeffs = [0.0f32; 256];
+    let BlockCoefficients {
+        channel: channel_coeffs,
+        coupling: coupling_coeffs,
+    } = coefficients;
     let first_coupled_channel = if state.chincpl.iter().any(|in_use| *in_use) {
         // AHT channels transmit their whole frame in block 0, so their bit
         // allocation is computed once there (with the high-efficiency bap
@@ -3867,10 +3950,10 @@ fn decode_block_pcm_mantissas(
 
     // Stereo rematrixing mixes the two channels' coefficients before the IMDCT,
     // so in 2/0 mode (exactly two fullband channels) the per-channel transforms
-    // are deferred: decode both channels' coeffs into `stereo_coeffs`, rematrix,
-    // then IMDCT. Other modes IMDCT each channel immediately (no extra buffer).
+    // are deferred: decode both channels' coeffs into their own buffer,
+    // rematrix, then IMDCT. Other modes IMDCT each channel immediately, all
+    // from the first buffer.
     let stereo = allocation.channel_end_mantissas().len() == 2;
-    let mut stereo_coeffs = [[0.0f32; 256]; 2];
 
     for (channel, &end_mantissa) in allocation.channel_end_mantissas().iter().enumerate() {
         if end_mantissa > 256 {
@@ -3910,7 +3993,7 @@ fn decode_block_pcm_mantissas(
             channel as i32,
             reader.position(),
         );
-        let mut coeffs = [0.0f32; 256];
+        let coeffs = &mut channel_coeffs[if stereo { channel } else { 0 }];
         if uses_aht {
             if block == 0 {
                 state.channel_allocations[channel].decode_aht_mantissas(
@@ -3923,14 +4006,14 @@ fn decode_block_pcm_mantissas(
             state.channel_allocations[channel].extract_aht_coeffs(
                 &state.aht_channel_pre_mantissas[channel],
                 block,
-                &mut coeffs,
+                coeffs,
                 0,
                 end_mantissa,
             );
         } else {
             state.channel_allocations[channel].decode_transform_coeffs(
                 reader,
-                &mut coeffs,
+                coeffs,
                 0,
                 end_mantissa,
                 &mut mantissa_state,
@@ -3952,14 +4035,14 @@ fn decode_block_pcm_mantissas(
                 state.coupling_allocation.extract_aht_coeffs(
                     &state.aht_coupling_pre_mantissas,
                     block,
-                    &mut coupling_coeffs,
+                    coupling_coeffs,
                     cpl_start,
                     cpl_end,
                 );
             } else {
                 state.coupling_allocation.decode_transform_coeffs(
                     reader,
-                    &mut coupling_coeffs,
+                    coupling_coeffs,
                     cpl_start,
                     cpl_end,
                     &mut mantissa_state,
@@ -3967,23 +4050,21 @@ fn decode_block_pcm_mantissas(
             }
         }
         if state.chincpl[channel] {
-            apply_standard_coupling(state, channel, &mut coeffs, &coupling_coeffs);
+            apply_standard_coupling(state, channel, coeffs, coupling_coeffs);
         }
-        if stereo {
-            stereo_coeffs[channel] = coeffs;
-        } else {
+        if !stereo {
             // FFmpeg applies spectral extension after rematrixing; outside 2/0
             // there is no rematrixing, so SPX runs right away.
             if state.spx_in_use && state.chinspx[channel] {
                 apply_spx_extension(
-                    &mut coeffs,
+                    coeffs,
                     state,
                     channel,
                     spx_attenuation_code(audio_frame, channel),
                 );
             }
             imdct[channel].apply(
-                &coeffs,
+                coeffs,
                 block_switch.get(channel).copied().unwrap_or(false),
                 &mut fullband_channels[channel][block_offset..block_offset + 256],
             );
@@ -3991,20 +4072,20 @@ fn decode_block_pcm_mantissas(
     }
 
     if stereo {
-        apply_rematrixing(&mut stereo_coeffs, allocation, state);
-        for channel in 0..2 {
+        apply_rematrixing(channel_coeffs, allocation, state);
+        for (channel, coeffs) in channel_coeffs.iter_mut().enumerate() {
             // SPX copies from the sub-extension region, which rematrixing may
             // have just rewritten — keep FFmpeg's rematrix-then-SPX order.
             if state.spx_in_use && state.chinspx[channel] {
                 apply_spx_extension(
-                    &mut stereo_coeffs[channel],
+                    coeffs,
                     state,
                     channel,
                     spx_attenuation_code(audio_frame, channel),
                 );
             }
             imdct[channel].apply(
-                &stereo_coeffs[channel],
+                coeffs,
                 block_switch.get(channel).copied().unwrap_or(false),
                 &mut fullband_channels[channel][block_offset..block_offset + 256],
             );
@@ -4035,7 +4116,7 @@ fn decode_block_pcm_mantissas(
             }
 
             bittrace_ch("mantissas_lfe_start", block, -2, reader.position());
-            let mut coeffs = [0.0f32; 256];
+            let coeffs = &mut channel_coeffs[0];
             if uses_aht {
                 if block == 0 {
                     lfe_allocation.decode_aht_mantissas(
@@ -4048,21 +4129,21 @@ fn decode_block_pcm_mantissas(
                 lfe_allocation.extract_aht_coeffs(
                     &state.aht_lfe_pre_mantissas,
                     block,
-                    &mut coeffs,
+                    coeffs,
                     0,
                     LFE_END_MANTISSA,
                 );
             } else {
                 lfe_allocation.decode_transform_coeffs(
                     reader,
-                    &mut coeffs,
+                    coeffs,
                     0,
                     LFE_END_MANTISSA,
                     &mut mantissa_state,
                 )?;
             }
             lfe_imdct.apply(
-                &coeffs,
+                coeffs,
                 false,
                 &mut lfe_channel[block_offset..block_offset + 256],
             );
@@ -4201,13 +4282,46 @@ fn spx_attenuation_code(audio_frame: &AudioFrameInfo, channel: usize) -> Option<
 /// Notch attenuation factors for one 5-bit SPX attenuation code
 /// (`ff_eac3_spx_atten_tab[code][bin] = 2^((bin+1)*(code+1)/-15)`).
 fn spx_attenuation_factors(code: u8) -> [f32; 3] {
-    let code = f64::from(code & 0x1f);
-    [
-        2f64.powf((code + 1.0) / -15.0) as f32,
-        2f64.powf(2.0 * (code + 1.0) / -15.0) as f32,
-        2f64.powf(3.0 * (code + 1.0) / -15.0) as f32,
-    ]
+    SPX_ATTENUATION_FACTORS[usize::from(code & 0x1f)]
 }
+
+/// [`spx_attenuation_factors`] for every code: `2^(k * (code + 1) / -15)`
+/// for k = 1, 2, 3, computed in f64 and rounded to f32 (the test below holds
+/// the table to that).
+const SPX_ATTENUATION_FACTORS: [[f32; 3]; 32] = [
+    [0.9548416, 0.9117225, 0.8705506],
+    [0.9117225, 0.8312379, 0.7578583],
+    [0.8705506, 0.7578583, 0.659754],
+    [0.8312379, 0.6909564, 0.57434916],
+    [0.7937005, 0.62996054, 0.5],
+    [0.7578583, 0.57434916, 0.4352753],
+    [0.7236346, 0.52364707, 0.37892914],
+    [0.6909564, 0.4774208, 0.329877],
+    [0.659754, 0.4352753, 0.28717458],
+    [0.62996054, 0.39685026, 0.25],
+    [0.6015125, 0.3618173, 0.21763764],
+    [0.57434916, 0.329877, 0.18946457],
+    [0.5484125, 0.30075625, 0.1649385],
+    [0.52364707, 0.27420625, 0.14358729],
+    [0.5, 0.25, 0.125],
+    [0.4774208, 0.22793062, 0.10881882],
+    [0.45586124, 0.20780948, 0.094732285],
+    [0.4352753, 0.18946457, 0.08246925],
+    [0.41561896, 0.1727391, 0.071793646],
+    [0.39685026, 0.15749013, 0.0625],
+    [0.37892914, 0.14358729, 0.05440941],
+    [0.3618173, 0.13091177, 0.047366142],
+    [0.3454782, 0.1193552, 0.041234624],
+    [0.329877, 0.10881882, 0.035896823],
+    [0.31498027, 0.099212565, 0.03125],
+    [0.30075625, 0.090454325, 0.027204705],
+    [0.28717458, 0.08246925, 0.023683071],
+    [0.27420625, 0.07518906, 0.020617312],
+    [0.26182353, 0.06855156, 0.017948411],
+    [0.25, 0.0625, 0.015625],
+    [0.2387104, 0.056982655, 0.013602353],
+    [0.22793062, 0.05195237, 0.011841536],
+];
 
 fn scan_frame_for_emdf(
     frame: &[u8],
@@ -4386,6 +4500,28 @@ mod tests {
         inspect_legacy_ac3_access_unit,
     };
     use crate::BedChannel;
+
+    #[test]
+    fn spx_attenuation_table_is_the_formula() {
+        for code in 0..32u8 {
+            let x = f64::from(code) + 1.0;
+            let computed = [
+                2f64.powf(x / -15.0) as f32,
+                2f64.powf(2.0 * x / -15.0) as f32,
+                2f64.powf(3.0 * x / -15.0) as f32,
+            ];
+            assert_eq!(
+                super::spx_attenuation_factors(code).map(f32::to_bits),
+                computed.map(f32::to_bits),
+                "code {code}"
+            );
+        }
+        // The code is five bits: higher bits are ignored.
+        assert_eq!(
+            super::spx_attenuation_factors(0x3f),
+            super::spx_attenuation_factors(0x1f)
+        );
+    }
 
     #[test]
     fn legacy_ac3_inspect_sizes_44_1_khz_odd_frmsizecod_frames() {

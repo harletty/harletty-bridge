@@ -822,8 +822,12 @@ impl AllocationState {
         if end > MAX_ALLOCATION_SIZE || start > end {
             return Err(ParseError::InvalidHeader("aht-range"));
         }
-        pre_mantissas.clear();
-        pre_mantissas.resize(end, [0; 6]);
+        // The decode writes every bin of `start..end`, the only ones read
+        // afterwards: a buffer already of that length is reused as it is.
+        if pre_mantissas.len() != end {
+            pre_mantissas.clear();
+            pre_mantissas.resize(end, [0; 6]);
+        }
         super::aht::decode_pre_mantissas(reader, &self.bap, start, end, pre_mantissas)
     }
 
@@ -838,21 +842,26 @@ impl AllocationState {
         start: usize,
         end: usize,
     ) {
-        target.fill(0.0);
         let end = end.min(pre_mantissas.len()).min(MAX_ALLOCATION_SIZE);
-        let (Some(target), Some(pre_mantissas), Some(shifts)) = (
+        let (Some(bins), Some(pre_mantissas), Some(shifts)) = (
             target.get_mut(start..end),
             pre_mantissas.get(start..end),
             self.shifts.get(start..end),
         ) else {
+            target.fill(0.0);
             return;
         };
         if block >= 6 {
+            target.fill(0.0);
             return;
         }
-        for ((slot, pre), &shift) in target.iter_mut().zip(pre_mantissas).zip(shifts) {
+        for ((slot, pre), &shift) in bins.iter_mut().zip(pre_mantissas).zip(shifts) {
             *slot = (pre[block] >> shift) as f32 * FROM_INT24;
         }
+        // Every bin of the range is now written; the rest of the target is
+        // zero, whatever it held.
+        target[..start].fill(0.0);
+        target[end..].fill(0.0);
     }
 
     fn decode_grouped_exponents(
