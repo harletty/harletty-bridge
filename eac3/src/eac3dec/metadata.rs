@@ -1102,49 +1102,108 @@ fn parse_joc_payload(reader: &mut BitReader<'_>) -> Result<JocPayload, ParseErro
     })
 }
 
+// Eight stream bits select a leaf or the remaining subtree. The six prefix
+// tables occupy 6 KiB and are built at compile time, without decoder state.
+struct HuffmanCode {
+    nodes: &'static [[i16; 2]],
+    prefix: [(i16, u8); 256],
+    zero_bit: u32,
+}
+
+impl HuffmanCode {
+    const fn new(nodes: &'static [[i16; 2]]) -> Self {
+        let mut prefix = [(0, 0); 256];
+        let mut word = 0;
+        while word < prefix.len() {
+            let mut node = 0i16;
+            let mut bits = 0;
+            while bits < 8 {
+                node = nodes[node as usize][(word >> (7 - bits)) & 1];
+                bits += 1;
+                if node <= 0 {
+                    break;
+                }
+            }
+            prefix[word] = (node, bits);
+            word += 1;
+        }
+        let zero_bit = if nodes[0][0] == -1 {
+            0
+        } else {
+            assert!(nodes[0][1] == -1);
+            1
+        };
+        Self {
+            nodes,
+            prefix,
+            zero_bit,
+        }
+    }
+}
+
 fn huffman_decode(
-    table: &'static [[i16; 2]],
+    code: &'static HuffmanCode,
     reader: &mut BitReader<'_>,
 ) -> Result<u16, ParseError> {
     let mut node = 0i16;
+    if let Some(prefix) = reader.show_bits(8) {
+        // All six codebooks give zero a one-bit code. Sparse matrices need
+        // no table lookup for it.
+        if prefix >> 7 == code.zero_bit {
+            reader.skip_bits(1);
+            return Ok(0);
+        }
+        let (next, bits) = code.prefix[prefix as usize];
+        reader.skip_bits(bits as usize);
+        if next <= 0 {
+            return Ok((!next) as u16);
+        }
+        node = next;
+    }
+    // The tail also handles fewer than eight bits left, preserving short-code
+    // acceptance and the error position of a truncated code.
     loop {
-        let bit = if read_bit(reader, "joc_huffman_bit")? {
-            1
-        } else {
-            0
-        };
-        node = table
+        let bit = usize::from(read_bit(reader, "joc_huffman_bit")?);
+        node = code
+            .nodes
             .get(node as usize)
-            .and_then(|children| children.get(bit))
-            .copied()
-            .ok_or(ParseError::InvalidHeader("joc_huffman_node"))?;
+            .ok_or(ParseError::InvalidHeader("joc_huffman_node"))?[bit];
         if node <= 0 {
             return Ok((!node) as u16);
         }
     }
 }
 
-fn huffman_table(mode: usize, kind: HuffmanType) -> &'static [[i16; 2]] {
+static HUFF_COARSE_GENERIC: HuffmanCode = HuffmanCode::new(JOC_HUFF_CODE_COARSE_GENERIC);
+static HUFF_FINE_GENERIC: HuffmanCode = HuffmanCode::new(JOC_HUFF_CODE_FINE_GENERIC);
+static HUFF_COARSE_COEFF_SPARSE: HuffmanCode = HuffmanCode::new(JOC_HUFF_CODE_COARSE_COEFF_SPARSE);
+static HUFF_FINE_COEFF_SPARSE: HuffmanCode = HuffmanCode::new(JOC_HUFF_CODE_FINE_COEFF_SPARSE);
+static HUFF_5CH_POS_INDEX_SPARSE: HuffmanCode =
+    HuffmanCode::new(JOC_HUFF_CODE_5CH_POS_INDEX_SPARSE);
+static HUFF_7CH_POS_INDEX_SPARSE: HuffmanCode =
+    HuffmanCode::new(JOC_HUFF_CODE_7CH_POS_INDEX_SPARSE);
+
+fn huffman_table(mode: usize, kind: HuffmanType) -> &'static HuffmanCode {
     match kind {
         HuffmanType::Matrix => {
             if mode == 1 {
-                JOC_HUFF_CODE_FINE_GENERIC
+                &HUFF_FINE_GENERIC
             } else {
-                JOC_HUFF_CODE_COARSE_GENERIC
+                &HUFF_COARSE_GENERIC
             }
         }
         HuffmanType::Vector => {
             if mode == 1 {
-                JOC_HUFF_CODE_FINE_COEFF_SPARSE
+                &HUFF_FINE_COEFF_SPARSE
             } else {
-                JOC_HUFF_CODE_COARSE_COEFF_SPARSE
+                &HUFF_COARSE_COEFF_SPARSE
             }
         }
         HuffmanType::Index => {
             if mode == 7 {
-                JOC_HUFF_CODE_7CH_POS_INDEX_SPARSE
+                &HUFF_7CH_POS_INDEX_SPARSE
             } else {
-                JOC_HUFF_CODE_5CH_POS_INDEX_SPARSE
+                &HUFF_5CH_POS_INDEX_SPARSE
             }
         }
     }
@@ -2038,5 +2097,75 @@ mod tests {
         assert_eq!(resolved.size, Some([0.75, 0.75, 0.75]));
         assert_eq!(resolved.screen_factor, Some(0.625));
         assert_eq!(resolved.depth_factor, Some(0.5));
+    }
+}
+
+#[cfg(test)]
+mod huffman_prefix_tests {
+    use super::*;
+
+    fn reference(nodes: &[[i16; 2]], reader: &mut BitReader<'_>) -> Result<u16, ParseError> {
+        let mut node = 0i16;
+        loop {
+            let bit = usize::from(read_bit(reader, "joc_huffman_bit")?);
+            node = nodes[node as usize][bit];
+            if node <= 0 {
+                return Ok((!node) as u16);
+            }
+        }
+    }
+
+    fn leaves(
+        nodes: &[[i16; 2]],
+        node: usize,
+        word: u64,
+        bits: usize,
+        out: &mut Vec<(u64, usize)>,
+    ) {
+        for bit in 0..2 {
+            let next = nodes[node][bit];
+            let word = (word << 1) | bit as u64;
+            if next <= 0 {
+                out.push((word, bits + 1));
+            } else {
+                leaves(nodes, next as usize, word, bits + 1, out);
+            }
+        }
+    }
+
+    #[test]
+    fn prefixes_match_every_code_and_truncation() {
+        for code in [
+            &HUFF_COARSE_GENERIC,
+            &HUFF_FINE_GENERIC,
+            &HUFF_COARSE_COEFF_SPARSE,
+            &HUFF_FINE_COEFF_SPARSE,
+            &HUFF_5CH_POS_INDEX_SPARSE,
+            &HUFF_7CH_POS_INDEX_SPARSE,
+        ] {
+            let mut paths = Vec::new();
+            leaves(code.nodes, 0, 0, 0, &mut paths);
+            for (word, bits) in paths {
+                for offset in 0..8 {
+                    let mut data = [0xa5u8; 16];
+                    for bit in 0..bits {
+                        let pos = offset + bit;
+                        data[pos / 8] &= !(1 << (7 - pos % 8));
+                        data[pos / 8] |= (((word >> (bits - 1 - bit)) & 1) as u8) << (7 - pos % 8);
+                    }
+                    for available in 0..=bits + 8 {
+                        let mut expected = BitReader::with_offset(&data, offset);
+                        expected.set_limit_bits(offset + available);
+                        let mut actual = expected;
+                        assert_eq!(
+                            huffman_decode(code, &mut actual),
+                            reference(code.nodes, &mut expected),
+                            "word={word:x}, bits={bits}, offset={offset}, available={available}"
+                        );
+                        assert_eq!(actual.position(), expected.position());
+                    }
+                }
+            }
+        }
     }
 }
