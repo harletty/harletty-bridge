@@ -522,6 +522,58 @@ pub(super) fn inverse_adaptive_prediction(
     orders!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
 }
 
+/// Up to `W` channels predicted together by a vector build of the
+/// prediction (`xll_avx2.rs`): the first `count` entries
+/// of each array are a channel's samples, prediction coefficients and order.
+#[cfg(target_arch = "x86_64")]
+pub(super) struct Group<'a, const W: usize> {
+    pub(super) samples: [&'a mut [i32]; W],
+    pub(super) coeff: [&'a [i32; DCA_XLL_PRED_ORDER_MAX]; W],
+    pub(super) order: [usize; W],
+    pub(super) count: usize,
+}
+
+/// Hand the channels `adaptive[..pending]` to `predict` up to `W` at a
+/// time, the last ones first, as long as at least two are left; `pending`
+/// then counts those not handed over. Nothing is handed over unless every
+/// channel has `nsamples` samples and an order below that.
+#[cfg(target_arch = "x86_64")]
+fn predict_grouped<const W: usize>(
+    chset: &mut [XllChSet],
+    adaptive: &[Adaptive],
+    pending: &mut usize,
+    nsamples: usize,
+    mut predict: impl FnMut(Group<'_, W>),
+) {
+    let whole = adaptive[..*pending]
+        .iter()
+        .all(|a| a.order < nsamples && chset[a.chs].band.msb[a.ch].len() >= nsamples);
+    while whole && *pending >= 2 {
+        let count = (*pending).min(W);
+        let channels = &adaptive[*pending - count..*pending];
+        *pending -= count;
+        let mut taken: [Vec<i32>; W] = std::array::from_fn(|_| Vec::new());
+        for (taken, a) in taken.iter_mut().zip(channels) {
+            *taken = std::mem::take(&mut chset[a.chs].band.msb[a.ch]);
+        }
+        let mut group = Group {
+            samples: std::array::from_fn(|_| &mut [][..]),
+            coeff: [&channels[0].coeff; W],
+            order: [0; W],
+            count,
+        };
+        for (lane, (taken, a)) in taken.iter_mut().zip(channels).enumerate() {
+            group.samples[lane] = &mut taken[..nsamples];
+            group.coeff[lane] = &a.coeff;
+            group.order[lane] = a.order;
+        }
+        predict(group);
+        for (taken, a) in taken.into_iter().zip(channels) {
+            chset[a.chs].band.msb[a.ch] = taken;
+        }
+    }
+}
+
 #[inline(always)]
 fn predict_order<const N: usize>(buf: &mut [i32], coeff: &[i32; DCA_XLL_PRED_ORDER_MAX]) {
     let taps: [i64; N] = std::array::from_fn(|k| coeff[N - 1 - k] as i64);
@@ -713,9 +765,21 @@ pub(crate) struct XllDecoder {
     x_descriptor_offset: Option<usize>,
     x_descriptor_size: Option<usize>,
     pub(crate) x_descriptor_navigation_used: bool,
+    /// The channels of the frame waiting for their adaptive prediction.
+    adaptive: Vec<Adaptive>,
     /// Scratch of the vector prediction.
     #[cfg(target_arch = "x86_64")]
     prediction: super::xll_avx2::Scratch,
+}
+
+/// A channel waiting for its adaptive prediction: channel `ch` of set
+/// `chs`, with the prediction coefficients derived from its reflection
+/// coefficients.
+struct Adaptive {
+    chs: usize,
+    ch: usize,
+    order: usize,
+    coeff: [i32; DCA_XLL_PRED_ORDER_MAX],
 }
 
 #[derive(Clone, Copy)]
@@ -1826,22 +1890,28 @@ impl XllDecoder {
         Ok(())
     }
 
+    /// The prediction, then the pairwise decorrelation, of one channel set
+    /// on its own.
     fn chs_filter_band_data(&mut self, chs: usize) {
+        self.chs_queue_prediction(chs);
+        self.predict_queued();
+        self.chs_undo_decorrelation(chs);
+    }
+
+    /// The prediction of a channel set's channels: the fixed one is run
+    /// here, the adaptive ones get their coefficients and wait on
+    /// `self.adaptive` for `predict_queued`, which runs them as many at a
+    /// time as the CPU allows, whichever set they belong to.
+    fn chs_queue_prediction(&mut self, chs: usize) {
         let nsamples = self.nframesamples;
         let c = &mut self.chset[chs];
         let b = &mut c.band;
-
-        // Inverse adaptive or fixed prediction.
-        let mut coeffs = [[0i32; DCA_XLL_PRED_ORDER_MAX]; DCA_XLL_CHANNELS_MAX];
-        // The adaptively predicted channels not yet run, `pending` of them.
-        let mut adaptive = [0usize; DCA_XLL_CHANNELS_MAX];
-        let mut pending = 0;
-        for i in 0..c.nchannels {
-            let order = b.adapt_pred_order[i];
+        for ch in 0..c.nchannels {
+            let order = b.adapt_pred_order[ch];
             if order > 0 {
-                let coeff = &mut coeffs[i];
+                let mut coeff = [0i32; DCA_XLL_PRED_ORDER_MAX];
                 for j in 0..order {
-                    let rc = b.adapt_refl_coeff[i][j];
+                    let rc = b.adapt_refl_coeff[ch][j];
                     for k in 0..(j + 1) / 2 {
                         let t1 = coeff[k];
                         let t2 = coeff[j - k - 1];
@@ -1850,56 +1920,60 @@ impl XllDecoder {
                     }
                     coeff[j] = rc;
                 }
-                adaptive[pending] = i;
-                pending += 1;
+                self.adaptive.push(Adaptive {
+                    chs,
+                    ch,
+                    order,
+                    coeff,
+                });
             } else {
-                let buf = &mut b.msb[i];
-                for _ in 0..b.fixed_pred_order[i] {
+                let buf = &mut b.msb[ch];
+                for _ in 0..b.fixed_pred_order[ch] {
                     for k in 1..nsamples {
                         buf[k] = buf[k].wrapping_add(buf[k - 1]);
                     }
                 }
             }
         }
-        // Four channels at a time where the CPU can; a channel left alone
-        // gains nothing from it.
+    }
+
+    /// Run the adaptive predictions queued by `chs_queue_prediction`: as
+    /// many channels at a time as a vector holds, where the CPU can (a
+    /// channel left alone gains nothing from it), the rest one by one.
+    fn predict_queued(&mut self) {
+        let nsamples = self.nframesamples;
+        // Lowered by the vector builds alone.
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let mut pending = self.adaptive.len();
         #[cfg(target_arch = "x86_64")]
         if crate::cpu::has_avx2() {
-            use super::xll_avx2::{Group, predict_group};
-            let whole = adaptive[..pending]
-                .iter()
-                .all(|&i| b.adapt_pred_order[i] < nsamples && b.msb[i].len() >= nsamples);
-            while whole && pending >= 2 {
-                let count = pending.min(4);
-                let channels = &adaptive[pending - count..pending];
-                pending -= count;
-                let mut taken: [Vec<i32>; 4] = Default::default();
-                for (taken, &i) in taken.iter_mut().zip(channels) {
-                    *taken = std::mem::take(&mut b.msb[i]);
-                }
-                let mut group = Group {
-                    samples: Default::default(),
-                    coeff: [&coeffs[0]; 4],
-                    order: [0; 4],
-                    count,
-                };
-                for (lane, (taken, &i)) in taken.iter_mut().zip(channels).enumerate() {
-                    group.samples[lane] = &mut taken[..nsamples];
-                    group.coeff[lane] = &coeffs[i];
-                    group.order[lane] = b.adapt_pred_order[i];
-                }
-                // SAFETY: AVX2 was detected above.
-                unsafe { predict_group(group, &mut self.prediction, inverse_adaptive_prediction) };
-                for (taken, &i) in taken.into_iter().zip(channels) {
-                    b.msb[i] = taken;
-                }
-            }
+            let scratch = &mut self.prediction;
+            predict_grouped::<4>(
+                &mut self.chset,
+                &self.adaptive,
+                &mut pending,
+                nsamples,
+                |g| {
+                    // SAFETY: AVX2 was detected above.
+                    unsafe {
+                        super::xll_avx2::predict_group(g, scratch, inverse_adaptive_prediction)
+                    }
+                },
+            );
         }
-        for &i in &adaptive[..pending] {
-            let order = b.adapt_pred_order[i];
-            inverse_adaptive_prediction(&mut b.msb[i][..nsamples], &coeffs[i], order);
+        for a in &self.adaptive[..pending] {
+            let buf = &mut self.chset[a.chs].band.msb[a.ch][..nsamples];
+            inverse_adaptive_prediction(buf, &a.coeff, a.order);
         }
+        self.adaptive.clear();
+    }
 
+    /// Undo a channel set's pairwise decorrelation and put its channels
+    /// back in their original order.
+    fn chs_undo_decorrelation(&mut self, chs: usize) {
+        let nsamples = self.nframesamples;
+        let c = &mut self.chset[chs];
+        let b = &mut c.band;
         // Inverse pairwise channel decorrelation + reorder to original order.
         if b.decor_enabled {
             for i in 0..c.nchannels / 2 {
@@ -2075,8 +2149,14 @@ impl XllDecoder {
         let p_pcm_bit_res = self.chset[0].pcm_bit_res;
         let p_storage = self.chset[0].storage_bit_res;
 
+        // The sets' channels are predicted together: a set's prediction
+        // depends on nothing outside the set.
         for chs in 0..self.nactivechsets {
-            self.chs_filter_band_data(chs);
+            self.chs_queue_prediction(chs);
+        }
+        self.predict_queued();
+        for chs in 0..self.nactivechsets {
+            self.chs_undo_decorrelation(chs);
 
             let full = (1u32 << self.chset[chs].nchannels) - 1;
             if self.chset[chs].residual_encode != full {

@@ -918,11 +918,32 @@ impl CoreDecoder {
         xch_base: usize,
     ) -> R<()> {
         #[cfg(target_arch = "x86_64")]
+        if crate::cpu::has_avx512() {
+            // SAFETY: `has_avx512` covers the features the function is
+            // compiled for.
+            return unsafe { self.parse_frame_data_avx512(gb, data, header, xch_base) };
+        }
+        #[cfg(target_arch = "x86_64")]
         if crate::cpu::has_avx2() {
             // SAFETY: `has_avx2` covers the features the function is
             // compiled for.
             return unsafe { self.parse_frame_data_avx2(gb, data, header, xch_base) };
         }
+        self.parse_frame_data_body(gb, data, header, xch_base)
+    }
+
+    /// `parse_frame_data_body` compiled for AVX-512: the AVX2 build's
+    /// operations on sixteen lanes, with the 64-bit shifts and products the
+    /// AVX2 instruction set has to spell out.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,avx512f,avx512bw,avx512dq,avx512vl")]
+    fn parse_frame_data_avx512(
+        &mut self,
+        gb: &mut BitReader,
+        data: &[u8],
+        header: Header,
+        xch_base: usize,
+    ) -> R<()> {
         self.parse_frame_data_body(gb, data, header, xch_base)
     }
 
