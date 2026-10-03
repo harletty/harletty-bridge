@@ -18,6 +18,12 @@
 //!     cargo run --release -p harletty --example decode_bench -- \
 //!         <truehd|eac3|dts> <mode> <iterations> <input>
 //!
+//! Run that way, the times depend on where the linker put each decoder's
+//! loops relative to cache lines, so a change to one decoder moves the
+//! others' times by a few per cent. For numbers that hold from one version
+//! to the next, go through `scripts/bench-vs-ffmpeg.sh`, which builds this
+//! with every function and branch target 64-byte aligned.
+//!
 //! Modes:
 //!     truehd  `auto` (presentation 2, else the highest that decodes — what
 //!             FFmpeg outputs), or a presentation index 0-3
