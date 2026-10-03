@@ -269,7 +269,7 @@ fn cmd_decode_eac3(
         }
     }
 
-    handler.finalize()?;
+    handler.finalize(&base_path, args.format, args.no_audio)?;
 
     match decode_thread.join() {
         Ok(Ok(())) => {
