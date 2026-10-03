@@ -4282,13 +4282,46 @@ fn spx_attenuation_code(audio_frame: &AudioFrameInfo, channel: usize) -> Option<
 /// Notch attenuation factors for one 5-bit SPX attenuation code
 /// (`ff_eac3_spx_atten_tab[code][bin] = 2^((bin+1)*(code+1)/-15)`).
 fn spx_attenuation_factors(code: u8) -> [f32; 3] {
-    let code = f64::from(code & 0x1f);
-    [
-        2f64.powf((code + 1.0) / -15.0) as f32,
-        2f64.powf(2.0 * (code + 1.0) / -15.0) as f32,
-        2f64.powf(3.0 * (code + 1.0) / -15.0) as f32,
-    ]
+    SPX_ATTENUATION_FACTORS[usize::from(code & 0x1f)]
 }
+
+/// [`spx_attenuation_factors`] for every code: `2^(k * (code + 1) / -15)`
+/// for k = 1, 2, 3, computed in f64 and rounded to f32 (the test below holds
+/// the table to that).
+const SPX_ATTENUATION_FACTORS: [[f32; 3]; 32] = [
+    [0.9548416, 0.9117225, 0.8705506],
+    [0.9117225, 0.8312379, 0.7578583],
+    [0.8705506, 0.7578583, 0.659754],
+    [0.8312379, 0.6909564, 0.57434916],
+    [0.7937005, 0.62996054, 0.5],
+    [0.7578583, 0.57434916, 0.4352753],
+    [0.7236346, 0.52364707, 0.37892914],
+    [0.6909564, 0.4774208, 0.329877],
+    [0.659754, 0.4352753, 0.28717458],
+    [0.62996054, 0.39685026, 0.25],
+    [0.6015125, 0.3618173, 0.21763764],
+    [0.57434916, 0.329877, 0.18946457],
+    [0.5484125, 0.30075625, 0.1649385],
+    [0.52364707, 0.27420625, 0.14358729],
+    [0.5, 0.25, 0.125],
+    [0.4774208, 0.22793062, 0.10881882],
+    [0.45586124, 0.20780948, 0.094732285],
+    [0.4352753, 0.18946457, 0.08246925],
+    [0.41561896, 0.1727391, 0.071793646],
+    [0.39685026, 0.15749013, 0.0625],
+    [0.37892914, 0.14358729, 0.05440941],
+    [0.3618173, 0.13091177, 0.047366142],
+    [0.3454782, 0.1193552, 0.041234624],
+    [0.329877, 0.10881882, 0.035896823],
+    [0.31498027, 0.099212565, 0.03125],
+    [0.30075625, 0.090454325, 0.027204705],
+    [0.28717458, 0.08246925, 0.023683071],
+    [0.27420625, 0.07518906, 0.020617312],
+    [0.26182353, 0.06855156, 0.017948411],
+    [0.25, 0.0625, 0.015625],
+    [0.2387104, 0.056982655, 0.013602353],
+    [0.22793062, 0.05195237, 0.011841536],
+];
 
 fn scan_frame_for_emdf(
     frame: &[u8],
@@ -4467,6 +4500,28 @@ mod tests {
         inspect_legacy_ac3_access_unit,
     };
     use crate::BedChannel;
+
+    #[test]
+    fn spx_attenuation_table_is_the_formula() {
+        for code in 0..32u8 {
+            let x = f64::from(code) + 1.0;
+            let computed = [
+                2f64.powf(x / -15.0) as f32,
+                2f64.powf(2.0 * x / -15.0) as f32,
+                2f64.powf(3.0 * x / -15.0) as f32,
+            ];
+            assert_eq!(
+                super::spx_attenuation_factors(code).map(f32::to_bits),
+                computed.map(f32::to_bits),
+                "code {code}"
+            );
+        }
+        // The code is five bits: higher bits are ignored.
+        assert_eq!(
+            super::spx_attenuation_factors(0x3f),
+            super::spx_attenuation_factors(0x1f)
+        );
+    }
 
     #[test]
     fn legacy_ac3_inspect_sizes_44_1_khz_odd_frmsizecod_frames() {
