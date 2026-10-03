@@ -490,19 +490,27 @@ impl ChannelSynth {
 }
 
 /// Which filter bank runs: the portable one of this file, or the one written
-/// for AVX2 (`synth_avx2.rs`) when the CPU has it. The arithmetic is integer,
-/// so both produce identical samples; AVX2 has the 23-bit clips and the
-/// 64-bit products the baseline x86-64 target has no vector instructions
-/// for.
+/// for AVX2 (`synth_avx2.rs`) or for AVX-512 (`synth_avx512.rs`) when the
+/// CPU has it. The arithmetic is integer, so all produce identical samples;
+/// AVX2 has the 23-bit clips and the 64-bit products the baseline x86-64
+/// target has no vector instructions for, and AVX-512 twice the width and
+/// the permutes that make the transforms' reorderings one instruction each.
+/// The LFE filters are the AVX2 ones under both.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Isa {
     Baseline,
     #[cfg(target_arch = "x86_64")]
     Avx2,
+    #[cfg(target_arch = "x86_64")]
+    Avx512,
 }
 
 impl Isa {
     fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::has_avx512() {
+            return Isa::Avx512;
+        }
         #[cfg(target_arch = "x86_64")]
         if crate::cpu::has_avx2() {
             return Isa::Avx2;
@@ -530,6 +538,18 @@ fn bank_32(
         // SAFETY: `Isa::Avx2` is only chosen when the CPU reports AVX2.
         Isa::Avx2 => unsafe {
             super::synth_avx2::bank_32(&mut synth.hist1, &mut synth.hist2, work, perfect, subs, dst)
+        },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `Isa::Avx512` is only chosen when the CPU reports AVX-512.
+        Isa::Avx512 => unsafe {
+            super::synth_avx512::bank_32(
+                &mut synth.hist1,
+                &mut synth.hist2,
+                work,
+                perfect,
+                subs,
+                dst,
+            )
         },
     }
 }
@@ -573,6 +593,11 @@ fn bank_64(
         // SAFETY: `Isa::Avx2` is only chosen when the CPU reports AVX2.
         Isa::Avx2 => unsafe {
             super::synth_avx2::bank_64(&mut synth.hist1, &mut synth.hist2, work, subs, dst)
+        },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `Isa::Avx512` is only chosen when the CPU reports AVX-512.
+        Isa::Avx512 => unsafe {
+            super::synth_avx512::bank_64(&mut synth.hist1, &mut synth.hist2, work, subs, dst)
         },
     }
 }
@@ -834,8 +859,8 @@ fn lfe_synth_fixed(isa: Isa, dec: &mut CoreDecoder, pcm: &mut [i32]) {
     match isa {
         Isa::Baseline => lfe_fir_fixed(dec.lfe(), pcm),
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: `Isa::Avx2` is only chosen when the CPU reports AVX2.
-        Isa::Avx2 => unsafe { super::synth_avx2::lfe_fixed(dec.lfe(), pcm) },
+        // SAFETY: both are only chosen when the CPU reports AVX2.
+        Isa::Avx2 | Isa::Avx512 => unsafe { super::synth_avx2::lfe_fixed(dec.lfe(), pcm) },
     }
     dec.shift_lfe_history(nlfesamples);
 }
@@ -870,8 +895,8 @@ fn lfe_synth(isa: Isa, dec: &mut CoreDecoder, pcm: &mut [f32]) {
     match isa {
         Isa::Baseline => lfe_fir_float(dec.lfe(), pcm),
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: `Isa::Avx2` is only chosen when the CPU reports AVX2.
-        Isa::Avx2 => unsafe { super::synth_avx2::lfe_float(dec.lfe(), pcm) },
+        // SAFETY: both are only chosen when the CPU reports AVX2.
+        Isa::Avx2 | Isa::Avx512 => unsafe { super::synth_avx2::lfe_float(dec.lfe(), pcm) },
     }
     // Update LFE history: move the last DCA_LFE_HISTORY decimated samples to the
     // front (mirrors the post-filter shift in ff_dca_core_filter_fixed).
@@ -1056,7 +1081,27 @@ mod tests {
                     .iter()
                     .any(|&x| x == (1 << 23) - 1 || x == -(1 << 23))
             );
-            assert!(run(Isa::detect(), perfect) == baseline);
+            for isa in Isa::available() {
+                assert!(run(isa, perfect) == baseline, "{isa:?}");
+            }
+        }
+    }
+
+    impl Isa {
+        /// Every build this CPU runs, the fastest last.
+        fn available() -> Vec<Isa> {
+            let mut all = vec![Isa::Baseline];
+            #[cfg(target_arch = "x86_64")]
+            {
+                if crate::cpu::has_avx2() {
+                    all.push(Isa::Avx2);
+                }
+                if crate::cpu::has_avx512() {
+                    all.push(Isa::Avx512);
+                }
+            }
+            assert_eq!(all.last(), Some(&Isa::detect()));
+            all
         }
     }
 

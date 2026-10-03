@@ -46,6 +46,8 @@ pub(crate) mod huffman;
 pub(crate) mod synth;
 #[cfg(target_arch = "x86_64")]
 mod synth_avx2;
+#[cfg(target_arch = "x86_64")]
+mod synth_avx512;
 pub(crate) mod tables;
 pub(crate) mod xll;
 #[cfg(target_arch = "x86_64")]
