@@ -88,6 +88,19 @@ const HEBAPTAB: [u8; 64] = [
     13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15, 16, 16, 16, 16, 17, 17, 17, 17, 18, 18, 18, 18,
     18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19,
 ];
+/// The bap tables as the words a gather reads.
+const BAPTAB_WIDE: [i32; 64] = widen(BAPTAB);
+const HEBAPTAB_WIDE: [i32; 64] = widen(HEBAPTAB);
+
+const fn widen(table: [u8; 64]) -> [i32; 64] {
+    let mut wide = [0i32; 64];
+    let mut i = 0;
+    while i < 64 {
+        wide[i] = table[i] as i32;
+        i += 1;
+    }
+    wide
+}
 const INT24_MAX: f32 = ((1 << 23) - 1) as f32;
 const FROM_INT24: f32 = 1.0 / INT24_MAX;
 const FROM_INT32: f32 = 1.0 / i32::MAX as f32;
@@ -199,6 +212,9 @@ pub(crate) struct AllocationState {
     bap: Vec<u8>,
     excite: Vec<i32>,
     mask: Vec<i32>,
+    /// Each bin's masking threshold, its band's spread out, while `bap` is
+    /// computed from it.
+    threshold: Vec<i32>,
     grouped_scratch: Vec<i32>,
     /// The arguments `bap` was last computed from, while the exponents it was
     /// computed from are still the current ones. `allocate` is a pure function
@@ -280,6 +296,7 @@ impl AllocationState {
             bap: vec![0; MAX_ALLOCATION_SIZE],
             excite: vec![0; MASK_BANDS],
             mask: vec![0; MASK_BANDS],
+            threshold: vec![0; MAX_ALLOCATION_SIZE],
             grouped_scratch: Vec::new(),
             allocated_with: None,
             mantissa_counts: None,
@@ -439,11 +456,12 @@ impl AllocationState {
 
         // The tables as arrays of their own: through `self` every store
         // would have the compiler fetch each `Vec`'s pointer again.
-        let (Ok(psd), Ok(integrated_psd), Ok(excite), Ok(mask), Ok(bap)) = (
+        let (Ok(psd), Ok(integrated_psd), Ok(excite), Ok(mask), Ok(threshold), Ok(bap)) = (
             <&[i32; MAX_ALLOCATION_SIZE]>::try_from(&self.psd[..]),
             <&[i32; MASK_BANDS]>::try_from(&self.integrated_psd[..]),
             <&mut [i32; MASK_BANDS]>::try_from(&mut self.excite[..]),
             <&mut [i32; MASK_BANDS]>::try_from(&mut self.mask[..]),
+            <&mut [i32; MAX_ALLOCATION_SIZE]>::try_from(&mut self.threshold[..]),
             <&mut [u8; MAX_ALLOCATION_SIZE]>::try_from(&mut self.bap[..]),
         ) else {
             return Ok(());
@@ -550,7 +568,8 @@ impl AllocationState {
             return Ok(());
         }
 
-        let bap_tab: &[u8; 64] = if aht { &HEBAPTAB } else { &BAPTAB };
+        // The band's threshold spread over its bins, so the lookup after it
+        // is one loop over the bins with nothing per band in it.
         let mut bin = start;
         let mut band = bnd_start;
         loop {
@@ -560,17 +579,22 @@ impl AllocationState {
                 masked = 0;
             }
             masked = (masked & 0x1fe0) + floor;
-            while bin < last_bin {
-                let address = ((psd[bin] - masked) >> 5).clamp(0, 63) as usize;
-                bap[bin] = bap_tab[address];
-                bin += 1;
+            for threshold in &mut threshold[bin..last_bin] {
+                *threshold = masked;
             }
+            bin = last_bin;
             band += 1;
             if end <= last_bin {
                 break;
             }
         }
-        bap[bin..].fill(0);
+        bap_from_psd(
+            &psd[start..end],
+            &threshold[start..end],
+            &mut bap[start..end],
+            if aht { &HEBAPTAB_WIDE } else { &BAPTAB_WIDE },
+        );
+        bap[end..].fill(0);
         self.allocated_with = Some(args);
         Ok(())
     }
@@ -941,6 +965,74 @@ impl AllocationState {
 
         Ok(())
     }
+}
+
+/// The `bap` of each bin from its PSD and its band's masking threshold:
+/// `table[((psd - threshold) >> 5) clamped to 0..=63]`.
+fn bap_from_psd(psd: &[i32], threshold: &[i32], bap: &mut [u8], table: &[i32; 64]) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the CPU has AVX2, just checked.
+        unsafe { bap_from_psd_avx2(psd, threshold, bap, table) };
+        return;
+    }
+    bap_from_psd_scalar(psd, threshold, bap, table);
+}
+
+fn bap_from_psd_scalar(psd: &[i32], threshold: &[i32], bap: &mut [u8], table: &[i32; 64]) {
+    for ((bap, &psd), &threshold) in bap.iter_mut().zip(psd).zip(threshold) {
+        let address = ((psd - threshold) >> 5).clamp(0, 63) as usize;
+        *bap = table[address] as u8;
+    }
+}
+
+/// [`bap_from_psd_scalar`] eight bins at a time: the addresses in a vector,
+/// the table read with a gather, the bins left over to the scalar loop.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bap_from_psd_avx2(psd: &[i32], threshold: &[i32], bap: &mut [u8], table: &[i32; 64]) {
+    use std::arch::x86_64::*;
+
+    let bins = bap.len().min(psd.len()).min(threshold.len());
+    let whole = bins - bins % 8;
+    let zero = _mm256_setzero_si256();
+    let top = _mm256_set1_epi32(63);
+    for at in (0..whole).step_by(8) {
+        // SAFETY: `at + 8 <= bins`, within every slice; the gather's indices
+        // are clamped to the table's 64 entries.
+        unsafe {
+            let psd = _mm256_loadu_si256(psd.as_ptr().add(at).cast());
+            let threshold = _mm256_loadu_si256(threshold.as_ptr().add(at).cast());
+            let address = _mm256_srai_epi32::<5>(_mm256_sub_epi32(psd, threshold));
+            let address = _mm256_min_epi32(_mm256_max_epi32(address, zero), top);
+            let values = _mm256_i32gather_epi32::<4>(table.as_ptr(), address);
+            // Each lane's low byte to the front of its 128-bit half, then
+            // the two halves' four bytes stored one after the other.
+            let bytes = _mm256_shuffle_epi8(
+                values,
+                _mm256_setr_epi8(
+                    0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 4, 8, 12, -1,
+                    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                ),
+            );
+            let low = _mm_cvtsi128_si32(_mm256_castsi256_si128(bytes));
+            let high = _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(bytes));
+            bap.as_mut_ptr()
+                .add(at)
+                .cast::<[u8; 4]>()
+                .write_unaligned(low.to_le_bytes());
+            bap.as_mut_ptr()
+                .add(at + 4)
+                .cast::<[u8; 4]>()
+                .write_unaligned(high.to_le_bytes());
+        }
+    }
+    bap_from_psd_scalar(
+        &psd[whole..bins],
+        &threshold[whole..bins],
+        &mut bap[whole..bins],
+        table,
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1497,6 +1589,43 @@ const EXPONENT_GROUP_DELTAS: [[i32; 3]; 128] = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The vector lookup gives the scalar one's `bap` for every table, bin
+    /// count and address, in and out of the table's range.
+    #[test]
+    fn bap_lookup_builds_agree() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for table in [&BAPTAB_WIDE, &HEBAPTAB_WIDE] {
+            for bins in [0usize, 1, 7, 8, 9, 15, 16, 100, 253, 256] {
+                let psd: Vec<i32> = (0..bins).map(|_| (next() % 6144) as i32 - 1024).collect();
+                let threshold: Vec<i32> =
+                    (0..bins).map(|_| (next() % 6144) as i32 - 1024).collect();
+                let mut scalar = vec![0xffu8; bins];
+                let mut dispatched = vec![0xffu8; bins];
+                bap_from_psd_scalar(&psd, &threshold, &mut scalar, table);
+                bap_from_psd(&psd, &threshold, &mut dispatched, table);
+                assert_eq!(scalar, dispatched, "{bins} bins");
+                #[cfg(target_arch = "x86_64")]
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    let mut avx2 = vec![0xffu8; bins];
+                    unsafe { bap_from_psd_avx2(&psd, &threshold, &mut avx2, table) };
+                    assert_eq!(scalar, avx2, "{bins} bins, AVX2");
+                }
+            }
+        }
+        // Every address of the table, once each, through the vector path.
+        let psd: Vec<i32> = (0..64).map(|address| (address << 5) + 7).collect();
+        let threshold = vec![0i32; 64];
+        let mut bap = vec![0u8; 64];
+        bap_from_psd(&psd, &threshold, &mut bap, &BAPTAB_WIDE);
+        assert_eq!(bap, BAPTAB);
+    }
 
     fn generate_quantization(levels: i32) -> Vec<i32> {
         let mut result = vec![0; levels as usize + 1];
