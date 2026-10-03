@@ -66,12 +66,12 @@ const IDCT6_COEFF_2: i64 = 3070444;
 
 /// 6-point IDCT over one bin's pre-mantissas, 24-bit fixed point
 /// (FFmpeg `idct6`).
-fn idct6(pre_mant: &mut [i32; 6]) {
+const fn idct6(pre_mant: &mut [i32; 6]) {
     let odd1 = pre_mant[1] - pre_mant[3] - pre_mant[5];
 
-    let scaled2 = ((i64::from(pre_mant[2]) * IDCT6_COEFF_0) >> 23) as i32;
-    let scaled4 = ((i64::from(pre_mant[4]) * IDCT6_COEFF_1) >> 23) as i32;
-    let scaled15 = ((i64::from(pre_mant[1] + pre_mant[5]) * IDCT6_COEFF_2) >> 23) as i32;
+    let scaled2 = (((pre_mant[2] as i64) * IDCT6_COEFF_0) >> 23) as i32;
+    let scaled4 = (((pre_mant[4] as i64) * IDCT6_COEFF_1) >> 23) as i32;
+    let scaled15 = ((((pre_mant[1] + pre_mant[5]) as i64) * IDCT6_COEFF_2) >> 23) as i32;
 
     let base = pre_mant[0] + (scaled4 >> 1);
     let even1 = pre_mant[0] - scaled4;
@@ -89,15 +89,40 @@ fn idct6(pre_mant: &mut [i32; 6]) {
     pre_mant[5] = even0 - odd0;
 }
 
-fn vq_row(hebap: usize, code: usize) -> Option<&'static [i16; 6]> {
+// A VQ index already determines all six blocks, so its inverse transform
+// can be shared by every frame instead of recomputed for each coded bin.
+const fn transformed<const N: usize>(table: &[[i16; 6]; N]) -> [[i32; 6]; N] {
+    let mut out = [[0; 6]; N];
+    let mut row = 0;
+    while row < N {
+        let mut column = 0;
+        while column < 6 {
+            out[row][column] = (table[row][column] as i32) << 8;
+            column += 1;
+        }
+        idct6(&mut out[row]);
+        row += 1;
+    }
+    out
+}
+
+static IDCT_VQ_1: [[i32; 6]; 4] = transformed(&VQ_HEBAP1);
+static IDCT_VQ_2: [[i32; 6]; 8] = transformed(&VQ_HEBAP2);
+static IDCT_VQ_3: [[i32; 6]; 16] = transformed(&VQ_HEBAP3);
+static IDCT_VQ_4: [[i32; 6]; 32] = transformed(&VQ_HEBAP4);
+static IDCT_VQ_5: [[i32; 6]; 128] = transformed(&VQ_HEBAP5);
+static IDCT_VQ_6: [[i32; 6]; 256] = transformed(&VQ_HEBAP6);
+static IDCT_VQ_7: [[i32; 6]; 512] = transformed(&VQ_HEBAP7);
+
+fn vq_row(hebap: usize, code: usize) -> Option<&'static [i32; 6]> {
     match hebap {
-        1 => VQ_HEBAP1.get(code),
-        2 => VQ_HEBAP2.get(code),
-        3 => VQ_HEBAP3.get(code),
-        4 => VQ_HEBAP4.get(code),
-        5 => VQ_HEBAP5.get(code),
-        6 => VQ_HEBAP6.get(code),
-        7 => VQ_HEBAP7.get(code),
+        1 => IDCT_VQ_1.get(code),
+        2 => IDCT_VQ_2.get(code),
+        3 => IDCT_VQ_3.get(code),
+        4 => IDCT_VQ_4.get(code),
+        5 => IDCT_VQ_5.get(code),
+        6 => IDCT_VQ_6.get(code),
+        7 => IDCT_VQ_7.get(code),
         _ => None,
     }
 }
@@ -188,16 +213,13 @@ pub(super) fn decode_pre_mantissas(
             // here; this decoder deliberately leaves them silent (see the
             // non-AHT bap==0 path).
             *pre = [0; 6];
-            continue;
         } else if bap < 8 {
             // Vector quantization: one codebook index covers all six blocks.
             let code = fields.take(bits) as usize;
             let Some(row) = vq_row(bap, code) else {
                 return Err(ParseError::InvalidHeader("aht-vq"));
             };
-            for (slot, &value) in pre.iter_mut().zip(row) {
-                *slot = i32::from(value) << 8;
-            }
+            *pre = *row;
         } else {
             // Gain-adaptive quantization. `log_gain` is non-zero only for
             // `hebap < end_bap` (<= 16), which is what keeps the `hebap - 8`
@@ -240,8 +262,8 @@ pub(super) fn decode_pre_mantissas(
                 }
                 *slot = mant;
             }
+            idct6(pre);
         }
-        idct6(pre);
     }
 
     if fields.position > reader.limit_bits() {
@@ -1259,6 +1281,33 @@ pub(super) const VQ_HEBAP7: [[i16; 6]; 512] = [
 mod tests {
     use super::*;
 
+    fn raw_vq_row(hebap: usize, code: usize) -> Option<&'static [i16; 6]> {
+        match hebap {
+            1 => VQ_HEBAP1.get(code),
+            2 => VQ_HEBAP2.get(code),
+            3 => VQ_HEBAP3.get(code),
+            4 => VQ_HEBAP4.get(code),
+            5 => VQ_HEBAP5.get(code),
+            6 => VQ_HEBAP6.get(code),
+            7 => VQ_HEBAP7.get(code),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn every_precomputed_vq_row_matches_runtime_idct() {
+        let mut checked = 0;
+        for (bap, &bits) in BITS_VS_HEBAP.iter().enumerate().take(8).skip(1) {
+            for code in 0..1 << bits {
+                let mut expected = raw_vq_row(bap, code).unwrap().map(|v| i32::from(v) << 8);
+                idct6(&mut expected);
+                assert_eq!(vq_row(bap, code), Some(&expected), "bap={bap}, code={code}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 956);
+    }
+
     /// The decode as it was first written: every field through the reader,
     /// checked one by one.
     fn decode_pre_mantissas_checked(
@@ -1338,7 +1387,7 @@ mod tests {
             } else if bap < 8 {
                 // Vector quantization: one codebook index covers all six blocks.
                 let code = reader.read_bits(bits).ok_or(ParseError::ShortPacket)? as usize;
-                let Some(row) = vq_row(bap, code) else {
+                let Some(row) = raw_vq_row(bap, code) else {
                     return Err(ParseError::InvalidHeader("aht-vq"));
                 };
                 for (slot, &value) in pre.iter_mut().zip(row) {
