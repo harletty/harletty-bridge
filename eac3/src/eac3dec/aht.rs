@@ -213,7 +213,6 @@ pub(super) fn decode_pre_mantissas(
             // here; this decoder deliberately leaves them silent (see the
             // non-AHT bap==0 path).
             *pre = [0; 6];
-            continue;
         } else if bap < 8 {
             // Vector quantization: one codebook index covers all six blocks.
             let code = fields.take(bits) as usize;
@@ -221,7 +220,6 @@ pub(super) fn decode_pre_mantissas(
                 return Err(ParseError::InvalidHeader("aht-vq"));
             };
             *pre = *row;
-            continue;
         } else {
             // Gain-adaptive quantization. `log_gain` is non-zero only for
             // `hebap < end_bap` (<= 16), which is what keeps the `hebap - 8`
@@ -264,8 +262,8 @@ pub(super) fn decode_pre_mantissas(
                 }
                 *slot = mant;
             }
+            idct6(pre);
         }
-        idct6(pre);
     }
 
     if fields.position > reader.limit_bits() {
@@ -1294,6 +1292,20 @@ mod tests {
             7 => VQ_HEBAP7.get(code),
             _ => None,
         }
+    }
+
+    #[test]
+    fn every_precomputed_vq_row_matches_runtime_idct() {
+        let mut checked = 0;
+        for (bap, &bits) in BITS_VS_HEBAP.iter().enumerate().take(8).skip(1) {
+            for code in 0..1 << bits {
+                let mut expected = raw_vq_row(bap, code).unwrap().map(|v| i32::from(v) << 8);
+                idct6(&mut expected);
+                assert_eq!(vq_row(bap, code), Some(&expected), "bap={bap}, code={code}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 956);
     }
 
     /// The decode as it was first written: every field through the reader,
