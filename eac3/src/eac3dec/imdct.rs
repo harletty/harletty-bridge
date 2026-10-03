@@ -130,7 +130,10 @@ fn imdct_fft_cache() -> &'static ImdctFftCache {
 #[cfg(target_arch = "x86_64")]
 use sse as kernel;
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+use neon as kernel;
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 use scalar as kernel;
 
 #[cfg(target_arch = "x86_64")]
@@ -325,9 +328,194 @@ mod sse {
     }
 }
 
+/// The SSE kernels in NEON, which every aarch64 has. Multiplies and adds are
+/// kept apart, as they are there and in the scalar kernels: a fused
+/// multiply-add would round once where those round twice.
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use std::arch::aarch64::*;
+
+    use super::{Complex32, Rotation, WINDOW, WINDOW_BACKWARDS};
+
+    /// Four lanes, last first.
+    #[inline(always)]
+    unsafe fn backwards(lanes: float32x4_t) -> float32x4_t {
+        unsafe {
+            let swapped = vrev64q_f32(lanes);
+            vextq_f32::<2>(swapped, swapped)
+        }
+    }
+
+    /// Bin `k` pairs the coefficient `2k` with `255 - 2k`.
+    pub(super) fn pre_rotate_512(
+        coeffs: &[f32; 256],
+        x: &Rotation<128, 64>,
+        z: &mut [Complex32; 128],
+    ) {
+        let coeffs = coeffs.as_ptr();
+        let z = z.as_mut_ptr().cast::<f32>();
+        for k in (0..128).step_by(4) {
+            // SAFETY: `2k + 8 <= 256` and `248 - 2k >= 0` bound the reads of
+            // `coeffs`, `k + 4 <= 128` those of `x` and the writes of `z`,
+            // whose `Complex32` is two `f32` in a row.
+            unsafe {
+                let im = vld2q_f32(coeffs.add(2 * k)).0;
+                let re = backwards(vld2q_f32(coeffs.add(248 - 2 * k)).1);
+                let x_re = vld1q_f32(x.re.as_ptr().add(k));
+                let x_im = vld1q_f32(x.im.as_ptr().add(k));
+                let out_re = vsubq_f32(vmulq_f32(re, x_re), vmulq_f32(im, x_im));
+                let out_im = vaddq_f32(vmulq_f32(re, x_im), vmulq_f32(im, x_re));
+                vst2q_f32(z.add(2 * k), float32x4x2_t(out_re, out_im));
+            }
+        }
+    }
+
+    /// Four bins from `at` on as their real and their imaginary parts.
+    ///
+    /// SAFETY: `at + 4` bins must be readable from `z`.
+    #[inline(always)]
+    unsafe fn split(z: *const f32, at: usize) -> (float32x4_t, float32x4_t) {
+        unsafe {
+            let bins = vld2q_f32(z.add(2 * at));
+            (bins.0, bins.1)
+        }
+    }
+
+    /// [`split`], last bin first.
+    ///
+    /// SAFETY: `at + 4` bins must be readable from `z`.
+    #[inline(always)]
+    unsafe fn split_backwards(z: *const f32, at: usize) -> (float32x4_t, float32x4_t) {
+        unsafe {
+            let bins = vld2q_f32(z.add(2 * at));
+            (backwards(bins.0), backwards(bins.1))
+        }
+    }
+
+    /// Window four values of `first` against the delay, write the samples at
+    /// `at` and mirrored from `255 - at`, and keep `second`.
+    ///
+    /// SAFETY: `at + 4 <= 128`.
+    #[inline(always)]
+    unsafe fn overlap_add(
+        delay: *mut f32,
+        output: *mut f32,
+        first: float32x4_t,
+        second: float32x4_t,
+        at: usize,
+    ) {
+        unsafe {
+            let delayed = vld1q_f32(delay.add(at));
+            let rising = vld1q_f32(WINDOW.as_ptr().add(at));
+            let falling = vld1q_f32(WINDOW_BACKWARDS.as_ptr().add(at));
+            let head = vaddq_f32(vmulq_f32(first, rising), vmulq_f32(delayed, falling));
+            let tail = vsubq_f32(vmulq_f32(delayed, rising), vmulq_f32(first, falling));
+            vst1q_f32(output.add(at), vaddq_f32(head, head));
+            vst1q_f32(output.add(252 - at), backwards(vaddq_f32(tail, tail)));
+            vst1q_f32(delay.add(at), second);
+        }
+    }
+
+    /// The even samples come from bins 64.. and the odd ones from bins ..64
+    /// read backwards.
+    pub(super) fn fold_512(
+        z: &[Complex32; 128],
+        x: &Rotation<128, 64>,
+        delay: &mut [f32; 128],
+        output: &mut [f32; 256],
+    ) {
+        let z = z.as_ptr().cast::<f32>();
+        let delay = delay.as_mut_ptr();
+        let output = output.as_mut_ptr();
+        // SAFETY: with `i + 4 <= 64`, the bins read are below 128, the
+        // factors below their 128 and 64, and `overlap_add` gets `2i + 8 <=
+        // 128`.
+        unsafe {
+            for i in (0..64).step_by(4) {
+                let (re, im) = split(z, 64 + i);
+                let x_re = vld1q_f32(x.re.as_ptr().add(64 + i));
+                let x_im = vld1q_f32(x.im.as_ptr().add(64 + i));
+                let high_re = vsubq_f32(vmulq_f32(re, x_re), vmulq_f32(im, x_im));
+                let high_im = vaddq_f32(vmulq_f32(re, x_im), vmulq_f32(im, x_re));
+                let (re, im) = split_backwards(z, 60 - i);
+                let x_re = vld1q_f32(x.re_backwards.as_ptr().add(i));
+                let x_im = vld1q_f32(x.im_backwards.as_ptr().add(i));
+                let low_re = vsubq_f32(vmulq_f32(re, x_re), vmulq_f32(im, x_im));
+                let low_im = vaddq_f32(vmulq_f32(re, x_im), vmulq_f32(im, x_re));
+                let first_even = vnegq_f32(high_im);
+                let second_even = vnegq_f32(high_re);
+                overlap_add(
+                    delay,
+                    output,
+                    vzip1q_f32(first_even, low_re),
+                    vzip1q_f32(second_even, low_im),
+                    2 * i,
+                );
+                overlap_add(
+                    delay,
+                    output,
+                    vzip2q_f32(first_even, low_re),
+                    vzip2q_f32(second_even, low_im),
+                    2 * i + 4,
+                );
+            }
+        }
+    }
+
+    /// The first transform gives the half that overlaps the previous block,
+    /// the second the half kept for the next. Only one part of each rotated
+    /// bin is a sample.
+    pub(super) fn fold_256(
+        a: &[Complex32; 64],
+        b: &[Complex32; 64],
+        x: &Rotation<64, 64>,
+        delay: &mut [f32; 128],
+        output: &mut [f32; 256],
+    ) {
+        let a = a.as_ptr().cast::<f32>();
+        let b = b.as_ptr().cast::<f32>();
+        let delay = delay.as_mut_ptr();
+        let output = output.as_mut_ptr();
+        // SAFETY: with `i + 4 <= 64`, the bins and the factors read are
+        // below 64, and `overlap_add` gets `2i + 8 <= 128`.
+        unsafe {
+            for i in (0..64).step_by(4) {
+                let x_re = vld1q_f32(x.re.as_ptr().add(i));
+                let x_im = vld1q_f32(x.im.as_ptr().add(i));
+                let x_re_back = vld1q_f32(x.re_backwards.as_ptr().add(i));
+                let x_im_back = vld1q_f32(x.im_backwards.as_ptr().add(i));
+                let (re, im) = split(a, i);
+                let a_im = vaddq_f32(vmulq_f32(re, x_im), vmulq_f32(im, x_re));
+                let (re, im) = split_backwards(a, 60 - i);
+                let a_re = vsubq_f32(vmulq_f32(re, x_re_back), vmulq_f32(im, x_im_back));
+                let (re, im) = split(b, i);
+                let b_re = vsubq_f32(vmulq_f32(re, x_re), vmulq_f32(im, x_im));
+                let (re, im) = split_backwards(b, 60 - i);
+                let b_im = vaddq_f32(vmulq_f32(re, x_im_back), vmulq_f32(im, x_re_back));
+                let first_even = vnegq_f32(a_im);
+                let second_even = vnegq_f32(b_re);
+                overlap_add(
+                    delay,
+                    output,
+                    vzip1q_f32(first_even, a_re),
+                    vzip1q_f32(second_even, b_im),
+                    2 * i,
+                );
+                overlap_add(
+                    delay,
+                    output,
+                    vzip2q_f32(first_even, a_re),
+                    vzip2q_f32(second_even, b_im),
+                    2 * i + 4,
+                );
+            }
+        }
+    }
+}
+
 /// The same arithmetic one bin at a time, where there is no vector version;
-/// what the tests hold the vector version to.
-#[cfg(any(test, not(target_arch = "x86_64")))]
+/// what the tests hold the vector versions to.
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
 mod scalar {
     use super::{Complex32, Rotation, WINDOW, WINDOW_BACKWARDS};
 
@@ -500,10 +688,10 @@ mod tests {
 
     /// The vector kernels do the scalar ones' arithmetic: same bits out, for
     /// the samples and for what is kept for the next block.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn vector_kernels_match_the_scalar_ones_bit_for_bit() {
-        use super::{scalar, sse, tables};
+        use super::{kernel, scalar, tables};
 
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut next = move || {
@@ -518,27 +706,27 @@ mod tests {
         for _ in 0..16 {
             let coeffs: [f32; 256] = std::array::from_fn(|_| next());
             let mut z_scalar = [Complex32::new(0.0, 0.0); 128];
-            let mut z_sse = z_scalar;
+            let mut z_vector = z_scalar;
             scalar::pre_rotate_512(&coeffs, &tables.long, &mut z_scalar);
-            sse::pre_rotate_512(&coeffs, &tables.long, &mut z_sse);
-            assert_eq!(z_scalar, z_sse);
+            kernel::pre_rotate_512(&coeffs, &tables.long, &mut z_vector);
+            assert_eq!(z_scalar, z_vector);
 
             let z: [Complex32; 128] = std::array::from_fn(|_| Complex32::new(next(), next()));
             let delay: [f32; 128] = std::array::from_fn(|_| next());
-            let (mut delay_scalar, mut delay_sse) = (delay, delay);
-            let (mut out_scalar, mut out_sse) = ([0.0f32; 256], [0.0f32; 256]);
+            let (mut delay_scalar, mut delay_vector) = (delay, delay);
+            let (mut out_scalar, mut out_vector) = ([0.0f32; 256], [0.0f32; 256]);
             scalar::fold_512(&z, &tables.long, &mut delay_scalar, &mut out_scalar);
-            sse::fold_512(&z, &tables.long, &mut delay_sse, &mut out_sse);
-            assert_eq!(bits(&out_scalar), bits(&out_sse));
-            assert_eq!(bits(&delay_scalar), bits(&delay_sse));
+            kernel::fold_512(&z, &tables.long, &mut delay_vector, &mut out_vector);
+            assert_eq!(bits(&out_scalar), bits(&out_vector));
+            assert_eq!(bits(&delay_scalar), bits(&delay_vector));
 
             let a: [Complex32; 64] = std::array::from_fn(|_| Complex32::new(next(), next()));
             let b: [Complex32; 64] = std::array::from_fn(|_| Complex32::new(next(), next()));
-            let (mut delay_scalar, mut delay_sse) = (delay, delay);
+            let (mut delay_scalar, mut delay_vector) = (delay, delay);
             scalar::fold_256(&a, &b, &tables.short, &mut delay_scalar, &mut out_scalar);
-            sse::fold_256(&a, &b, &tables.short, &mut delay_sse, &mut out_sse);
-            assert_eq!(bits(&out_scalar), bits(&out_sse));
-            assert_eq!(bits(&delay_scalar), bits(&delay_sse));
+            kernel::fold_256(&a, &b, &tables.short, &mut delay_vector, &mut out_vector);
+            assert_eq!(bits(&out_scalar), bits(&out_vector));
+            assert_eq!(bits(&delay_scalar), bits(&delay_vector));
         }
     }
 
