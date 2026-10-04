@@ -48,3 +48,6 @@ iamf-codecs = { git = "https://github.com/harletty/iamf-rs", rev = "1f841d2cc7ee
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1.0.142"

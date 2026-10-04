@@ -6,15 +6,23 @@
  * file into memory, feeds the codec's parser 64 KiB chunks and times parsing
  * plus decoding on one thread: no demuxer, no output, no ffmpeg CLI threads.
  *
+ * IAMF has no parser: `iamf` instead runs libavformat's IAMF demuxer over
+ * the in-memory stream and decodes every substream with its own decoder,
+ * one after the other on the same thread. FFmpeg renders no mix, so this is
+ * the substreams' codec cost alone — framing, OBU parsing, decoding — not a
+ * render to a layout.
+ *
  * Build (the script does this):
  *   cc -O2 -o ffmpeg_decode_bench ffmpeg_decode_bench.c \
- *       $(pkg-config --cflags --libs libavcodec libavutil)
+ *       $(pkg-config --cflags --libs libavformat libavcodec libavutil)
  *
  * Usage:
  *   ffmpeg_decode_bench <decoder> <iterations> <input> [opt=value ...]
  *
- *   decoder   a libavcodec decoder name: truehd, ac3, eac3, dca
- *   opt=value decoder private options, e.g. drc_scale=0 or core_only=1
+ *   decoder   a libavcodec decoder name: truehd, ac3, eac3, dca; or iamf
+ *   opt=value decoder private options, e.g. drc_scale=0 or core_only=1;
+ *             for iamf, opus=libopus decodes Opus with libopus instead of
+ *             FFmpeg's own decoder
  *
  * Prints one JSON object on stdout.
  */
@@ -26,6 +34,8 @@
 #include <time.h>
 
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavformat/avio.h>
 #include <libavutil/avutil.h>
 #include <libavutil/dict.h>
 #include <libavutil/log.h>
@@ -116,6 +126,117 @@ static Tally pass(const AVCodec *codec, const AVDictionary *opts,
     return t;
 }
 
+/* An in-memory stream for libavformat. */
+typedef struct Mem {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+} Mem;
+
+static int mem_read(void *opaque, uint8_t *buf, int buf_size)
+{
+    Mem *m = opaque;
+    size_t left = m->size - m->pos;
+    if (!left)
+        return AVERROR_EOF;
+    size_t n = left < (size_t)buf_size ? left : (size_t)buf_size;
+    memcpy(buf, m->data + m->pos, n);
+    m->pos += n;
+    return (int)n;
+}
+
+static int64_t mem_seek(void *opaque, int64_t offset, int whence)
+{
+    Mem *m = opaque;
+    int64_t base;
+    switch (whence & ~AVSEEK_FORCE) {
+    case SEEK_SET: base = 0; break;
+    case SEEK_CUR: base = (int64_t)m->pos; break;
+    case SEEK_END: base = (int64_t)m->size; break;
+    case AVSEEK_SIZE: return (int64_t)m->size;
+    default: return -1;
+    }
+    if (base + offset < 0 || base + offset > (int64_t)m->size)
+        return -1;
+    m->pos = (size_t)(base + offset);
+    return (int64_t)m->pos;
+}
+
+#define MAX_SUBSTREAMS 64
+
+/* Demux an IAMF stream and decode every substream. The tally's frames and
+ * samples are the first substream's (every substream spans the same
+ * timeline); its channels are summed over the substreams. */
+static Tally pass_iamf(const AVDictionary *opts, const uint8_t *data, size_t size)
+{
+    Tally t = {0};
+    Mem mem = {data, size, 0};
+    uint8_t *io_buf = av_malloc(CHUNK);
+    AVIOContext *io = avio_alloc_context(io_buf, CHUNK, 0, &mem, mem_read, NULL, mem_seek);
+    AVFormatContext *fmt = avformat_alloc_context();
+    if (!io || !fmt) {
+        fprintf(stderr, "out of memory\n");
+        exit(70);
+    }
+    fmt->pb = io;
+    if (avformat_open_input(&fmt, NULL, av_find_input_format("iamf"), NULL) < 0) {
+        fprintf(stderr, "libavformat cannot open this IAMF stream\n");
+        exit(70);
+    }
+    const AVDictionaryEntry *opus = av_dict_get(opts, "opus", NULL, 0);
+    unsigned n = fmt->nb_streams;
+    if (n == 0 || n > MAX_SUBSTREAMS) {
+        fprintf(stderr, "%u substreams\n", n);
+        exit(70);
+    }
+    AVCodecContext *ctx[MAX_SUBSTREAMS];
+    Tally sub[MAX_SUBSTREAMS] = {{0}};
+    for (unsigned i = 0; i < n; i++) {
+        const AVCodecParameters *par = fmt->streams[i]->codecpar;
+        const AVCodec *codec = par->codec_id == AV_CODEC_ID_OPUS && opus
+                                   ? avcodec_find_decoder_by_name(opus->value)
+                                   : avcodec_find_decoder(par->codec_id);
+        ctx[i] = codec ? avcodec_alloc_context3(codec) : NULL;
+        if (!ctx[i] || avcodec_parameters_to_context(ctx[i], par) < 0) {
+            fprintf(stderr, "no decoder for substream %u\n", i);
+            exit(70);
+        }
+        ctx[i]->thread_count = 1;
+        if (avcodec_open2(ctx[i], codec, NULL) < 0) {
+            fprintf(stderr, "cannot open decoder %s\n", codec->name);
+            exit(70);
+        }
+    }
+    AVPacket *pkt = av_packet_alloc();
+    AVFrame *frame = av_frame_alloc();
+    int ret;
+    while ((ret = av_read_frame(fmt, pkt)) >= 0) {
+        unsigned i = (unsigned)pkt->stream_index;
+        if (i < n)
+            send(ctx[i], pkt, frame, &sub[i]);
+        av_packet_unref(pkt);
+    }
+    if (ret != AVERROR_EOF)
+        t.errors++;
+    for (unsigned i = 0; i < n; i++) {
+        send(ctx[i], NULL, frame, &sub[i]);
+        t.channels += sub[i].channels;
+        t.errors += sub[i].errors;
+        avcodec_free_context(&ctx[i]);
+    }
+    t.frames = sub[0].frames;
+    t.samples = sub[0].samples;
+    t.sample_rate = sub[0].sample_rate;
+    t.sample_fmt = sub[0].sample_fmt;
+
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+    avformat_close_input(&fmt);
+    av_freep(&io->buffer);
+    avio_context_free(&io);
+    return t;
+}
+
 static double now_ms(void)
 {
     struct timespec ts;
@@ -143,8 +264,9 @@ int main(int argc, char **argv)
         return 64;
     }
 
-    const AVCodec *codec = avcodec_find_decoder_by_name(name);
-    if (!codec) {
+    int iamf = !strcmp(name, "iamf");
+    const AVCodec *codec = iamf ? NULL : avcodec_find_decoder_by_name(name);
+    if (!iamf && !codec) {
         fprintf(stderr, "no libavcodec decoder named %s\n", name);
         return 64;
     }
@@ -176,11 +298,11 @@ int main(int argc, char **argv)
     fclose(f);
 
     /* One untimed pass, as on the harletty side. */
-    Tally tally = pass(codec, opts, data, size);
+    Tally tally = iamf ? pass_iamf(opts, data, size) : pass(codec, opts, data, size);
     double *times = malloc(sizeof(double) * iterations);
     for (int i = 0; i < iterations; i++) {
         double start = now_ms();
-        Tally t = pass(codec, opts, data, size);
+        Tally t = iamf ? pass_iamf(opts, data, size) : pass(codec, opts, data, size);
         times[i] = now_ms() - start;
         if (t.frames != tally.frames || t.samples != tally.samples) {
             fprintf(stderr, "a pass decoded something else than the first\n");

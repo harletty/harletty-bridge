@@ -42,3 +42,10 @@ extern "C" fn create_bridge(strict: bool) -> FormatBridgeBox {
 extern "C" fn set_host_log_sink(sink: usize) {
     logging::register_host_log_sink(sink);
 }
+
+/// A bridge as the host gets one, for in-process callers linking the rlib —
+/// `examples/bridge_bench.rs` — rather than loading the library.
+#[doc(hidden)]
+pub fn new_bridge(strict: bool) -> FormatBridgeBox {
+    create_bridge(strict)
+}
