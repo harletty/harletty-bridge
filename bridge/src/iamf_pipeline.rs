@@ -3,9 +3,11 @@
 //! The host hands over the OBU stream in arbitrary chunks. The bridge frames
 //! complete OBUs itself, collects the descriptor OBUs that open an IA
 //! sequence, builds an iamf-rs [`StreamDecoder`] from them, and feeds it the
-//! temporal units that follow. Every mix is rendered to BS.2051 System J
-//! (7.1.4) and goes out as a labelled channel bed, which the renderer then
-//! places on the actual speakers like any other bed.
+//! temporal units that follow. Every mix is rendered to a bed — BS.2051
+//! System J (7.1.4), or IAMF's 9.1.6 when the mix carries channels 7.1.4
+//! has no speaker for (the ±60° wides, the top sides) — and goes out as a
+//! labelled channel bed, which the renderer then places on the actual
+//! speakers like any other bed.
 //!
 //! Framing the OBUs here rather than handing raw chunks to the decoder is what
 //! lets the bridge start mid-stream (everything before the first sequence
@@ -22,19 +24,18 @@ use iamf_codecs::DefaultFactory;
 use iamf_dec::layout::SoundSystem;
 use iamf_dec::position::ObjectPosition;
 use iamf_dec::presentation::Descriptors;
-use iamf_dec::stream::{DecodedObject, OutputSampleType, StreamDecoder, StreamSettings};
+use iamf_dec::stream::{
+    DecodedObject, MixSelection, OutputSampleType, StreamDecoder, StreamSettings,
+};
 use iamf_obu::descriptors::{AudioElementConfig, CodecId};
 
 use crate::bridge::AtmosBridge;
 use crate::frame_builders::float_to_pcm_i32;
 use crate::logging::panic_message;
 
-/// The layout every mix is rendered to.
-const OUTPUT_LAYOUT: SoundSystem = SoundSystem::J;
-
 /// System J in the decoder's IAMF channel order: L, R, C, LFE, Lss, Rss, Lrs,
 /// Rrs, Ltf, Rtf, Ltb, Rtb.
-const OUTPUT_LABELS: [RChannelLabel; 12] = [
+const BED_714_LABELS: [RChannelLabel; 12] = [
     RChannelLabel::L,
     RChannelLabel::R,
     RChannelLabel::C,
@@ -48,6 +49,132 @@ const OUTPUT_LABELS: [RChannelLabel; 12] = [
     RChannelLabel::Tbl,
     RChannelLabel::Tbr,
 ];
+
+/// IAMF's 9.1.6 in the decoder's IAMF channel order: FL, FR, FC, LFE, BL,
+/// BR, FLc, FRc, SiL, SiR, TpFL, TpFR, TpBL, TpBR, TpSiL, TpSiR. Its FL/FR
+/// are the wides (about ±60°) and its FLc/FRc the ±30° pair a 7.1.4 calls
+/// L/R, so they take the `Lw`/`Rw` and `L`/`R` labels.
+const BED_916_LABELS: [RChannelLabel; 16] = [
+    RChannelLabel::Lw,
+    RChannelLabel::Rw,
+    RChannelLabel::C,
+    RChannelLabel::LFE,
+    RChannelLabel::Lb,
+    RChannelLabel::Rb,
+    RChannelLabel::L,
+    RChannelLabel::R,
+    RChannelLabel::Ls,
+    RChannelLabel::Rs,
+    RChannelLabel::Tfl,
+    RChannelLabel::Tfr,
+    RChannelLabel::Tbl,
+    RChannelLabel::Tbr,
+    RChannelLabel::Tsl,
+    RChannelLabel::Tsr,
+];
+
+/// The bed a mix is rendered to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Bed {
+    /// BS.2051 System J, the default.
+    #[default]
+    Bed714,
+    /// IAMF's 9.1.6, for a mix with an element whose channels 7.1.4 has no
+    /// speaker for: see [`Bed::for_mix`].
+    Bed916,
+}
+
+impl Bed {
+    fn layout(self) -> SoundSystem {
+        match self {
+            Bed::Bed714 => SoundSystem::J,
+            Bed::Bed916 => SoundSystem::Ext916,
+        }
+    }
+
+    fn labels(self) -> &'static [RChannelLabel] {
+        match self {
+            Bed::Bed714 => &BED_714_LABELS,
+            Bed::Bed916 => &BED_916_LABELS,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Bed::Bed714 => "7.1.4",
+            Bed::Bed916 => "9.1.6",
+        }
+    }
+
+    /// The bed mix `mix_id` needs: 9.1.6 when one of its elements is in an
+    /// expanded layout carrying the ±60° wides or the top sides (9.1.6,
+    /// Stereo-F, Stereo-TpSi, Top-6ch, 10.2.9.3), which 7.1.4 would fold
+    /// between its neighbours; 7.1.4 otherwise, whatever the rest is
+    /// (ambisonics included), so that the common case keeps its bed.
+    fn for_mix(descriptors: &Descriptors, mix_id: u32) -> Bed {
+        let wide = descriptors
+            .mix_presentations
+            .iter()
+            .filter(|mix| mix.mix_presentation_id == mix_id)
+            .flat_map(|mix| &mix.sub_mixes)
+            .flat_map(|sub_mix| &sub_mix.elements)
+            .filter_map(|sub| {
+                descriptors
+                    .audio_elements
+                    .iter()
+                    .find(|element| element.audio_element_id == sub.audio_element_id)
+            })
+            .any(|element| match &element.config {
+                AudioElementConfig::ChannelBased { layers } => layers.first().is_some_and(|l| {
+                    l.loudspeaker_layout == 15
+                        && matches!(l.expanded_loudspeaker_layout, Some(8 | 9 | 11 | 12 | 13))
+                }),
+                _ => false,
+            });
+        if wide { Bed::Bed916 } else { Bed::Bed714 }
+    }
+
+    /// The nominal angles of the bed's channels, which BS.2051 states:
+    /// System J's main layer at 0°, ±30°, ±90° and ±135°, its upper layer
+    /// at ±45° and ±135°, 30° up; 9.1.6 (System H's layout less its centre
+    /// and bottom channels) adds the wides at ±60° and the top sides at
+    /// ±90°, 30° up.
+    pub(crate) fn declared_poses(self) -> RVec<RChannelPose> {
+        use RChannelLabel::*;
+        const BED_714: [(RChannelLabel, f32, f32); 11] = [
+            (C, 0.0, 0.0),
+            (L, -30.0, 0.0),
+            (R, 30.0, 0.0),
+            (Ls, -90.0, 0.0),
+            (Rs, 90.0, 0.0),
+            (Lb, -135.0, 0.0),
+            (Rb, 135.0, 0.0),
+            (Tfl, -45.0, 30.0),
+            (Tfr, 45.0, 30.0),
+            (Tbl, -135.0, 30.0),
+            (Tbr, 135.0, 30.0),
+        ];
+        const WIDES_AND_TOP_SIDES: [(RChannelLabel, f32, f32); 4] = [
+            (Lw, -60.0, 0.0),
+            (Rw, 60.0, 0.0),
+            (Tsl, -90.0, 30.0),
+            (Tsr, 90.0, 30.0),
+        ];
+        let extra: &[_] = match self {
+            Bed::Bed714 => &[],
+            Bed::Bed916 => &WIDES_AND_TOP_SIDES,
+        };
+        BED_714
+            .iter()
+            .chain(extra)
+            .map(|&(label, azimuth_deg, elevation_deg)| RChannelPose {
+                label,
+                azimuth_deg,
+                elevation_deg,
+            })
+            .collect()
+    }
+}
 
 /// Samples between two object positions: the IAMF decoder evaluates each
 /// object's animated position this often (5.3 ms at 48 kHz), and the
@@ -181,6 +308,8 @@ pub(crate) struct IamfState {
     pub(crate) frame_count: u64,
     /// Objects the selected mix hands out (IAMF v2.0), 0 for a bed only.
     num_objects: usize,
+    /// The bed the selected mix is rendered to.
+    bed: Bed,
     /// Absolute sample position of the next frame, for metadata events.
     sample_pos: u64,
     /// The temporal unit being pulled, interleaved: kept from one unit to
@@ -220,6 +349,11 @@ impl IamfState {
     /// The decoded mix has objects (IAMF v2.0).
     pub(crate) fn has_objects(&self) -> bool {
         self.decoder.is_some() && self.num_objects > 0
+    }
+
+    /// The bed's channel poses, as [`Bed::declared_poses`] states them.
+    pub(crate) fn declared_poses(&self) -> RVec<RChannelPose> {
+        self.bed.declared_poses()
     }
 
     /// `IAMF (Opus) ambisonics + stereo`, once a sequence decodes.
@@ -303,27 +437,39 @@ impl IamfState {
 
     /// Build the decoder from the collected descriptors.
     fn open_sequence(&mut self) -> Result<(), String> {
-        let mut settings = StreamSettings::default();
-        settings.layout = OUTPUT_LAYOUT;
-        settings.sample_type = Some(OutputSampleType::Int32LittleEndian);
-        // Objects are rendered by orender, not by the decoder.
-        settings.object_passthrough = true;
-        settings.object_position_interval = POSITION_INTERVAL;
-        let decoder =
+        let build = |bed: Bed, mix: MixSelection| {
+            let mut settings = StreamSettings::default();
+            settings.layout = bed.layout();
+            settings.mix_selection = mix;
+            settings.sample_type = Some(OutputSampleType::Int32LittleEndian);
+            // Objects are rendered by orender, not by the decoder.
+            settings.object_passthrough = true;
+            settings.object_position_interval = POSITION_INTERVAL;
             StreamDecoder::new_from_descriptors(&self.descriptors, settings, &DefaultFactory)
-                .map_err(|err| format!("iamf: cannot decode this sequence: {err}"))?;
+                .map_err(|err| format!("iamf: cannot decode this sequence: {err}"))
+        };
+        // The mix is chosen for a 7.1.4 playback, as it always was; only
+        // then is its bed chosen, and the decoder rebuilt for that same mix
+        // when it is not 7.1.4.
+        let mut decoder = build(Bed::Bed714, MixSelection::Auto)?;
         let (mix_id, _) = decoder.selected_mix();
+        let bed = Descriptors::collect(&self.descriptors)
+            .map_or(Bed::Bed714, |parsed| Bed::for_mix(&parsed, mix_id));
+        if bed != Bed::Bed714 {
+            decoder = build(bed, MixSelection::ById(mix_id))?;
+        }
         let description = describe(&self.descriptors);
         self.num_objects = decoder.num_objects();
         log::info!(
             "atmos-bridge: iamf sequence: {description}, mix {mix_id}: {} at {} Hz",
             match (decoder.has_rendered_elements(), self.num_objects) {
-                (true, 0) => "rendered to 7.1.4".to_owned(),
-                (true, n) => format!("7.1.4 bed + {n} object(s)"),
+                (true, 0) => format!("rendered to {}", bed.name()),
+                (true, n) => format!("{} bed + {n} object(s)", bed.name()),
                 (false, n) => format!("{n} object(s)"),
             },
             decoder.sample_rate()
         );
+        self.bed = bed;
         self.objects = ObjectState::default();
         self.description = Some(description);
         self.decoder = Some(SendDecoder(decoder));
@@ -368,11 +514,12 @@ impl IamfState {
         let Some(decoder) = self.decoder.as_mut().map(SendDecoder::get) else {
             return Ok(());
         };
+        let labels = self.bed.labels();
         let channels = decoder.num_output_channels();
-        if channels != OUTPUT_LABELS.len() {
+        if channels != labels.len() {
             return Err(format!(
                 "iamf: decoder renders {channels} channels, the bed has {}",
-                OUTPUT_LABELS.len()
+                labels.len()
             ));
         }
         let sample_rate = decoder.sample_rate();
@@ -385,7 +532,7 @@ impl IamfState {
             }
             // Left in the decoder, which reuses their buffers.
             let objects = decoder.objects();
-            let mut frame = build_frame(&self.unit, bed.then_some(channels), objects, sample_rate);
+            let mut frame = build_frame(&self.unit, bed.then_some(labels), objects, sample_rate);
             let first_object_channel = if bed { channels } else { 0 };
             frame.metadata = object_metadata(
                 objects,
@@ -433,13 +580,15 @@ fn bed_to_pcm_i32(sample: f32) -> i32 {
 }
 
 /// One temporal unit as a frame: the rendered bed (interleaved, when the
-/// mix has non-object elements), then one channel per object.
+/// mix has non-object elements, with its labels), then one channel per
+/// object.
 fn build_frame(
     unit: &[f32],
-    bed_channels: Option<usize>,
+    bed_labels: Option<&[RChannelLabel]>,
     objects: &[DecodedObject],
     sample_rate: u32,
 ) -> RDecodedFrame {
+    let bed_channels = bed_labels.map(<[RChannelLabel]>::len);
     let bed = bed_channels.unwrap_or(0);
     let sample_count = match bed_channels {
         Some(channels) => unit.len() / channels,
@@ -471,8 +620,8 @@ fn build_frame(
     }
     let pcm: RVec<i32> = pcm.into();
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(channels);
-    if bed_channels.is_some() {
-        channel_labels.extend(OUTPUT_LABELS.iter().copied());
+    if let Some(labels) = bed_labels {
+        channel_labels.extend(labels.iter().copied());
     }
     channel_labels.extend(std::iter::repeat_n(RChannelLabel::Object, objects.len()));
     RDecodedFrame {
@@ -723,33 +872,6 @@ fn ambisonics_name(channels: u8) -> String {
     format!("ambisonics {order}{suffix} order")
 }
 
-/// BS.2051 System J (4+7+0), the nominal angles of the bed the decoder
-/// renders: the main layer at 0°, ±30°, ±90° and ±135°, the upper layer at
-/// ±45° and ±135°, 30° up.
-pub(crate) fn declared_poses() -> RVec<RChannelPose> {
-    use RChannelLabel::*;
-    [
-        (C, 0.0, 0.0),
-        (L, -30.0, 0.0),
-        (R, 30.0, 0.0),
-        (Ls, -90.0, 0.0),
-        (Rs, 90.0, 0.0),
-        (Lb, -135.0, 0.0),
-        (Rb, 135.0, 0.0),
-        (Tfl, -45.0, 30.0),
-        (Tfr, 45.0, 30.0),
-        (Tbl, -135.0, 30.0),
-        (Tbr, 135.0, 30.0),
-    ]
-    .into_iter()
-    .map(|(label, azimuth_deg, elevation_deg)| RChannelPose {
-        label,
-        azimuth_deg,
-        elevation_deg,
-    })
-    .collect()
-}
-
 /// Raw-transport entry point: buffer `data`, decode what completes, and apply
 /// the pipeline's failure policy (strict mode surfaces and resets).
 pub(crate) fn push_iamf(bridge: &mut AtmosBridge, data: &[u8], result: &mut RPushResult) {
@@ -944,12 +1066,12 @@ mod tests {
         assert_eq!(bridge.source_label().as_str(), "IAMF (PCM) 7.1.4");
         assert_eq!(bridge.fixed_channel_poses().len(), 11);
         for frame in &frames {
-            assert_eq!(frame.channel_labels.as_slice(), OUTPUT_LABELS.as_slice());
+            assert_eq!(frame.channel_labels.as_slice(), BED_714_LABELS.as_slice());
             assert_eq!(frame.sampling_frequency, 48_000);
             assert!(frame.metadata.is_empty(), "a bed carries no metadata");
         }
         let (channels, expected) = read_wav_s16(&reference);
-        assert_eq!(usize::from(channels), OUTPUT_LABELS.len());
+        assert_eq!(usize::from(channels), BED_714_LABELS.len());
         assert_eq!(interleaved(&frames), expected);
     }
 
@@ -974,10 +1096,56 @@ mod tests {
         assert!(
             frames
                 .iter()
-                .all(|f| f.channel_labels.as_slice() == OUTPUT_LABELS.as_slice())
+                .all(|f| f.channel_labels.as_slice() == BED_714_LABELS.as_slice())
         );
         let ours = interleaved(&frames);
         let (_, expected) = read_wav_s16(&reference);
+        assert_eq!(ours.len(), expected.len());
+        // A matrix render, compared at the reference's 16 bits.
+        let max_diff = ours
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| ((a - b).abs() + 128) >> 8)
+            .max();
+        assert!(max_diff <= Some(1), "max diff {max_diff:?} (16-bit steps)");
+    }
+
+    #[test]
+    fn a_mix_with_wides_is_rendered_to_a_916_bed() {
+        // A 9.1.6 element beside a Stereo-F one (base-enhanced): 7.1.4 would
+        // fold the ±60° wides and the top sides between their neighbours,
+        // so the bed is 9.1.6; the mix declares 9.1.6 as its second layout.
+        let (Some(stream), Some(reference)) = (
+            vector("test_000609.iamf"),
+            vector("test_000609_rendered_id_42_sub_mix_0_layout_1.wav"),
+        ) else {
+            eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
+            return;
+        };
+        let mut bridge = AtmosBridge::new(false);
+        let frames = decode_raw(&mut bridge, &std::fs::read(stream).unwrap());
+        assert_eq!(
+            bridge.source_label().as_str(),
+            "IAMF (PCM) 9.1.6 + stereo-F"
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.channel_labels.as_slice() == BED_916_LABELS.as_slice())
+        );
+        let poses = bridge.fixed_channel_poses();
+        assert_eq!(poses.len(), 15, "every channel but the LFE");
+        let pose = |label| {
+            let p = poses.iter().find(|p| p.label == label).unwrap();
+            (p.azimuth_deg, p.elevation_deg)
+        };
+        assert_eq!(pose(RChannelLabel::L), (-30.0, 0.0));
+        assert_eq!(pose(RChannelLabel::Lw), (-60.0, 0.0));
+        assert_eq!(pose(RChannelLabel::Tsr), (90.0, 30.0));
+
+        let (channels, expected) = read_wav_s16(&reference);
+        assert_eq!(usize::from(channels), BED_916_LABELS.len());
+        let ours = interleaved(&frames);
         assert_eq!(ours.len(), expected.len());
         // A matrix render, compared at the reference's 16 bits.
         let max_diff = ours
@@ -1043,7 +1211,7 @@ mod tests {
         // trimmed from the first unit, which the resumed one never reaches.
         const UNIT: usize = 960;
         const PRE_SKIP: usize = 312;
-        let channels = OUTPUT_LABELS.len();
+        let channels = BED_714_LABELS.len();
         let units_after_seek = unit_starts.len() - unit_starts.len() / 2;
         let end_trim = unit_starts.len() * UNIT - all.len() / channels - PRE_SKIP;
         assert_eq!(resumed.len() / channels, units_after_seek * UNIT - end_trim);
@@ -1141,7 +1309,7 @@ mod tests {
         assert!(bridge.has_objects());
         assert_eq!(bridge.source_label().as_str(), "IAMF (PCM) 5.1 + 4 objects");
         let labels = frames[0].channel_labels.as_slice();
-        assert_eq!(labels[..12], OUTPUT_LABELS);
+        assert_eq!(labels[..12], BED_714_LABELS);
         assert_eq!(labels[12..], [RChannelLabel::Object; 4]);
         let declared = &frames[0].metadata[0].object_channels;
         assert_eq!(
