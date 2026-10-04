@@ -5,10 +5,15 @@
 # Alternate profiles carry their folds in per-frame metadata and ignore the
 # `sources` list.
 #
-# `estimate_unknown`: a waveform whose fold the stream does not state (an
-# object record without reference rows) has its fold measured from the bed's
-# own audio, frame by frame, so it plays at its position and leaves the bed.
-# Set to false to keep such a waveform in the bed and mute its own channel.
+# `render_unstated`: an object record without reference rows says the
+# encoder panned the object into the bed from its position; its fold is
+# recomputed with that renderer and subtracted, so it plays at its position
+# and leaves the bed.
+# `estimate_unknown`: a waveform whose fold is still unknown after that
+# (render off, or a bed layout the renderer cannot cover) has its fold
+# measured from the bed's own audio, frame by frame.
+# With both false such a waveform stays in the bed and its channel is muted.
+render_unstated: true
 estimate_unknown: true
 sources:
   - source: TFL

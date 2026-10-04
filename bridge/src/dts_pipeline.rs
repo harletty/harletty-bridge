@@ -13,9 +13,11 @@
 // gains the stream's private metadata states; that contribution is removed
 // from the bed before the waveform is emitted at its own position, so nothing
 // plays twice. A waveform whose fold is not stated (an object record without
-// reference rows) has its fold estimated from the audio (`dca::FoldEstimator`)
-// and is treated the same; with estimation off it stays in the bed and its
-// own channel is silent.
+// reference rows) was panned into the bed by the encoder from its position:
+// that render is recomputed (`dca::FoldRenderer`) and subtracted the same way.
+// Whatever is still unknown (render off, or a layout the renderer cannot
+// cover) has its fold estimated from the audio (`dca::FoldEstimator`); with
+// both off it stays in the bed and its own channel is silent.
 
 use abi_stable::std_types::{RString, RVec};
 use bridge_api::RPushResult;
@@ -23,8 +25,9 @@ use bridge_api::{
     RChannelLabel, RDecodedFrame, REvent, RMetadataFrame, RNameUpdate, RObjectChannel,
 };
 use dca::{
-    CorePcmFrame, ExssKind, FoldEstimator, FoldPlan, HdError, HdFrame, MAX_SOURCES, SourceRole,
-    SphericalPosition, XMetadata, XPresentation, exss_kind, exss_substream_size, parse_header,
+    CorePcmFrame, ExssKind, FoldEstimator, FoldPlan, FoldRenderer, HdError, HdFrame, MAX_SOURCES,
+    SourceRole, SphericalPosition, XMetadata, XPresentation, exss_kind, exss_substream_size,
+    parse_header,
 };
 use serde::Deserialize;
 
@@ -64,6 +67,10 @@ pub(crate) struct FoldSource {
 pub(crate) struct DtsFoldConfig {
     #[serde(default)]
     pub sources: Vec<FoldSource>,
+    /// Recompute the fold of an object the stream says the encoder rendered
+    /// into the bed from its position (no reference rows), and subtract it.
+    #[serde(default = "default_true")]
+    pub render_unstated: bool,
     /// Estimate the fold of a waveform the stream does not state one for,
     /// from the bed's own audio, so the waveform plays at its position and
     /// leaves the bed. Off, such a waveform stays in the bed and is muted.
@@ -125,6 +132,11 @@ pub(crate) struct DtsXState {
     pub(crate) last_metadata: Option<XMetadata>,
     /// Position last announced per object feed, for sparse events.
     emitted_positions: [Option<SphericalPosition>; MAX_SOURCES],
+    /// Recomputed folds of the objects rendered into the bed from their
+    /// position.
+    renderer: FoldRenderer,
+    /// Whether the recomputed folds have been announced for this stream.
+    render_noted: bool,
     /// Running fold estimates for the waveforms whose fold is not stated.
     estimator: FoldEstimator,
     /// Whether the estimation has been announced for this stream.
@@ -431,6 +443,7 @@ fn build_hd_frame_with_extensions(
                     state.locked
                 );
                 state.estimator.reset();
+                state.renderer.reset();
             }
             state.locked = Some(detected);
             detected
@@ -453,6 +466,22 @@ fn build_hd_frame_with_extensions(
     } else {
         FoldPlan::all_unknown(presentation.feed_count())
     };
+    if detected.is_some() && fold_config.render_unstated && plan.has_unknown() {
+        if let Some(metadata) = state.last_metadata {
+            state.renderer.apply(&mut plan, &metadata, sample_count);
+            if !state.render_noted && metadata.sources().count() > 0 {
+                let rendered = (0..metadata.source_count())
+                    .filter(|&feed| metadata.fold_is_rendered(feed))
+                    .count();
+                if rendered > 0 {
+                    state.render_noted = true;
+                    log::info!(
+                        "dts: {presentation:?} carries {rendered} object(s) rendered into the bed from their position; recomputing that fold"
+                    );
+                }
+            }
+        }
+    }
     if detected.is_some() && fold_config.estimate_unknown && plan.has_unknown() {
         if !state.estimation_noted {
             state.estimation_noted = true;
@@ -1263,6 +1292,77 @@ mod tests {
             "Rs residual {}",
             rs_residual / dry_rs
         );
+    }
+
+    #[test]
+    fn d1_objects_rendered_from_their_position_leave_the_bed_without_estimation() {
+        let n = 1024;
+        let extension: Vec<Vec<f32>> = (0..6).map(|i| noise(300 + i, n)).collect();
+        let dry: Vec<Vec<f32>> = (0..9)
+            .map(|i| noise(400 + i, n).iter().map(|v| v * 0.3).collect())
+            .collect();
+        // The encoder's render of the two mode-0 objects at (-+34.5, 12) on
+        // 7.1, as measured in the corpus, by DCA speaker.
+        let left = [
+            (0usize, 0.1305f32),
+            (1, 0.9152),
+            (2, 0.1305),
+            (3, 0.3430),
+            (7, 0.1037),
+        ];
+        let mirror = |speaker: usize| match speaker {
+            1 => 2,
+            2 => 1,
+            3 => 4,
+            7 => 8,
+            other => other,
+        };
+        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
+        for speaker in [0usize, 1, 2, 3, 4, 5, 7, 8] {
+            let mut parts: Vec<(&[f32], f32)> = Vec::new();
+            for &(s, g) in &left {
+                if s == speaker {
+                    parts.push((extension[0].as_slice(), g));
+                }
+                if mirror(s) == speaker {
+                    parts.push((extension[1].as_slice(), g));
+                }
+            }
+            samples[speaker] = Some(folded(&dry[speaker], &parts));
+        }
+        let mut hd = hd_frame(samples, extension);
+        hd.xll_segment_samples = n;
+        hd.x_present = false;
+        hd.x_imax = true;
+
+        let mut sources = vec![
+            object(-69, 24, BedFold::Unknown),
+            object(69, 24, BedFold::Unknown),
+        ];
+        sources.extend(heights(0.0));
+        let mut metadata = XMetadata::from_sources(&sources).unwrap();
+        metadata.mark_rendered(0, false);
+        metadata.mark_rendered(1, false);
+        let mut state = state_with(Some(metadata));
+        let (frame, emitted) = build_without_estimation(&hd, &mut state);
+
+        assert!(emitted);
+        let width = frame.channel_count as usize;
+        for (column, speaker) in [0usize, 1, 2, 3, 4, 5, 7, 8].into_iter().enumerate() {
+            for sample in 0..n {
+                let got = frame.pcm[sample * width + column] as f32 / 8_388_608.0;
+                assert!(
+                    (got - dry[speaker][sample]).abs() < 2e-4,
+                    "speaker {speaker} sample {sample}: {got} vs {}",
+                    dry[speaker][sample]
+                );
+            }
+        }
+        for sample in 0..n {
+            let row = &frame.pcm[sample * width..(sample + 1) * width];
+            assert_pcm_close(row[12], hd.x_samples[0][sample]);
+            assert_pcm_close(row[13], hd.x_samples[1][sample]);
+        }
     }
 
     #[test]

@@ -15,7 +15,8 @@ use crate::dts_to_oamd::{BedSource, DtsLayout, convert_dts};
 use anyhow::Result;
 use damf::{Configuration, Event, SourceCodec};
 use dca::{
-    CorePcmFrame, FoldEstimator, FoldPlan, HdFrame, PcmPushResult, XMetadata, XPresentation,
+    CorePcmFrame, FoldEstimator, FoldPlan, FoldRenderer, HdFrame, PcmPushResult, XMetadata,
+    XPresentation,
 };
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -207,6 +208,9 @@ pub struct DtsDecodeHandler {
     warned_dropped_channels: bool,
     /// Whether the unreadable-metadata warning has already been emitted.
     warned_unreadable_metadata: bool,
+    /// Recompute the fold of an object the stream says the encoder rendered
+    /// into the bed from its position, and subtract it.
+    pub render_folds: bool,
     /// Estimate the fold of a waveform the stream states none for, from the
     /// bed's audio, rather than keeping it in the bed muted.
     pub estimate_folds: bool,
@@ -216,6 +220,7 @@ pub struct DtsDecodeHandler {
     /// Write one mono WAV per channel, `<prefix>_<n>.wav`, instead of the
     /// interleaved audio file.
     pub mono_prefix: Option<PathBuf>,
+    renderer: FoldRenderer,
     estimator: FoldEstimator,
     /// Whether the estimation has been announced.
     noted_estimation: bool,
@@ -283,9 +288,11 @@ impl Default for DtsDecodeHandler {
             metadata_header_written: false,
             warned_dropped_channels: false,
             warned_unreadable_metadata: false,
+            render_folds: true,
             estimate_folds: true,
             bed_conform: false,
             mono_prefix: None,
+            renderer: FoldRenderer::new(),
             estimator: FoldEstimator::new(),
             noted_estimation: false,
             source_codec: SourceCodec::DtsX714,
@@ -408,6 +415,11 @@ impl DtsDecodeHandler {
 
         let layout = DtsLayout::from_hd(&active, presentation, metadata.as_ref(), self.bed_conform);
         let mut plan = self.fold_plan(presentation, metadata.as_ref());
+        if let (Some(_), Some(metadata), true) =
+            (presentation, metadata.as_ref(), self.render_folds)
+        {
+            self.renderer.apply(&mut plan, metadata, sample_count);
+        }
         if presentation.is_some() && self.estimate_folds && plan.has_unknown() {
             if !self.noted_estimation {
                 self.noted_estimation = true;

@@ -53,3 +53,4 @@ pub(crate) mod xll;
 #[cfg(target_arch = "x86_64")]
 mod xll_avx2;
 pub(crate) mod xmeta;
+pub(crate) mod xrender;
