@@ -42,11 +42,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_yaml_ng = "0.10"
 # iamf-rs is not on crates.io: pinned to a reviewed commit of harletty's fork,
 # which adds IAMF v2.0 object passthrough and an allocation-free f32 output
-# path to baylesj/iamf-rs, and puts a parameter tick on one sample when the
-# rates agree.
-iamf-obu = { git = "https://github.com/harletty/iamf-rs", rev = "378bb59d70f4833912f239099ec7266568c1e1f9", optional = true }
-iamf-dec = { git = "https://github.com/harletty/iamf-rs", rev = "378bb59d70f4833912f239099ec7266568c1e1f9", default-features = false, optional = true }
-iamf-codecs = { git = "https://github.com/harletty/iamf-rs", rev = "378bb59d70f4833912f239099ec7266568c1e1f9", default-features = false, features = ["pcm", "flac", "aac", "opus-ffi"], optional = true }
+# path to baylesj/iamf-rs, puts a parameter tick on one sample when the
+# rates agree, and renders the expanded loudspeaker layouts (9.1.6,
+# 10.2.9.3, 7.1.5.4 and their subsets).
+iamf-obu = { git = "https://github.com/harletty/iamf-rs", rev = "29e4793a8c85a8a24341c153acd49ac84b6ca1a5", optional = true }
+iamf-dec = { git = "https://github.com/harletty/iamf-rs", rev = "29e4793a8c85a8a24341c153acd49ac84b6ca1a5", default-features = false, optional = true }
+iamf-codecs = { git = "https://github.com/harletty/iamf-rs", rev = "29e4793a8c85a8a24341c153acd49ac84b6ca1a5", default-features = false, features = ["pcm", "flac", "aac", "opus-ffi"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

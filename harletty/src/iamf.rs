@@ -16,7 +16,7 @@
 use anyhow::{Result, anyhow, bail};
 use iamf_codecs::DefaultFactory;
 use iamf_dec::MatrixLayout;
-use iamf_dec::layout::{SoundSystem, loudspeaker_info};
+use iamf_dec::layout::{SoundSystem, expanded_info, loudspeaker_info};
 use iamf_dec::position::ObjectPosition;
 use iamf_dec::presentation::Descriptors;
 use iamf_dec::reconstruct::Reconstructed;
@@ -416,18 +416,26 @@ fn describe(descriptors: &[u8], decoder: &StreamDecoder) -> Result<Sequence> {
         match &element.config {
             AudioElementConfig::ChannelBased { layers } => {
                 let Some(top) = layers.last() else { continue };
-                if top.loudspeaker_layout == 15 && top.expanded_loudspeaker_layout == Some(0) {
-                    // Expanded layout 0, the LFE of 7.1.4 alone.
-                    reached[BED_LFE] = true;
-                    names.push("LFE".to_owned());
-                    continue;
-                }
-                names.push(layer_name(top.loudspeaker_layout).to_owned());
+                names.push(
+                    layer_name(top.loudspeaker_layout, top.expanded_loudspeaker_layout).to_owned(),
+                );
                 // The decoder renders the highest layer to System J (7.1.4
                 // matches no lower one); the channels it reaches are those
-                // its rendering matrix has a gain for.
-                match loudspeaker_info(top.loudspeaker_layout) {
-                    Some(info) => mark_rendered(info.matrix, info.channels, &mut reached),
+                // its rendering matrix has a gain for. An expanded layout is
+                // the only layer, rendered whole or, as a subset, through
+                // the rows of its reference layout's matrix.
+                let layout = if top.loudspeaker_layout == 15 {
+                    top.expanded_loudspeaker_layout
+                        .and_then(expanded_info)
+                        .map(|info| (info.matrix, info.rows, info.channels))
+                } else {
+                    loudspeaker_info(top.loudspeaker_layout)
+                        .map(|info| (info.matrix, None, info.channels))
+                };
+                match layout {
+                    Some((matrix, rows, channels)) => {
+                        mark_rendered(matrix, rows, channels, &mut reached);
+                    }
                     None => reached = [true; BED_CHANNELS],
                 }
             }
@@ -488,13 +496,22 @@ fn describe(descriptors: &[u8], decoder: &StreamDecoder) -> Result<Sequence> {
 
 /// Mark the System J channels a `channels`-channel layout of `matrix`
 /// renders into, one input channel at a time so that no two gains can
-/// cancel.
-fn mark_rendered(matrix: MatrixLayout, channels: usize, reached: &mut [bool; BED_CHANNELS]) {
+/// cancel. `rows` are the matrix rows of a subset layout's channels.
+fn mark_rendered(
+    matrix: MatrixLayout,
+    rows: Option<&'static [usize]>,
+    channels: usize,
+    reached: &mut [bool; BED_CHANNELS],
+) {
     for input in 0..channels {
         let planar = (0..channels)
             .map(|i| vec![if i == input { 1.0 } else { 0.0 }])
             .collect();
-        let probe = Reconstructed::Channels { matrix, planar };
+        let probe = Reconstructed::Channels {
+            matrix,
+            rows,
+            planar,
+        };
         match iamf_dec::render::render(&probe, OUTPUT_LAYOUT.matrix_layout()) {
             Ok(rendered) => {
                 for (slot, plane) in reached.iter_mut().zip(&rendered) {
@@ -508,9 +525,33 @@ fn mark_rendered(matrix: MatrixLayout, channels: usize, reached: &mut [bool; BED
     }
 }
 
-/// IAMF `loudspeaker_layout` (§3.7.4).
-fn layer_name(layout: u8) -> &'static str {
+/// IAMF `loudspeaker_layout` (§3.6.2), and `expanded_loudspeaker_layout`
+/// when it is 15.
+fn layer_name(layout: u8, expanded: Option<u8>) -> &'static str {
     match layout {
+        15 => match expanded {
+            Some(0) => "LFE",
+            Some(1) => "stereo-S",
+            Some(2) => "stereo-SS",
+            Some(3) => "stereo-RS",
+            Some(4) => "stereo-TF",
+            Some(5) => "stereo-TB",
+            Some(6) => "top 4ch",
+            Some(7) => "3.0",
+            Some(8) => "9.1.6",
+            Some(9) => "stereo-F",
+            Some(10) => "stereo-Si",
+            Some(11) => "stereo-TpSi",
+            Some(12) => "top 6ch",
+            Some(13) => "10.2.9.3",
+            Some(14) => "LFE pair",
+            Some(15) => "bottom 3ch",
+            Some(16) => "7.1.5.4",
+            Some(17) => "bottom 4ch",
+            Some(18) => "top 1ch",
+            Some(19) => "top 5ch",
+            _ => "expanded layout",
+        },
         0 => "mono",
         1 => "stereo",
         2 => "5.1",
@@ -656,17 +697,36 @@ mod tests {
     fn a_layout_reaches_the_channels_its_matrix_renders_into() {
         let mut reached = [false; BED_CHANNELS];
         let info = loudspeaker_info(7).unwrap();
-        mark_rendered(info.matrix, info.channels, &mut reached);
+        mark_rendered(info.matrix, None, info.channels, &mut reached);
         assert_eq!(reached, [true; BED_CHANNELS]);
 
         let mut reached = [false; BED_CHANNELS];
         let info = loudspeaker_info(2).unwrap();
-        mark_rendered(info.matrix, info.channels, &mut reached);
+        mark_rendered(info.matrix, None, info.channels, &mut reached);
         // L, R, C, LFE, Lss, Rss, Lrs, Rrs, then the four heights.
         assert_eq!(
             reached,
             [
                 true, true, true, true, false, false, true, true, false, false, false, false
+            ]
+        );
+
+        // An expanded subset reaches what its reference layout's rows do:
+        // the LFE of 7.1.4 alone; the top front pair of 7.1.4.
+        let mut reached = [false; BED_CHANNELS];
+        let info = expanded_info(0).unwrap();
+        mark_rendered(info.matrix, info.rows, info.channels, &mut reached);
+        let mut lfe = [false; BED_CHANNELS];
+        lfe[BED_LFE] = true;
+        assert_eq!(reached, lfe);
+
+        let mut reached = [false; BED_CHANNELS];
+        let info = expanded_info(4).unwrap();
+        mark_rendered(info.matrix, info.rows, info.channels, &mut reached);
+        assert_eq!(
+            reached,
+            [
+                false, false, false, false, false, false, false, false, true, true, false, false
             ]
         );
     }
