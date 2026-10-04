@@ -1,6 +1,6 @@
 use abi_stable::std_types::{RSlice, RStr, RString, RVec};
 use bridge_api::{
-    FormatBridge, RChannelPose, RCoordinateFormat, RInputTransport, RPushResult,
+    FormatBridge, RChannelPose, RCoordinateFormat, RInputTransport, RPushResult, RSourceFamily,
     RVbapCartesianDefaults, RVbapTableMode,
 };
 use eac3::{CorePcmFrame, Extractor as Eac3RawExtractor, FrameType, ObjectPcmDecoder, PcmDecoder};
@@ -27,6 +27,35 @@ use crate::logging::bridge_diag_log;
 use crate::mat::MatStream;
 use crate::perf::PerfStats;
 use crate::truehd_pipeline::{configure_parser, process_extractor_input, required_presentations};
+
+/// The source families this bridge declares (`BridgeLib::source_families`),
+/// by the names `source_family` returns. The renderer knows none of them by
+/// name: these entries are what it, and Studio, offer.
+const FAMILY_DOLBY: &str = "dolby";
+const FAMILY_DTS: &str = "dts";
+const FAMILY_AURO: &str = "auro";
+const FAMILY_IAMF: &str = "iamf";
+
+/// The catalogue: Dolby's codecs share the room-cube bed; DTS states ITU
+/// angles but has always rendered in the room; an unfolded Auro-3D carrier
+/// asks for its speakers equidistant on a sphere; IAMF's loudspeaker
+/// layouts are ITU BS.2051 angles, a sphere too. IAMF only when this build
+/// decodes it.
+pub(crate) fn source_families() -> RVec<RSourceFamily> {
+    let family = |name: &str, label: &str, default_mode: &str| RSourceFamily {
+        name: name.into(),
+        label: label.into(),
+        default_mode: default_mode.into(),
+    };
+    let mut families = RVec::new();
+    families.push(family(FAMILY_DOLBY, "Dolby", "room"));
+    families.push(family(FAMILY_DTS, "DTS", "room"));
+    families.push(family(FAMILY_AURO, "Auro-3D", "sphere"));
+    if cfg!(feature = "iamf") {
+        families.push(family(FAMILY_IAMF, "Eclipsa / IAMF", "sphere"));
+    }
+    families
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct Eac3DiagStats {
@@ -1170,21 +1199,18 @@ impl FormatBridge for AtmosBridge {
     }
 
     fn source_family(&self) -> RString {
-        // The renderer's placement policy is chosen per family
-        // (`renderer::placement`): Dolby's codecs share the room-cube bed,
-        // DTS its ITU angles, and an unfolded Auro-3D carrier is its own
-        // family with its own default (a sphere). IAMF has no family of its
-        // own yet: the empty name is the generic family.
+        // One of the families `source_families` declares: the renderer's
+        // placement policy is chosen per family (`renderer::placement`).
         RString::from(if self.iamf_active {
-            ""
+            FAMILY_IAMF
         } else if self.dts_active {
             if self.dts_auro.is_unfolding() {
-                "auro"
+                FAMILY_AURO
             } else {
-                "dts"
+                FAMILY_DTS
             }
         } else {
-            "dolby"
+            FAMILY_DOLBY
         })
     }
 
@@ -1513,6 +1539,37 @@ mod raw_transport_tests {
         bridge.dts_active = false;
         bridge.eac3_active = true;
         assert_eq!(bridge.source_family().as_str(), "dolby");
+    }
+
+    /// Every family a stream can name is in the catalogue the renderer
+    /// learns them from — a name missing there would render as generic and
+    /// could not be set apart.
+    #[test]
+    fn every_declared_family_is_in_the_catalogue() {
+        let catalogue: Vec<String> = source_families()
+            .iter()
+            .map(|family| family.name.to_string())
+            .collect();
+        let mut bridge = AtmosBridge::new(false);
+        let mut seen = vec![bridge.source_family().to_string()];
+        bridge.dts_active = true;
+        seen.push(bridge.source_family().to_string());
+        bridge.dts_active = false;
+        bridge.iamf_active = true;
+        if cfg!(feature = "iamf") {
+            seen.push(bridge.source_family().to_string());
+        }
+        seen.push(FAMILY_AURO.to_owned());
+        for name in seen {
+            assert!(catalogue.contains(&name), "{name} not in {catalogue:?}");
+        }
+        for family in source_families().iter() {
+            assert!(
+                matches!(family.default_mode.as_str(), "room" | "sphere"),
+                "{}",
+                family.default_mode
+            );
+        }
     }
 
     /// The label names the carrier the demux found and the spatial layer

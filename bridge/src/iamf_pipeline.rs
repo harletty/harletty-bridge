@@ -1234,7 +1234,7 @@ mod tests {
 
         assert!(bridge.is_ready());
         assert!(!bridge.has_objects());
-        assert_eq!(bridge.source_family().as_str(), "");
+        assert_eq!(bridge.source_family().as_str(), "iamf");
         assert_eq!(bridge.source_label().as_str(), "IAMF (PCM) 7.1.4");
         assert_eq!(bridge.fixed_channel_poses().len(), 11);
         for frame in &frames {
