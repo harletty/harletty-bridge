@@ -49,9 +49,9 @@ serde_yaml_ng = "0.10.0"
 serde_json = "1.0.142"
 # Keep the rev in step with bridge/Cargo.toml: both hosts decode IAMF with the
 # same reviewed commit of harletty's fork (object passthrough, f32 output).
-iamf-obu = { git = "https://github.com/harletty/iamf-rs", rev = "378bb59d70f4833912f239099ec7266568c1e1f9", optional = true }
-iamf-dec = { git = "https://github.com/harletty/iamf-rs", rev = "378bb59d70f4833912f239099ec7266568c1e1f9", default-features = false, optional = true }
-iamf-codecs = { git = "https://github.com/harletty/iamf-rs", rev = "378bb59d70f4833912f239099ec7266568c1e1f9", default-features = false, features = ["pcm", "flac", "aac", "opus-ffi"], optional = true }
+iamf-obu = { git = "https://github.com/harletty/iamf-rs", rev = "ad0290c4dba8a589090458f07e30acb4c2a09392", optional = true }
+iamf-dec = { git = "https://github.com/harletty/iamf-rs", rev = "ad0290c4dba8a589090458f07e30acb4c2a09392", default-features = false, optional = true }
+iamf-codecs = { git = "https://github.com/harletty/iamf-rs", rev = "ad0290c4dba8a589090458f07e30acb4c2a09392", default-features = false, features = ["pcm", "flac", "aac", "opus-ffi"], optional = true }
 
 [dev-dependencies]
 sha2 = "0.10"
