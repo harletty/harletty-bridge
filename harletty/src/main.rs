@@ -22,6 +22,10 @@ mod cli;
 mod codec_probe;
 mod dts_to_oamd;
 mod eac3_to_oamd;
+#[cfg(feature = "iamf")]
+mod iamf;
+#[cfg(feature = "iamf")]
+mod iamf_to_oamd;
 mod input;
 mod settings;
 mod signature;

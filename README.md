@@ -228,8 +228,9 @@ code is byte-identical to upstream, including the whole DAMF master-set
 writer and the CAF/Wave64 writers. What was added here is E-AC-3 JOC and
 DTS/DTS:X input, the latter exported as ADM — on a DTS-HD MA carrier and on
 a lossy DTS-HD HRA one ([docs/dtsx-lossy-carrier.md](docs/dtsx-lossy-carrier.md)) —
-and the unfolding of Auro-3D carriers (a DTS-HD MA track whose low bits
-hold a folded 9.1 to 13.1 layout) into their bed and height layer.
+the unfolding of Auro-3D carriers (a DTS-HD MA track whose low bits
+hold a folded 9.1 to 13.1 layout) into their bed and height layer, and
+IAMF input (v2.0 objects and v1.1 beds, in builds with the `iamf` feature).
 
 It turns those bitstreams into Dolby Atmos master files (`.atmos`,
 `.atmos.metadata`, plus CAF/WAV audio), reading a file or stdin, so it
@@ -245,7 +246,8 @@ option, output files, recipes and limitations.**
 
 Grab `harletty-cli-<version>-<system>.zip` from the
 [releases page](https://github.com/harletty/harletty-bridge/releases),
-or build it with `cargo build --release -p harletty`.
+or build it with `cargo build --release -p harletty` (add `--features iamf`
+for IAMF input, which links the system libopus).
 
 The rename is not a claim of authorship — it exists because the binary
 accepts a superset of upstream's inputs and writes labels upstream does

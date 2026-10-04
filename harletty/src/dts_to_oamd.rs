@@ -121,7 +121,7 @@ pub fn spatial_channel_to_speaker(channel: SpatialChannel) -> Option<SpeakerLabe
 /// Whether an OAMD speaker belongs to the Atmos bed (up to 7.1.2). Anything
 /// else a DTS:X or Auro-3D layout puts in the bed — the four corner heights,
 /// the wides — has no place in a bed an Atmos encoder accepts.
-fn is_atmos_bed_speaker(speaker: SpeakerLabels) -> bool {
+pub(crate) fn is_atmos_bed_speaker(speaker: SpeakerLabels) -> bool {
     matches!(
         speaker,
         SpeakerLabels::L
@@ -140,7 +140,7 @@ fn is_atmos_bed_speaker(speaker: SpeakerLabels) -> bool {
 /// Where a bed speaker sits as a static object, in DAMF space (x right,
 /// y front, z up, each -1..=1): the heights at the ceiling corners, the
 /// wides on the side walls ahead of the listener.
-fn static_speaker_position(speaker: SpeakerLabels) -> [f64; 3] {
+pub(crate) fn static_speaker_position(speaker: SpeakerLabels) -> [f64; 3] {
     match speaker {
         SpeakerLabels::Lfh => [-1.0, 1.0, 1.0],
         SpeakerLabels::Rfh => [1.0, 1.0, 1.0],

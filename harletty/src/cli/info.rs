@@ -26,6 +26,17 @@ pub fn cmd_info(args: &InfoArgs, cli: &Cli, multi: Option<&MultiProgress>) -> Re
         return super::dts_info::cmd_info_dts(&mut probe_reader, prefix, args);
     }
 
+    if codec == Codec::Iamf {
+        // From the first byte: the sequence header opens the stream.
+        let reader = if probe_reader.is_pipe() {
+            probe_reader.replaying(prefix)
+        } else {
+            drop(probe_reader);
+            InputReader::new(&args.input)?
+        };
+        return super::iamf_info::cmd_info_iamf(reader, args);
+    }
+
     if args.matrices || args.params || args.filters || args.stats {
         drop(probe_reader);
         return super::inspect::run(args, cli);
