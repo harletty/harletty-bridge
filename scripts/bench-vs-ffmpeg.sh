@@ -21,9 +21,14 @@
 #            FFmpeg's core_only when harletty decoded the core alone (an
 #            XBR-only HRA extension, which harletty does not decode). On a
 #            DTS:X stream harletty also decodes the X feeds: compare channels.
+#   IAMF     not like for like: harletty's decoder lives in the bridge, so
+#            `bridge/examples/bridge_bench.rs` times the bridge (built with
+#            the `iamf` feature) decoding and rendering every mix to 7.1.4;
+#            FFmpeg renders nothing, it demuxes and decodes the substreams.
+#            FFmpeg reads no IAMF v2.0 sequence: those rows are harletty's.
 #
 # Codec by extension: .thd .mlp → TrueHD; .ac3 → AC-3; .eac3 .ec3 → E-AC-3;
-# .dts .dtshd → DTS.
+# .dts .dtshd → DTS; .iamf → IAMF.
 #
 # Usage:
 #   scripts/bench-vs-ffmpeg.sh [-n ITERATIONS] [-c CPU] [-j OUT.jsonl] <input>...
@@ -70,6 +75,7 @@ table() {
         def codec_name:
             if .codec == "truehd" then "TrueHD"
             elif .codec == "dts" or .codec == "dca" then "DTS"
+            elif .codec == "iamf" then "IAMF"
             elif .role == "ffmpeg" then (.codec | ascii_upcase)
             else "E-AC-3" end;
         group_by(.row)
@@ -79,7 +85,12 @@ table() {
             (map(select(.role == "harletty"))[0]) as $h
             | (map(select(.role == "ffmpeg"))[0]) as $f
             | (map(select(.role == "extra"))[0]) as $x
-            | "| \($h.row) | \($f | codec_name)\(if $f.codec == "dca" and $h.hd_frames == 0 then " (core)" else "" end)"
+            | if $f == null then
+              "| \($h.row) | \($h | codec_name) | \($h.audio_seconds | . * 10 | round / 10)"
+              + " | \($h.median_ms | ms) | — | — | \(rt($h)) | — | \($h.channels)/—"
+              + "\(if $h.errors > 0 then " ⚠ errors \($h.errors)" else "" end) | |"
+              else
+              "| \($h.row) | \($f | codec_name)\(if $f.codec == "dca" and $h.hd_frames == 0 then " (core)" else "" end)"
               + " | \($h.audio_seconds | . * 10 | round / 10)"
               + " | \($h.median_ms | ms) | \($f.median_ms | ms)"
               + " | \($h.median_ms / $f.median_ms | . * 100 | round / 100)"
@@ -89,6 +100,7 @@ table() {
               + " | \(if $x == null then ""
                      elif $x.codec == "truehd" then "presentation 3: \($x.median_ms | ms) ms, \($x.channels) ch"
                      else "JOC objects: \($x.median_ms | ms) ms, \($x.channels) ch" end) |"
+              end
           )
         | .[]' "$results"
 }
@@ -108,13 +120,20 @@ echo "building harletty's decode_bench (release)…" >&2
 cargo build --quiet --release --manifest-path "$root/Cargo.toml" \
     -p harletty --example decode_bench
 harletty_bench=$target/release/examples/decode_bench
+bridge_bench=""
+if printf '%s\n' "$@" | grep -qi '\.iamf$'; then
+    echo "building the bridge's bridge_bench with IAMF (release)…" >&2
+    cargo build --quiet --release --manifest-path "$root/Cargo.toml" \
+        -p harletty-bridge --example bridge_bench --features iamf
+    bridge_bench=$target/release/examples/bridge_bench
+fi
 
 echo "building ffmpeg_decode_bench against $(pkg-config --modversion libavcodec | sed 's/^/libavcodec /')…" >&2
 ffmpeg_bench=$target/ffmpeg-decode-bench/ffmpeg_decode_bench
 mkdir -p "$(dirname "$ffmpeg_bench")"
 # shellcheck disable=SC2046 # pkg-config output is meant to split
 cc -O2 -o "$ffmpeg_bench" "$root/tools/ffmpeg-decode-bench/ffmpeg_decode_bench.c" \
-    $(pkg-config --cflags --libs libavcodec libavutil)
+    $(pkg-config --cflags --libs libavformat libavcodec libavutil)
 
 pin=()
 [[ -n $cpu ]] && pin=(taskset -c "$cpu")
@@ -164,6 +183,14 @@ for input in "$@"; do
                 run "$name" ffmpeg "$ffmpeg_bench" dca "$iterations" "$input" core_only=1 >/dev/null
             else
                 run "$name" ffmpeg "$ffmpeg_bench" dca "$iterations" "$input" >/dev/null
+            fi
+            ;;
+        *.iamf)
+            echo "IAMF     $name" >&2
+            run "$name" harletty "$bridge_bench" iamf "$iterations" "$input" >/dev/null
+            # FFmpeg reads no IAMF v2.0 sequence (objects): no FFmpeg row then.
+            if "$ffmpeg_bench" iamf 1 "$input" >/dev/null 2>&1; then
+                run "$name" ffmpeg "$ffmpeg_bench" iamf "$iterations" "$input" >/dev/null
             fi
             ;;
         *)
