@@ -6,6 +6,18 @@
 # (libavcodec), both timing framing plus decoding over the same 64 KiB
 # chunks. The table shows the median of the timed passes.
 #
+# harletty's benches (`decode_bench`, and `bridge_bench` for IAMF) are built
+# with every function and every branch target aligned to a 64-byte line
+# (`-align-all-functions=6`, `-align-all-nofallthru-blocks=6`), in their own
+# target directory (`target/bench`). Without that, a change anywhere in the
+# binary moves the other decoders' hot loops across cache lines, and a decoder
+# whose code did not change measures a few per cent faster or slower: a change
+# to the E-AC-3 decoder once read as a 3 % loss on every lossless DTS stream.
+# With it, the same code measures the same whatever sits next to it. The
+# shipped CLI is built without these flags, so its absolute times differ
+# slightly; the comparison between two harletty versions, and against FFmpeg,
+# is what this bench is for. Set BENCH_LAYOUT=plain to build as the CLI is.
+#
 # Like for like, per codec:
 #   TrueHD   harletty presentation 2 (else the widest below it) against FFmpeg,
 #            which never decodes past substream 2. On a stream with a
@@ -66,7 +78,7 @@ table() {
     local results=$1
     echo
     echo "CPU: $(jq -rs '.[0].cpu // "?"' "$results"), $(jq -rs '.[0].iterations' "$results") timed passes, median shown$(jq -rs '.[0].pinned // empty | ", pinned to CPU \(.)"' "$results")."
-    echo "FFmpeg $(jq -rs 'map(select(.role == "ffmpeg"))[0].ffmpeg_version // "?"' "$results"); harletty $(jq -rs '.[0].harletty // "?"' "$results")."
+    echo "FFmpeg $(jq -rs 'map(select(.role == "ffmpeg"))[0].ffmpeg_version // "?"' "$results"); harletty $(jq -rs '.[0].harletty // "?"' "$results")$(jq -rs 'map(select(.role == "harletty"))[0].layout // empty | ", \(.) layout"' "$results")."
     echo "×RT = seconds of audio decoded per second of CPU. ratio = harletty time / FFmpeg time (> 1 = harletty slower)."
     echo
     jq -rs '
@@ -116,16 +128,25 @@ done
 
 target=${CARGO_TARGET_DIR:-$root/target}
 
-echo "building harletty's decode_bench (release)…" >&2
-cargo build --quiet --release --manifest-path "$root/Cargo.toml" \
-    -p harletty --example decode_bench
-harletty_bench=$target/release/examples/decode_bench
+# The bench binaries in their own directory: their RUSTFLAGS would otherwise
+# have cargo rebuild everything in the shared one, both ways.
+layout=${BENCH_LAYOUT:-aligned}
+case $layout in
+    aligned) rustflags="-C llvm-args=-align-all-functions=6 -C llvm-args=-align-all-nofallthru-blocks=6" ;;
+    plain) rustflags="" ;;
+    *) echo "BENCH_LAYOUT must be aligned or plain" >&2; exit 64 ;;
+esac
+bench_target=$target/bench/$layout
+echo "building harletty's decode_bench (release, $layout layout)…" >&2
+RUSTFLAGS="$rustflags" cargo build --quiet --release --manifest-path "$root/Cargo.toml" \
+    --target-dir "$bench_target" -p harletty --example decode_bench
+harletty_bench=$bench_target/release/examples/decode_bench
 bridge_bench=""
 if printf '%s\n' "$@" | grep -qi '\.iamf$'; then
-    echo "building the bridge's bridge_bench with IAMF (release)…" >&2
-    cargo build --quiet --release --manifest-path "$root/Cargo.toml" \
-        -p harletty-bridge --example bridge_bench --features iamf
-    bridge_bench=$target/release/examples/bridge_bench
+    echo "building the bridge's bridge_bench with IAMF (release, $layout layout)…" >&2
+    RUSTFLAGS="$rustflags" cargo build --quiet --release --manifest-path "$root/Cargo.toml" \
+        --target-dir "$bench_target" -p harletty-bridge --example bridge_bench --features iamf
+    bridge_bench=$bench_target/release/examples/bridge_bench
 fi
 
 echo "building ffmpeg_decode_bench against $(pkg-config --modversion libavcodec | sed 's/^/libavcodec /')…" >&2
@@ -148,8 +169,9 @@ run() {
     local row=$1 role=$2
     shift 2
     "${pin[@]}" "$@" | jq -c --arg row "$row" --arg role "$role" --arg cpu "$cpu_name" --arg pin "$cpu" \
-            --arg harletty "$harletty_version" \
+            --arg harletty "$harletty_version" --arg layout "$layout" \
             '. + {row: $row, role: $role, cpu: $cpu, harletty: $harletty}
+             + (if .decoder == "harletty" then {layout: $layout} else {} end)
              + (if $pin == "" then {} else {pinned: $pin} end)' \
         | tee -a "$results"
 }
