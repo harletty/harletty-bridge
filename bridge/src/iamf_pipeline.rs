@@ -14,10 +14,18 @@
 //! header is dropped), skip the reserved OBU types the spec tells parsers to
 //! ignore, ignore the redundant descriptor copies a stream repeats for random
 //! access, and notice a new IA sequence starting.
+//!
+//! A mix that codes its dialogue as an element of its own (harlettizer's
+//! `--voices-to-bed`: an M&E element and a `Dialogue` one) has that element
+//! handed out by the decoder instead of rendered into the bed: its channels
+//! follow the bed in the frame, in the element's own layout, tagged
+//! `dialogue` (`FormatBridge::channel_tags`) so the renderer can set its
+//! level. A renderer that ignores the tag sums them with the bed, which is
+//! the mix again.
 
 use abi_stable::std_types::{RString, RVec};
 use bridge_api::{
-    RChannelLabel, RChannelPose, RDecodedFrame, REvent, RMetadataFrame, RNameUpdate,
+    RChannelLabel, RChannelPose, RChannelTag, RDecodedFrame, REvent, RMetadataFrame, RNameUpdate,
     RObjectChannel, RPushResult,
 };
 use iamf_codecs::DefaultFactory;
@@ -25,9 +33,9 @@ use iamf_dec::layout::SoundSystem;
 use iamf_dec::position::ObjectPosition;
 use iamf_dec::presentation::Descriptors;
 use iamf_dec::stream::{
-    DecodedObject, MixSelection, OutputSampleType, StreamDecoder, StreamSettings,
+    DecodedElement, DecodedObject, MixSelection, OutputSampleType, StreamDecoder, StreamSettings,
 };
-use iamf_obu::descriptors::{AudioElementConfig, CodecId};
+use iamf_obu::descriptors::{AudioElementConfig, CodecId, ElementGainOffset};
 
 use crate::bridge::AtmosBridge;
 use crate::frame_builders::float_to_pcm_i32;
@@ -316,6 +324,19 @@ pub(crate) struct IamfState {
     /// the next so the decoder renders into the same buffer.
     unit: Vec<f32>,
     objects: ObjectState,
+    /// The mix's dialogue element, handed out beside the bed.
+    dialogue: Option<Dialogue>,
+}
+
+/// A dialogue element the decoder hands out rather than renders.
+struct Dialogue {
+    audio_element_id: u32,
+    /// Its channels, in the decoder's rendering order.
+    labels: &'static [RChannelLabel],
+    /// What the mix calls it (`Dialogue`).
+    label: String,
+    /// The mix's `content_language` tag, if it has one.
+    language: String,
 }
 
 /// What the renderer was last told about the objects, so declarations and
@@ -359,6 +380,29 @@ impl IamfState {
     /// `IAMF (Opus) ambisonics + stereo`, once a sequence decodes.
     pub(crate) fn description(&self) -> Option<&str> {
         self.description.as_deref()
+    }
+
+    /// The dialogue channels, when the mix codes its dialogue apart: they
+    /// follow the bed (or open the frame when there is no bed).
+    pub(crate) fn channel_tags(&self) -> RVec<RChannelTag> {
+        let (Some(decoder), Some(dialogue)) = (&self.decoder, &self.dialogue) else {
+            return RVec::new();
+        };
+        let first = if decoder.0.has_rendered_elements() {
+            self.bed.labels().len()
+        } else {
+            0
+        };
+        let mut tags = RVec::with_capacity(1);
+        tags.push(RChannelTag {
+            kind: RString::from("dialogue"),
+            language: RString::from(dialogue.language.as_str()),
+            label: RString::from(dialogue.label.as_str()),
+            channels: (first..first + dialogue.labels.len())
+                .map(|channel| channel as u32)
+                .collect(),
+        });
+        tags
     }
 
     /// Frame everything buffered and decode it, pushing the decoded temporal
@@ -460,12 +504,22 @@ impl IamfState {
         }
         let description = describe(&self.descriptors);
         self.num_objects = decoder.num_objects();
+        self.dialogue = find_dialogue(&self.descriptors, mix_id)
+            .filter(|dialogue| decoder.split_element(dialogue.audio_element_id));
         log::info!(
-            "atmos-bridge: iamf sequence: {description}, mix {mix_id}: {} at {} Hz",
+            "atmos-bridge: iamf sequence: {description}, mix {mix_id}: {}{} at {} Hz",
             match (decoder.has_rendered_elements(), self.num_objects) {
                 (true, 0) => format!("rendered to {}", bed.name()),
                 (true, n) => format!("{} bed + {n} object(s)", bed.name()),
                 (false, n) => format!("{n} object(s)"),
+            },
+            match &self.dialogue {
+                Some(dialogue) => format!(
+                    " + dialogue element {} ({} ch)",
+                    dialogue.audio_element_id,
+                    dialogue.labels.len()
+                ),
+                None => String::new(),
             },
             decoder.sample_rate()
         );
@@ -483,6 +537,7 @@ impl IamfState {
             self.pull(out)?;
         }
         self.decoder = None;
+        self.dialogue = None;
         Ok(())
     }
 
@@ -532,8 +587,21 @@ impl IamfState {
             }
             // Left in the decoder, which reuses their buffers.
             let objects = decoder.objects();
-            let mut frame = build_frame(&self.unit, bed.then_some(labels), objects, sample_rate);
-            let first_object_channel = if bed { channels } else { 0 };
+            let dialogue = self.dialogue.as_ref().and_then(|dialogue| {
+                let element = decoder
+                    .elements()
+                    .iter()
+                    .find(|e| e.audio_element_id == dialogue.audio_element_id)?;
+                Some((element, dialogue.labels))
+            });
+            let mut frame = build_frame(
+                &self.unit,
+                bed.then_some(labels),
+                dialogue,
+                objects,
+                sample_rate,
+            );
+            let first_object_channel = frame.channel_count as usize - objects.len();
             frame.metadata = object_metadata(
                 objects,
                 first_object_channel,
@@ -580,23 +648,27 @@ fn bed_to_pcm_i32(sample: f32) -> i32 {
 }
 
 /// One temporal unit as a frame: the rendered bed (interleaved, when the
-/// mix has non-object elements, with its labels), then one channel per
-/// object.
+/// mix has elements rendered into it, with its labels), the dialogue
+/// element's channels when it is handed out, then one channel per object.
 fn build_frame(
     unit: &[f32],
     bed_labels: Option<&[RChannelLabel]>,
+    dialogue: Option<(&DecodedElement, &'static [RChannelLabel])>,
     objects: &[DecodedObject],
     sample_rate: u32,
 ) -> RDecodedFrame {
     let bed_channels = bed_labels.map(<[RChannelLabel]>::len);
     let bed = bed_channels.unwrap_or(0);
-    let sample_count = match bed_channels {
-        Some(channels) => unit.len() / channels,
-        None => objects.first().map_or(0, |o| o.samples.len()),
+    let sample_count = match (bed_channels, dialogue) {
+        (Some(channels), _) => unit.len() / channels,
+        (None, Some((element, _))) => element.planes.first().map_or(0, Vec::len),
+        (None, None) => objects.first().map_or(0, |o| o.samples.len()),
     };
-    let channels = bed + objects.len();
+    let dialogue_channels = dialogue.map_or(0, |(_, labels)| labels.len());
+    let channels = bed + dialogue_channels + objects.len();
+    let first_object = bed + dialogue_channels;
     let mut pcm: Vec<i32>;
-    if objects.is_empty() {
+    if objects.is_empty() && dialogue.is_none() {
         pcm = Vec::with_capacity(sample_count * channels);
         pcm.extend(
             unit[..sample_count * channels]
@@ -612,15 +684,25 @@ fn build_frame(
                 }
             }
         }
+        if let Some((element, _)) = dialogue {
+            for (index, plane) in element.planes.iter().enumerate().take(dialogue_channels) {
+                for (out, &sample) in pcm.chunks_exact_mut(channels).zip(plane) {
+                    out[bed + index] = bed_to_pcm_i32(sample);
+                }
+            }
+        }
         for (index, object) in objects.iter().enumerate() {
             for (out, &sample) in pcm.chunks_exact_mut(channels).zip(&object.samples) {
-                out[bed + index] = float_to_pcm_i32(sample);
+                out[first_object + index] = float_to_pcm_i32(sample);
             }
         }
     }
     let pcm: RVec<i32> = pcm.into();
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(channels);
     if let Some(labels) = bed_labels {
+        channel_labels.extend(labels.iter().copied());
+    }
+    if let Some((_, labels)) = dialogue {
         channel_labels.extend(labels.iter().copied());
     }
     channel_labels.extend(std::iter::repeat_n(RChannelLabel::Object, objects.len()));
@@ -817,6 +899,96 @@ fn object_metadata(
         ramp_duration: 0,
     });
     frames
+}
+
+/// The mix's dialogue element, if it codes one apart: a channel-based
+/// element beside others in the selected mix, annotated as dialogue (what
+/// harlettizer's `--voices-to-bed` writes: `Dialogue`) or, with no such
+/// annotation, the only one a listener may adjust (an element gain offset
+/// of type RANGE, IAMF v2.0's mark of a dialogue level control).
+fn find_dialogue(descriptors: &[u8], mix_id: u32) -> Option<Dialogue> {
+    let parsed = Descriptors::collect(descriptors).ok()?;
+    let mix = parsed
+        .mix_presentations
+        .iter()
+        .find(|mix| mix.mix_presentation_id == mix_id)?;
+    let elements = &mix.sub_mixes.first()?.elements;
+    if elements.len() < 2 {
+        return None;
+    }
+    // A channel-based element whose top layer the renderer has labels for.
+    let candidates: Vec<(&_, &'static [RChannelLabel])> = elements
+        .iter()
+        .filter_map(|sub| {
+            let element = parsed
+                .audio_elements
+                .iter()
+                .find(|e| e.audio_element_id == sub.audio_element_id)?;
+            let AudioElementConfig::ChannelBased { layers } = &element.config else {
+                return None;
+            };
+            let top = layers.last()?;
+            if top.expanded_loudspeaker_layout.is_some() {
+                return None;
+            }
+            Some((sub, layout_labels(top.loudspeaker_layout)?))
+        })
+        .collect();
+    let is_dialogue = |annotation: &String| annotation.to_ascii_lowercase().contains("dialog");
+    let (sub, labels) = match candidates
+        .iter()
+        .find(|(sub, _)| sub.localized_annotations.iter().any(is_dialogue))
+    {
+        Some(found) => *found,
+        None => {
+            let mut adjustable = candidates.iter().filter(|(sub, _)| {
+                matches!(
+                    sub.element_gain_offset,
+                    Some(ElementGainOffset::Range { .. })
+                )
+            });
+            let only = adjustable.next()?;
+            if adjustable.next().is_some() {
+                return None;
+            }
+            *only
+        }
+    };
+    Some(Dialogue {
+        audio_element_id: sub.audio_element_id,
+        labels,
+        label: sub
+            .localized_annotations
+            .first()
+            .cloned()
+            .unwrap_or_default(),
+        language: mix
+            .tags
+            .iter()
+            .find(|(name, _)| name == "content_language")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default(),
+    })
+}
+
+/// The channels of an IAMF `loudspeaker_layout` (§3.7.4) in the decoder's
+/// rendering order (§7.2 `channel_layout`), as renderer labels. The upper
+/// pair of the x.y.2 layouts and of 3.1.2 is the front one of the 7.1.4
+/// bed, 30° up.
+fn layout_labels(layout: u8) -> Option<&'static [RChannelLabel]> {
+    use RChannelLabel::*;
+    Some(match layout {
+        0 => &[C],
+        1 => &[L, R],
+        2 => &[L, R, C, LFE, Ls, Rs],
+        3 => &[L, R, C, LFE, Ls, Rs, Tfl, Tfr],
+        4 => &[L, R, C, LFE, Ls, Rs, Tfl, Tfr, Tbl, Tbr],
+        5 => &[L, R, C, LFE, Ls, Rs, Lb, Rb],
+        6 => &[L, R, C, LFE, Ls, Rs, Lb, Rb, Tfl, Tfr],
+        7 => &[L, R, C, LFE, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr],
+        8 => &[L, R, C, LFE, Tfl, Tfr],
+        _ => return None,
+    })
 }
 
 /// IAMF `loudspeaker_layout` (§3.6.2), and `expanded_loudspeaker_layout`
@@ -1348,6 +1520,97 @@ mod tests {
         bridge.reset();
         let after = decode_raw(&mut bridge, &stream);
         assert_eq!(after[0].metadata[0].object_channels.len(), 4);
+    }
+
+    #[test]
+    fn a_dialogue_element_follows_the_bed_tagged() {
+        // Base-advanced: two stereo LPCM elements, the first adjustable
+        // (element gain offset of type RANGE) and neither annotated — the
+        // adjustable one is the dialogue.
+        let Some(path) = vector("test_000854.iamf") else {
+            eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
+            return;
+        };
+        let stream = std::fs::read(path).unwrap();
+        let mut bridge = AtmosBridge::new(false);
+        let frames = decode_raw(&mut bridge, &stream);
+        assert!(!frames.is_empty());
+        assert!(!bridge.has_objects());
+        let labels = frames[0].channel_labels.as_slice();
+        assert_eq!(labels[..12], BED_714_LABELS);
+        assert_eq!(labels[12..], [RChannelLabel::L, RChannelLabel::R]);
+        let tags = bridge.channel_tags();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].kind.as_str(), "dialogue");
+        assert_eq!(tags[0].label.as_str(), "test_sub_mix_0_audio_element_0");
+        assert_eq!(tags[0].channels.as_slice(), [12, 13]);
+
+        // Rendered to the bed and added back, the dialogue gives the mix.
+        let mut settings = StreamSettings::default();
+        settings.layout = SoundSystem::J;
+        // The v2.0 profiles, as the bridge asks for them.
+        settings.object_passthrough = true;
+        let mut whole =
+            StreamDecoder::new_from_descriptors(&stream, settings, &DefaultFactory).unwrap();
+        let mut mix = Vec::new();
+        let mut unit = Vec::new();
+        whole.decode(&stream).unwrap();
+        while whole.get_output_temporal_unit_f32(&mut unit).unwrap() {
+            mix.extend_from_slice(&unit);
+        }
+        let scale = 1.0 / 8_388_608.0;
+        let mut ours = Vec::with_capacity(mix.len());
+        let mut peak = 0f32;
+        for frame in &frames {
+            let n = frame.sample_count as usize;
+            let planes: Vec<Vec<f32>> = (12..14)
+                .map(|c| {
+                    (0..n)
+                        .map(|s| frame.pcm[s * 14 + c] as f32 * scale)
+                        .collect()
+                })
+                .collect();
+            let info = iamf_dec::layout::loudspeaker_info(1).unwrap();
+            let rendered = iamf_dec::render::render(
+                &iamf_dec::reconstruct::Reconstructed::Channels {
+                    matrix: info.matrix,
+                    rows: None,
+                    planar: planes,
+                },
+                SoundSystem::J.matrix_layout(),
+            )
+            .unwrap();
+            for s in 0..n {
+                for c in 0..12 {
+                    let dialogue = rendered[c][s];
+                    peak = peak.max(dialogue.abs());
+                    ours.push(frame.pcm[s * 14 + c] as f32 * scale + dialogue);
+                }
+            }
+        }
+        assert_eq!(ours.len(), mix.len());
+        assert!(peak > 0.01, "the dialogue is silent");
+        let worst = ours
+            .iter()
+            .zip(&mix)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 4.0 * scale, "bed + dialogue differs by {worst}");
+    }
+
+    #[test]
+    fn a_mix_of_unmarked_elements_tags_nothing() {
+        // Two-layer 5.1 + stereo, neither annotated nor adjustable: the bed
+        // as before.
+        let Some(path) = vector("test_000087.iamf") else {
+            eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
+            return;
+        };
+        let stream = std::fs::read(path).unwrap();
+        let mut bridge = AtmosBridge::new(false);
+        let frames = decode_raw(&mut bridge, &stream);
+        assert_eq!(frames[0].channel_labels.as_slice(), BED_714_LABELS);
+        assert!(bridge.channel_tags().is_empty());
     }
 
     #[test]

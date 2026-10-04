@@ -1188,6 +1188,16 @@ impl FormatBridge for AtmosBridge {
         })
     }
 
+    fn channel_tags(&self) -> RVec<bridge_api::RChannelTag> {
+        // IAMF's dialogue element, when a mix codes it apart; no other
+        // format here tags anything.
+        #[cfg(feature = "iamf")]
+        if self.iamf_active {
+            return self.iamf.channel_tags();
+        }
+        RVec::new()
+    }
+
     fn source_label(&self) -> RString {
         // What the host's track information calls the stream: the carrier
         // the demux found, then the spatial layer actually decoded over it.
