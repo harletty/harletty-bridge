@@ -1130,9 +1130,6 @@ impl HuffmanCode {
             while bits < 8 && node > 0 {
                 node = nodes[node as usize][(word >> (7 - bits)) & 1];
                 bits += 1;
-                if node <= 0 {
-                    break;
-                }
             }
             prefix[word] = (node, bits);
             word += 1;
