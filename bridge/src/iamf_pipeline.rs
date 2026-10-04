@@ -183,6 +183,9 @@ pub(crate) struct IamfState {
     num_objects: usize,
     /// Absolute sample position of the next frame, for metadata events.
     sample_pos: u64,
+    /// The temporal unit being pulled, interleaved: kept from one unit to
+    /// the next so the decoder renders into the same buffer.
+    unit: Vec<f32>,
     objects: ObjectState,
 }
 
@@ -375,16 +378,17 @@ impl IamfState {
         let sample_rate = decoder.sample_rate();
         let bed = decoder.has_rendered_elements();
         loop {
-            let unit = match decoder.get_output_temporal_unit() {
-                Ok(Some(unit)) => unit,
-                Ok(None) => return Ok(()),
+            match decoder.get_output_temporal_unit_f32(&mut self.unit) {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
                 Err(err) => return Err(format!("iamf: render error: {err}")),
-            };
-            let objects = decoder.take_objects();
-            let mut frame = build_frame(&unit, bed.then_some(channels), &objects, sample_rate);
+            }
+            // Left in the decoder, which reuses their buffers.
+            let objects = decoder.objects();
+            let mut frame = build_frame(&self.unit, bed.then_some(channels), objects, sample_rate);
             let first_object_channel = if bed { channels } else { 0 };
             frame.metadata = object_metadata(
-                &objects,
+                objects,
                 first_object_channel,
                 self.sample_pos,
                 sample_rate,
@@ -398,32 +402,74 @@ impl IamfState {
     }
 }
 
-/// One temporal unit as a frame: the rendered bed (s32le interleaved, when
-/// the mix has non-object elements), then one channel per object.
+/// A rendered bed sample at the bridge's 24-bit scale: the decoder's own
+/// 32-bit quantization (`iamf_dec::post::quantize_s32`, full scale 2^31,
+/// ties to even) shifted down to 2^23, which is what the bed has always
+/// been — computed in f32, four samples at a time, instead of through f64.
+///
+/// With `y` the sample at the 24-bit scale, rounding at 32 bits then
+/// flooring the shift is `floor(y + 2^-9)`: the 32-bit rounding only shows
+/// when it carries into bit 8, a tie never does, and past 2^15 `y` has no
+/// bits below 2^-8 to round. The sum is not exact in f32, so it is not
+/// formed: `y` is split into its integer part and an exact remainder, and
+/// the remainder compared with the two thresholds.
+#[inline]
+fn bed_to_pcm_i32(sample: f32) -> i32 {
+    const CARRY: f32 = 1.0 - 1.0 / 512.0;
+    const BORROW: f32 = -1.0 / 512.0;
+    let scaled = sample * 8_388_608.0;
+    // NaN is silence, as the decoder's quantizer has it.
+    let scaled = if scaled.is_nan() {
+        0.0
+    } else {
+        scaled.clamp(-8_388_608.0, 8_388_607.0)
+    };
+    // `as i32` saturates, which baseline x86-64 only does one sample at a
+    // time; nothing is left to saturate.
+    // SAFETY: `scaled` is not NaN and lies within ±2^23, well inside i32.
+    let whole = unsafe { scaled.to_int_unchecked::<i32>() };
+    let rest = scaled - whole as f32;
+    whole + i32::from(rest >= CARRY) - i32::from(rest < BORROW)
+}
+
+/// One temporal unit as a frame: the rendered bed (interleaved, when the
+/// mix has non-object elements), then one channel per object.
 fn build_frame(
-    unit: &[u8],
+    unit: &[f32],
     bed_channels: Option<usize>,
     objects: &[DecodedObject],
     sample_rate: u32,
 ) -> RDecodedFrame {
     let bed = bed_channels.unwrap_or(0);
     let sample_count = match bed_channels {
-        Some(channels) => unit.len() / 4 / channels,
+        Some(channels) => unit.len() / channels,
         None => objects.first().map_or(0, |o| o.samples.len()),
     };
     let channels = bed + objects.len();
-    let mut pcm: RVec<i32> = RVec::with_capacity(sample_count * channels);
-    for t in 0..sample_count {
-        // The decoder's full scale is 2^31, the bridge's 2^23.
-        for b in unit[t * bed * 4..(t + 1) * bed * 4].chunks_exact(4) {
-            pcm.push(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) >> 8);
+    let mut pcm: Vec<i32>;
+    if objects.is_empty() {
+        pcm = Vec::with_capacity(sample_count * channels);
+        pcm.extend(
+            unit[..sample_count * channels]
+                .iter()
+                .map(|&sample| bed_to_pcm_i32(sample)),
+        );
+    } else {
+        pcm = vec![0i32; sample_count * channels];
+        if bed > 0 {
+            for (out, source) in pcm.chunks_exact_mut(channels).zip(unit.chunks_exact(bed)) {
+                for (out, &sample) in out.iter_mut().zip(source) {
+                    *out = bed_to_pcm_i32(sample);
+                }
+            }
         }
-        for object in objects {
-            pcm.push(float_to_pcm_i32(
-                object.samples.get(t).copied().unwrap_or(0.0),
-            ));
+        for (index, object) in objects.iter().enumerate() {
+            for (out, &sample) in pcm.chunks_exact_mut(channels).zip(&object.samples) {
+                out[bed + index] = float_to_pcm_i32(sample);
+            }
         }
     }
+    let pcm: RVec<i32> = pcm.into();
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(channels);
     if bed_channels.is_some() {
         channel_labels.extend(OUTPUT_LABELS.iter().copied());
@@ -1088,5 +1134,62 @@ mod tests {
         assert!(out.is_empty());
         assert!(state.descriptors.is_empty());
         assert!(state.buf.is_empty());
+    }
+
+    /// The f32 formulation is the decoder's 32-bit quantization shifted
+    /// down, for every input: the carries around each 24-bit step, the
+    /// clamp edges, non-finite values and a strided sweep of all f32s.
+    #[test]
+    fn bed_samples_are_the_decoder_s32_shifted_down() {
+        let check = |sample: f32| {
+            assert_eq!(
+                bed_to_pcm_i32(sample),
+                iamf_dec::post::quantize_s32(sample) >> 8,
+                "sample {sample:e} ({:#010x})",
+                sample.to_bits()
+            );
+        };
+        // Around every 2^-9 of a 24-bit step near zero, where the 32-bit
+        // rounding carries, and their float neighbours.
+        for n in -300_000i32..=300_000 {
+            let sample = n as f32 / (8_388_608.0 * 1024.0);
+            check(sample);
+            check(f32::from_bits(sample.to_bits() + 1));
+            check(f32::from_bits(sample.to_bits().wrapping_sub(1)));
+        }
+        for n in -70_000i32..=70_000 {
+            // Halves of a 32-bit step: the ties.
+            check(n as f32 / 4_294_967_296.0);
+            // Around 2^15 steps, where f32 stops resolving 2^-9 of a step.
+            for base in [32_767.0f32, 32_768.0, 16_384.0, 8_388_607.0] {
+                check((base + n as f32 / 1024.0) / 8_388_608.0);
+                check(-(base + n as f32 / 1024.0) / 8_388_608.0);
+            }
+        }
+        for sample in [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.999_999_94,
+            -0.999_999_94,
+            1.000_000_1,
+            2.0,
+            -2.0,
+            1.0e30,
+            -1.0e30,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::MIN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ] {
+            check(sample);
+        }
+        for bits in (0..=u32::MAX).step_by(4_093) {
+            check(f32::from_bits(bits));
+        }
     }
 }
