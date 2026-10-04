@@ -14,7 +14,9 @@
 //!   codec   only names the result (`iamf`); the bridge detects the stream
 //!
 //! Build with the codec's feature: `--features iamf` for IAMF. Prints one
-//! JSON object on stdout, in `decode_bench`'s shape.
+//! JSON object on stdout, in `decode_bench`'s shape, plus `pcm_hash`: an
+//! FNV-1a hash of every decoded sample and object position, taken on the
+//! untimed pass, so two builds can be checked for the same output.
 
 use std::hint::black_box;
 use std::process::ExitCode;
@@ -38,7 +40,22 @@ struct Tally {
     errors: u64,
 }
 
-fn pass(data: &[u8]) -> Tally {
+/// FNV-1a over what a pass decoded.
+struct Hash(u64);
+
+impl Hash {
+    fn new() -> Self {
+        Hash(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+}
+
+fn pass(data: &[u8], mut hash: Option<&mut Hash>) -> Tally {
     let mut bridge = harletty_bridge::new_bridge(false);
     let mut t = Tally::default();
     for chunk in data.chunks(CHUNK) {
@@ -55,6 +72,21 @@ fn pass(data: &[u8]) -> Tally {
                 t.object_frames += 1;
             }
             black_box(frame.pcm.first());
+            if let Some(hash) = hash.as_deref_mut() {
+                for sample in frame.pcm.iter() {
+                    hash.write(&sample.to_le_bytes());
+                }
+                for metadata in frame.metadata.iter() {
+                    hash.write(&metadata.sample_pos.to_le_bytes());
+                    for event in metadata.events.iter() {
+                        hash.write(&event.id.to_le_bytes());
+                        hash.write(&event.sample_pos.to_le_bytes());
+                        for axis in event.pos {
+                            hash.write(&axis.to_le_bytes());
+                        }
+                    }
+                }
+            }
         }
     }
     t
@@ -83,11 +115,12 @@ fn main() -> ExitCode {
     };
 
     // One untimed pass, as on the FFmpeg side.
-    let tally = pass(&data);
+    let mut hash = Hash::new();
+    let tally = pass(&data, Some(&mut hash));
     let mut times = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let start = Instant::now();
-        let t = pass(&data);
+        let t = pass(&data, None);
         times.push(start.elapsed().as_secs_f64() * 1e3);
         if t != tally {
             eprintln!("a pass decoded something else than the first");
@@ -115,6 +148,7 @@ fn main() -> ExitCode {
             "sample_rate": tally.sample_rate,
             "object_frames": tally.object_frames,
             "errors": tally.errors,
+            "pcm_hash": format!("{:016x}", hash.0),
             "audio_seconds": audio_seconds,
             "iterations": iterations,
             "min_ms": times[0],
