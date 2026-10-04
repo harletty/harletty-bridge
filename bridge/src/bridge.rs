@@ -1152,11 +1152,11 @@ impl FormatBridge for AtmosBridge {
         // and DTS declares its lower layer from the ETSI loudspeaker table.
         // Dolby's bed is defined in its room cube, not by angles, and
         // declares nothing: the renderer's room model is its model. IAMF's
-        // bed is the BS.2051 layout the decoder rendered to, whose angles
-        // the recommendation states.
+        // bed is the layout the decoder rendered to (BS.2051 System J, or
+        // 9.1.6 with its wides), whose angles the recommendation states.
         #[cfg(feature = "iamf")]
         if self.iamf_active {
-            return crate::iamf_pipeline::declared_poses();
+            return self.iamf.declared_poses();
         }
         if self.dts_active {
             if self.dts_auro.is_unfolding() {
