@@ -25,6 +25,7 @@ pub use dcadec::xmeta::{
     REFERENCE_MASK_7_1, REFERENCE_SPEAKERS, SourceMetadata, SourceRole, SphericalPosition,
     XMetadata, XMetadataError, gain_code_linear,
 };
+pub use dcadec::xrender::FoldRenderer;
 pub use extract::{ExtractError, Extractor, Frame};
 pub use hd::{ExssKind, HdDecoder, HdError, HdFrame, exss_has_xll, exss_kind, exss_substream_size};
 pub use parser::{

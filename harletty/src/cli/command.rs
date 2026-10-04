@@ -110,6 +110,13 @@ pub struct DecodeArgs {
     #[arg(long)]
     pub no_fold_estimate: bool,
 
+    /// Keep a DTS:X object the encoder rendered into the bed from its
+    /// position (a record without reference rows) out of the recomputed
+    /// fold: it is then estimated from the bed, or kept there muted with
+    /// `--no-fold-estimate`.
+    #[arg(long)]
+    pub no_fold_render: bool,
+
     /// Specify warp mode when not present in metadata
     #[arg(long, value_enum)]
     pub warp_mode: Option<WarpMode>,

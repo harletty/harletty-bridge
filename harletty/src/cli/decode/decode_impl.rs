@@ -333,6 +333,7 @@ fn cmd_decode_dts(
     let mut handler = DtsDecodeHandler::default();
     handler.warp_mode = args.warp_mode;
     handler.estimate_folds = !args.no_fold_estimate;
+    handler.render_folds = !args.no_fold_render;
     handler.bed_conform = args.bed_conform;
     handler.mono_prefix = args.mono_prefix.clone();
     let start_time = std::time::Instant::now();

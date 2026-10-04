@@ -278,8 +278,11 @@ pub enum BedFold {
     /// Linear gain of the waveform in each reference column; 0.0 is absent.
     Known([f32; REFERENCE_CHANNELS]),
     /// The waveform is in the bed, but the stream does not say at which
-    /// gains (an object record without reference rows). Nothing can be
-    /// subtracted, so the waveform must not be rendered a second time.
+    /// gains (an object record without reference rows). When the metadata
+    /// marks it rendered ([`XMetadata::fold_is_rendered`]) the encoder panned
+    /// it from its position and [`crate::FoldRenderer`] recomputes the gains;
+    /// otherwise nothing can be subtracted, so the waveform must not be
+    /// rendered a second time.
     Unknown,
 }
 
@@ -310,6 +313,12 @@ pub struct XMetadata {
     count: usize,
     reference_speakers: [u8; REFERENCE_CHANNELS],
     reference_count: usize,
+    /// Bit `k` set when waveform `k`'s fold is the encoder's render of its
+    /// position (a mode-0 object record).
+    rendered: u16,
+    /// Bit `k` set when that render folds its virtual speakers directly into
+    /// the bed speaker under each.
+    direct: u16,
 }
 
 impl XMetadata {
@@ -353,6 +362,8 @@ impl XMetadata {
             count: sources.len(),
             reference_speakers,
             reference_count,
+            rendered: 0,
+            direct: 0,
         })
     }
 
@@ -371,6 +382,31 @@ impl XMetadata {
 
     pub fn sources(&self) -> impl Iterator<Item = &SourceMetadata> {
         self.sources[..self.count].iter().flatten()
+    }
+
+    /// Whether waveform `feed` is an object the encoder rendered into the bed
+    /// from its transmitted position, without stating the gains.
+    pub fn fold_is_rendered(&self, feed: usize) -> bool {
+        feed < self.count && self.rendered & (1 << feed) != 0
+    }
+
+    /// Whether that render folds its virtual speakers directly into the bed
+    /// speaker under each, rather than spreading them.
+    pub fn fold_is_direct(&self, feed: usize) -> bool {
+        self.fold_is_rendered(feed) && self.direct & (1 << feed) != 0
+    }
+
+    /// Mark waveform `feed` as rendered from its position (see
+    /// [`Self::fold_is_rendered`]), for metadata assembled by hand.
+    pub fn mark_rendered(&mut self, feed: usize, direct: bool) {
+        if feed < self.count {
+            self.rendered |= 1 << feed;
+            if direct {
+                self.direct |= 1 << feed;
+            } else {
+                self.direct &= !(1 << feed);
+            }
+        }
     }
 }
 
@@ -451,6 +487,29 @@ impl FoldPlan {
     /// Whether any waveform of this frame has no stated fold.
     pub fn has_unknown(&self) -> bool {
         self.unknown != 0
+    }
+
+    /// Give waveform `feed` a gain in `speaker` that ramps from `start` to
+    /// `target` over `length` samples. Both zero leaves the speaker alone.
+    pub(crate) fn set_ramp(
+        &mut self,
+        speaker: usize,
+        feed: usize,
+        start: f32,
+        target: f32,
+        length: usize,
+    ) {
+        if speaker >= FOLD_SPEAKERS || feed >= self.count || (start == 0.0 && target == 0.0) {
+            return;
+        }
+        self.gains[speaker][feed] = start;
+        self.slope[speaker][feed] = (target - start) / length.max(1) as f32;
+        self.used[speaker] |= 1 << feed;
+    }
+
+    /// Waveform `feed` now has a fold and may be rendered on its own channel.
+    pub(crate) fn mark_known(&mut self, feed: usize) {
+        self.unknown &= !(1u16 << feed);
     }
 
     /// The gain of waveform `feed` in `speaker` at the start of the frame
@@ -796,6 +855,8 @@ fn parse_standard(payload: &[u8], source_count: usize) -> R<XMetadata> {
         count: FIXED_HEIGHT_COUNT,
         reference_speakers: REFERENCE_SPEAKERS.map(|speaker| speaker as u8),
         reference_count: REFERENCE_CHANNELS,
+        rendered: 0,
+        direct: 0,
     })
 }
 
@@ -858,7 +919,9 @@ fn parse_alternate(payload: &[u8], source_count: usize) -> R<XMetadata> {
     // envelope CRC follows it directly (object-only variant), or a type-3
     // element describing the height quartet does and must end exactly at
     // the CRC.
-    let (type3_start, object_count, reference_mask) = parse_type241(prefix, &mut sources)?;
+    let mut renders = RenderedFolds::default();
+    let (type3_start, object_count, reference_mask) =
+        parse_type241(prefix, &mut sources, &mut renders)?;
     let (reference_speakers, reference_count) = reference_speakers(reference_mask)
         .ok_or(XMetadataError::Unsupported("reference layout"))?;
     let heights_present = type3_start + 2 != prefix.len();
@@ -881,6 +944,8 @@ fn parse_alternate(payload: &[u8], source_count: usize) -> R<XMetadata> {
         count: source_count,
         reference_speakers,
         reference_count,
+        rendered: renders.rendered,
+        direct: renders.direct,
     })
 }
 
@@ -944,7 +1009,22 @@ fn parse_type3(bytes: &[u8], reference_mask: u32) -> R<[SourceMetadata; FIXED_HE
 /// fixed-channel alternatives. Fills `objects` by declared index and returns
 /// the byte offset at which the next element starts, the declared object
 /// count and the reference mask the rows are expressed over.
-fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<(usize, usize, u32)> {
+/// Which type-241 records leave their fold to the renderer, by waveform.
+#[derive(Default)]
+struct RenderedFolds {
+    rendered: u16,
+    direct: u16,
+}
+
+/// Position-options bit that folds a rendered object's virtual speakers
+/// directly into the bed speaker under each (0x24 rather than 0x20).
+const POSITION_DIRECT_FOLD: u32 = 0x04;
+
+fn parse_type241(
+    bytes: &[u8],
+    objects: &mut [Option<SourceMetadata>],
+    renders: &mut RenderedFolds,
+) -> R<(usize, usize, u32)> {
     let mut b = Bits { bytes, pos: 0 };
     for (width, value) in [
         (8, 241),
@@ -1037,9 +1117,11 @@ fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<(usi
         }
         // 0x20 on every stream but one, which sets one further bit without
         // adding a field: the element still ends exactly on its CRC boundary.
-        match b.read(7)? {
-            0x20 | 0x24 => {}
-            _ => return Err(XMetadataError::Unsupported("type-241 position options")),
+        // That bit chooses how a rendered object's virtual speakers fold into
+        // the bed (see `xrender`); 0x20 also flags the elevation as present.
+        let position_options = b.read(7)?;
+        if !matches!(position_options, 0x20 | 0x24) {
+            return Err(XMetadataError::Unsupported("type-241 position options"));
         }
         b.expect(1, 1, "type-241 gain present")?;
         b.expect(1, 1, "type-241 position flag")?;
@@ -1063,6 +1145,13 @@ fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<(usi
             }
             BedFold::Known(fold)
         } else {
+            // Mode 0: no rows. The encoder rendered the object into the bed
+            // from this position.
+            let bit = 1u16 << indices[record];
+            renders.rendered |= bit;
+            if position_options & POSITION_DIRECT_FOLD != 0 {
+                renders.direct |= bit;
+            }
             BedFold::Unknown
         };
         objects[indices[record]] = Some(SourceMetadata {
@@ -2075,7 +2164,16 @@ mod tests {
                 if feed == 0 { -69 } else { 69 }
             );
             assert_eq!(position.elevation_half_degrees, 24);
+            assert!(
+                metadata.fold_is_rendered(feed),
+                "a mode-0 object is rendered"
+            );
+            assert!(
+                !metadata.fold_is_direct(feed),
+                "0x20 spreads the virtual folds"
+            );
         }
+        assert!((2..6).all(|feed| !metadata.fold_is_rendered(feed)));
         let plan = FoldPlan::from_metadata(&metadata);
         assert!(!plan.source_is_known(0) && !plan.source_is_known(1));
         assert!((2..6).all(|feed| plan.source_is_known(feed)));
@@ -2327,6 +2425,14 @@ mod tests {
         let plan = FoldPlan::from_metadata(&metadata);
         assert!(!plan.source_is_known(0), "the object's fold is withheld");
         assert!((1..5).all(|feed| plan.source_is_known(feed)));
+        assert!(metadata.fold_is_rendered(0) && metadata.fold_is_direct(0));
+
+        // Rendered from its position, the centre object folds into C alone.
+        let mut rendered = plan;
+        crate::dcadec::xrender::FoldRenderer::new().apply(&mut rendered, &metadata, 4);
+        assert!(rendered.source_is_known(0));
+        assert!((rendered.gain(0, 0) - 1.0).abs() < 1e-6);
+        assert!((1..FOLD_SPEAKERS).all(|speaker| rendered.gain(speaker, 0) == 0.0));
 
         // The corpus frame itself reads the same way.
         let corpus = XMetadata::parse(&D0_MODE_ZERO_PAYLOAD, 5).expect("corpus frame");

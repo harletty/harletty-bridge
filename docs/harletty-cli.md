@@ -105,7 +105,8 @@ harletty decode [OPTIONS] <INPUT>
 | `--presentation <0-3>` | index | `3` | Which TrueHD presentation to decode. `3` is the 16-channel Atmos presentation; `0`–`2` are the stereo/5.1/7.1 downmixes carried in the same stream. **TrueHD only** — silently ignored for E-AC-3 and DTS, which have no equivalent. |
 | `--bed-conform` | flag | off | Keep the bed to what an Atmos bed can hold. TrueHD: declare a 7.1.2 bed. DTS:X and Auro-3D: the corner heights (and wides) leave the bed for static objects at their speaker positions, so the master set can feed an Atmos encoder. |
 | `--mono-prefix PREFIX` | path | — | Write the audio as one mono 24-bit RIFF WAV per channel, `PREFIX_<n>.wav` with n from 0 in the order of the interleaved file (a master set's bed, then its objects), instead of one interleaved file; `.atmos` and `.atmos.metadata` are written as usual, and the header still names the interleaved file, which is not written. For a front end that would otherwise de-interleave the CAF itself. Not combinable with `--bed-conform` on TrueHD. |
-| `--no-fold-estimate` | flag | off | DTS:X only. A waveform whose bed fold the stream does not state is normally given a fold estimated from the bed's audio, so it plays at its position and leaves the bed. With this flag it stays in the bed and its own channel is muted. |
+| `--no-fold-render` | flag | off | DTS:X only. An object record without reference rows says the encoder rendered the object into the bed from its position; that fold is normally recomputed and subtracted, so the object plays at its position and leaves the bed. With this flag the object falls to the fold estimate (or stays in the bed, muted, with `--no-fold-estimate`). |
+| `--no-fold-estimate` | flag | off | DTS:X only. A waveform whose bed fold is still unknown (not stated, and not recomputed from its position) is normally given a fold estimated from the bed's audio, so it plays at its position and leaves the bed. With this flag it stays in the bed and its own channel is muted. |
 | `--warp-mode` | `normal`, `warping`, `prologiciix`, `loro` | *(from stream)* | Downmix warp mode to declare when the metadata does not carry one. |
 | `--no-estimate-progress` | flag | off | Skip the pre-pass that counts frames for the progress bar. Automatic for stdin, which cannot be pre-scanned. |
 
@@ -373,9 +374,11 @@ of drift.
   the fixed heights become bed channels. The private metadata is read
   from corpus evidence rather than a specification, so the alternate
   profiles (D0, D1, D3, D4, 5.1+1, 7.1.4+3) are reported as experimental. A
-  waveform whose bed fold the stream does not state has that fold
-  estimated from the bed's audio (see `--no-fold-estimate`), so it plays
-  on its own track and leaves the bed.
+  object whose bed fold the stream does not state was rendered into the
+  bed by the encoder from its position; that render is recomputed and
+  removed (see `--no-fold-render`). Whatever is still unknown has its fold
+  estimated from the bed's audio (see `--no-fold-estimate`), so it plays on
+  its own track and leaves the bed.
 - **Auro-3D is unfolded, not decoded bit-exactly.** A DTS-HD MA track
   that carries an Auro-Codec side channel in its low bits is recognised
   and unfolded into the layout it was encoded from: a `7.1_5H_1T` carrier
