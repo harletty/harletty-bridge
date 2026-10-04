@@ -173,11 +173,15 @@ pub enum SourceCodec {
     Auro3d131,
     #[serde(rename = "Auro-3D")]
     Auro3d,
+    /// IAMF (AOMedia Immersive Audio Model and Formats), whatever its
+    /// profile: v2.0 objects, a v1.1 channel bed, or both.
+    #[serde(rename = "IAMF")]
+    Iamf,
 }
 
 impl SourceCodec {
     /// Every label, for the taxonomy checks.
-    pub const ALL: [SourceCodec; 14] = [
+    pub const ALL: [SourceCodec; 15] = [
         SourceCodec::TrueHD,
         SourceCodec::Eac3Joc,
         SourceCodec::DtsX714,
@@ -192,6 +196,7 @@ impl SourceCodec {
         SourceCodec::Auro3d111,
         SourceCodec::Auro3d131,
         SourceCodec::Auro3d,
+        SourceCodec::Iamf,
     ];
 
     /// The string this codec is written as: the `sourceCodec` of the DAMF
@@ -214,6 +219,7 @@ impl SourceCodec {
             SourceCodec::Auro3d111 => "Auro-3D-11.1",
             SourceCodec::Auro3d131 => "Auro-3D-13.1",
             SourceCodec::Auro3d => "Auro-3D",
+            SourceCodec::Iamf => "IAMF",
         }
     }
 }
@@ -768,6 +774,27 @@ impl Event {
             id: Some(id),
             ..Default::default()
         }
+    }
+
+    /// An object moving to `pos`, reached `ramp_length` samples after
+    /// `sample_pos`, and nothing else restated: for a source that states
+    /// positions as a trajectory rather than as payloads repeating every
+    /// field, so there is nothing to diff (IAMF).
+    pub fn position_update(id: u32, sample_pos: u64, pos: [f64; 3], ramp_length: u32) -> Self {
+        Self {
+            id: Some(id),
+            sample_pos: Some(sample_pos),
+            pos: Some(VecDisplay(pos.to_vec())),
+            ramp_length: Some(ramp_length),
+            ..Default::default()
+        }
+    }
+
+    /// Restate where the object is, for a caller that holds the position
+    /// more exactly than the OAMD payload the event was projected from: its
+    /// encoding halves and offsets each coordinate, which rounds.
+    pub fn set_pos(&mut self, pos: [f64; 3]) {
+        self.pos = Some(VecDisplay(pos.to_vec()));
     }
 
     fn diff(&self, b: &Self) -> Self {

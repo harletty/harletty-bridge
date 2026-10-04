@@ -7,6 +7,8 @@ pub mod dts_thread;
 pub mod eac3_handler;
 pub mod eac3_thread;
 pub mod handler;
+#[cfg(feature = "iamf")]
+pub mod iamf_handler;
 pub mod output;
 pub mod processor;
 pub mod progress;

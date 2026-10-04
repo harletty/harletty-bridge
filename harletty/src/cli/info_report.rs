@@ -40,7 +40,12 @@ pub const SCHEMA: u32 = 1;
 /// spatial metadata and `codec` `DTS`; they now report `DTS:X-7.1.4` and the
 /// new `codec` value `DTS-HD HRA`. A consumer holding a `DTS` verdict for a
 /// track whose container says DTS-HD HRA should re-probe it.
-pub const TAXONOMY_VERSION: u32 = 3;
+///
+/// 4: `IAMF`, for a standalone IAMF stream (a build with the `iamf`
+/// feature decodes it): objects and channel bed alike, whatever the profile.
+/// Such tracks reported no frame found; a consumer holding that verdict for
+/// an IAMF track should re-probe it.
+pub const TAXONOMY_VERSION: u32 = 4;
 
 /// The versions alone, for `harletty taxonomy`.
 #[derive(Debug, Serialize)]
@@ -60,8 +65,8 @@ pub struct InfoReport {
     /// The build: git describe, decoder library version, timestamp.
     pub build: &'static str,
     pub taxonomy: u32,
-    /// `TrueHD`, `EAC3`, `DTS` (core only) or `DTS-HD MA`; `null` when no
-    /// frame was found, with `error` saying why.
+    /// `TrueHD`, `EAC3`, `DTS` (core only), `DTS-HD HRA`, `DTS-HD MA` or
+    /// `IAMF`; `null` when no frame was found, with `error` saying why.
     pub codec: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -77,6 +82,8 @@ pub struct InfoReport {
     pub eac3: Option<Eac3Facts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auro: Option<AuroFacts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iamf: Option<IamfFacts>,
     /// Whether the stream's metadata is signed by the key this machine
     /// holds. Absent for a codec whose signature this binary cannot check,
     /// which today is every codec but TrueHD.
@@ -93,7 +100,7 @@ pub struct InfoReport {
 pub struct Spatial {
     /// The DAMF `sourceCodec` label.
     pub label: String,
-    /// `atmos`, `joc`, `dtsx` or `auro`.
+    /// `atmos`, `joc`, `dtsx`, `auro` or `iamf`.
     pub kind: &'static str,
     /// Waveforms presented as objects, when the presentation says.
     pub objects: Option<u32>,
@@ -181,6 +188,25 @@ pub struct AuroFacts {
     pub original: Option<&'static str>,
 }
 
+/// What an IA sequence holds. The profiles come from its header; the rest
+/// from its descriptors, which only a build with the `iamf` feature reads
+/// (`null` otherwise).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IamfFacts {
+    /// The sequence header's primary profile: `simple`, `base`,
+    /// `base-enhanced`, `base-advanced`, `advanced-1` or `advanced-2`.
+    pub profile: &'static str,
+    pub additional_profile: &'static str,
+    /// The substreams' codec: `FLAC`, `Opus`, `AAC` or `PCM`.
+    pub codec: Option<&'static str>,
+    /// The mix presentation `decode` decodes.
+    pub mix: Option<u32>,
+    /// Audio elements in that mix.
+    pub elements: Option<u32>,
+    /// Objects it carries (IAMF v2.0).
+    pub objects: Option<u32>,
+}
+
 impl InfoReport {
     /// A report with the versions filled in and nothing established yet.
     pub fn new() -> Self {
@@ -197,6 +223,7 @@ impl InfoReport {
             truehd: None,
             eac3: None,
             auro: None,
+            iamf: None,
             signature: None,
             frames_seen: 0,
             seconds_seen: 0.0,
