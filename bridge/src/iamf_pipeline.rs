@@ -596,7 +596,9 @@ fn describe(descriptors: &[u8]) -> String {
         .map(|element| match &element.config {
             AudioElementConfig::ChannelBased { layers } => layers
                 .last()
-                .map_or("channels", |layer| layer_name(layer.loudspeaker_layout))
+                .map_or("channels", |layer| {
+                    layer_name(layer.loudspeaker_layout, layer.expanded_loudspeaker_layout)
+                })
                 .to_owned(),
             AudioElementConfig::AmbisonicsMono {
                 output_channel_count,
@@ -843,9 +845,33 @@ fn layout_labels(layout: u8) -> Option<&'static [RChannelLabel]> {
     })
 }
 
-/// IAMF `loudspeaker_layout` (§3.7.4).
-fn layer_name(layout: u8) -> &'static str {
+/// IAMF `loudspeaker_layout` (§3.6.2), and `expanded_loudspeaker_layout`
+/// when it is 15.
+fn layer_name(layout: u8, expanded: Option<u8>) -> &'static str {
     match layout {
+        15 => match expanded {
+            Some(0) => "LFE",
+            Some(1) => "stereo-S",
+            Some(2) => "stereo-SS",
+            Some(3) => "stereo-RS",
+            Some(4) => "stereo-TF",
+            Some(5) => "stereo-TB",
+            Some(6) => "top 4ch",
+            Some(7) => "3.0",
+            Some(8) => "9.1.6",
+            Some(9) => "stereo-F",
+            Some(10) => "stereo-Si",
+            Some(11) => "stereo-TpSi",
+            Some(12) => "top 6ch",
+            Some(13) => "10.2.9.3",
+            Some(14) => "LFE pair",
+            Some(15) => "bottom 3ch",
+            Some(16) => "7.1.5.4",
+            Some(17) => "bottom 4ch",
+            Some(18) => "top 1ch",
+            Some(19) => "top 5ch",
+            _ => "expanded layout",
+        },
         0 => "mono",
         1 => "stereo",
         2 => "5.1",
@@ -1103,6 +1129,41 @@ mod tests {
     }
 
     #[test]
+    fn an_expanded_7154_stream_renders_to_the_714_bed() {
+        // IAMF v2.0 expanded layout 16: a 7.1.5.4 LPCM element beside a
+        // stereo one (advanced profile), rendered to System J through
+        // 7.1.5.4's own matrix; its second declared layout is System J.
+        let (Some(stream), Some(reference)) = (
+            vector("test_000833.iamf"),
+            vector("test_000833_rendered_id_42_sub_mix_0_layout_1.wav"),
+        ) else {
+            eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
+            return;
+        };
+        let mut bridge = AtmosBridge::new(false);
+        let frames = decode_raw(&mut bridge, &std::fs::read(stream).unwrap());
+        assert_eq!(
+            bridge.source_label().as_str(),
+            "IAMF (PCM) 7.1.5.4 + stereo"
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.channel_labels.as_slice() == OUTPUT_LABELS.as_slice())
+        );
+        let ours = interleaved(&frames);
+        let (_, expected) = read_wav_s16(&reference);
+        assert_eq!(ours.len(), expected.len());
+        // A matrix render, compared at the reference's 16 bits.
+        let max_diff = ours
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| ((a - b).abs() + 128) >> 8)
+            .max();
+        assert!(max_diff <= Some(1), "max diff {max_diff:?} (16-bit steps)");
+    }
+
+    #[test]
     fn opus_714_decodes_within_the_lossy_tolerance() {
         let (Some(stream), Some(reference)) = (
             vector("test_000220.iamf"),
@@ -1348,6 +1409,7 @@ mod tests {
             let rendered = iamf_dec::render::render(
                 &iamf_dec::reconstruct::Reconstructed::Channels {
                     matrix: info.matrix,
+                    rows: None,
                     planar: planes,
                 },
                 OUTPUT_LAYOUT.matrix_layout(),
