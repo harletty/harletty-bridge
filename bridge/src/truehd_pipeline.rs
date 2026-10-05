@@ -504,6 +504,8 @@ pub(crate) fn process_extractor_input(
     if input.is_empty() {
         return;
     }
+    #[cfg(test)]
+    crate::bridge::injected_panic::hit(crate::bridge::RawCodec::TrueHd);
 
     #[cfg(feature = "bridge-perf")]
     let push_started = Instant::now();
