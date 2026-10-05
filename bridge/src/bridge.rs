@@ -13,8 +13,7 @@ use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, pa
 use truehd::structs::access_unit::AccessUnit;
 
 use crate::ac3_native::NativeAc3Decoder;
-use crate::auro_pipeline::DtsAuroState;
-use crate::dts_pipeline::{DtsFoldConfig, DtsXState};
+use crate::dts_pipeline::{DtsPipeline, FAMILY_AURO, FAMILY_DTS};
 use crate::eac3_pipeline::{
     DecodedDependent, Eac3IndependentOutcome, PendingEac3Dependent,
     build_legacy_ac3_core_failure_silence, decode_eac3_independent, decode_eac3_inspected,
@@ -26,17 +25,13 @@ use crate::frame_builders::validate_frame_shape;
 use crate::logging::bridge_diag_log;
 use crate::mat::MatStream;
 use crate::perf::PerfStats;
-#[cfg(feature = "iamf")]
-use crate::shared::AfterPush;
-use crate::shared::SharedState;
+use crate::shared::{AfterPush, SharedState};
 use crate::truehd_pipeline::{configure_parser, process_extractor_input, required_presentations};
 
 /// The source families this bridge declares (`BridgeLib::source_families`),
 /// by the names `source_family` returns. The renderer knows none of them by
 /// name: these entries are what it, and Studio, offer.
 const FAMILY_DOLBY: &str = "dolby";
-const FAMILY_DTS: &str = "dts";
-const FAMILY_AURO: &str = "auro";
 const FAMILY_IAMF: &str = "iamf";
 
 /// The catalogue: Dolby's codecs share the room-cube bed; DTS states ITU
@@ -145,22 +140,6 @@ pub(crate) mod injected_panic {
             panic!("injected panic in the {codec:?} path");
         }
     }
-}
-
-/// Which DTS carrier the frames come in: what the demux found after the
-/// core. Named the way FFmpeg names the profiles, so a host's track
-/// information reads the same on either decoder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum DtsProfile {
-    /// A core frame alone (DTS, DTS-ES, DTS 96/24).
-    #[default]
-    Core,
-    /// An extension substream without a lossless asset — DTS-HD High
-    /// Resolution Audio and the other lossy extensions, of which only the
-    /// core is decoded.
-    Hd,
-    /// An extension substream with a lossless asset: DTS-HD Master Audio.
-    Ma,
 }
 
 /// Best-effort codec detection on a raw access unit, used when the host did not
@@ -305,33 +284,9 @@ pub(crate) struct AtmosBridge {
     pub(crate) raw_codec: Option<RawCodec>,
     pub(crate) eac3_diag_stats: Eac3DiagStats,
     // ── DTS (DCA) pipeline ───────────────────────────────────────────
-    /// Raw byte buffer for demuxing `[core][exss]` DTS-HD frames.
-    pub(crate) dts_buf: Vec<u8>,
-    /// Plain DTS core (5.1) decoder.
-    pub(crate) dts_decoder: Box<dca::PcmDecoder>,
-    /// DTS-HD Master Audio lossless (5.1/7.1) decoder.
-    pub(crate) dts_hd_decoder: Box<dca::HdDecoder>,
-    pub(crate) dts_frame_count: u64,
-    /// DTS:X extension state: latched presentation shape, last readable
-    /// metadata, announced object positions. Cleared with the pipeline.
-    pub(crate) dts_x: DtsXState,
+    pub(crate) dts: DtsPipeline,
     /// True when the most recent `push_packet` used the DTS path.
     pub(crate) dts_active: bool,
-    /// Live stream fact: the latest DTS frame's surround pair is the
-    /// carrier's side-surround pair (Lss/Rss, ±90°) rather than its surround
-    /// pair (Ls/Rs, ±110°). Both play through `Ls`/`Rs`; this picks the angle
-    /// the pair is declared at (`fixed_channel_poses`).
-    pub(crate) dts_surrounds_on_side: bool,
-    pub(crate) dts_fold_config: DtsFoldConfig,
-    /// Live stream fact: the latest DTS frame emitted object channels. Set
-    /// from what the frame presented rather than from its profile, so every
-    /// object-bearing presentation reaches it by the same route.
-    pub(crate) dts_objects_active: bool,
-    /// The carrier of the latest DTS frame, for the source label.
-    pub(crate) dts_profile: DtsProfile,
-    /// Auro-3D detection and unfolding over the lossless DTS-HD output.
-    /// Holds the first frames back until the carrier question is settled.
-    pub(crate) dts_auro: DtsAuroState,
     // ── IAMF pipeline ────────────────────────────────────────────────
     #[cfg(feature = "iamf")]
     pub(crate) iamf: Box<crate::iamf_pipeline::IamfState>,
@@ -405,17 +360,8 @@ impl AtmosBridge {
             forced_raw_codec: None,
             raw_codec: None,
             eac3_diag_stats: Eac3DiagStats::default(),
-            dts_buf: Vec::new(),
-            dts_decoder: Box::new(dca::PcmDecoder::new()),
-            dts_hd_decoder: Box::new(dca::HdDecoder::new()),
-            dts_frame_count: 0,
-            dts_x: DtsXState::default(),
+            dts: DtsPipeline::new(),
             dts_active: false,
-            dts_surrounds_on_side: false,
-            dts_fold_config: DtsFoldConfig::from_env(),
-            dts_objects_active: false,
-            dts_profile: DtsProfile::default(),
-            dts_auro: DtsAuroState::default(),
             #[cfg(feature = "iamf")]
             iamf: Box::default(),
             #[cfg(not(feature = "iamf"))]
@@ -471,16 +417,8 @@ impl AtmosBridge {
         self.eac3_active = false;
 
         // DTS reset.
-        self.dts_buf.clear();
-        self.dts_decoder.reset();
-        self.dts_hd_decoder.reset();
-        self.dts_frame_count = 0;
-        self.dts_x = DtsXState::default();
+        self.dts.reset();
         self.dts_active = false;
-        self.dts_surrounds_on_side = false;
-        self.dts_objects_active = false;
-        self.dts_profile = DtsProfile::default();
-        self.dts_auro.reset();
 
         // IAMF reset: the stream position goes, the sequence's configuration
         // stays, so decoding resumes without waiting for a sequence header.
@@ -908,8 +846,14 @@ impl AtmosBridge {
                     RawCodec::Dts => {
                         self.eac3_active = false;
                         self.dts_active = true;
-                        self.dts_buf.extend_from_slice(data.as_slice());
-                        crate::dts_pipeline::drain_dts(self, &mut result);
+                        #[cfg(test)]
+                        injected_panic::hit(RawCodec::Dts);
+                        let after =
+                            self.dts
+                                .push_raw(&mut self.shared, data.as_slice(), &mut result);
+                        if after == AfterPush::ResetPipeline {
+                            self.reset_pipeline();
+                        }
                     }
                     RawCodec::Iamf => {
                         self.eac3_active = false;
@@ -1033,18 +977,17 @@ impl AtmosBridge {
                 if crate::dts_spdif::accepts_data_type(data_type) {
                     self.eac3_active = false;
                     self.dts_active = true;
-                    let payload = crate::dts_spdif::normalise_payload(data.as_slice());
-                    // Types I/II/III carry the frame directly; type IV wraps it
-                    // in a start code plus a length, and pads the burst past it.
-                    // Fed whole, the pipeline finds no sync word and decodes
-                    // nothing at all.
-                    let payload = if data_type == crate::dts_spdif::DTSHD_DATA_TYPE {
-                        crate::dts_spdif::unwrap_hd_payload(&payload).unwrap_or(&payload)
-                    } else {
-                        &payload
-                    };
-                    self.dts_buf.extend_from_slice(payload);
-                    crate::dts_pipeline::drain_dts(self, &mut result);
+                    #[cfg(test)]
+                    injected_panic::hit(RawCodec::Dts);
+                    let after = self.dts.push_iec61937(
+                        &mut self.shared,
+                        data.as_slice(),
+                        data_type,
+                        &mut result,
+                    );
+                    if after == AfterPush::ResetPipeline {
+                        self.reset_pipeline();
+                    }
                     return result;
                 }
 
@@ -1121,7 +1064,7 @@ impl FormatBridge for AtmosBridge {
         if self.iamf.is_ready() {
             return true;
         }
-        self.frame_count > 0 || self.eac3_frame_count > 0 || self.dts_frame_count > 0
+        self.frame_count > 0 || self.eac3_frame_count > 0 || self.dts.is_ready()
     }
 
     fn has_objects(&self) -> bool {
@@ -1135,17 +1078,7 @@ impl FormatBridge for AtmosBridge {
             return false;
         }
         if self.dts_active {
-            if self.dts_objects_active {
-                return true;
-            }
-            // DTS core, and the presentations whose feeds are all fixed - the
-            // standard height quartet and D0's five - are labeled fixed
-            // channels. Whether those are placed directly or virtualized
-            // remains the renderer's channel-mode decision. A presentation
-            // that declares objects labels those feeds as object channels
-            // instead: D1, D3 and D4 over the height quartet, and the
-            // object-only variant for the single one it carries alone.
-            return false;
+            return self.dts.has_objects();
         }
         if self.eac3_active {
             // E-AC3/AC-3 is spatial only when it actually carries JOC object
@@ -1264,11 +1197,7 @@ impl FormatBridge for AtmosBridge {
             return self.iamf.declared_poses();
         }
         if self.dts_active {
-            if self.dts_auro.is_unfolding() {
-                self.dts_auro.declared_poses()
-            } else {
-                crate::labels::dts_declared_poses(self.dts_surrounds_on_side)
-            }
+            self.dts.fixed_channel_poses()
         } else {
             RVec::new()
         }
@@ -1280,11 +1209,7 @@ impl FormatBridge for AtmosBridge {
         RString::from(if self.iamf_active {
             FAMILY_IAMF
         } else if self.dts_active {
-            if self.dts_auro.is_unfolding() {
-                FAMILY_AURO
-            } else {
-                FAMILY_DTS
-            }
+            self.dts.source_family()
         } else {
             FAMILY_DOLBY
         })
@@ -1314,21 +1239,7 @@ impl FormatBridge for AtmosBridge {
         }
         let mut label = String::with_capacity(40);
         if self.dts_active {
-            label.push_str(match self.dts_profile {
-                DtsProfile::Core => "DTS",
-                DtsProfile::Hd => "DTS-HD HRA",
-                DtsProfile::Ma => "DTS-HD MA",
-            });
-            if let Some(layout) = self.dts_auro.unfolded_layout() {
-                label.push_str(" + Auro-3D");
-                if let Some(name) = layout.auro_name() {
-                    label.push(' ');
-                    label.push_str(name);
-                }
-            } else if let Some(presentation) = self.dts_x.locked {
-                label.push_str(" + DTS:X ");
-                label.push_str(presentation.layout_label());
-            }
+            self.dts.source_label(&mut label);
         } else if self.eac3_active {
             let stats = &self.eac3_diag_stats;
             label.push_str(if stats.total_frames > stats.legacy_ac3_frames {
@@ -1412,6 +1323,7 @@ impl FormatBridge for AtmosBridge {
 #[cfg(test)]
 mod raw_transport_tests {
     use super::*;
+    use crate::dts_pipeline::DtsProfile;
     use bridge_api::RChannelLabel;
     use std::io::Read;
 
@@ -1603,7 +1515,7 @@ mod raw_transport_tests {
             "DTS declares its ETSI angles"
         );
         // A stream that named the pair Lss/Rss is declared on the side.
-        bridge.dts_surrounds_on_side = true;
+        bridge.dts.surrounds_on_side = true;
         let poses = bridge.fixed_channel_poses();
         assert!(
             poses
@@ -1611,7 +1523,7 @@ mod raw_transport_tests {
                 .any(|p| p.label == bridge_api::RChannelLabel::Ls && p.azimuth_deg == -90.0),
             "a side-surround pair is declared at ±90°"
         );
-        bridge.dts_surrounds_on_side = false;
+        bridge.dts.surrounds_on_side = false;
         bridge.dts_active = false;
         bridge.eac3_active = true;
         assert_eq!(bridge.source_family().as_str(), "dolby");
@@ -1656,19 +1568,19 @@ mod raw_transport_tests {
         assert_eq!(bridge.source_label().as_str(), "", "nothing before a frame");
 
         bridge.dts_active = true;
-        bridge.dts_frame_count = 1;
+        bridge.dts.frame_count = 1;
         assert_eq!(bridge.source_label().as_str(), "DTS");
-        bridge.dts_profile = DtsProfile::Hd;
+        bridge.dts.profile = DtsProfile::Hd;
         assert_eq!(bridge.source_label().as_str(), "DTS-HD HRA");
-        bridge.dts_profile = DtsProfile::Ma;
+        bridge.dts.profile = DtsProfile::Ma;
         assert_eq!(bridge.source_label().as_str(), "DTS-HD MA");
-        bridge.dts_x.locked = Some(dca::XPresentation::Height);
+        bridge.dts.x.locked = Some(dca::XPresentation::Height);
         assert_eq!(bridge.source_label().as_str(), "DTS-HD MA + DTS:X 7.1.4");
-        bridge.dts_x.locked = Some(dca::XPresentation::ObjectsD3);
+        bridge.dts.x.locked = Some(dca::XPresentation::ObjectsD3);
         assert_eq!(bridge.source_label().as_str(), "DTS-HD MA + DTS:X 7.1.4+4");
 
         bridge.dts_active = false;
-        bridge.dts_frame_count = 0;
+        bridge.dts.frame_count = 0;
         bridge.eac3_active = true;
         bridge.eac3_frame_count = 1;
         bridge.eac3_diag_stats.total_frames = 1;
@@ -1779,7 +1691,7 @@ mod raw_transport_tests {
             frames.extend(result.frames.into_iter());
         }
         assert!(
-            bridge.dts_auro.is_unfolding(),
+            bridge.dts.auro.is_unfolding(),
             "the carrier was not confirmed"
         );
         assert!(!bridge.has_objects(), "Auro is fixed channels, not objects");
@@ -1875,7 +1787,7 @@ mod raw_transport_tests {
         assert!(result.error_message.is_empty(), "{}", result.error_message);
         assert!(!result.frames.is_empty(), "no HD frames decoded");
         assert!(!bridge.has_objects());
-        assert_eq!(bridge.dts_profile, DtsProfile::Hd);
+        assert_eq!(bridge.dts.profile, DtsProfile::Hd);
         assert_eq!(bridge.source_family().as_str(), "dts");
         assert_eq!(bridge.source_label().as_str(), "DTS-HD HRA + DTS:X 7.1.4");
         let f = result
