@@ -1,5 +1,6 @@
 mod ac3_native;
 mod bridge;
+mod dolby;
 mod eac3_pipeline;
 mod eac3_spdif;
 mod labels;

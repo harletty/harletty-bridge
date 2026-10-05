@@ -10,11 +10,12 @@ use truehd::process::{
 };
 use truehd::structs::access_unit::AccessUnit;
 
-use crate::bridge::{AtmosBridge, DrcMode};
+use crate::dolby::{DolbyPipeline, DrcMode};
 use crate::labels::{channel_label_to_r, oamd_speaker_to_label};
 use crate::logging::{bridge_diag_log, drc_diag_log_enabled, panic_message};
 use crate::metadata::build_metadata_frame_from_oamd;
 use crate::perf::PerfStats;
+use crate::shared::{AfterPush, SharedState};
 
 /// Applies everything a fresh [`Parser`] needs to match this bridge's contract.
 ///
@@ -87,7 +88,7 @@ struct DrainContext<'a> {
     current_dialogue_level: &'a mut Option<i8>,
     recovering_until_major_sync: &'a mut bool,
     drc_mode: DrcMode,
-    /// See [`AtmosBridge::truehd_presentations_stale`].
+    /// See [`DolbyPipeline::truehd_presentations_stale`].
     presentations_stale: &'a mut bool,
     total_samples: &'a mut u64,
     declared_object_channels: &'a mut Option<RVec<bridge_api::RObjectChannel>>,
@@ -497,15 +498,14 @@ fn build_thd_frame(
 }
 
 pub(crate) fn process_extractor_input(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
     input: &[u8],
     result: &mut RPushResult,
-) {
+) -> AfterPush {
     if input.is_empty() {
-        return;
+        return AfterPush::Continue;
     }
-    #[cfg(test)]
-    crate::bridge::injected_panic::hit(crate::bridge::RawCodec::TrueHd);
 
     #[cfg(feature = "bridge-perf")]
     let push_started = Instant::now();
@@ -519,7 +519,7 @@ pub(crate) fn process_extractor_input(
             parser: &mut bridge.parser,
             decoder: &mut bridge.decoder,
             frame_count: &mut bridge.frame_count,
-            strict: bridge.shared.strict,
+            strict: shared.strict,
             presentation: bridge.presentation,
             current_substream_info: &mut bridge.current_substream_info,
             current_extended_substream_info: &mut bridge.current_extended_substream_info,
@@ -527,8 +527,8 @@ pub(crate) fn process_extractor_input(
             recovering_until_major_sync: &mut bridge.recovering_until_major_sync,
             drc_mode: bridge.drc_mode,
             presentations_stale: &mut bridge.truehd_presentations_stale,
-            total_samples: &mut bridge.shared.total_samples,
-            declared_object_channels: &mut bridge.shared.declared_object_channels,
+            total_samples: &mut shared.total_samples,
+            declared_object_channels: &mut shared.declared_object_channels,
             spatial_labels: &mut bridge.truehd_spatial_labels,
             perf: &mut bridge.perf,
         };
@@ -551,9 +551,10 @@ pub(crate) fn process_extractor_input(
             result.frames.extend(frames);
             if let Some(msg) = err {
                 result.error_message = msg.into();
-                bridge.reset_pipeline();
                 result.did_reset = true;
+                return AfterPush::ResetPipeline;
             }
+            AfterPush::Continue
         }
         Err(panic_info) => {
             let msg = panic_message(&panic_info);
@@ -561,11 +562,11 @@ pub(crate) fn process_extractor_input(
                 "Panic caught during frame processing: {}. Resetting pipeline.",
                 msg
             );
-            bridge.reset_pipeline();
             result.did_reset = true;
-            if bridge.shared.strict {
+            if shared.strict {
                 result.error_message = msg.into();
             }
+            AfterPush::ResetPipeline
         }
     }
 }

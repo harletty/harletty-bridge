@@ -9,11 +9,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(feature = "bridge-perf")]
 use std::time::Instant;
 
-use crate::bridge::AtmosBridge;
+use crate::dolby::DolbyPipeline;
 use crate::frame_builders::float_to_pcm_i32;
 use crate::labels::bed_channel_to_r;
 use crate::logging::bridge_diag_log;
 use crate::metadata::build_eac3_metadata_frame;
+use crate::shared::SharedState;
 
 const LEGACY_AC3_SAMPLE_COUNT: u32 = 1536;
 const LEGACY_AC3_CHANNEL_COUNT: u32 = 6;
@@ -87,7 +88,8 @@ pub(crate) enum Eac3IndependentOutcome {
 /// switch), the frame is decoded again by the other decoder, so what comes
 /// out of the frame is what the rule says.
 pub(crate) fn decode_eac3_independent(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
     frame: &[u8],
     can_carry_dependents: bool,
 ) -> Eac3IndependentOutcome {
@@ -103,6 +105,7 @@ pub(crate) fn decode_eac3_independent(
                 emit_eac3_frame_info_diagnostic(bridge, &push.info);
                 return Eac3IndependentOutcome::Emit(decode_eac3_objects(
                     bridge,
+                    shared,
                     frame,
                     Some(push),
                 ));
@@ -118,7 +121,9 @@ pub(crate) fn decode_eac3_independent(
                     )));
                 }
                 emit_eac3_frame_diagnostic(bridge, frame, &inspection);
-                return Eac3IndependentOutcome::Emit(decode_eac3_objects(bridge, frame, None));
+                return Eac3IndependentOutcome::Emit(decode_eac3_objects(
+                    bridge, shared, frame, None,
+                ));
             }
         }
     }
@@ -127,17 +132,17 @@ pub(crate) fn decode_eac3_independent(
         Ok(Some(result)) if !can_carry_dependents || carries_self_contained_joc(&result.info) => {
             bridge.eac3_expect_self_contained_joc = true;
             emit_eac3_frame_info_diagnostic(bridge, &result.info);
-            Eac3IndependentOutcome::Emit(Ok(build_object_frame(bridge, frame, result)))
+            Eac3IndependentOutcome::Emit(Ok(build_object_frame(bridge, shared, frame, result)))
         }
         // An independent whose JOC declares a wider downmix than it carries:
         // held for its dependents like any other core.
         Ok(Some(_)) => {
             bridge.eac3_expect_self_contained_joc = false;
-            hold_or_emit_core(bridge, frame, can_carry_dependents)
+            hold_or_emit_core(bridge, shared, frame, can_carry_dependents)
         }
         Ok(None) | Err(_) => {
             bridge.eac3_expect_self_contained_joc = false;
-            hold_or_emit_core(bridge, frame, can_carry_dependents)
+            hold_or_emit_core(bridge, shared, frame, can_carry_dependents)
         }
     }
 }
@@ -146,7 +151,8 @@ pub(crate) fn decode_eac3_independent(
 /// said dependent, its inspection said otherwise) the way every frame used to
 /// be routed: on the inspection.
 pub(crate) fn decode_eac3_inspected(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
     frame: &[u8],
     inspection: &Eac3Inspection,
 ) -> Eac3IndependentOutcome {
@@ -165,31 +171,33 @@ pub(crate) fn decode_eac3_inspected(
         };
     }
     emit_eac3_frame_diagnostic(bridge, frame, inspection);
-    Eac3IndependentOutcome::Emit(decode_eac3_objects(bridge, frame, None))
+    Eac3IndependentOutcome::Emit(decode_eac3_objects(bridge, shared, frame, None))
 }
 
 /// The objects of a frame already known to carry them, falling back to its
 /// core when the object decoder finds none; `decoded` is the core already
 /// decoded for it, if any, so it is not decoded twice.
 fn decode_eac3_objects(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
     frame: &[u8],
     decoded: Option<eac3::PcmPushResult>,
 ) -> Result<RDecodedFrame, String> {
     if let Ok(Some(result)) = bridge.eac3_object_decoder.push_access_unit(frame) {
-        return Ok(build_object_frame(bridge, frame, result));
+        return Ok(build_object_frame(bridge, shared, frame, result));
     }
     let push = match decoded {
         Some(push) => Ok(push),
         None => bridge.eac3_pcm_decoder.push_access_unit(frame),
     };
-    emit_core_frame(bridge, frame, push)
+    emit_core_frame(bridge, shared, frame, push)
 }
 
 /// The core of a frame that turned out to carry no self-contained objects:
 /// held when it can still be extended, emitted otherwise.
 fn hold_or_emit_core(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
     frame: &[u8],
     can_carry_dependents: bool,
 ) -> Eac3IndependentOutcome {
@@ -200,7 +208,7 @@ fn hold_or_emit_core(
                 update_eac3_dialogue_level(bridge, &push.info);
                 Eac3IndependentOutcome::Hold(push)
             } else {
-                Eac3IndependentOutcome::Emit(emit_core_frame(bridge, frame, Ok(push)))
+                Eac3IndependentOutcome::Emit(emit_core_frame(bridge, shared, frame, Ok(push)))
             }
         }
         Err(err) => {
@@ -213,13 +221,14 @@ fn hold_or_emit_core(
                 )));
             }
             emit_eac3_frame_diagnostic(bridge, frame, &inspection);
-            Eac3IndependentOutcome::Emit(emit_core_frame(bridge, frame, Err(err)))
+            Eac3IndependentOutcome::Emit(emit_core_frame(bridge, shared, frame, Err(err)))
         }
     }
 }
 
 fn build_object_frame(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
     frame: &[u8],
     result: ObjectPcmPushResult,
 ) -> RDecodedFrame {
@@ -227,7 +236,7 @@ fn build_object_frame(
     let sample_count = result.pcm.samples_per_channel();
     let base_sample_pos = bridge.eac3_total_samples;
     bridge.eac3_total_samples += sample_count as u64;
-    let rf = build_eac3_frame_from_object(result, base_sample_pos, bridge);
+    let rf = build_eac3_frame_from_object(result, base_sample_pos, bridge, shared);
     bridge.perf.maybe_report(bridge.eac3_frame_count);
     maybe_dump_ok_frame(frame, "obj");
     rf
@@ -239,18 +248,20 @@ fn build_object_frame(
 /// core PCM decode.  Converts the result into one [`RDecodedFrame`].
 #[cfg(test)]
 pub(crate) fn process_eac3_frame(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
     frame: &[u8],
     inspection: &Eac3Inspection,
 ) -> Result<RDecodedFrame, String> {
     emit_eac3_frame_diagnostic(bridge, frame, inspection);
-    decode_eac3_objects(bridge, frame, None)
+    decode_eac3_objects(bridge, shared, frame, None)
 }
 
 /// Emit a decoded core as a frame, or stand in silence for the decode errors
 /// that are known to recover.
 fn emit_core_frame(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
     frame: &[u8],
     push: Result<eac3::PcmPushResult, AccessUnitParseError>,
 ) -> Result<RDecodedFrame, String> {
@@ -263,7 +274,7 @@ fn emit_core_frame(
             let sample_count = decoded_samples as u32;
             let base_sample_pos = bridge.eac3_total_samples;
             bridge.eac3_total_samples += sample_count as u64;
-            let rf = build_eac3_frame_from_core(&pcm, &info, base_sample_pos, bridge);
+            let rf = build_eac3_frame_from_core(&pcm, &info, base_sample_pos, bridge, shared);
             bridge.perf.maybe_report(bridge.eac3_frame_count);
             maybe_dump_ok_frame(frame, "pcm");
             Ok(rf)
@@ -341,18 +352,19 @@ pub(crate) fn eac3_frame_can_carry_dependents(inspection: &Eac3Inspection) -> bo
 /// Record the dialogue level of an access unit the bridge is holding rather
 /// than emitting immediately, so the frame it eventually produces carries the
 /// level its own bitstream declared.
-pub(crate) fn note_eac3_dialogue_level(bridge: &mut AtmosBridge, info: &AccessUnitInfo) {
+pub(crate) fn note_eac3_dialogue_level(bridge: &mut DolbyPipeline, info: &AccessUnitInfo) {
     update_eac3_dialogue_level(bridge, info);
 }
 
 /// Emit a buffered independent core that ended up standing alone.
 pub(crate) fn build_buffered_core_frame(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
     push: &eac3::PcmPushResult,
 ) -> RDecodedFrame {
     let base_sample_pos = bridge.eac3_total_samples;
     bridge.eac3_total_samples += push.pcm.samples_per_channel() as u64;
-    build_eac3_frame_from_core(&push.pcm, &push.info, base_sample_pos, bridge)
+    build_eac3_frame_from_core(&push.pcm, &push.info, base_sample_pos, bridge, shared)
 }
 
 /// Turn a complete presentation - a core plus the dependents that followed it -
@@ -364,7 +376,8 @@ pub(crate) fn build_buffered_core_frame(
 /// then decides the outcome: a JOC payload there means objects, its absence
 /// means the merged bed.
 pub(crate) fn resolve_eac3_presentation(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
     core: CorePcmFrame,
     dependents: &[PendingEac3Dependent],
 ) -> Result<RDecodedFrame, String> {
@@ -423,7 +436,7 @@ pub(crate) fn resolve_eac3_presentation(
             "E-AC3 JOC declares a {}-channel downmix (joc_dmx_config_idx {}) but the bed carries an overlaid dependent",
             joc.channel_count, joc.downmix_config
         );
-        if bridge.shared.strict {
+        if shared.strict {
             return Err(message);
         }
         bridge_diag_log(log::Level::Warn, &message);
@@ -451,6 +464,7 @@ pub(crate) fn resolve_eac3_presentation(
                 result,
                 base_sample_pos,
                 bridge,
+                shared,
             ))
         }
         // The dependent announced a JOC payload the decoder then found nothing
@@ -469,7 +483,7 @@ pub(crate) fn resolve_eac3_presentation(
             let diag = eac3_frame_reject_diag(last);
             maybe_dump_reject_frame(last, "depobj");
             let message = format!("E-AC3 dependent object decode error: {err} {diag}");
-            if bridge.shared.strict {
+            if shared.strict {
                 return Err(message);
             }
             // Non-strict playback keeps going on the bed rather than losing a
@@ -536,14 +550,18 @@ fn carries_self_contained_joc(info: &AccessUnitInfo) -> bool {
 }
 
 pub(crate) fn diagnose_eac3_frame(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
     frame: &[u8],
     inspection: &Eac3Inspection,
 ) {
     emit_eac3_frame_diagnostic(bridge, frame, inspection);
 }
 
-fn emit_eac3_frame_diagnostic(bridge: &mut AtmosBridge, frame: &[u8], inspection: &Eac3Inspection) {
+fn emit_eac3_frame_diagnostic(
+    bridge: &mut DolbyPipeline,
+    frame: &[u8],
+    inspection: &Eac3Inspection,
+) {
     match inspection {
         Ok(info) => emit_eac3_frame_info_diagnostic(bridge, info),
         Err(err) => {
@@ -555,7 +573,7 @@ fn emit_eac3_frame_diagnostic(bridge: &mut AtmosBridge, frame: &[u8], inspection
     }
 }
 
-fn emit_eac3_frame_info_diagnostic(bridge: &mut AtmosBridge, info: &AccessUnitInfo) {
+fn emit_eac3_frame_info_diagnostic(bridge: &mut DolbyPipeline, info: &AccessUnitInfo) {
     bridge.eac3_diag_stats.total_frames += 1;
     match info.frame_type {
         FrameType::LegacyAc3 => bridge.eac3_diag_stats.legacy_ac3_frames += 1,
@@ -814,7 +832,7 @@ fn eac3_header_bed_labels(frame: &[u8]) -> Option<RVec<RChannelLabel>> {
 /// list is derived from it and matches the decoded neighbours. Returns `None`
 /// only when the header itself does not parse as legacy AC-3.
 pub(crate) fn build_legacy_ac3_core_failure_silence(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
     frame: &[u8],
 ) -> Option<RDecodedFrame> {
     let info = legacy_ac3_info(frame)?;
@@ -830,7 +848,7 @@ fn build_silence_frame(
     sample_rate: u32,
     sample_count: u32,
     channel_labels: RVec<RChannelLabel>,
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
 ) -> RDecodedFrame {
     let sample_count_usize = sample_count as usize;
     let channel_count = channel_labels.len();
@@ -854,7 +872,8 @@ fn build_silence_frame(
 fn build_eac3_frame_from_object(
     result: ObjectPcmPushResult,
     base_sample_pos: u64,
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
 ) -> RDecodedFrame {
     let pcm_frame = &result.pcm;
     let info = &result.info;
@@ -892,7 +911,7 @@ fn build_eac3_frame_from_object(
                 base_sample_pos,
                 num_bed_channels,
                 object_channels,
-                bridge,
+                shared,
             );
             #[cfg(feature = "bridge-perf")]
             {
@@ -1057,7 +1076,8 @@ pub(crate) fn build_eac3_frame_from_core(
     core: &CorePcmFrame,
     info: &AccessUnitInfo,
     base_sample_pos: u64,
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
 ) -> RDecodedFrame {
     let sampling_frequency = core.sample_rate;
     let sample_count = core.samples_per_channel();
@@ -1079,7 +1099,7 @@ pub(crate) fn build_eac3_frame_from_core(
     for payload in info.payloads() {
         if let ParsedEmdfPayloadData::Oamd(oamd) = &payload.parsed {
             let evo_base = base_sample_pos + payload.info.sample_offset.unwrap_or(0) as u64;
-            let meta = build_eac3_metadata_frame(oamd, evo_base, base_sample_pos, 0, 0, bridge);
+            let meta = build_eac3_metadata_frame(oamd, evo_base, base_sample_pos, 0, 0, shared);
             metadata.push(meta);
         }
     }
@@ -1111,7 +1131,7 @@ pub(crate) fn build_eac3_frame_from_core(
 /// would sit unpaired forever and the track would be silent. DRC/dialnorm come
 /// from the AC-3 frame itself (`frame`).
 pub(crate) fn build_standalone_ac3_core_frame(
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
     core: &CorePcmFrame,
     frame: &[u8],
 ) -> RDecodedFrame {
@@ -1129,7 +1149,7 @@ pub(crate) fn build_standalone_ac3_core_frame(
 fn build_eac3_channel_bed_frame(
     core: &CorePcmFrame,
     info: Option<&AccessUnitInfo>,
-    bridge: &mut AtmosBridge,
+    bridge: &mut DolbyPipeline,
 ) -> RDecodedFrame {
     let sample_count = core.samples_per_channel();
     let total_channel_count = core.total_channels();
@@ -1162,14 +1182,14 @@ fn build_eac3_channel_bed_frame(
     }
 }
 
-fn update_eac3_dialogue_level(bridge: &mut AtmosBridge, info: &AccessUnitInfo) {
+fn update_eac3_dialogue_level(bridge: &mut DolbyPipeline, info: &AccessUnitInfo) {
     bridge.current_dialogue_level = Some(info.dialogue_normalization[0]);
 }
 
-fn eac3_drc_params(bridge: &AtmosBridge, info: &AccessUnitInfo, sample_count: u32) -> (f32, u32) {
+fn eac3_drc_params(bridge: &DolbyPipeline, info: &AccessUnitInfo, sample_count: u32) -> (f32, u32) {
     match bridge.drc_mode {
-        crate::bridge::DrcMode::Off => (1.0, 0),
-        crate::bridge::DrcMode::Standard => {
+        crate::dolby::DrcMode::Off => (1.0, 0),
+        crate::dolby::DrcMode::Standard => {
             let gain = info
                 .block_drc
                 .iter()
@@ -1182,7 +1202,7 @@ fn eac3_drc_params(bridge: &AtmosBridge, info: &AccessUnitInfo, sample_count: u3
             let ramp = if gain != 1.0 { sample_count } else { 0 };
             (gain, ramp)
         }
-        crate::bridge::DrcMode::Heavy => {
+        crate::dolby::DrcMode::Heavy => {
             let gain = if info.heavy_compression_exists[0] {
                 decode_ac3_heavy_range_word(info.heavy_compression_word[0])
             } else {
@@ -1214,6 +1234,7 @@ fn decode_ac3_heavy_range_word(word: u8) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::AtmosBridge;
     use eac3::{
         AccessUnitInfo, AudioFrameInfo, AuxParseStatus, BedChannel, BlockDrcInfo, CorePcmFrame,
         EmdfSource, FrameType, JocPayload, OamdPayload, ObjectPcmFrame,
@@ -1593,11 +1614,16 @@ mod tests {
         let mut frame = vec![0u8; 1234];
         frame[..8].copy_from_slice(&[0x0B, 0x77, 0x2A, 0x68, 0x22, 0x30, 0xE1, 0xFF]);
 
-        let decoded = process_eac3_frame(&mut bridge, &frame, &inspect_eac3_frame(&frame))
-            .expect("legacy AC-3 silence frame");
+        let decoded = process_eac3_frame(
+            &mut bridge.dolby,
+            &mut bridge.shared,
+            &frame,
+            &inspect_eac3_frame(&frame),
+        )
+        .expect("legacy AC-3 silence frame");
 
-        assert_eq!(bridge.eac3_diag_stats.total_frames, 1);
-        assert_eq!(bridge.eac3_diag_stats.legacy_ac3_frames, 1);
+        assert_eq!(bridge.dolby.eac3_diag_stats.total_frames, 1);
+        assert_eq!(bridge.dolby.eac3_diag_stats.legacy_ac3_frames, 1);
         assert_eq!(decoded.sampling_frequency, 48_000);
         assert_eq!(decoded.sample_count, LEGACY_AC3_SAMPLE_COUNT);
         assert_eq!(decoded.channel_count, LEGACY_AC3_CHANNEL_COUNT);
@@ -1663,7 +1689,7 @@ mod tests {
                     fullband_channels: vec![vec![0.0]; order.len()],
                     lfe_channel: lfe_on.then(|| vec![0.0]),
                 };
-                let decoded = build_eac3_channel_bed_frame(&core, None, &mut bridge);
+                let decoded = build_eac3_channel_bed_frame(&core, None, &mut bridge.dolby);
                 let silence = bed_labels_for_channel_mode(channel_mode, lfe_on);
                 assert_eq!(
                     silence.as_slice(),
@@ -1682,8 +1708,8 @@ mod tests {
         let mut frame = vec![0u8; 1672];
         frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0x40]);
 
-        let silence =
-            build_legacy_ac3_core_failure_silence(&mut bridge, &frame).expect("legacy AC-3 header");
+        let silence = build_legacy_ac3_core_failure_silence(&mut bridge.dolby, &frame)
+            .expect("legacy AC-3 header");
 
         assert_eq!(silence.sampling_frequency, 44_100);
         assert_eq!(silence.sample_count, LEGACY_AC3_SAMPLE_COUNT);
@@ -1695,12 +1721,12 @@ mod tests {
         assert_eq!(silence.pcm.len(), LEGACY_AC3_SAMPLE_COUNT as usize * 2);
         assert!(silence.pcm.iter().all(|sample| *sample == 0));
         assert_eq!(
-            bridge.eac3_total_samples,
+            bridge.dolby.eac3_total_samples,
             u64::from(LEGACY_AC3_SAMPLE_COUNT)
         );
         // Not a legacy AC-3 header (E-AC-3 bsid=16): nothing to stand in for.
         frame[5] = 0x80;
-        assert!(build_legacy_ac3_core_failure_silence(&mut bridge, &frame).is_none());
+        assert!(build_legacy_ac3_core_failure_silence(&mut bridge.dolby, &frame).is_none());
     }
 
     #[test]
@@ -1715,7 +1741,7 @@ mod tests {
     #[test]
     fn standard_drc_uses_last_block_dynamic_range_word() {
         let mut bridge = AtmosBridge::new(false);
-        bridge.drc_mode = crate::bridge::DrcMode::Standard;
+        bridge.dolby.drc_mode = crate::dolby::DrcMode::Standard;
         let mut info = minimal_access_unit_info();
         info.block_drc = vec![
             BlockDrcInfo {
@@ -1728,7 +1754,7 @@ mod tests {
             },
         ];
 
-        let (gain, ramp) = eac3_drc_params(&bridge, &info, 1536);
+        let (gain, ramp) = eac3_drc_params(&bridge.dolby, &info, 1536);
 
         assert!((gain - decode_ac3_dynamic_range_word(0x20)).abs() < 1e-6);
         assert_eq!(ramp, 1536);
@@ -1737,7 +1763,7 @@ mod tests {
     #[test]
     fn heavy_drc_prefers_heavy_word_and_falls_back_to_standard_word() {
         let mut bridge = AtmosBridge::new(false);
-        bridge.drc_mode = crate::bridge::DrcMode::Heavy;
+        bridge.dolby.drc_mode = crate::dolby::DrcMode::Heavy;
 
         let mut heavy_info = minimal_access_unit_info();
         heavy_info.heavy_compression_exists = [true, false];
@@ -1746,7 +1772,7 @@ mod tests {
             dynamic_range_exists: [true, false],
             dynamic_range_word: [0x40, 0x00],
         }];
-        let (heavy_gain, _) = eac3_drc_params(&bridge, &heavy_info, 1536);
+        let (heavy_gain, _) = eac3_drc_params(&bridge.dolby, &heavy_info, 1536);
         assert!((heavy_gain - decode_ac3_heavy_range_word(0x20)).abs() < 1e-6);
 
         let mut fallback_info = minimal_access_unit_info();
@@ -1754,7 +1780,7 @@ mod tests {
             dynamic_range_exists: [true, false],
             dynamic_range_word: [0x40, 0x00],
         }];
-        let (fallback_gain, _) = eac3_drc_params(&bridge, &fallback_info, 1536);
+        let (fallback_gain, _) = eac3_drc_params(&bridge.dolby, &fallback_info, 1536);
         assert!((fallback_gain - decode_ac3_dynamic_range_word(0x40)).abs() < 1e-6);
     }
 }
@@ -1821,7 +1847,7 @@ mod presentation_assembly {
             "the second independent ends the first presentation, emitting exactly one frame"
         );
         assert!(
-            bridge.pending_eac3_core.is_some(),
+            bridge.dolby.pending_eac3_core.is_some(),
             "the second independent is now the one being held"
         );
     }
@@ -1841,7 +1867,7 @@ mod presentation_assembly {
             "a self-contained JOC presentation must be emitted, not held"
         );
         assert!(
-            bridge.pending_eac3_core.is_none(),
+            bridge.dolby.pending_eac3_core.is_none(),
             "and nothing must be left pending behind it"
         );
     }
@@ -1869,11 +1895,11 @@ mod presentation_assembly {
             "the next independent ends the group, emitting exactly one presentation"
         );
         assert_eq!(
-            bridge.eac3_diag_stats.dependent_pair_attempts, 1,
+            bridge.dolby.eac3_diag_stats.dependent_pair_attempts, 1,
             "the group must have been resolved as a pair, not as a bare core"
         );
         assert_eq!(
-            bridge.eac3_diag_stats.dependent_frames_dropped, 0,
+            bridge.dolby.eac3_diag_stats.dependent_frames_dropped, 0,
             "no dependent in a well-formed group is an orphan"
         );
     }
@@ -1891,11 +1917,12 @@ mod presentation_assembly {
         push(&mut bridge, &dependent());
         push(&mut bridge, &dependent());
         assert_eq!(
-            bridge.eac3_diag_stats.dependent_frames_dropped, 0,
+            bridge.dolby.eac3_diag_stats.dependent_frames_dropped, 0,
             "the second dependent belongs to the same group, not to nothing"
         );
         assert_eq!(
             bridge
+                .dolby
                 .pending_eac3_core
                 .as_ref()
                 .map(|pending| pending.dependents.len()),
@@ -1915,18 +1942,18 @@ mod presentation_assembly {
     #[test]
     fn an_orphan_dependent_emits_nothing_and_does_not_advance_the_timeline() {
         let mut bridge = AtmosBridge::new(false);
-        let before = bridge.eac3_total_samples;
+        let before = bridge.dolby.eac3_total_samples;
         assert_eq!(
             push(&mut bridge, &dependent()),
             0,
             "an orphan dependent must not produce a presentation"
         );
         assert_eq!(
-            bridge.eac3_total_samples, before,
+            bridge.dolby.eac3_total_samples, before,
             "an orphan dependent must not advance the timeline"
         );
         assert!(
-            bridge.pending_eac3_core.is_none(),
+            bridge.dolby.pending_eac3_core.is_none(),
             "an orphan dependent must not become a pending core"
         );
     }
@@ -1941,7 +1968,7 @@ mod presentation_assembly {
             emitted += push(&mut bridge, INDEPENDENT);
         }
         assert_eq!(emitted, 2, "three independents resolve two presentations");
-        let samples = bridge.eac3_total_samples;
+        let samples = bridge.dolby.eac3_total_samples;
         assert!(
             samples > 0,
             "the resolved presentations must advance the timeline"
