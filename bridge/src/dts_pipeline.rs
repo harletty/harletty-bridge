@@ -250,8 +250,8 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                             &hd,
                             &mut bridge.dts_x,
                             &bridge.dts_fold_config,
-                            bridge.total_samples,
-                            &mut bridge.declared_object_channels,
+                            bridge.shared.total_samples,
+                            &mut bridge.shared.declared_object_channels,
                         ) {
                             bridge.dts_objects_active = emitted_objects;
                             if kind == ExssKind::Lossless {
@@ -275,14 +275,14 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                                 result.frames.push(frame);
                             }
                         }
-                        bridge.total_samples += n as u64;
+                        bridge.shared.total_samples += n as u64;
                         bridge.dts_frame_count += 1;
                     }
                     Err(HdError::Pending) => {} // PBR buffering; no frame this packet
                     Err(e) => {
                         let msg = format!("dts_hd_decode_error={e:?}");
                         log::warn!("{msg}");
-                        if bridge.strict {
+                        if bridge.shared.strict {
                             result.error_message = RString::from(msg);
                             bridge.reset_pipeline();
                             result.did_reset = true;
@@ -305,13 +305,13 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                         bridge.dts_surrounds_on_side = false;
                         bridge.dts_auro.not_a_carrier(&mut result.frames);
                         result.frames.push(build_core_frame(pcm));
-                        bridge.total_samples += pcm.samples_per_channel() as u64;
+                        bridge.shared.total_samples += pcm.samples_per_channel() as u64;
                         bridge.dts_frame_count += 1;
                     }
                     Err(err) => {
                         let msg = format!("dts_decode_error={err}");
                         log::warn!("{msg}");
-                        if bridge.strict {
+                        if bridge.shared.strict {
                             result.error_message = RString::from(msg);
                             bridge.reset_pipeline();
                             result.did_reset = true;
@@ -330,14 +330,14 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                     bridge.dts_objects_active = false;
                     bridge.dts_surrounds_on_side = false;
                     bridge.dts_auro.not_a_carrier(&mut result.frames);
-                    bridge.total_samples += pcm.samples_per_channel() as u64;
+                    bridge.shared.total_samples += pcm.samples_per_channel() as u64;
                     bridge.dts_frame_count += 1;
                     result.frames.push(frame);
                 }
                 Err(err) => {
                     let msg = format!("dts_decode_error={err}");
                     log::warn!("{msg}");
-                    if bridge.strict {
+                    if bridge.shared.strict {
                         result.error_message = RString::from(msg);
                         bridge.reset_pipeline();
                         result.did_reset = true;

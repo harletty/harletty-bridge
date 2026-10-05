@@ -13,6 +13,7 @@ mod logging;
 mod mat;
 mod metadata;
 mod perf;
+mod shared;
 mod truehd_pipeline;
 
 use abi_stable::std_types::RVec;

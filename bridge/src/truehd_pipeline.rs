@@ -511,7 +511,10 @@ pub(crate) fn process_extractor_input(
     let push_started = Instant::now();
     bridge.extractor.push_bytes(input);
     #[cfg(feature = "bridge-perf")]
-    bridge.perf.record_extractor_push(push_started.elapsed());
+    bridge
+        .shared
+        .perf
+        .record_extractor_push(push_started.elapsed());
 
     let panic_result = {
         let mut ctx = DrainContext {
@@ -519,7 +522,7 @@ pub(crate) fn process_extractor_input(
             parser: &mut bridge.parser,
             decoder: &mut bridge.decoder,
             frame_count: &mut bridge.frame_count,
-            strict: bridge.strict,
+            strict: bridge.shared.strict,
             presentation: bridge.presentation,
             current_substream_info: &mut bridge.current_substream_info,
             current_extended_substream_info: &mut bridge.current_extended_substream_info,
@@ -527,10 +530,10 @@ pub(crate) fn process_extractor_input(
             recovering_until_major_sync: &mut bridge.recovering_until_major_sync,
             drc_mode: bridge.drc_mode,
             presentations_stale: &mut bridge.truehd_presentations_stale,
-            total_samples: &mut bridge.total_samples,
-            declared_object_channels: &mut bridge.declared_object_channels,
+            total_samples: &mut bridge.shared.total_samples,
+            declared_object_channels: &mut bridge.shared.declared_object_channels,
             spatial_labels: &mut bridge.truehd_spatial_labels,
-            perf: &mut bridge.perf,
+            perf: &mut bridge.shared.perf,
         };
         #[cfg(feature = "bridge-perf")]
         let drain_started = Instant::now();
@@ -542,7 +545,7 @@ pub(crate) fn process_extractor_input(
             )
         }));
         #[cfg(feature = "bridge-perf")]
-        bridge.perf.record_drain(drain_started.elapsed());
+        bridge.shared.perf.record_drain(drain_started.elapsed());
         result
     };
 
@@ -563,7 +566,7 @@ pub(crate) fn process_extractor_input(
             );
             bridge.reset_pipeline();
             result.did_reset = true;
-            if bridge.strict {
+            if bridge.shared.strict {
                 result.error_message = msg.into();
             }
         }

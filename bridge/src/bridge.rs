@@ -25,7 +25,7 @@ use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::validate_frame_shape;
 use crate::logging::bridge_diag_log;
 use crate::mat::MatStream;
-use crate::perf::PerfStats;
+use crate::shared::SharedState;
 use crate::truehd_pipeline::{configure_parser, process_extractor_input, required_presentations};
 
 /// The source families this bridge declares (`BridgeLib::source_families`),
@@ -339,10 +339,8 @@ pub(crate) struct AtmosBridge {
     /// True when the most recent `push_packet` used the IAMF path.
     pub(crate) iamf_active: bool,
     // ── Shared ───────────────────────────────────────────────────────
+    pub(crate) shared: SharedState,
     pub(crate) presentation: u8,
-    pub(crate) strict: bool,
-    /// Running total of decoded samples (used for metadata timestamping).
-    pub(crate) total_samples: u64,
     /// Current dialogue level from the last major sync.
     pub(crate) current_dialogue_level: Option<i8>,
     /// Substream info tracking for change detection (TrueHD only).
@@ -354,15 +352,10 @@ pub(crate) struct AtmosBridge {
     pub(crate) truehd_presentations_stale: bool,
     pub(crate) drc_mode: DrcMode,
     pub(crate) frame_count: u64,
-    /// Last object↔channel declaration emitted (sparse re-emission on change
-    /// and after reset). Shared by the TrueHD and E-AC3 metadata paths.
-    pub(crate) declared_object_channels:
-        Option<abi_stable::std_types::RVec<bridge_api::RObjectChannel>>,
     /// Fixed-channel labels of the active TrueHD spatial presentation
     /// (bed labels from the OAMD bed assignment, then `Object` fillers).
     pub(crate) truehd_spatial_labels:
         Option<abi_stable::std_types::RVec<bridge_api::RChannelLabel>>,
-    pub(crate) perf: PerfStats,
 }
 
 impl AtmosBridge {
@@ -374,19 +367,12 @@ impl AtmosBridge {
         let mut parser = Box::new(Parser::default());
         let mut decoder = Box::new(Decoder::default());
 
-        let fail_level = if strict {
-            log::Level::Warn
-        } else {
-            log::Level::Error
-        };
+        let shared = SharedState::new(strict);
+        let fail_level = shared.fail_level();
         decoder.set_fail_level(fail_level);
         configure_parser(&mut parser, fail_level, presentation, DrcMode::default());
 
-        let eac3_log_level = if strict {
-            log::Level::Warn
-        } else {
-            log::Level::Error
-        };
+        let eac3_log_level = fail_level;
         let mut eac3_pcm = Box::new(PcmDecoder::new());
         eac3_pcm.set_debug_log_level(eac3_log_level);
         let mut eac3_dependent_pcm = Box::new(PcmDecoder::new());
@@ -431,9 +417,8 @@ impl AtmosBridge {
             #[cfg(not(feature = "iamf"))]
             iamf_refusal_reported: false,
             iamf_active: false,
+            shared,
             presentation,
-            strict,
-            total_samples: 0,
             current_dialogue_level: None,
             current_substream_info: None,
             current_extended_substream_info: None,
@@ -441,9 +426,7 @@ impl AtmosBridge {
             truehd_presentations_stale: false,
             drc_mode: DrcMode::Off,
             frame_count: 0,
-            declared_object_channels: None,
             truehd_spatial_labels: None,
-            perf: PerfStats::default(),
         };
 
         #[cfg(feature = "bridge-perf")]
@@ -456,7 +439,7 @@ impl AtmosBridge {
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|&v| v > 0)
                 .unwrap_or(120);
-            bridge.perf.configure(enabled, interval);
+            bridge.shared.perf.configure(enabled, interval);
         }
 
         bridge
@@ -507,11 +490,7 @@ impl AtmosBridge {
         self.raw_codec = None;
 
         // Re-apply configuration to new parser/decoder instances.
-        let fail_level = if self.strict {
-            log::Level::Warn
-        } else {
-            log::Level::Error
-        };
+        let fail_level = self.shared.fail_level();
         self.decoder.set_fail_level(fail_level);
         self.eac3_pcm_decoder.set_debug_log_level(fail_level);
         self.eac3_object_decoder.set_debug_log_level(fail_level);
@@ -522,7 +501,7 @@ impl AtmosBridge {
             self.drc_mode,
         );
         self.truehd_presentations_stale = false;
-        self.declared_object_channels = None;
+        self.shared.declared_object_channels = None;
         self.truehd_spatial_labels = None;
         self.recovering_until_major_sync = false;
     }
@@ -901,7 +880,7 @@ impl AtmosBridge {
         match transport {
             RInputTransport::Raw => {
                 #[cfg(feature = "bridge-perf")]
-                self.perf.note_raw_packet(data.len());
+                self.shared.perf.note_raw_packet(data.len());
                 // One-shot diagnostic: log the first raw packet's first 64 bytes so we
                 // can correlate what the host (e.g. mpv-omniphony's ad_orender) feeds
                 // us against what the SPDIF path receives. Triggered only until the
@@ -954,7 +933,7 @@ impl AtmosBridge {
                     #[cfg(feature = "bridge-perf")]
                     let mat_started = Instant::now();
                     #[cfg(feature = "bridge-perf")]
-                    self.perf.note_mat_packet(data.len());
+                    self.shared.perf.note_mat_packet(data.len());
                     self.mat_stream.push_payload(data.as_slice());
                     loop {
                         #[cfg(feature = "bridge-perf")]
@@ -963,9 +942,10 @@ impl AtmosBridge {
                             Ok(Some(chunk)) => {
                                 #[cfg(feature = "bridge-perf")]
                                 {
-                                    self.perf
+                                    self.shared
+                                        .perf
                                         .record_mat_chunk_extract(chunk_extract_started.elapsed());
-                                    self.perf.note_mat_chunk(chunk.len());
+                                    self.shared.perf.note_mat_chunk(chunk.len());
                                 }
                                 process_extractor_input(self, &chunk, &mut result);
                                 if result.did_reset {
@@ -974,18 +954,20 @@ impl AtmosBridge {
                             }
                             Ok(None) => {
                                 #[cfg(feature = "bridge-perf")]
-                                self.perf
+                                self.shared
+                                    .perf
                                     .record_mat_chunk_extract(chunk_extract_started.elapsed());
                                 break;
                             }
                             Err(msg) => {
                                 #[cfg(feature = "bridge-perf")]
-                                self.perf
+                                self.shared
+                                    .perf
                                     .record_mat_chunk_extract(chunk_extract_started.elapsed());
                                 log::warn!("{msg}");
                                 self.reset_pipeline();
                                 result.did_reset = true;
-                                if self.strict {
+                                if self.shared.strict {
                                     result.error_message = msg.into();
                                 }
                                 return result;
@@ -993,7 +975,7 @@ impl AtmosBridge {
                         }
                     }
                     #[cfg(feature = "bridge-perf")]
-                    self.perf.record_mat(mat_started.elapsed());
+                    self.shared.perf.record_mat(mat_started.elapsed());
                     return result;
                 }
 
@@ -1056,7 +1038,7 @@ impl AtmosBridge {
                 let msg =
                     format!("Unsupported IEC 61937 data type for this bridge: 0x{data_type:02X}");
                 log::warn!("{msg}");
-                if self.strict {
+                if self.shared.strict {
                     result.error_message = msg.into();
                     self.reset_pipeline();
                     result.did_reset = true;
@@ -1103,7 +1085,7 @@ impl FormatBridge for AtmosBridge {
                 frames: RVec::new(),
                 // A host that did not ask for strict decoding plays through a
                 // reset; an error message would fail its call instead.
-                error_message: if self.strict {
+                error_message: if self.shared.strict {
                     msg.into()
                 } else {
                     RString::new()
@@ -1216,7 +1198,7 @@ impl FormatBridge for AtmosBridge {
             #[cfg(feature = "bridge-perf")]
             "perf_profile" => {
                 let enabled = matches!(value.as_str(), "1" | "true" | "on" | "yes");
-                let report_every = self.perf.configure_profile(enabled);
+                let report_every = self.shared.perf.configure_profile(enabled);
                 eprintln!(
                     "harletty-bridge perf profiling {} (report_every_frames={})",
                     if enabled { "enabled" } else { "disabled" },
@@ -1227,7 +1209,7 @@ impl FormatBridge for AtmosBridge {
             #[cfg(feature = "bridge-perf")]
             "perf_report_every" => match value.as_str().parse::<u64>() {
                 Ok(interval) if interval > 0 => {
-                    self.perf.configure_report_every(interval);
+                    self.shared.perf.configure_report_every(interval);
                     eprintln!(
                         "harletty-bridge perf reporting interval set to {} frames",
                         interval
@@ -1824,15 +1806,15 @@ mod raw_transport_tests {
         // Output is one block behind input, and no more.
         let emitted: u64 = frames.iter().map(|f| u64::from(f.sample_count)).sum();
         assert!(
-            bridge.total_samples - emitted <= 4096,
+            bridge.shared.total_samples - emitted <= 4096,
             "{} held back",
-            bridge.total_samples - emitted
+            bridge.shared.total_samples - emitted
         );
         eprintln!(
             "{} frames, {} channels, {emitted}/{} samples out",
             frames.len(),
             channels,
-            bridge.total_samples
+            bridge.shared.total_samples
         );
     }
 

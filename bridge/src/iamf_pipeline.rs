@@ -1049,17 +1049,17 @@ fn ambisonics_name(channels: u8) -> String {
 pub(crate) fn push_iamf(bridge: &mut AtmosBridge, data: &[u8], result: &mut RPushResult) {
     #[cfg(test)]
     crate::bridge::injected_panic::hit(crate::bridge::RawCodec::Iamf);
-    let strict = bridge.strict;
+    let strict = bridge.shared.strict;
     let state = &mut *bridge.iamf;
     state.buf.extend_from_slice(data);
     // Metadata events are stamped on the bridge's running sample position.
-    state.sample_pos = bridge.total_samples;
+    state.sample_pos = bridge.shared.total_samples;
     let mut frames = RVec::new();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         state.drain(strict, &mut frames)
     }));
     let decoded: u64 = frames.iter().map(|f| u64::from(f.sample_count)).sum();
-    bridge.total_samples += decoded;
+    bridge.shared.total_samples += decoded;
     result.frames.extend(frames);
     match outcome {
         Ok(Ok(())) => {}

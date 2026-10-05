@@ -50,7 +50,8 @@ pub(crate) fn build_eac3_metadata_frame(
             channel: (num_bed_channels + k) as u32,
         })
         .collect();
-    let object_channels = declare_object_channels(&mut bridge.declared_object_channels, current);
+    let object_channels =
+        declare_object_channels(&mut bridge.shared.declared_object_channels, current);
 
     RMetadataFrame {
         events,
