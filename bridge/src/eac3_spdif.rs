@@ -12,7 +12,7 @@
 
 use log::warn;
 
-use crate::logging::bridge_external_log;
+use crate::logging::{HexBytes, bridge_log};
 
 /// IEC 61937 data type for E-AC-3.
 const IEC61937_EAC3_DATA_TYPE: u8 = 0x15;
@@ -145,22 +145,14 @@ impl Eac3SpdifStream {
     /// separately and the new payload provides the continuation bytes.
     pub fn push_payload(&mut self, payload: &[u8]) {
         // Log the first bytes to diagnose endianness.
-        let preview_len = payload.len().min(16);
-        let preview: String = payload[..preview_len]
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        bridge_external_log(
+        bridge_log!(
+            target: "harletty-bridge::eac3_spdif",
             log::Level::Debug,
-            "harletty-bridge::eac3_spdif",
-            &format!(
-                "Eac3SpdifStream push_payload: {} bytes, preview=[{}], pending_target={}, pending_consumed={}",
-                payload.len(),
-                preview,
-                self.pending_frame_target,
-                self.pending_frame_consumed
-            ),
+            "Eac3SpdifStream push_payload: {} bytes, preview=[{}], pending_target={}, pending_consumed={}",
+            payload.len(),
+            HexBytes(&payload[..payload.len().min(16)]),
+            self.pending_frame_target,
+            self.pending_frame_consumed
         );
         self.buffer.clear();
         self.buffer.extend_from_slice(payload);
@@ -269,15 +261,13 @@ impl Eac3SpdifStream {
                         let looks_like_sync_be = b0 == 0x0B && b1 == 0x77;
                         let looks_like_sync_swapped = b0 == 0x77 && b1 == 0x0B;
                         if looks_like_sync_be || looks_like_sync_swapped {
-                            bridge_external_log(
+                            bridge_log!(
+                                target: "harletty-bridge::eac3_spdif",
                                 log::Level::Debug,
-                                "harletty-bridge::eac3_spdif",
-                                &format!(
-                                    "Eac3SpdifStream: detected raw syncframe (no length prefix), bytes=0x{:02X} 0x{:02X} order={}",
-                                    b0,
-                                    b1,
-                                    if looks_like_sync_be { "BE" } else { "swapped" }
-                                ),
+                                "Eac3SpdifStream: detected raw syncframe (no length prefix), bytes=0x{:02X} 0x{:02X} order={}",
+                                b0,
+                                b1,
+                                if looks_like_sync_be { "BE" } else { "swapped" }
                             );
                         }
                         !(looks_like_sync_be || looks_like_sync_swapped)
@@ -345,17 +335,13 @@ impl Eac3SpdifStream {
                             unswap_words(&mut frame);
                         }
 
-                        let preview: Vec<String> =
-                            frame.iter().take(8).map(|b| format!("{b:02X}")).collect();
-                        bridge_external_log(
+                        bridge_log!(
+                            target: "harletty-bridge::eac3_spdif",
                             log::Level::Debug,
-                            "harletty-bridge::eac3_spdif",
-                            &format!(
-                                "eac3_spdif_raw frame={}B need_unswap={} first8=[{}]",
-                                frame.len(),
-                                need_unswap,
-                                preview.join(" ")
-                            ),
+                            "eac3_spdif_raw frame={}B need_unswap={} first8=[{}]",
+                            frame.len(),
+                            need_unswap,
+                            HexBytes(&frame[..frame.len().min(8)])
                         );
 
                         let new_remaining = bytes_remaining.saturating_sub(frame_bytes);
@@ -377,15 +363,13 @@ impl Eac3SpdifStream {
 
                     let remaining = bytes_remaining.saturating_sub(2);
 
-                    bridge_external_log(
+                    bridge_log!(
+                        target: "harletty-bridge::eac3_spdif",
                         log::Level::Debug,
-                        "harletty-bridge::eac3_spdif",
-                        &format!(
-                            "Eac3SpdifStream length_code: raw={} as_bits={}B remaining_in_payload={}",
-                            length_code,
-                            (length_code + 7) / 8,
-                            remaining
-                        ),
+                        "Eac3SpdifStream length_code: raw={} as_bits={}B remaining_in_payload={}",
+                        length_code,
+                        (length_code + 7) / 8,
+                        remaining
                     );
 
                     if length_code == 0 {
@@ -404,13 +388,11 @@ impl Eac3SpdifStream {
                     let frame_bytes = if header_frame_bytes > length_code_bytes
                         && header_frame_bytes <= remaining
                     {
-                        bridge_external_log(
+                        bridge_log!(
+                            target: "harletty-bridge::eac3_spdif",
                             log::Level::Warn,
-                            "harletty-bridge::eac3_spdif",
-                            &format!(
-                                "Eac3SpdifStream length_code disagrees with E-AC3 header: code={} as_bits={}B header={}B; using header size",
-                                length_code, length_code_bytes, header_frame_bytes
-                            ),
+                            "Eac3SpdifStream length_code disagrees with E-AC3 header: code={} as_bits={}B header={}B; using header size",
+                            length_code, length_code_bytes, header_frame_bytes
                         );
                         header_frame_bytes
                     } else {
@@ -454,16 +436,12 @@ impl Eac3SpdifStream {
                     }
 
                     if need_unswap {
-                        let preview: Vec<String> =
-                            frame.iter().take(8).map(|b| format!("{b:02X}")).collect();
-                        bridge_external_log(
+                        bridge_log!(
+                            target: "harletty-bridge::eac3_spdif",
                             log::Level::Debug,
-                            "harletty-bridge::eac3_spdif",
-                            &format!(
-                                "eac3_spdif_length_prefixed unswapped frame={}B first8=[{}]",
-                                frame.len(),
-                                preview.join(" ")
-                            ),
+                            "eac3_spdif_length_prefixed unswapped frame={}B first8=[{}]",
+                            frame.len(),
+                            HexBytes(&frame[..frame.len().min(8)])
                         );
                     }
 
