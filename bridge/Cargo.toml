@@ -15,15 +15,22 @@ license = "GPL-3.0-or-later"
 name = "harletty_bridge"
 crate-type = ["cdylib", "rlib"]
 
+# The codec families this bridge decodes, one crate each; a stream of a family
+# left out is refused by name. At least one is needed. An IAMF-only bridge,
+# say, is `--no-default-features --features iamf`, and holds no other
+# family's decoder (scripts/check-crate-isolation.sh).
 [features]
-default = []
-# Per-stage timings of the Dolby paths (TRUEHD_BRIDGE_PERF_*).
-bridge-perf = ["bridge-family-dolby/bridge-perf"]
-# IAMF (AOMedia Immersive Audio Model and Formats): the bridge-family-iamf
-# crate. Off by default: its Opus decoding links libopus (pkg-config, or
-# OPUS_LIB_DIR), and the Windows and macOS release builds do not provide one
-# yet.
+default = ["dolby", "dts"]
+# TrueHD, E-AC-3 / AC-3 and their objects: bridge-family-dolby.
+dolby = ["dep:bridge-family-dolby"]
+# DTS, DTS-HD, DTS:X and Auro-3D over DTS-HD MA: bridge-family-dts.
+dts = ["dep:bridge-family-dts"]
+# IAMF (AOMedia Immersive Audio Model and Formats): bridge-family-iamf. Off by
+# default: its Opus decoding links libopus (pkg-config, or OPUS_LIB_DIR), and
+# the Windows and macOS release builds do not provide one yet.
 iamf = ["dep:bridge-family-iamf"]
+# Per-stage timings of the Dolby paths (TRUEHD_BRIDGE_PERF_*).
+bridge-perf = ["bridge-family-dolby?/bridge-perf"]
 
 # Path deps reach out of the workspace to the sibling Omniphony checkout:
 # `bridge/../../Omniphony` is the workflow symlink locally and the second
@@ -31,8 +38,8 @@ iamf = ["dep:bridge-family-iamf"]
 [dependencies]
 bridge_api = { version = "0.5.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
 bridge-common = { version = "0.8.0", path = "../bridge-common" }
-bridge-family-dolby = { version = "0.8.0", path = "../bridge-family-dolby" }
-bridge-family-dts = { version = "0.8.0", path = "../bridge-family-dts" }
+bridge-family-dolby = { version = "0.8.0", path = "../bridge-family-dolby", optional = true }
+bridge-family-dts = { version = "0.8.0", path = "../bridge-family-dts", optional = true }
 bridge-family-iamf = { version = "0.8.0", path = "../bridge-family-iamf", optional = true }
 abi_stable = "0.11"
 log = "0.4"
