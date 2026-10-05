@@ -131,6 +131,11 @@ pub(crate) mod injected_panic {
         ARMED.with(|armed| armed.set(Some(codec)));
     }
 
+    /// The armed panic has not been hit yet.
+    pub(crate) fn is_armed() -> bool {
+        ARMED.with(|armed| armed.get().is_some())
+    }
+
     pub(crate) fn hit(codec: RawCodec) {
         if ARMED.with(|armed| armed.get()) == Some(codec) {
             ARMED.with(|armed| armed.set(None));
@@ -1067,9 +1072,10 @@ impl FormatBridge for AtmosBridge {
     /// `#[sabi_trait]` method does not unwind into the host: abi_stable
     /// prints "Attempted to panic across the ffi boundary" and exits the
     /// process — the player, mid-film. Here it resets the pipeline and comes
-    /// back as an error, and the next packet decodes from a clean state. The
-    /// finer guards of the TrueHD and IAMF paths stay: they keep the frames
-    /// decoded before the panic.
+    /// back as a reset, and the next packet decodes from a clean state. Only
+    /// strict mode gets the message as an error, as with every other decode
+    /// failure here. The finer guards of the TrueHD and IAMF paths stay: they
+    /// keep the frames decoded before the panic.
     fn push_packet(
         &mut self,
         data: RSlice<'_, u8>,
@@ -1095,7 +1101,13 @@ impl FormatBridge for AtmosBridge {
             self.reset_pipeline();
             RPushResult {
                 frames: RVec::new(),
-                error_message: msg.into(),
+                // A host that did not ask for strict decoding plays through a
+                // reset; an error message would fail its call instead.
+                error_message: if self.strict {
+                    msg.into()
+                } else {
+                    RString::new()
+                },
                 did_reset: true,
             }
         })
@@ -2214,18 +2226,29 @@ mod panic_guard_tests {
         bridge.push_packet(RSlice::from_slice(data), RInputTransport::Raw, 0)
     }
 
+    /// What a caught panic comes back as from a non-strict bridge, the kind
+    /// every host creates: the pipeline reset, nothing decoded, no error. A
+    /// panic still armed would mean `codec`'s path was never entered.
+    fn assert_caught(codec: RawCodec, result: &RPushResult) {
+        assert!(
+            !injected_panic::is_armed(),
+            "{codec:?}: the path was not entered"
+        );
+        assert!(result.did_reset, "{codec:?}: the pipeline is reset");
+        assert!(result.frames.is_empty());
+        assert!(
+            result.error_message.is_empty(),
+            "{codec:?}: a reset rather than an error, got {:?}",
+            result.error_message
+        );
+    }
+
     /// Arm a panic in `codec`'s path, push `packet`: the panic comes back as
-    /// an error with the pipeline reset, not through the FFI boundary.
+    /// a reset, not through the FFI boundary.
     fn assert_panic_is_caught(bridge: &mut AtmosBridge, codec: RawCodec, packet: &[u8]) {
         injected_panic::arm(codec);
         let result = push(bridge, packet);
-        assert!(result.did_reset, "{codec:?}: the pipeline is reset");
-        assert!(
-            result.error_message.contains("injected panic"),
-            "{codec:?}: the panic is reported, got {:?}",
-            result.error_message
-        );
-        assert!(result.frames.is_empty());
+        assert_caught(codec, &result);
     }
 
     /// Push `stream` in packets and count the frames it decodes.
@@ -2241,14 +2264,14 @@ mod panic_guard_tests {
     }
 
     #[test]
-    fn a_panic_in_the_eac3_path_is_an_error_and_the_stream_decodes_after_it() {
+    fn a_panic_in_the_eac3_path_is_a_reset_and_the_stream_decodes_after_it() {
         let mut bridge = AtmosBridge::new(false);
         assert_panic_is_caught(&mut bridge, RawCodec::Eac3, &EAC3[..8192]);
         assert!(decoded_frames(&mut bridge, EAC3) > 0);
     }
 
     #[test]
-    fn a_panic_in_the_dts_path_is_an_error_and_the_stream_decodes_after_it() {
+    fn a_panic_in_the_dts_path_is_a_reset_and_the_stream_decodes_after_it() {
         let mut bridge = AtmosBridge::new(false);
         assert_panic_is_caught(&mut bridge, RawCodec::Dts, DTS);
         assert!(decoded_frames(&mut bridge, DTS) > 0);
@@ -2256,7 +2279,7 @@ mod panic_guard_tests {
 
     /// Over IEC 61937 too: the guard is around the whole of `push_packet`.
     #[test]
-    fn a_panic_in_the_iec61937_dts_path_is_an_error() {
+    fn a_panic_in_the_iec61937_dts_path_is_a_reset() {
         let mut bridge = AtmosBridge::new(false);
         injected_panic::arm(RawCodec::Dts);
         let result = bridge.push_packet(
@@ -2264,14 +2287,28 @@ mod panic_guard_tests {
             RInputTransport::Iec61937,
             0x0B, // DTS type I: the frame goes in as it is
         );
+        assert_caught(RawCodec::Dts, &result);
+    }
+
+    /// Strict mode gets the panic as an error as well, as it does every other
+    /// decode failure.
+    #[test]
+    fn a_strict_bridge_reports_the_panic_as_an_error() {
+        let mut bridge = AtmosBridge::new(true);
+        injected_panic::arm(RawCodec::Dts);
+        let result = push(&mut bridge, DTS);
         assert!(result.did_reset);
-        assert!(result.error_message.contains("injected panic"));
+        assert!(
+            result.error_message.contains("injected panic"),
+            "{:?}",
+            result.error_message
+        );
     }
 
     /// TrueHD has no small fixture here: the panic is caught, and the bridge
     /// takes the next packet without one.
     #[test]
-    fn a_panic_in_the_truehd_path_is_an_error() {
+    fn a_panic_in_the_truehd_path_is_a_reset() {
         let mut bridge = AtmosBridge::new(false);
         assert!(bridge.configure("input_codec".into(), "truehd".into()));
         let packet = [0x00, 0x00, 0x00, 0x00, 0xF8, 0x72, 0x6F, 0xBA, 0, 0, 0, 0];
@@ -2288,7 +2325,7 @@ mod panic_guard_tests {
     /// the path refuses the stream before decoding anything.
     #[cfg(feature = "iamf")]
     #[test]
-    fn a_panic_in_the_iamf_path_is_an_error() {
+    fn a_panic_in_the_iamf_path_is_a_reset() {
         let mut bridge = AtmosBridge::new(false);
         assert!(bridge.configure("input_codec".into(), "iamf".into()));
         let header = [0xF8, 0x06, b'i', b'a', b'm', b'f', 0x00, 0x00];
