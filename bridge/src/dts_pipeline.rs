@@ -192,6 +192,8 @@ impl DtsXState {
 
 /// Demux and decode all complete DTS frames buffered in `bridge.dts_buf`.
 pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
+    #[cfg(test)]
+    crate::bridge::injected_panic::hit(crate::bridge::RawCodec::Dts);
     let mut consumed = 0usize;
     loop {
         let rest = &bridge.dts_buf[consumed..];

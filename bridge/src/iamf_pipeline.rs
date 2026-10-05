@@ -1047,6 +1047,8 @@ fn ambisonics_name(channels: u8) -> String {
 /// Raw-transport entry point: buffer `data`, decode what completes, and apply
 /// the pipeline's failure policy (strict mode surfaces and resets).
 pub(crate) fn push_iamf(bridge: &mut AtmosBridge, data: &[u8], result: &mut RPushResult) {
+    #[cfg(test)]
+    crate::bridge::injected_panic::hit(crate::bridge::RawCodec::Iamf);
     let strict = bridge.strict;
     let state = &mut *bridge.iamf;
     state.buf.extend_from_slice(data);

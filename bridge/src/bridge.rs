@@ -115,6 +115,35 @@ pub(crate) enum RawCodec {
     Iamf,
 }
 
+/// Test-only panic injection at the entry of each codec path, for the tests
+/// of [`FormatBridge::push_packet`]'s guard. Armed for one codec, it panics
+/// once, the next time that path is entered on this thread.
+#[cfg(test)]
+pub(crate) mod injected_panic {
+    use super::RawCodec;
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<Option<RawCodec>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn arm(codec: RawCodec) {
+        ARMED.with(|armed| armed.set(Some(codec)));
+    }
+
+    /// The armed panic has not been hit yet.
+    pub(crate) fn is_armed() -> bool {
+        ARMED.with(|armed| armed.get().is_some())
+    }
+
+    pub(crate) fn hit(codec: RawCodec) {
+        if ARMED.with(|armed| armed.get()) == Some(codec) {
+            ARMED.with(|armed| armed.set(None));
+            panic!("injected panic in the {codec:?} path");
+        }
+    }
+}
+
 /// Which DTS carrier the frames come in: what the demux found after the
 /// core. Named the way FFmpeg names the profiles, so a host's track
 /// information reads the same on either decoder.
@@ -618,6 +647,8 @@ impl AtmosBridge {
         result: &mut RPushResult,
         temporary_silence_pushed: &mut bool,
     ) -> Result<(), ()> {
+        #[cfg(test)]
+        injected_panic::hit(RawCodec::Eac3);
         self.eac3_frame_count += 1;
         // A dependent substream belongs to the access unit it immediately
         // follows, so any other kind of unit ends the group in hand. Only a
@@ -852,8 +883,10 @@ impl AtmosBridge {
     }
 }
 
-impl FormatBridge for AtmosBridge {
-    fn push_packet(
+impl AtmosBridge {
+    /// The body of [`FormatBridge::push_packet`], which runs it under its
+    /// panic guard.
+    fn push_packet_unguarded(
         &mut self,
         data: RSlice<'_, u8>,
         transport: RInputTransport,
@@ -1031,6 +1064,53 @@ impl FormatBridge for AtmosBridge {
                 result
             }
         }
+    }
+}
+
+impl FormatBridge for AtmosBridge {
+    /// Every packet goes through one panic guard. A panic escaping a
+    /// `#[sabi_trait]` method does not unwind into the host: abi_stable
+    /// prints "Attempted to panic across the ffi boundary" and exits the
+    /// process — the player, mid-film. Here it resets the pipeline and comes
+    /// back as a reset, and the next packet decodes from a clean state. Only
+    /// strict mode gets the message as an error, as with every other decode
+    /// failure here. The finer guards of the TrueHD and IAMF paths stay: they
+    /// keep the frames decoded before the panic.
+    fn push_packet(
+        &mut self,
+        data: RSlice<'_, u8>,
+        transport: RInputTransport,
+        data_type: u8,
+    ) -> RPushResult {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.push_packet_unguarded(data, transport, data_type)
+        }));
+        outcome.unwrap_or_else(|payload| {
+            let msg = format!(
+                "decoder panic: {}; pipeline reset",
+                crate::logging::panic_message(&payload)
+            );
+            bridge_diag_log(log::Level::Error, &msg);
+            log::error!("{msg}");
+            // The panicking decoder's state is unknown: IAMF keeps its
+            // sequence configuration across a reset, so it is rebuilt.
+            #[cfg(feature = "iamf")]
+            if self.iamf_active {
+                *self.iamf = crate::iamf_pipeline::IamfState::default();
+            }
+            self.reset_pipeline();
+            RPushResult {
+                frames: RVec::new(),
+                // A host that did not ask for strict decoding plays through a
+                // reset; an error message would fail its call instead.
+                error_message: if self.strict {
+                    msg.into()
+                } else {
+                    RString::new()
+                },
+                did_reset: true,
+            }
+        })
     }
 
     fn reset(&mut self) {
@@ -2132,5 +2212,129 @@ mod stack_footprint_tests {
             .expect("spawn small-stack thread")
             .join()
             .expect("bridge construction overflowed a 512 KiB stack");
+    }
+}
+
+#[cfg(test)]
+mod panic_guard_tests {
+    use super::*;
+
+    const EAC3: &[u8] = include_bytes!("../../harletty/tests/fixtures/joc_atmos_1s.eac3");
+    const DTS: &[u8] = include_bytes!("../../harletty/tests/fixtures/dts_core_tone_10f.dts");
+
+    fn push(bridge: &mut AtmosBridge, data: &[u8]) -> RPushResult {
+        bridge.push_packet(RSlice::from_slice(data), RInputTransport::Raw, 0)
+    }
+
+    /// What a caught panic comes back as from a non-strict bridge, the kind
+    /// every host creates: the pipeline reset, nothing decoded, no error. A
+    /// panic still armed would mean `codec`'s path was never entered.
+    fn assert_caught(codec: RawCodec, result: &RPushResult) {
+        assert!(
+            !injected_panic::is_armed(),
+            "{codec:?}: the path was not entered"
+        );
+        assert!(result.did_reset, "{codec:?}: the pipeline is reset");
+        assert!(result.frames.is_empty());
+        assert!(
+            result.error_message.is_empty(),
+            "{codec:?}: a reset rather than an error, got {:?}",
+            result.error_message
+        );
+    }
+
+    /// Arm a panic in `codec`'s path, push `packet`: the panic comes back as
+    /// a reset, not through the FFI boundary.
+    fn assert_panic_is_caught(bridge: &mut AtmosBridge, codec: RawCodec, packet: &[u8]) {
+        injected_panic::arm(codec);
+        let result = push(bridge, packet);
+        assert_caught(codec, &result);
+    }
+
+    /// Push `stream` in packets and count the frames it decodes.
+    fn decoded_frames(bridge: &mut AtmosBridge, stream: &[u8]) -> usize {
+        stream
+            .chunks(4096)
+            .map(|packet| {
+                let result = push(bridge, packet);
+                assert!(result.error_message.is_empty(), "{}", result.error_message);
+                result.frames.len()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_panic_in_the_eac3_path_is_a_reset_and_the_stream_decodes_after_it() {
+        let mut bridge = AtmosBridge::new(false);
+        assert_panic_is_caught(&mut bridge, RawCodec::Eac3, &EAC3[..8192]);
+        assert!(decoded_frames(&mut bridge, EAC3) > 0);
+    }
+
+    #[test]
+    fn a_panic_in_the_dts_path_is_a_reset_and_the_stream_decodes_after_it() {
+        let mut bridge = AtmosBridge::new(false);
+        assert_panic_is_caught(&mut bridge, RawCodec::Dts, DTS);
+        assert!(decoded_frames(&mut bridge, DTS) > 0);
+    }
+
+    /// Over IEC 61937 too: the guard is around the whole of `push_packet`.
+    #[test]
+    fn a_panic_in_the_iec61937_dts_path_is_a_reset() {
+        let mut bridge = AtmosBridge::new(false);
+        injected_panic::arm(RawCodec::Dts);
+        let result = bridge.push_packet(
+            RSlice::from_slice(&DTS[..2048]),
+            RInputTransport::Iec61937,
+            0x0B, // DTS type I: the frame goes in as it is
+        );
+        assert_caught(RawCodec::Dts, &result);
+    }
+
+    /// Strict mode gets the panic as an error as well, as it does every other
+    /// decode failure.
+    #[test]
+    fn a_strict_bridge_reports_the_panic_as_an_error() {
+        let mut bridge = AtmosBridge::new(true);
+        injected_panic::arm(RawCodec::Dts);
+        let result = push(&mut bridge, DTS);
+        assert!(result.did_reset);
+        assert!(
+            result.error_message.contains("injected panic"),
+            "{:?}",
+            result.error_message
+        );
+    }
+
+    /// TrueHD has no small fixture here: the panic is caught, and the bridge
+    /// takes the next packet without one.
+    #[test]
+    fn a_panic_in_the_truehd_path_is_a_reset() {
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("input_codec".into(), "truehd".into()));
+        let packet = [0x00, 0x00, 0x00, 0x00, 0xF8, 0x72, 0x6F, 0xBA, 0, 0, 0, 0];
+        assert_panic_is_caught(&mut bridge, RawCodec::TrueHd, &packet);
+        let after = push(&mut bridge, &packet);
+        assert!(
+            !after.error_message.contains("panic"),
+            "{}",
+            after.error_message
+        );
+    }
+
+    /// IAMF reaches the guard only in a build with the decoder in; without it
+    /// the path refuses the stream before decoding anything.
+    #[cfg(feature = "iamf")]
+    #[test]
+    fn a_panic_in_the_iamf_path_is_a_reset() {
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("input_codec".into(), "iamf".into()));
+        let header = [0xF8, 0x06, b'i', b'a', b'm', b'f', 0x00, 0x00];
+        assert_panic_is_caught(&mut bridge, RawCodec::Iamf, &header);
+        let after = push(&mut bridge, &header);
+        assert!(
+            !after.error_message.contains("panic"),
+            "{}",
+            after.error_message
+        );
     }
 }
