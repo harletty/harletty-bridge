@@ -15,11 +15,12 @@ mod metadata;
 mod perf;
 mod truehd_pipeline;
 
+use abi_stable::std_types::RVec;
 use abi_stable::{
     export_root_module, prefix_type::PrefixTypeTrait, sabi_trait::prelude::TD_Opaque,
 };
 use bridge::AtmosBridge;
-use bridge_api::{BridgeLib, BridgeLibRef, FormatBridge_TO, FormatBridgeBox};
+use bridge_api::{BridgeLib, BridgeLibRef, FormatBridge_TO, FormatBridgeBox, RSourceFamily};
 
 // Silence unused import warning — FormatBridge is used via the proc-macro generated impl.
 #[allow(unused_imports)]
@@ -31,6 +32,7 @@ fn get_library() -> BridgeLibRef {
     BridgeLib {
         new_bridge: create_bridge,
         set_host_log_sink,
+        source_families,
     }
     .leak_into_prefix()
 }
@@ -41,6 +43,10 @@ extern "C" fn create_bridge(strict: bool) -> FormatBridgeBox {
 
 extern "C" fn set_host_log_sink(sink: usize) {
     logging::register_host_log_sink(sink);
+}
+
+extern "C" fn source_families() -> RVec<RSourceFamily> {
+    bridge::source_families()
 }
 
 /// A bridge as the host gets one, for in-process callers linking the rlib —
