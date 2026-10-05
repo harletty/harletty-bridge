@@ -319,8 +319,8 @@ are not distributable under the same terms, so they are worth separating:
   crates.io and on our fork of `truehd` (`truehd` and `truehdd-macros` are
   Apache-2.0 too), so the binary carries no copyleft.
 - **`libharletty_bridge.so` / `.dll`, the decoder bridge** —
-  **GPL-3.0-or-later**. It links `bridge_api`, `spdif` and `sys` from
-  [Omniphony](https://github.com/mgth/Omniphony), which are GPL-3.0-or-later,
+  **GPL-3.0-or-later**. It links `bridge_api` from
+  [Omniphony](https://github.com/mgth/Omniphony), which is GPL-3.0-or-later,
   and the resulting library is a combined work. Apache-2.0 code may be
   combined into a GPLv3 work, so there is no licence conflict — but what you
   receive is governed by the GPL, and linking it into a proprietary program is

@@ -48,11 +48,9 @@ check() {
   fi
 }
 
-# The realtime plugin must never pull in the offline writers or CLI machinery.
-# env_logger is deliberately NOT listed: it reaches the bridge through
-# Omniphony's `sys` crate, so it is not a CLI-side leak and forbidding it here
-# would fail for the wrong reason.
-check harletty-bridge "realtime plugin" damf clap indicatif indicatif-log-bridge
+# The realtime plugin must never pull in the offline writers or CLI machinery,
+# nor a logger of its own: its diagnostics go through the host's log sink.
+check harletty-bridge "realtime plugin" damf clap indicatif indicatif-log-bridge env_logger
 
 # ...and the offline CLI must never pull in the bridge ABI: it stays a pure
 # offline tool, buildable without the sibling Omniphony checkout.
