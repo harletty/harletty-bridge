@@ -34,6 +34,7 @@ use serde::Deserialize;
 use crate::bridge::{AtmosBridge, DtsProfile};
 use crate::frame_builders::float_to_pcm_i32;
 use crate::labels::{dca_bed_channel_to_r, dca_spatial_channel_to_r};
+use crate::logging::{bridge_diag_log, bridge_log};
 use crate::metadata::declare_object_channels;
 
 const CORE_SYNC: [u8; 4] = 0x7FFE_8001u32.to_be_bytes();
@@ -155,7 +156,8 @@ impl DtsXState {
     fn note_parse_failure(&mut self, error: dca::XMetadataError) {
         self.parse_failures += 1;
         if self.parse_failures == 1 || self.parse_failures.is_power_of_two() {
-            log::warn!(
+            bridge_log!(
+                log::Level::Warn,
                 "dts: extension metadata unreadable ({error:?}, {} frames so far); {}",
                 self.parse_failures,
                 if self.last_metadata.is_some() {
@@ -172,7 +174,8 @@ impl DtsXState {
     fn note_bed_extension_dropout(&mut self, reason: &str) {
         self.bed_extension_dropouts += 1;
         if self.bed_extension_dropouts == 1 || self.bed_extension_dropouts.is_power_of_two() {
-            log::warn!(
+            bridge_log!(
+                log::Level::Warn,
                 "dts: XXCH channels unavailable ({reason}, {} frames so far); playing the core bed",
                 self.bed_extension_dropouts
             );
@@ -182,7 +185,8 @@ impl DtsXState {
     fn note_feed_dropout(&mut self, reason: &str) {
         self.feed_dropouts += 1;
         if self.feed_dropouts == 1 || self.feed_dropouts.is_power_of_two() {
-            log::warn!(
+            bridge_log!(
+                log::Level::Warn,
                 "dts: extension waveforms unavailable ({reason}, {} frames so far); emitting silent extension channels",
                 self.feed_dropouts
             );
@@ -281,7 +285,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                     Err(HdError::Pending) => {} // PBR buffering; no frame this packet
                     Err(e) => {
                         let msg = format!("dts_hd_decode_error={e:?}");
-                        log::warn!("{msg}");
+                        bridge_diag_log(log::Level::Warn, &msg);
                         if bridge.strict {
                             result.error_message = RString::from(msg);
                             bridge.reset_pipeline();
@@ -310,7 +314,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                     }
                     Err(err) => {
                         let msg = format!("dts_decode_error={err}");
-                        log::warn!("{msg}");
+                        bridge_diag_log(log::Level::Warn, &msg);
                         if bridge.strict {
                             result.error_message = RString::from(msg);
                             bridge.reset_pipeline();
@@ -336,7 +340,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                 }
                 Err(err) => {
                     let msg = format!("dts_decode_error={err}");
-                    log::warn!("{msg}");
+                    bridge_diag_log(log::Level::Warn, &msg);
                     if bridge.strict {
                         result.error_message = RString::from(msg);
                         bridge.reset_pipeline();
@@ -425,7 +429,8 @@ fn build_hd_frame_with_extensions(
     for &spkr in &active {
         let channel = hd.samples[spkr].as_ref().expect("active speaker");
         if channel.len() != sample_count {
-            log::warn!(
+            bridge_log!(
+                log::Level::Warn,
                 "dts: bed channel {spkr} length {} != {sample_count}; dropping frame",
                 channel.len()
             );
@@ -440,7 +445,8 @@ fn build_hd_frame_with_extensions(
     let presentation = match (detected, state.locked) {
         (Some(detected), _) => {
             if state.locked.is_some_and(|locked| locked != detected) {
-                log::warn!(
+                bridge_log!(
+                    log::Level::Warn,
                     "dts: extension presentation changed {:?} -> {detected:?}; channel shape changes",
                     state.locked
                 );
@@ -477,7 +483,8 @@ fn build_hd_frame_with_extensions(
                     .count();
                 if rendered > 0 {
                     state.render_noted = true;
-                    log::info!(
+                    bridge_log!(
+                        log::Level::Info,
                         "dts: {presentation:?} carries {rendered} object(s) rendered into the bed from their position; recomputing that fold"
                     );
                 }
@@ -487,7 +494,8 @@ fn build_hd_frame_with_extensions(
     if detected.is_some() && fold_config.estimate_unknown && plan.has_unknown() {
         if !state.estimation_noted {
             state.estimation_noted = true;
-            log::info!(
+            bridge_log!(
+                log::Level::Info,
                 "dts: {:?} carries waveform(s) without a stated bed fold; estimating their fold from the bed",
                 presentation
             );
@@ -668,7 +676,8 @@ fn build_object_metadata(
     let (object_channels, name_updates) = if declaration_unchanged {
         (RVec::new(), RVec::new())
     } else {
-        log::info!(
+        bridge_log!(
+            log::Level::Info,
             "dts: {presentation:?} declares object channels for extension waveforms {}..{}",
             object_feeds.start,
             object_feeds.end

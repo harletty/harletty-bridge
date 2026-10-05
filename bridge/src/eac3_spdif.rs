@@ -10,8 +10,6 @@
 //
 // Reference: ffmpeg libavformat/spdifenc.c
 
-use log::warn;
-
 use crate::logging::{HexBytes, bridge_log};
 
 /// IEC 61937 data type for E-AC-3.
@@ -229,7 +227,8 @@ impl Eac3SpdifStream {
                         if frame.len() >= 2 {
                             let sync = u16::from_be_bytes([frame[0], frame[1]]);
                             if sync != EAC3_SYNCWORD {
-                                warn!(
+                                bridge_log!(
+                                    log::Level::Warn,
                                     "E-AC3 SPDIF: bad syncword 0x{:04X} (expected 0x{:04X}) in {}B frame",
                                     sync,
                                     EAC3_SYNCWORD,
@@ -426,7 +425,8 @@ impl Eac3SpdifStream {
                     if frame.len() >= 2 {
                         let sync = u16::from_be_bytes([frame[0], frame[1]]);
                         if sync != EAC3_SYNCWORD {
-                            warn!(
+                            bridge_log!(
+                                log::Level::Warn,
                                 "E-AC-3 SPDIF: bad syncword 0x{:04X} (expected 0x{:04X}) in {}B frame",
                                 sync,
                                 EAC3_SYNCWORD,

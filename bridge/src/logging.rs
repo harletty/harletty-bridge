@@ -6,6 +6,13 @@
 //! atomic, not a lock. The maximum is `HARLETTY_LOG` (`off`, `error`, `warn`,
 //! `info`, `debug`, `trace`), `info` when unset; a host can change it at any
 //! time through the `log_level` configure key.
+//!
+//! The `log` crate's macros are not used here. Loaded as a plugin, the bridge
+//! carries its own copy of `log`, with no logger installed, so their records
+//! reach nobody; linked in-process as an rlib, it shares the host's logger,
+//! which it must not replace. The bridge never calls `log::set_logger` for that
+//! reason, so records the decoder crates emit through `log` (the truehd crate's,
+//! some per block) are not forwarded either.
 
 use abi_stable::std_types::RStr;
 use bridge_api::{BridgeHostLogSink, RLogLevel};
@@ -179,6 +186,32 @@ mod tests {
         set_max_level(log::LevelFilter::Trace);
         assert!(log_enabled(log::Level::Trace));
         set_max_level(DEFAULT_LEVEL);
+    }
+
+    #[test]
+    fn no_source_logs_through_the_log_crate_macros() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let macros: Vec<String> = ["error", "warn", "info", "debug", "trace"]
+            .iter()
+            .flat_map(|level| [format!("log::{level}!("), format!("use log::{level}")])
+            .collect();
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            for (index, line) in source.lines().enumerate() {
+                if macros.iter().any(|m| line.contains(m.as_str())) {
+                    offenders.push(format!("{}:{}", path.display(), index + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the bridge's `log` records reach no host; use bridge_log! or bridge_diag_log: {offenders:?}"
+        );
     }
 
     #[test]

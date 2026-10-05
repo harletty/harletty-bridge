@@ -12,7 +12,7 @@ use std::time::Instant;
 use crate::bridge::AtmosBridge;
 use crate::frame_builders::float_to_pcm_i32;
 use crate::labels::bed_channel_to_r;
-use crate::logging::bridge_diag_log;
+use crate::logging::{bridge_diag_log, bridge_log};
 use crate::metadata::build_eac3_metadata_frame;
 
 const LEGACY_AC3_SAMPLE_COUNT: u32 = 1536;
@@ -590,9 +590,13 @@ fn maybe_dump_short_packet_frame(frame: &[u8]) {
     }
     let path = "/tmp/eac3_short_packet.bin";
     if let Err(err) = std::fs::write(path, frame) {
-        log::warn!("failed to dump short-packet frame to {path}: {err}");
+        bridge_log!(
+            log::Level::Warn,
+            "failed to dump short-packet frame to {path}: {err}"
+        );
     } else {
-        log::warn!(
+        bridge_log!(
+            log::Level::Warn,
             "dumped first short-packet E-AC3 frame ({} bytes) to {path}",
             frame.len()
         );
@@ -622,9 +626,13 @@ fn maybe_dump_reject_frame(frame: &[u8], reason: &str) {
     }
     let path = format!("/tmp/eac3_reject_{idx:04}_{reason}.bin");
     if let Err(err) = std::fs::write(&path, frame) {
-        log::warn!("failed to dump rejected E-AC3 frame to {path}: {err}");
+        bridge_log!(
+            log::Level::Warn,
+            "failed to dump rejected E-AC3 frame to {path}: {err}"
+        );
     } else {
-        log::warn!(
+        bridge_log!(
+            log::Level::Warn,
             "dumped rejected E-AC3 frame [{reason}] ({} bytes) to {path}",
             frame.len()
         );
@@ -642,9 +650,13 @@ fn maybe_dump_ok_frame(frame: &[u8], path_kind: &str) {
     }
     let path = format!("/tmp/eac3_ok_{idx:04}_{path_kind}.bin");
     if let Err(err) = std::fs::write(&path, frame) {
-        log::warn!("failed to dump accepted E-AC3 frame to {path}: {err}");
+        bridge_log!(
+            log::Level::Warn,
+            "failed to dump accepted E-AC3 frame to {path}: {err}"
+        );
     } else {
-        log::warn!(
+        bridge_log!(
+            log::Level::Warn,
             "dumped accepted E-AC3 frame [{path_kind}] ({} bytes) to {path}",
             frame.len()
         );
