@@ -35,6 +35,12 @@ pub struct MatStream {
     state: ParserState,
     pending_chunk_bytes: Option<usize>,
     perf_stats: Option<MatPerfStats>,
+    /// Chunk headers of size 0 skipped in the current payload, reported once
+    /// the payload is done: a corrupt payload can hold thousands.
+    zero_size_chunks: usize,
+    /// Payloads that held any, since the last reset; only the 1st, 2nd, 4th,
+    /// 8th... are reported.
+    payloads_with_zero_size_chunks: u64,
 }
 
 impl Default for MatStream {
@@ -45,6 +51,8 @@ impl Default for MatStream {
             state: ParserState::WaitingForPayload,
             pending_chunk_bytes: None,
             perf_stats: None,
+            zero_size_chunks: 0,
+            payloads_with_zero_size_chunks: 0,
         }
     }
 }
@@ -88,6 +96,25 @@ impl MatStream {
         self.cursor = 0;
         self.state = ParserState::WaitingForPayload;
         self.pending_chunk_bytes = None;
+        self.zero_size_chunks = 0;
+        self.payloads_with_zero_size_chunks = 0;
+    }
+
+    /// Report the zero-size chunk headers of the payload just finished.
+    fn report_zero_size_chunks(&mut self) {
+        if self.zero_size_chunks == 0 {
+            return;
+        }
+        self.payloads_with_zero_size_chunks += 1;
+        let payloads = self.payloads_with_zero_size_chunks;
+        if payloads == 1 || payloads.is_power_of_two() {
+            bridge_log!(
+                log::Level::Warn,
+                "Invalid MAT chunk size (0) {} time(s) in a payload, skipping 2 bytes each ({payloads} payload(s) so far)",
+                self.zero_size_chunks
+            );
+        }
+        self.zero_size_chunks = 0;
     }
 
     #[allow(dead_code)]
@@ -105,6 +132,7 @@ impl MatStream {
     }
 
     pub fn push_payload(&mut self, payload: &[u8]) {
+        self.report_zero_size_chunks();
         self.buffer.clear();
         self.buffer.extend_from_slice(payload);
         self.cursor = 0;
@@ -235,7 +263,10 @@ impl MatStream {
     pub fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
         'outer: loop {
             match self.state {
-                ParserState::WaitingForPayload => return Ok(None),
+                ParserState::WaitingForPayload => {
+                    self.report_zero_size_chunks();
+                    return Ok(None);
+                }
 
                 ParserState::VerifyingMatStart { payload_size } => {
                     if self.remaining_buffer_len() < MAT_START_CODE.len() {
@@ -396,10 +427,7 @@ impl MatStream {
                     ]);
                     let chunk_size = ((raw & 0x0FFF) << 1) as usize;
                     if chunk_size == 0 {
-                        bridge_log!(
-                            log::Level::Warn,
-                            "Invalid MAT chunk size (0), skipping 2 bytes"
-                        );
+                        self.zero_size_chunks += 1;
                         self.advance(2);
                         self.state = ParserState::ReadingPayload {
                             bytes_remaining: bytes_remaining.saturating_sub(2),
@@ -580,5 +608,24 @@ mod tests {
         }
 
         assert_eq!(out, copy_swapped_words(&raw_chunk));
+    }
+
+    #[test]
+    fn zero_size_chunks_are_counted_per_payload() {
+        // A run of 0x1000 words: each reads as a chunk header of size 0.
+        let mut payload = MAT_START_CODE.to_vec();
+        for _ in 0..1000 {
+            payload.extend_from_slice(&[0x00, 0x10]);
+        }
+
+        let mut stream = MatStream::default();
+        for pushed in 1..=3 {
+            stream.push_payload(&payload);
+            while stream.next_chunk().unwrap().is_some() {}
+            assert_eq!(stream.zero_size_chunks, 0);
+            assert_eq!(stream.payloads_with_zero_size_chunks, pushed);
+        }
+        stream.reset();
+        assert_eq!(stream.payloads_with_zero_size_chunks, 0);
     }
 }
