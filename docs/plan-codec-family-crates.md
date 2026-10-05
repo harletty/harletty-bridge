@@ -1,8 +1,9 @@
 # Plan: one crate per codec family inside the bridge
 
-Status: proposed. Step 1 of a possible two-step split; step 2 (one plugin
-library per family) is out of scope here and only becomes mechanical once this
-lands.
+Status: implemented on `refactor/codec-family-crates` (see Outcome at the end
+for where it departs from the plan). Step 1 of a possible two-step split; step
+2 (one plugin library per family) is out of scope here and only becomes
+mechanical once this lands.
 
 ## Goal
 
@@ -237,3 +238,29 @@ leaves output bit-identical.
   multi-bridge config and N libraries to rebuild in lockstep with the host's
   `abi_stable` version. Not justified by the IAMF-only goal, which this step
   meets on its own.
+
+## Outcome
+
+Done as planned, output bit-identical at every step (51 streams, raw and
+IEC 61937, `pcm_hash` and `host_hash`, default and IAMF builds). Where the
+code departs from the sketch above:
+
+- **No `FamilyPipeline` trait.** Each family exposes the same set of
+  inherent methods (`push_raw` / `push_iec61937`, `reset`, `is_ready`,
+  `has_objects`, `source_family`, `source_label`, poses, tags) and the router
+  calls them directly. A trait only earns its keep with step 2.
+- **The router keeps two flags** (`dts_active`, `iamf_active`) rather than
+  an `active: Option<Family>`: they record the codec of the last packet,
+  decoded or refused, which is what the default build already reported for a
+  refused IAMF stream. Dolby is the case where neither is set.
+- **Families are held inline**, their decoders boxed inside them as before,
+  not boxed per family: the struct stays within the footprint test's budget
+  and the hot path gains no pointer hop.
+- **`PerfStats` belongs to the Dolby family** from the start of the move
+  (step 4), not to `SharedState`, for the reason given above.
+- **Tests:** the Dolby tests that pushed packets through the whole bridge
+  drive the family through a test harness with the same fields; the router
+  keeps what it decides itself, gated on the families each test needs.
+- **Also removed:** `spdif`, `sys`, `anyhow` and `libc`, all unused; the
+  bundled DTS fold table moved to the DTS crate.
+

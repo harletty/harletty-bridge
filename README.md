@@ -220,6 +220,27 @@ The build produces `target/release/libharletty_bridge.{so,dylib}` on
 unix and `target\release\harletty_bridge.dll` on Windows. Point
 `bridge_path` at that file exactly as in the install steps above.
 
+### Choosing the codec families
+
+Each codec family is a crate of its own, and a Cargo feature of the bridge
+picks which ones it contains:
+
+| Feature | Decodes | Default |
+|---|---|---|
+| `dolby` | TrueHD (raw and MAT), E-AC-3 / AC-3 with JOC objects | yes |
+| `dts` | DTS, DTS-HD, DTS:X, Auro-3D over DTS-HD MA | yes |
+| `iamf` | IAMF (Eclipsa Audio); its Opus path links the system libopus | no |
+
+A stream of a family left out is refused by name. For instance, a bridge
+that decodes IAMF and nothing else:
+
+```sh
+cargo build --release -p harletty-bridge --no-default-features --features iamf
+```
+
+Such a build holds none of the other families' decoders, which CI checks
+(`scripts/check-crate-isolation.sh`).
+
 ## The offline `harletty` CLI
 
 **`harletty` is a fork of [`truehdd`](https://github.com/truehdd/truehdd)
@@ -268,7 +289,11 @@ The repo is a virtual cargo workspace — no package at the root. It
 builds two artifacts from one decoder lineage.
 
 ```
-bridge/              # bridge entry points + transport (raw / IEC61937) glue
+bridge/              # the plugin: entry points, codec detection, routing to a family
+bridge-common/       # what the families share (state, host logging, frame helpers)
+bridge-family-dolby/ # TrueHD (raw / MAT) and E-AC-3 / AC-3 JOC paths
+bridge-family-dts/   # DTS, DTS-HD, DTS:X and Auro-3D paths
+bridge-family-iamf/  # IAMF path (iamf-rs)
 harletty/            # offline CLI: decode/info, codec probing, codec->OAMD
 damf/                # DAMF metadata + CAF/WAV writers (CLI-side only)
 truehdd-macros/      # proc macros used by the CAF writer and `info`
