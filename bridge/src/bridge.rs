@@ -23,7 +23,7 @@ use crate::eac3_pipeline::{
 };
 use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::validate_frame_shape;
-use crate::logging::bridge_diag_log;
+use crate::logging::{bridge_diag_log, bridge_log};
 use crate::mat::MatStream;
 use crate::perf::PerfStats;
 use crate::truehd_pipeline::{configure_parser, process_extractor_input, required_presentations};
@@ -719,12 +719,11 @@ impl AtmosBridge {
                     diagnose_eac3_frame(self, frame, &inspection);
                     self.eac3_diag_stats.ac3_core_decode_failures += 1;
                     self.eac3_diag_stats.last_ac3_core_decode_error = Some(err.clone());
-                    bridge_diag_log(
+                    bridge_log!(
                         log::Level::Warn,
-                        &format!(
-                            "ac3_core_decode_failed index={} error={}",
-                            self.eac3_frame_count, err
-                        ),
+                        "ac3_core_decode_failed index={} error={}",
+                        self.eac3_frame_count,
+                        err
                     );
                     // Stand in one frame of silence for the core and stop here.
                     // This used to fall through to the E-AC-3 decoders, which
@@ -772,17 +771,15 @@ impl AtmosBridge {
         match decode_result {
             Ok(decoded_frame) => {
                 if let Err(reason) = validate_frame_shape(&decoded_frame) {
-                    bridge_diag_log(
+                    bridge_log!(
                         log::Level::Warn,
-                        &format!(
-                            "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={}",
-                            self.eac3_frame_count,
-                            reason,
-                            decoded_frame.sampling_frequency,
-                            decoded_frame.sample_count,
-                            decoded_frame.channel_count,
-                            decoded_frame.pcm.len()
-                        ),
+                        "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={}",
+                        self.eac3_frame_count,
+                        reason,
+                        decoded_frame.sampling_frequency,
+                        decoded_frame.sample_count,
+                        decoded_frame.channel_count,
+                        decoded_frame.pcm.len()
                     );
                     return Ok(());
                 }
@@ -1021,7 +1018,7 @@ impl AtmosBridge {
                                 break;
                             }
                             Err(msg) => {
-                                bridge_diag_log(log::Level::Warn, &format!("eac3_error={msg}"));
+                                bridge_log!(log::Level::Warn, "eac3_error={msg}");
                                 log::warn!("{msg}");
                                 self.reset_pipeline();
                                 result.did_reset = true;
@@ -1213,6 +1210,22 @@ impl FormatBridge for AtmosBridge {
                 );
                 true
             }
+            // Process-wide, like the host's own level: messages above it are
+            // never formatted nor handed to the sink (see `logging`).
+            "log_level" => match value.as_str().trim().parse::<log::LevelFilter>() {
+                Ok(level) => {
+                    crate::logging::set_max_level(level);
+                    true
+                }
+                Err(_) => {
+                    bridge_log!(
+                        log::Level::Warn,
+                        "atmos-bridge: unknown log_level {:?}",
+                        value.as_str()
+                    );
+                    false
+                }
+            },
             #[cfg(feature = "bridge-perf")]
             "perf_profile" => {
                 let enabled = matches!(value.as_str(), "1" | "true" | "on" | "yes");
@@ -1396,12 +1409,11 @@ impl FormatBridge for AtmosBridge {
                 return false;
             }
         };
-        bridge_diag_log(
+        bridge_log!(
             log::Level::Info,
-            &format!(
-                "[harletty][drc] set_drc_mode {:?} -> {:?}",
-                self.drc_mode, new_mode
-            ),
+            "[harletty][drc] set_drc_mode {:?} -> {:?}",
+            self.drc_mode,
+            new_mode
         );
         if required_presentations(self.presentation, new_mode)
             != required_presentations(self.presentation, self.drc_mode)
@@ -1519,6 +1531,19 @@ mod raw_transport_tests {
         assert_eq!(sniff_raw_codec(&thd), Some(RawCodec::TrueHd));
         // Truncated before the code.
         assert_eq!(sniff_raw_codec(&[0xF8, 0x06, b'i', b'a']), None);
+    }
+
+    #[test]
+    fn configure_log_level_sets_the_forwarded_level() {
+        let _guard = crate::logging::LEVEL_TEST_LOCK.lock().unwrap();
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("log_level".into(), "debug".into()));
+        assert!(crate::logging::log_enabled(log::Level::Debug));
+        assert!(bridge.configure("log_level".into(), "WARN".into()));
+        assert!(!crate::logging::log_enabled(log::Level::Info));
+        assert!(!bridge.configure("log_level".into(), "loud".into()));
+        assert!(!crate::logging::log_enabled(log::Level::Info));
+        crate::logging::set_max_level(log::LevelFilter::Info);
     }
 
     #[test]
