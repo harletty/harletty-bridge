@@ -192,6 +192,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-family-dolby"
+version = "0.8.0"
+dependencies = [
+ "abi_stable",
+ "bridge-common",
+ "bridge_api",
+ "eac3",
+ "log",
+ "truehd",
+]
+
+[[package]]
 name = "bridge-family-dts"
 version = "0.8.0"
 dependencies = [
@@ -676,15 +688,13 @@ version = "0.8.0"
 dependencies = [
  "abi_stable",
  "bridge-common",
+ "bridge-family-dolby",
  "bridge-family-dts",
  "bridge-family-iamf",
  "bridge_api",
- "eac3",
- "libc",
  "log",
  "serde_json",
  "spdif",
- "truehd",
 ]
 
 [[package]]

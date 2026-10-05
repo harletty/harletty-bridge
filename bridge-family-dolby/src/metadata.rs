@@ -171,7 +171,7 @@ fn extract_eac3_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::AtmosBridge;
+    use crate::dolby::test_bridge::TestBridge;
 
     fn empty_oamd_payload() -> OamdPayload {
         OamdPayload {
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn eac3_metadata_declares_objects_sparsely() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         let mut payload = empty_oamd_payload();
         payload.object_count = 3;
         payload.dynamic_objects = 2;

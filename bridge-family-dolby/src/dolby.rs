@@ -34,7 +34,7 @@ use crate::truehd_pipeline::{configure_parser, process_extractor_input, required
 
 /// The source family every Dolby stream reports
 /// (`FormatBridge::source_family`).
-pub(crate) const FAMILY_DOLBY: &str = "dolby";
+pub const FAMILY_DOLBY: &str = "dolby";
 
 #[derive(Debug, Default)]
 pub(crate) struct Eac3DiagStats {
@@ -130,7 +130,7 @@ pub(crate) enum PendingEac3Core {
 /// transient is a single `Decoder` in a leaf frame. The cost is one pointer
 /// hop per pipeline entry — never per sample — so hot loops are unaffected.
 /// `tests::atmos_bridge_stack_footprint_stays_small` guards the invariant.
-pub(crate) struct DolbyPipeline {
+pub struct DolbyPipeline {
     // ── TrueHD pipeline ──────────────────────────────────────────────
     pub(crate) mat_stream: MatStream,
     pub(crate) extractor: Extractor,
@@ -196,7 +196,7 @@ pub(crate) struct DolbyPipeline {
 }
 
 impl DolbyPipeline {
-    pub(crate) fn new(shared: &SharedState) -> Self {
+    pub fn new(shared: &SharedState) -> Self {
         // Default to presentation 3 (full Atmos/JOC); overridable via configure().
         let presentation = 3u8;
 
@@ -265,7 +265,7 @@ impl DolbyPipeline {
 
     /// Forget the stream (seek, sync loss), then re-apply the configuration
     /// to the fresh parser and decoders. The running counters stay.
-    pub(crate) fn reset(&mut self, shared: &SharedState) {
+    pub fn reset(&mut self, shared: &SharedState) {
         // TrueHD reset.
         self.mat_stream.reset();
         self.extractor = Extractor::default();
@@ -303,7 +303,7 @@ impl DolbyPipeline {
 
     /// Raw transport, TrueHD: access units as they come in the elementary
     /// stream.
-    pub(crate) fn push_raw_truehd(
+    pub fn push_raw_truehd(
         &mut self,
         shared: &mut SharedState,
         data: &[u8],
@@ -315,7 +315,7 @@ impl DolbyPipeline {
 
     /// Raw transport, E-AC-3 / AC-3: syncframes as they come in the
     /// elementary stream.
-    pub(crate) fn push_raw_eac3(
+    pub fn push_raw_eac3(
         &mut self,
         shared: &mut SharedState,
         data: &[u8],
@@ -328,13 +328,13 @@ impl DolbyPipeline {
 
     /// The IEC 61937 data types this family decodes: TrueHD in MAT (0x16)
     /// and E-AC-3 (0x15).
-    pub(crate) fn accepts_data_type(data_type: u8) -> bool {
+    pub fn accepts_data_type(data_type: u8) -> bool {
         MatStream::accepts_data_type(data_type) || Eac3SpdifStream::accepts_data_type(data_type)
     }
 
     /// IEC 61937 transport: one burst payload of one of the data types
     /// [`Self::accepts_data_type`] takes.
-    pub(crate) fn push_iec61937(
+    pub fn push_iec61937(
         &mut self,
         shared: &mut SharedState,
         data: &[u8],
@@ -425,11 +425,24 @@ impl DolbyPipeline {
         AfterPush::Continue
     }
 
-    pub(crate) fn is_ready(&self) -> bool {
+    /// Count a raw-transport packet in the `bridge-perf` statistics, whichever
+    /// family it goes to: they are the bridge's only timing profile.
+    #[cfg(feature = "bridge-perf")]
+    pub fn note_raw_packet(&mut self, len: usize) {
+        self.perf.note_raw_packet(len);
+    }
+
+    /// The stream moved to another family: no Dolby codec is the current
+    /// one until a Dolby packet says which.
+    pub fn leave(&mut self) {
+        self.eac3_active = false;
+    }
+
+    pub fn is_ready(&self) -> bool {
         self.frame_count > 0 || self.eac3_frame_count > 0
     }
 
-    pub(crate) fn has_objects(&self) -> bool {
+    pub fn has_objects(&self) -> bool {
         if self.eac3_active {
             // E-AC3/AC-3 is spatial only when it actually carries JOC object
             // payloads (Atmos). `frames_seen` counts every decoded frame, so it
@@ -447,7 +460,7 @@ impl DolbyPipeline {
 
     /// The host's configuration keys this family answers: `presentation`
     /// (TrueHD), and the `bridge-perf` keys. `None` for any other key.
-    pub(crate) fn configure(&mut self, key: &str, value: &str) -> Option<bool> {
+    pub fn configure(&mut self, key: &str, value: &str) -> Option<bool> {
         Some(match key {
             "presentation" => {
                 let p = match value {
@@ -506,7 +519,7 @@ impl DolbyPipeline {
         })
     }
 
-    pub(crate) fn supported_drc_modes() -> RVec<RString> {
+    pub fn supported_drc_modes() -> RVec<RString> {
         vec![
             RString::from("Off"),
             RString::from("standard/line"),
@@ -515,7 +528,7 @@ impl DolbyPipeline {
         .into()
     }
 
-    pub(crate) fn set_drc_mode(&mut self, mode: &str) -> bool {
+    pub fn set_drc_mode(&mut self, mode: &str) -> bool {
         let new_mode = match mode {
             "Off" => DrcMode::Off,
             "Standard" | "Line" | "standard/line" => DrcMode::Standard,
@@ -544,7 +557,7 @@ impl DolbyPipeline {
     }
 
     /// The carrier, then the spatial layer decoded over it.
-    pub(crate) fn source_label(&self, label: &mut String) {
+    pub fn source_label(&self, label: &mut String) {
         if self.eac3_active {
             let stats = &self.eac3_diag_stats;
             label.push_str(if stats.total_frames > stats.legacy_ac3_frames {
@@ -902,5 +915,270 @@ impl DolbyPipeline {
             }
         }
         AfterPush::Continue
+    }
+}
+
+/// The Dolby paths as the bridge drives them, for this crate's tests: the
+/// same `dolby` and `shared` fields, the raw codec sniffed and locked the way
+/// the bridge does for a Dolby stream, and the whole pipeline reset when a
+/// path asks.
+#[cfg(test)]
+pub(crate) mod test_bridge {
+    use super::*;
+    use abi_stable::std_types::{RSlice, RStr};
+    use bridge_api::RInputTransport;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum RawCodec {
+        TrueHd,
+        Eac3,
+    }
+
+    pub(crate) struct TestBridge {
+        pub(crate) dolby: DolbyPipeline,
+        pub(crate) shared: SharedState,
+        forced: Option<RawCodec>,
+        locked: Option<RawCodec>,
+    }
+
+    impl TestBridge {
+        pub(crate) fn new(strict: bool) -> Self {
+            let shared = SharedState::new(strict);
+            Self {
+                dolby: DolbyPipeline::new(&shared),
+                shared,
+                forced: None,
+                locked: None,
+            }
+        }
+
+        fn raw_codec(&mut self, data: &[u8]) -> RawCodec {
+            if let Some(codec) = self.locked.or(self.forced) {
+                self.locked = Some(codec);
+                return codec;
+            }
+            if data.len() >= 8 && data[4..8] == [0xF8, 0x72, 0x6F, 0xBA] {
+                self.locked = Some(RawCodec::TrueHd);
+                return RawCodec::TrueHd;
+            }
+            if data.len() >= 2 && (data[..2] == [0x0B, 0x77] || data[..2] == [0x77, 0x0B]) {
+                self.locked = Some(RawCodec::Eac3);
+                return RawCodec::Eac3;
+            }
+            RawCodec::TrueHd
+        }
+
+        pub(crate) fn push_packet(
+            &mut self,
+            data: RSlice<'_, u8>,
+            transport: RInputTransport,
+            data_type: u8,
+        ) -> RPushResult {
+            let mut result = RPushResult {
+                frames: RVec::new(),
+                error_message: RString::new(),
+                did_reset: false,
+            };
+            let data = data.as_slice();
+            let after = match transport {
+                RInputTransport::Raw => match self.raw_codec(data) {
+                    RawCodec::TrueHd => {
+                        self.dolby
+                            .push_raw_truehd(&mut self.shared, data, &mut result)
+                    }
+                    RawCodec::Eac3 => self
+                        .dolby
+                        .push_raw_eac3(&mut self.shared, data, &mut result),
+                },
+                RInputTransport::Iec61937 => {
+                    assert!(DolbyPipeline::accepts_data_type(data_type));
+                    self.dolby
+                        .push_iec61937(&mut self.shared, data, data_type, &mut result)
+                }
+            };
+            if after == AfterPush::ResetPipeline {
+                self.dolby.reset(&self.shared);
+                self.shared.declared_object_channels = None;
+                self.locked = None;
+            }
+            result
+        }
+
+        pub(crate) fn configure(&mut self, key: RStr<'_>, value: RStr<'_>) -> bool {
+            if key.as_str() == "input_codec" {
+                self.forced = match value.as_str() {
+                    "truehd" => Some(RawCodec::TrueHd),
+                    "eac3" => Some(RawCodec::Eac3),
+                    other => panic!("the test bridge takes no input_codec {other:?}"),
+                };
+                self.locked = None;
+                return true;
+            }
+            self.dolby
+                .configure(key.as_str(), value.as_str())
+                .unwrap_or(false)
+        }
+
+        pub(crate) fn set_drc_mode(&mut self, mode: RStr<'_>) -> bool {
+            self.dolby.set_drc_mode(mode.as_str())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_bridge::TestBridge;
+    use super::*;
+    use crate::dolby::DrcMode;
+    use abi_stable::std_types::RSlice;
+    use bridge_api::{RChannelLabel, RInputTransport};
+
+    /// The label names the carrier and the spatial layer decoded over it.
+    #[test]
+    fn source_label_names_the_carrier_and_its_spatial_layer() {
+        let mut dolby = DolbyPipeline::new(&SharedState::new(false));
+        let label = |dolby: &DolbyPipeline| {
+            let mut label = String::new();
+            dolby.source_label(&mut label);
+            label
+        };
+        dolby.eac3_active = true;
+        dolby.eac3_diag_stats.total_frames = 1;
+        dolby.eac3_diag_stats.legacy_ac3_frames = 1;
+        assert_eq!(label(&dolby), "Dolby Digital");
+        dolby.eac3_diag_stats.total_frames = 2;
+        assert_eq!(label(&dolby), "Dolby Digital Plus");
+        dolby.eac3_diag_stats.joc_frames = 1;
+        assert_eq!(label(&dolby), "Dolby Digital Plus + Dolby Atmos");
+
+        dolby.eac3_active = false;
+        assert_eq!(label(&dolby), "Dolby TrueHD");
+        dolby.truehd_spatial_labels = Some(RVec::new());
+        assert_eq!(label(&dolby), "Dolby TrueHD + Dolby Atmos");
+    }
+
+    #[test]
+    fn failed_legacy_ac3_core_becomes_silence_in_decoder_channel_order() {
+        // 44.1 kHz frmsizecod=29 header (1672-byte frame) handed over two
+        // bytes short: the core decoder rejects it, and the access unit must
+        // still advance the stream by one frame of silence whose channel list
+        // is the one decoded frames carry (fullband order, then LFE) — not a
+        // second, differently ordered list that would make the renderer
+        // replan the bed twice around every dropped frame.
+        let mut frame = vec![0u8; 1670];
+        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1]);
+        let mut bridge = TestBridge::new(false);
+        let mut result = RPushResult {
+            frames: RVec::new(),
+            error_message: RString::new(),
+            did_reset: false,
+        };
+        let mut temporary_silence_pushed = false;
+
+        bridge
+            .dolby
+            .process_eac3_access_unit(
+                &mut bridge.shared,
+                &frame,
+                &mut result,
+                &mut temporary_silence_pushed,
+            )
+            .expect("a failed core is not a pipeline error");
+
+        assert!(result.error_message.is_empty(), "{}", result.error_message);
+        assert!(!result.did_reset);
+        assert_eq!(bridge.dolby.eac3_diag_stats.ac3_core_decode_failures, 1);
+        assert_eq!(bridge.dolby.eac3_diag_stats.legacy_ac3_frames, 1);
+        assert_eq!(bridge.dolby.eac3_total_samples, 1536);
+        assert_eq!(result.frames.len(), 1);
+        let silence = &result.frames[0];
+        assert_eq!(silence.sampling_frequency, 44_100);
+        assert_eq!(silence.sample_count, 1536);
+        assert_eq!(silence.channel_count, 6);
+        assert_eq!(
+            silence.channel_labels.as_slice(),
+            &[
+                RChannelLabel::L,
+                RChannelLabel::C,
+                RChannelLabel::R,
+                RChannelLabel::Ls,
+                RChannelLabel::Rs,
+                RChannelLabel::LFE,
+            ]
+        );
+        assert_eq!(silence.pcm.len(), 1536 * 6);
+        assert!(silence.pcm.iter().all(|sample| *sample == 0));
+        assert!(silence.metadata.is_empty());
+    }
+
+    /// The presentations asked of the TrueHD parser follow the DRC mode, and a
+    /// mode set in mid-stream reaches the parser at the next major sync, where
+    /// every substream can be taken up, with the frames a bridge in that mode
+    /// from the start hands out.
+    #[test]
+    fn truehd_presentations_follow_the_drc_mode_at_a_major_sync() {
+        use crate::truehd_pipeline::required_presentations;
+
+        // The DRC log asks for every presentation whatever the mode.
+        if crate::logging::drc_diag_log_enabled() {
+            return;
+        }
+
+        assert_eq!(
+            required_presentations(2, DrcMode::Off),
+            [false, false, true, false]
+        );
+        assert_eq!(
+            required_presentations(2, DrcMode::Standard),
+            [false, false, true, false]
+        );
+        assert_eq!(
+            required_presentations(2, DrcMode::Heavy),
+            [true, true, true, false]
+        );
+
+        // One major sync and one access unit after it, four times over.
+        let unit = truehd::process::EXAMPLE_DATA;
+        let push = |bridge: &mut TestBridge, copies: usize| {
+            let bytes = unit.repeat(copies);
+            let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
+
+            assert!(result.error_message.is_empty(), "{}", result.error_message);
+            assert!(!result.did_reset);
+            result
+                .frames
+                .into_iter()
+                .map(|f| (f.pcm.to_vec(), f.drc_gain.to_bits(), f.drc_ramp_duration))
+                .collect::<Vec<_>>()
+        };
+
+        let mut heavy = TestBridge::new(false);
+        heavy.configure("input_codec".into(), "truehd".into());
+        assert!(heavy.set_drc_mode("heavy/RF".into()));
+        let mut expected = push(&mut heavy, 1);
+        expected.extend(push(&mut heavy, 3));
+        assert!(!heavy.dolby.truehd_presentations_stale);
+
+        let mut bridge = TestBridge::new(false);
+        bridge.configure("input_codec".into(), "truehd".into());
+        let mut frames = push(&mut bridge, 1);
+        assert!(!bridge.dolby.truehd_presentations_stale);
+
+        // Nothing is asked of the parser between two major syncs.
+        assert!(bridge.set_drc_mode("standard/line".into()));
+        assert!(!bridge.dolby.truehd_presentations_stale);
+        assert!(bridge.set_drc_mode("heavy/RF".into()));
+        assert!(bridge.dolby.truehd_presentations_stale);
+
+        frames.extend(push(&mut bridge, 3));
+        assert!(!bridge.dolby.truehd_presentations_stale);
+
+        assert!(frames.len() >= 6, "{} frames", frames.len());
+        assert_eq!(frames.len(), expected.len());
+        for (i, (frame, expected)) in frames.iter().zip(&expected).enumerate() {
+            assert_eq!(frame.0, expected.0, "samples of frame {i}");
+        }
+        // From the major sync after the mode was set, the gains too.
+        assert_eq!(frames[4..], expected[4..]);
     }
 }

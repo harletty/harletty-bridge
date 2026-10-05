@@ -1234,7 +1234,7 @@ fn decode_ac3_heavy_range_word(word: u8) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::AtmosBridge;
+    use crate::dolby::test_bridge::TestBridge;
     use eac3::{
         AccessUnitInfo, AudioFrameInfo, AuxParseStatus, BedChannel, BlockDrcInfo, CorePcmFrame,
         EmdfSource, FrameType, JocPayload, OamdPayload, ObjectPcmFrame,
@@ -1249,9 +1249,9 @@ mod tests {
     /// `HARLETTY_EAC3_PAIR_FIXTURE` — keep such captures on disk, not tmpfs.
     #[test]
     fn aladdin_eac3_pair_emits_nonsilent_bed() {
-        use crate::bridge::AtmosBridge;
+        use crate::dolby::test_bridge::TestBridge;
         use abi_stable::std_types::RSlice;
-        use bridge_api::{FormatBridge, RInputTransport};
+        use bridge_api::RInputTransport;
 
         let path = std::env::var("HARLETTY_EAC3_PAIR_FIXTURE")
             .unwrap_or_else(|_| "/tmp/aladdin/fr.eac3".to_string());
@@ -1260,7 +1260,7 @@ mod tests {
             return;
         };
 
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         let mut pcm_f32: Vec<f32> = Vec::new();
         let mut channels = 0u32;
         let mut frames = 0u64;
@@ -1296,56 +1296,6 @@ mod tests {
         assert!(frames > 0, "no frames decoded from the E-AC3 pair stream");
         assert!(channels >= 6, "expected >= 5.1, got {channels} channels");
         assert!(peak > 1e-4, "decoded bed is silent (peak={peak})");
-    }
-
-    /// Local-only end-to-end check: decode a real DTS (DTS-HD MA / DTS:X) stream
-    /// through the bridge's raw path and confirm it emits a non-silent
-    /// multichannel bed (the 2D core/HD path; DTS:X objects are ignored). Skips
-    /// when the local capture is absent; dumps PCM for `compare_pcm` vs ffmpeg.
-    #[test]
-    fn dts_decodes_nonsilent_bed() {
-        use crate::bridge::AtmosBridge;
-        use abi_stable::std_types::RSlice;
-        use bridge_api::{FormatBridge, RInputTransport};
-
-        let path = "/tmp/dts/sample.dts";
-        let Ok(bytes) = std::fs::read(path) else {
-            eprintln!("skip: {path} not present");
-            return;
-        };
-
-        let mut bridge = AtmosBridge::new(false);
-        let mut pcm_f32: Vec<f32> = Vec::new();
-        let mut channels = 0u32;
-        let mut frames = 0u64;
-        let mut labels = String::new();
-        for chunk in bytes.chunks(4096) {
-            let r = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
-            for f in r.frames.iter() {
-                frames += 1;
-                channels = f.channel_count;
-                if labels.is_empty() {
-                    labels = format!("{:?}", f.channel_labels);
-                }
-                for &s in f.pcm.iter() {
-                    pcm_f32.push(s as f32 / 8_388_608.0);
-                }
-            }
-        }
-        eprintln!("dts labels: {labels}");
-
-        assert!(frames > 0, "no frames decoded from the DTS stream");
-        assert!(channels >= 6, "expected >= 5.1, got {channels} channels");
-        let peak = pcm_f32.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        assert!(peak > 1e-4, "decoded DTS bed is silent (peak={peak})");
-        eprintln!("dts decoded {frames} frames, {channels} ch, peak={peak:.4}");
-        let _ = std::fs::write(
-            "/tmp/dts/harletty_bridge.f32",
-            pcm_f32
-                .iter()
-                .flat_map(|s| s.to_le_bytes())
-                .collect::<Vec<u8>>(),
-        );
     }
 
     fn object_pcm_frame(core: CorePcmFrame, object_channels: Vec<Vec<f32>>) -> ObjectPcmFrame {
@@ -1610,7 +1560,7 @@ mod tests {
 
     #[test]
     fn legacy_ac3_not_eac3_frame_can_advance_as_silence() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         let mut frame = vec![0u8; 1234];
         frame[..8].copy_from_slice(&[0x0B, 0x77, 0x2A, 0x68, 0x22, 0x30, 0xE1, 0xFF]);
 
@@ -1679,7 +1629,7 @@ mod tests {
 
     #[test]
     fn silence_labels_match_the_decoded_core_for_every_channel_mode() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         for channel_mode in 0u8..=7 {
             for lfe_on in [false, true] {
                 let order = eac3::fullband_channel_order(channel_mode).unwrap();
@@ -1702,7 +1652,7 @@ mod tests {
 
     #[test]
     fn legacy_ac3_core_failure_silence_follows_the_header() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         // 44.1 kHz, acmod=2 (2/0) without LFE, bsid=8: byte 6 = 0b010_00_0_0…
         // (acmod, dsurmod, lfeon).
         let mut frame = vec![0u8; 1672];
@@ -1740,7 +1690,7 @@ mod tests {
 
     #[test]
     fn standard_drc_uses_last_block_dynamic_range_word() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         bridge.dolby.drc_mode = crate::dolby::DrcMode::Standard;
         let mut info = minimal_access_unit_info();
         info.block_drc = vec![
@@ -1762,7 +1712,7 @@ mod tests {
 
     #[test]
     fn heavy_drc_prefers_heavy_word_and_falls_back_to_standard_word() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         bridge.dolby.drc_mode = crate::dolby::DrcMode::Heavy;
 
         let mut heavy_info = minimal_access_unit_info();
@@ -1802,9 +1752,9 @@ mod tests {
 /// captured stream (see `aladdin_eac3_pair_emits_nonsilent_bed`).
 #[cfg(test)]
 mod presentation_assembly {
-    use crate::bridge::AtmosBridge;
+    use crate::dolby::test_bridge::TestBridge;
     use abi_stable::std_types::RSlice;
-    use bridge_api::{FormatBridge, RInputTransport};
+    use bridge_api::RInputTransport;
 
     /// A real independent E-AC-3 access unit, 2/0, carrying no JOC.
     const INDEPENDENT: &[u8] = include_bytes!("../../eac3/tests/data/aht_independent_stereo.bin");
@@ -1822,7 +1772,7 @@ mod presentation_assembly {
         frame
     }
 
-    fn push(bridge: &mut AtmosBridge, frame: &[u8]) -> usize {
+    fn push(bridge: &mut TestBridge, frame: &[u8]) -> usize {
         bridge
             .push_packet(RSlice::from_slice(frame), RInputTransport::Raw, 0)
             .frames
@@ -1835,7 +1785,7 @@ mod presentation_assembly {
     /// for a following dependent to attach to.
     #[test]
     fn an_independent_core_waits_for_the_access_unit_that_follows_it() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         assert_eq!(
             push(&mut bridge, INDEPENDENT),
             0,
@@ -1860,7 +1810,7 @@ mod presentation_assembly {
     /// put an access unit of latency on the common Atmos stream for nothing.
     #[test]
     fn a_joc_frame_its_own_channels_satisfy_is_emitted_on_arrival() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         assert_eq!(
             push(&mut bridge, SELF_CONTAINED_JOC),
             1,
@@ -1882,7 +1832,7 @@ mod presentation_assembly {
     /// then quietly dropped.
     #[test]
     fn a_dependent_group_resolves_into_exactly_one_emitted_presentation() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         assert_eq!(push(&mut bridge, INDEPENDENT), 0, "the core is held");
         assert_eq!(
             push(&mut bridge, &dependent()),
@@ -1912,7 +1862,7 @@ mod presentation_assembly {
     /// unit carrying the objects.
     #[test]
     fn a_second_dependent_joins_the_group_instead_of_being_orphaned() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         push(&mut bridge, INDEPENDENT);
         push(&mut bridge, &dependent());
         push(&mut bridge, &dependent());
@@ -1941,7 +1891,7 @@ mod presentation_assembly {
     /// channels onto another's bed.
     #[test]
     fn an_orphan_dependent_emits_nothing_and_does_not_advance_the_timeline() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         let before = bridge.dolby.eac3_total_samples;
         assert_eq!(
             push(&mut bridge, &dependent()),
@@ -1962,7 +1912,7 @@ mod presentation_assembly {
     /// syncframe: three independents resolve two of them and hold the third.
     #[test]
     fn the_timeline_advances_once_per_resolved_presentation() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         let mut emitted = 0;
         for _ in 0..3 {
             emitted += push(&mut bridge, INDEPENDENT);

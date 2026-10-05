@@ -1,17 +1,11 @@
-mod ac3_native;
-mod bridge;
-mod dolby;
-mod eac3_pipeline;
-mod eac3_spdif;
-mod labels;
-mod mat;
-mod metadata;
-mod perf;
-mod truehd_pipeline;
+//! The bridge a host loads: a router over the codec families, each in its
+//! own crate (`bridge-family-dolby`, `bridge-family-dts`,
+//! `bridge-family-iamf`), on what they share (`bridge-common`).
 
-// The codec families and what they share live in their own crates; these
-// keep the `crate::` paths the remaining in-crate paths use.
-use bridge_common::{frame_builders, logging, shared};
+mod bridge;
+
+// The `crate::` paths the router uses for what the families share.
+use bridge_common::{logging, shared};
 #[cfg(feature = "iamf")]
 use bridge_family_iamf as iamf_pipeline;
 

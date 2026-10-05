@@ -4,9 +4,9 @@ use bridge_api::{
     RVbapCartesianDefaults, RVbapTableMode,
 };
 
-use crate::dolby::{DolbyPipeline, FAMILY_DOLBY};
 use crate::logging::{bridge_diag_log, bridge_log};
 use crate::shared::{AfterPush, SharedState};
+use bridge_family_dolby::{DolbyPipeline, FAMILY_DOLBY};
 use bridge_family_dts::{DtsPipeline, FAMILY_AURO, FAMILY_DTS};
 
 /// The source family IAMF streams report. The renderer knows no family by
@@ -235,7 +235,7 @@ impl AtmosBridge {
         match transport {
             RInputTransport::Raw => {
                 #[cfg(feature = "bridge-perf")]
-                self.dolby.perf.note_raw_packet(data.len());
+                self.dolby.note_raw_packet(data.len());
                 // One-shot diagnostic: log the first raw packet's first 64 bytes so we
                 // can correlate what the host (e.g. mpv-omniphony's ad_orender) feeds
                 // us against what the SPDIF path receives. Triggered only until the
@@ -271,7 +271,7 @@ impl AtmosBridge {
                         }
                     }
                     RawCodec::Dts => {
-                        self.dolby.eac3_active = false;
+                        self.dolby.leave();
                         self.dts_active = true;
                         #[cfg(test)]
                         injected_panic::hit(RawCodec::Dts);
@@ -283,7 +283,7 @@ impl AtmosBridge {
                         }
                     }
                     RawCodec::Iamf => {
-                        self.dolby.eac3_active = false;
+                        self.dolby.leave();
                         self.dts_active = false;
                         #[cfg(feature = "iamf")]
                         {
@@ -330,7 +330,7 @@ impl AtmosBridge {
 
                 // ── DTS (data types 0x0B/0x0C/0x0D/0x11) ──────────────
                 if bridge_family_dts::accepts_data_type(data_type) {
-                    self.dolby.eac3_active = false;
+                    self.dolby.leave();
                     self.dts_active = true;
                     #[cfg(test)]
                     injected_panic::hit(RawCodec::Dts);
@@ -586,8 +586,6 @@ impl FormatBridge for AtmosBridge {
 #[cfg(test)]
 mod raw_transport_tests {
     use super::*;
-    use crate::dolby::DrcMode;
-    use bridge_api::RChannelLabel;
     use std::io::Read;
 
     fn read_prefix(path: &str, bytes: u64) -> Option<Vec<u8>> {
@@ -600,60 +598,6 @@ mod raw_transport_tests {
     fn corpus_path(variable: &str) -> Option<String> {
         let path = std::env::var(variable).ok()?;
         std::path::Path::new(&path).is_file().then_some(path)
-    }
-
-    #[test]
-    fn failed_legacy_ac3_core_becomes_silence_in_decoder_channel_order() {
-        // 44.1 kHz frmsizecod=29 header (1672-byte frame) handed over two
-        // bytes short: the core decoder rejects it, and the access unit must
-        // still advance the stream by one frame of silence whose channel list
-        // is the one decoded frames carry (fullband order, then LFE) — not a
-        // second, differently ordered list that would make the renderer
-        // replan the bed twice around every dropped frame.
-        let mut frame = vec![0u8; 1670];
-        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1]);
-        let mut bridge = AtmosBridge::new(false);
-        let mut result = RPushResult {
-            frames: RVec::new(),
-            error_message: RString::new(),
-            did_reset: false,
-        };
-        let mut temporary_silence_pushed = false;
-
-        bridge
-            .dolby
-            .process_eac3_access_unit(
-                &mut bridge.shared,
-                &frame,
-                &mut result,
-                &mut temporary_silence_pushed,
-            )
-            .expect("a failed core is not a pipeline error");
-
-        assert!(result.error_message.is_empty(), "{}", result.error_message);
-        assert!(!result.did_reset);
-        assert_eq!(bridge.dolby.eac3_diag_stats.ac3_core_decode_failures, 1);
-        assert_eq!(bridge.dolby.eac3_diag_stats.legacy_ac3_frames, 1);
-        assert_eq!(bridge.dolby.eac3_total_samples, 1536);
-        assert_eq!(result.frames.len(), 1);
-        let silence = &result.frames[0];
-        assert_eq!(silence.sampling_frequency, 44_100);
-        assert_eq!(silence.sample_count, 1536);
-        assert_eq!(silence.channel_count, 6);
-        assert_eq!(
-            silence.channel_labels.as_slice(),
-            &[
-                RChannelLabel::L,
-                RChannelLabel::C,
-                RChannelLabel::R,
-                RChannelLabel::Ls,
-                RChannelLabel::Rs,
-                RChannelLabel::LFE,
-            ]
-        );
-        assert_eq!(silence.pcm.len(), 1536 * 6);
-        assert!(silence.pcm.iter().all(|sample| *sample == 0));
-        assert!(silence.metadata.is_empty());
     }
 
     #[test]
@@ -797,8 +741,16 @@ mod raw_transport_tests {
             "DTS declares its ETSI angles"
         );
         bridge.dts_active = false;
-        bridge.dolby.eac3_active = true;
         assert_eq!(bridge.source_family().as_str(), "dolby");
+    }
+
+    /// Nothing is named before a frame decoded: until then the codec path is
+    /// a guess, and the host has its own. The labels themselves are each
+    /// family's (their own tests; the corpus tests read them through here).
+    #[test]
+    fn source_label_is_empty_before_a_frame() {
+        let bridge = AtmosBridge::new(false);
+        assert_eq!(bridge.source_label().as_str(), "");
     }
 
     /// Every family a stream can name is in the catalogue the renderer
@@ -830,107 +782,6 @@ mod raw_transport_tests {
                 family.default_mode
             );
         }
-    }
-
-    /// The label names the carrier the demux found and the spatial layer
-    /// decoded over it, once a frame decoded; nothing before.
-    #[test]
-    fn source_label_names_the_carrier_and_its_spatial_layer() {
-        let mut bridge = AtmosBridge::new(false);
-        assert_eq!(bridge.source_label().as_str(), "", "nothing before a frame");
-
-        // The DTS labels are the DTS family's (its own tests); the corpus
-        // tests below read them through the bridge.
-        bridge.dolby.eac3_active = true;
-        bridge.dolby.eac3_frame_count = 1;
-        bridge.dolby.eac3_diag_stats.total_frames = 1;
-        bridge.dolby.eac3_diag_stats.legacy_ac3_frames = 1;
-        assert_eq!(bridge.source_label().as_str(), "Dolby Digital");
-        bridge.dolby.eac3_diag_stats.total_frames = 2;
-        assert_eq!(bridge.source_label().as_str(), "Dolby Digital Plus");
-        bridge.dolby.eac3_diag_stats.joc_frames = 1;
-        assert_eq!(
-            bridge.source_label().as_str(),
-            "Dolby Digital Plus + Dolby Atmos"
-        );
-
-        bridge.dolby.eac3_active = false;
-        bridge.dolby.eac3_frame_count = 0;
-        bridge.dolby.frame_count = 1;
-        assert_eq!(bridge.source_label().as_str(), "Dolby TrueHD");
-        bridge.dolby.truehd_spatial_labels = Some(RVec::new());
-        assert_eq!(bridge.source_label().as_str(), "Dolby TrueHD + Dolby Atmos");
-    }
-
-    /// The presentations asked of the TrueHD parser follow the DRC mode, and a
-    /// mode set in mid-stream reaches the parser at the next major sync, where
-    /// every substream can be taken up, with the frames a bridge in that mode
-    /// from the start hands out.
-    #[test]
-    fn truehd_presentations_follow_the_drc_mode_at_a_major_sync() {
-        use crate::truehd_pipeline::required_presentations;
-
-        // The DRC log asks for every presentation whatever the mode.
-        if crate::logging::drc_diag_log_enabled() {
-            return;
-        }
-
-        assert_eq!(
-            required_presentations(2, DrcMode::Off),
-            [false, false, true, false]
-        );
-        assert_eq!(
-            required_presentations(2, DrcMode::Standard),
-            [false, false, true, false]
-        );
-        assert_eq!(
-            required_presentations(2, DrcMode::Heavy),
-            [true, true, true, false]
-        );
-
-        // One major sync and one access unit after it, four times over.
-        let unit = truehd::process::EXAMPLE_DATA;
-        let push = |bridge: &mut AtmosBridge, copies: usize| {
-            let bytes = unit.repeat(copies);
-            let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
-
-            assert!(result.error_message.is_empty(), "{}", result.error_message);
-            assert!(!result.did_reset);
-            result
-                .frames
-                .into_iter()
-                .map(|f| (f.pcm.to_vec(), f.drc_gain.to_bits(), f.drc_ramp_duration))
-                .collect::<Vec<_>>()
-        };
-
-        let mut heavy = AtmosBridge::new(false);
-        heavy.configure("input_codec".into(), "truehd".into());
-        assert!(heavy.set_drc_mode("heavy/RF".into()));
-        let mut expected = push(&mut heavy, 1);
-        expected.extend(push(&mut heavy, 3));
-        assert!(!heavy.dolby.truehd_presentations_stale);
-
-        let mut bridge = AtmosBridge::new(false);
-        bridge.configure("input_codec".into(), "truehd".into());
-        let mut frames = push(&mut bridge, 1);
-        assert!(!bridge.dolby.truehd_presentations_stale);
-
-        // Nothing is asked of the parser between two major syncs.
-        assert!(bridge.set_drc_mode("standard/line".into()));
-        assert!(!bridge.dolby.truehd_presentations_stale);
-        assert!(bridge.set_drc_mode("heavy/RF".into()));
-        assert!(bridge.dolby.truehd_presentations_stale);
-
-        frames.extend(push(&mut bridge, 3));
-        assert!(!bridge.dolby.truehd_presentations_stale);
-
-        assert!(frames.len() >= 6, "{} frames", frames.len());
-        assert_eq!(frames.len(), expected.len());
-        for (i, (frame, expected)) in frames.iter().zip(&expected).enumerate() {
-            assert_eq!(frame.0, expected.0, "samples of frame {i}");
-        }
-        // From the major sync after the mode was set, the gains too.
-        assert_eq!(frames[4..], expected[4..]);
     }
 
     // End-to-end: feed a raw DTS core stream through the FormatBridge and check
@@ -1237,6 +1088,55 @@ mod raw_transport_tests {
         );
         assert!(metadata.events.iter().all(|event| event.has_pos));
     }
+
+    /// Local-only end-to-end check: decode a real DTS (DTS-HD MA / DTS:X) stream
+    /// through the bridge's raw path and confirm it emits a non-silent
+    /// multichannel bed (the 2D core/HD path; DTS:X objects are ignored). Skips
+    /// when the local capture is absent; dumps PCM for `compare_pcm` vs ffmpeg.
+    #[test]
+    fn dts_decodes_nonsilent_bed() {
+        use abi_stable::std_types::RSlice;
+        use bridge_api::{FormatBridge, RInputTransport};
+
+        let path = "/tmp/dts/sample.dts";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skip: {path} not present");
+            return;
+        };
+
+        let mut bridge = AtmosBridge::new(false);
+        let mut pcm_f32: Vec<f32> = Vec::new();
+        let mut channels = 0u32;
+        let mut frames = 0u64;
+        let mut labels = String::new();
+        for chunk in bytes.chunks(4096) {
+            let r = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+            for f in r.frames.iter() {
+                frames += 1;
+                channels = f.channel_count;
+                if labels.is_empty() {
+                    labels = format!("{:?}", f.channel_labels);
+                }
+                for &s in f.pcm.iter() {
+                    pcm_f32.push(s as f32 / 8_388_608.0);
+                }
+            }
+        }
+        eprintln!("dts labels: {labels}");
+
+        assert!(frames > 0, "no frames decoded from the DTS stream");
+        assert!(channels >= 6, "expected >= 5.1, got {channels} channels");
+        let peak = pcm_f32.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(peak > 1e-4, "decoded DTS bed is silent (peak={peak})");
+        eprintln!("dts decoded {frames} frames, {channels} ch, peak={peak:.4}");
+        let _ = std::fs::write(
+            "/tmp/dts/harletty_bridge.f32",
+            pcm_f32
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1375,7 +1275,7 @@ mod stack_footprint_tests {
             .stack_size(MACOS_PLAYBACK_STACK)
             .spawn(|| {
                 let bridge = AtmosBridge::new(false);
-                assert_eq!(bridge.dolby.presentation, 3);
+                assert!(!bridge.is_ready());
             })
             .expect("spawn small-stack thread")
             .join()
