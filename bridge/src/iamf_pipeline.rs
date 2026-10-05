@@ -37,9 +37,9 @@ use iamf_dec::stream::{
 };
 use iamf_obu::descriptors::{AudioElementConfig, CodecId, ElementGainOffset};
 
-use crate::bridge::AtmosBridge;
 use crate::frame_builders::float_to_pcm_i32;
 use crate::logging::panic_message;
+use crate::shared::{AfterPush, SharedState};
 
 /// System J in the decoder's IAMF channel order: L, R, C, LFE, Lss, Rss, Lrs,
 /// Rrs, Ltf, Rtf, Ltb, Rtb.
@@ -1046,31 +1046,35 @@ fn ambisonics_name(channels: u8) -> String {
 
 /// Raw-transport entry point: buffer `data`, decode what completes, and apply
 /// the pipeline's failure policy (strict mode surfaces and resets).
-pub(crate) fn push_iamf(bridge: &mut AtmosBridge, data: &[u8], result: &mut RPushResult) {
-    #[cfg(test)]
-    crate::bridge::injected_panic::hit(crate::bridge::RawCodec::Iamf);
-    let strict = bridge.shared.strict;
-    let state = &mut *bridge.iamf;
+pub(crate) fn push_iamf(
+    state: &mut IamfState,
+    shared: &mut SharedState,
+    data: &[u8],
+    result: &mut RPushResult,
+) -> AfterPush {
+    let strict = shared.strict;
     state.buf.extend_from_slice(data);
     // Metadata events are stamped on the bridge's running sample position.
-    state.sample_pos = bridge.shared.total_samples;
+    state.sample_pos = shared.total_samples;
     let mut frames = RVec::new();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         state.drain(strict, &mut frames)
     }));
     let decoded: u64 = frames.iter().map(|f| u64::from(f.sample_count)).sum();
-    bridge.shared.total_samples += decoded;
+    shared.total_samples += decoded;
     result.frames.extend(frames);
     match outcome {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => AfterPush::Continue,
         Ok(Err(msg)) => {
             log::warn!("{msg}");
             // An unsupported sequence is reported once, then its audio is
             // dropped until the next sequence header.
             result.error_message = RString::from(msg);
             if strict {
-                bridge.reset_pipeline();
                 result.did_reset = true;
+                AfterPush::ResetPipeline
+            } else {
+                AfterPush::Continue
             }
         }
         Err(panic_info) => {
@@ -1078,12 +1082,12 @@ pub(crate) fn push_iamf(bridge: &mut AtmosBridge, data: &[u8], result: &mut RPus
             log::warn!("iamf: panic caught while decoding: {msg}. Resetting pipeline.");
             // The decoder's state is unknown after a panic: rebuild it from
             // the next sequence header.
-            *bridge.iamf = IamfState::default();
-            bridge.reset_pipeline();
+            *state = IamfState::default();
             result.did_reset = true;
             if strict {
                 result.error_message = RString::from(msg);
             }
+            AfterPush::ResetPipeline
         }
     }
 }

@@ -25,6 +25,8 @@ use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::validate_frame_shape;
 use crate::logging::bridge_diag_log;
 use crate::mat::MatStream;
+#[cfg(feature = "iamf")]
+use crate::shared::AfterPush;
 use crate::shared::SharedState;
 use crate::truehd_pipeline::{configure_parser, process_extractor_input, required_presentations};
 
@@ -910,7 +912,19 @@ impl AtmosBridge {
                         self.eac3_active = false;
                         self.dts_active = false;
                         #[cfg(feature = "iamf")]
-                        crate::iamf_pipeline::push_iamf(self, data.as_slice(), &mut result);
+                        {
+                            #[cfg(test)]
+                            injected_panic::hit(RawCodec::Iamf);
+                            let after = crate::iamf_pipeline::push_iamf(
+                                &mut self.iamf,
+                                &mut self.shared,
+                                data.as_slice(),
+                                &mut result,
+                            );
+                            if after == AfterPush::ResetPipeline {
+                                self.reset_pipeline();
+                            }
+                        }
                         #[cfg(not(feature = "iamf"))]
                         if !self.iamf_refusal_reported {
                             // Reported once per stream, not per packet.

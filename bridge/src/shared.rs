@@ -40,3 +40,16 @@ impl SharedState {
         }
     }
 }
+
+/// What a codec path asks of the bridge once it has handled a packet. A path
+/// owns only its own state, so resetting the whole pipeline — every codec, the
+/// sniffed codec, the shared declarations — is the bridge's to do.
+// Only the IAMF path returns it so far; the DTS and Dolby paths follow.
+#[cfg_attr(not(feature = "iamf"), allow(dead_code))]
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterPush {
+    Continue,
+    /// Reset the whole pipeline before returning the result.
+    ResetPipeline,
+}
