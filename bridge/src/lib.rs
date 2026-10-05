@@ -55,3 +55,11 @@ extern "C" fn source_families() -> RVec<RSourceFamily> {
 pub fn new_bridge(strict: bool) -> FormatBridgeBox {
     create_bridge(strict)
 }
+
+/// Install a host log sink, for the same in-process callers as
+/// [`new_bridge`]: without one, every diagnostic down to `Debug` goes to
+/// stderr, which no real host does.
+#[doc(hidden)]
+pub fn set_log_sink(sink: bridge_api::BridgeHostLogSink) {
+    set_host_log_sink(sink as usize);
+}
