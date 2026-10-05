@@ -534,7 +534,7 @@ impl AtmosBridge {
         match self.resolve_pending_presentation(result) {
             Ok(()) => Ok(()),
             Err(msg) => {
-                log::warn!("{msg}");
+                bridge_diag_log(log::Level::Warn, &msg);
                 self.reset_pipeline();
                 result.did_reset = true;
                 result.error_message = msg.as_str().into();
@@ -793,7 +793,7 @@ impl AtmosBridge {
                 Ok(())
             }
             Err(msg) => {
-                log::warn!("{msg}");
+                bridge_diag_log(log::Level::Warn, &msg);
                 self.reset_pipeline();
                 result.did_reset = true;
                 result.error_message = msg.as_str().into();
@@ -869,7 +869,6 @@ impl AtmosBridge {
                 Err(err) => {
                     let msg = format!("eac3_raw_extract_error={err:?}");
                     bridge_diag_log(log::Level::Warn, &msg);
-                    log::warn!("{msg}");
                     self.reset_pipeline();
                     result.did_reset = true;
                     result.error_message = msg.into();
@@ -934,7 +933,7 @@ impl AtmosBridge {
                             // Reported once per stream, not per packet.
                             self.iamf_refusal_reported = true;
                             let msg = "iamf: this bridge was built without IAMF support";
-                            log::warn!("{msg}");
+                            bridge_diag_log(log::Level::Warn, msg);
                             result.error_message = msg.into();
                         }
                     }
@@ -979,7 +978,7 @@ impl AtmosBridge {
                                 #[cfg(feature = "bridge-perf")]
                                 self.perf
                                     .record_mat_chunk_extract(chunk_extract_started.elapsed());
-                                log::warn!("{msg}");
+                                bridge_diag_log(log::Level::Warn, &msg);
                                 self.reset_pipeline();
                                 result.did_reset = true;
                                 if self.strict {
@@ -1019,7 +1018,6 @@ impl AtmosBridge {
                             }
                             Err(msg) => {
                                 bridge_log!(log::Level::Warn, "eac3_error={msg}");
-                                log::warn!("{msg}");
                                 self.reset_pipeline();
                                 result.did_reset = true;
                                 result.error_message = msg.into();
@@ -1052,7 +1050,7 @@ impl AtmosBridge {
                 // Unsupported data type.
                 let msg =
                     format!("Unsupported IEC 61937 data type for this bridge: 0x{data_type:02X}");
-                log::warn!("{msg}");
+                bridge_diag_log(log::Level::Warn, &msg);
                 if self.strict {
                     result.error_message = msg.into();
                     self.reset_pipeline();
@@ -1088,7 +1086,6 @@ impl FormatBridge for AtmosBridge {
                 crate::logging::panic_message(&payload)
             );
             bridge_diag_log(log::Level::Error, &msg);
-            log::error!("{msg}");
             // The panicking decoder's state is unknown: IAMF keeps its
             // sequence configuration across a reset, so it is rebuilt.
             #[cfg(feature = "iamf")]
@@ -1111,7 +1108,7 @@ impl FormatBridge for AtmosBridge {
     }
 
     fn reset(&mut self) {
-        log::info!("Bridge reset requested");
+        bridge_log!(log::Level::Info, "Bridge reset requested");
         self.reset_pipeline();
         // Note: total_samples is NOT reset — it tracks the global position for
         // continuous-mode timestamping. The handler manages segment offsets.
@@ -1171,14 +1168,19 @@ impl FormatBridge for AtmosBridge {
                     s => match s.parse::<u8>() {
                         Ok(p) if p < MAX_PRESENTATIONS as u8 => p,
                         Ok(p) => {
-                            log::warn!(
+                            bridge_log!(
+                                log::Level::Warn,
                                 "atmos-bridge: presentation {p} out of range (0–{})",
                                 MAX_PRESENTATIONS - 1
                             );
                             return false;
                         }
                         Err(_) => {
-                            log::warn!("atmos-bridge: cannot parse presentation value {:?}", s);
+                            bridge_log!(
+                                log::Level::Warn,
+                                "atmos-bridge: cannot parse presentation value {:?}",
+                                s
+                            );
                             return false;
                         }
                     },
@@ -1187,7 +1189,7 @@ impl FormatBridge for AtmosBridge {
                 self.parser
                     .set_required_presentations(&required_presentations(p, self.drc_mode));
                 self.truehd_presentations_stale = false;
-                log::debug!("atmos-bridge: presentation set to {p}");
+                bridge_log!(log::Level::Debug, "atmos-bridge: presentation set to {p}");
                 true
             }
             "input_codec" => {
@@ -1198,13 +1200,14 @@ impl FormatBridge for AtmosBridge {
                     "iamf" => Some(RawCodec::Iamf),
                     "auto" | "" => None,
                     s => {
-                        log::warn!("atmos-bridge: unknown input_codec {s:?}");
+                        bridge_log!(log::Level::Warn, "atmos-bridge: unknown input_codec {s:?}");
                         return false;
                     }
                 };
                 // Force re-resolution against the new codec on the next packet.
                 self.raw_codec = None;
-                log::debug!(
+                bridge_log!(
+                    log::Level::Debug,
                     "atmos-bridge: input_codec set to {:?}",
                     self.forced_raw_codec
                 );
@@ -1248,7 +1251,8 @@ impl FormatBridge for AtmosBridge {
                     true
                 }
                 _ => {
-                    log::warn!(
+                    bridge_log!(
+                        log::Level::Warn,
                         "atmos-bridge: invalid perf_report_every value {:?}",
                         value.as_str()
                     );
@@ -1258,7 +1262,11 @@ impl FormatBridge for AtmosBridge {
             #[cfg(not(feature = "bridge-perf"))]
             "perf_profile" | "perf_report_every" => false,
             _ => {
-                log::debug!("atmos-bridge: unknown configuration key {:?}", key.as_str());
+                bridge_log!(
+                    log::Level::Debug,
+                    "atmos-bridge: unknown configuration key {:?}",
+                    key.as_str()
+                );
                 false
             }
         }

@@ -22,6 +22,7 @@ use auro::{Detector, StreamId, Unfolder};
 use bridge_api::{RChannelLabel, RChannelPose, RDecodedFrame};
 
 use crate::labels::auro_stream_to_r;
+use crate::logging::bridge_log;
 
 /// Samples to hold back before giving up on a stream that shows no valid
 /// block at all: two of the largest blocks, so a block of any size has had
@@ -265,7 +266,8 @@ impl DtsAuroState {
         let outputs: Vec<StreamId> = match detection.original.streams() {
             Some(streams) => streams.as_slice().iter().map(|&id| StreamId(id)).collect(),
             None => {
-                log::warn!(
+                bridge_log!(
+                    log::Level::Warn,
                     "dts: Auro-3D layout {:?} has no known stream list; keeping the carrier as is",
                     detection.original
                 );
@@ -276,7 +278,8 @@ impl DtsAuroState {
             }
         };
         let name = |layout: auro::Layout| layout.name().unwrap_or("?");
-        log::info!(
+        bridge_log!(
+            log::Level::Info,
             "dts: Auro-3D carrier {} folded into {} ({}-sample blocks); unfolding to {} channels",
             name(detection.original),
             name(detection.carrier),

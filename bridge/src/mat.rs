@@ -1,4 +1,4 @@
-use log::warn;
+use crate::logging::bridge_log;
 
 const IEC61937_TRUEHD_DATA_TYPE: u8 = 0x16;
 
@@ -396,7 +396,10 @@ impl MatStream {
                     ]);
                     let chunk_size = ((raw & 0x0FFF) << 1) as usize;
                     if chunk_size == 0 {
-                        warn!("Invalid MAT chunk size (0), skipping 2 bytes");
+                        bridge_log!(
+                            log::Level::Warn,
+                            "Invalid MAT chunk size (0), skipping 2 bytes"
+                        );
                         self.advance(2);
                         self.state = ParserState::ReadingPayload {
                             bytes_remaining: bytes_remaining.saturating_sub(2),
