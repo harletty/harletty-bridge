@@ -17,13 +17,15 @@ compile_error!("harletty-bridge needs a codec family: enable `dolby`, `dts` or `
 /// The source family IAMF streams report. The renderer knows no family by
 /// name: the catalogue below is what it, and Studio, offer.
 const FAMILY_IAMF: &str = "iamf";
-/// What a refused DTS stream reports (the DTS family's own name), in a build
-/// without it.
+/// What a refused stream reports (its family's own name), in a build
+/// without that family.
 #[cfg(not(feature = "dts"))]
 const FAMILY_DTS: &str = "dts";
+#[cfg(not(feature = "dolby"))]
+const FAMILY_DOLBY: &str = "dolby";
 
-/// What the bridge reports before a packet, and for a Dolby stream: Dolby,
-/// or with no Dolby in the build, the first family it has.
+/// What the bridge reports before a stream is identified: Dolby, or with no
+/// Dolby in the build, the first family it has.
 const IDLE_FAMILY: &str = if cfg!(feature = "dolby") {
     "dolby"
 } else if cfg!(feature = "dts") {
@@ -258,6 +260,15 @@ impl AtmosBridge {
             return Some(RawCodec::Iamf);
         }
         cfg!(feature = "dolby").then_some(RawCodec::TrueHd)
+    }
+
+    /// The stream is a Dolby one this build refused, as opposed to no stream
+    /// identified yet: both leave the DTS and IAMF flags down.
+    fn refused_dolby(&self) -> bool {
+        #[cfg(not(feature = "dolby"))]
+        return matches!(self.refused, Some(RawCodec::TrueHd | RawCodec::Eac3));
+        #[cfg(feature = "dolby")]
+        return false;
     }
 
     /// Refuse a stream whose family this build does not decode: by name, and
@@ -570,6 +581,8 @@ impl FormatBridge for AtmosBridge {
             #[cfg(not(feature = "dts"))]
             let family = FAMILY_DTS;
             family
+        } else if self.refused_dolby() {
+            FAMILY_DOLBY
         } else {
             IDLE_FAMILY
         })
@@ -653,8 +666,10 @@ impl FormatBridge for AtmosBridge {
 #[cfg(test)]
 mod raw_transport_tests {
     use super::*;
+    #[cfg(feature = "dts")]
     use std::io::Read;
 
+    #[cfg(feature = "dts")]
     fn read_prefix(path: &str, bytes: u64) -> Option<Vec<u8>> {
         let mut input = std::fs::File::open(path).ok()?;
         let mut prefix = Vec::with_capacity(bytes as usize);
@@ -662,6 +677,7 @@ mod raw_transport_tests {
         Some(prefix)
     }
 
+    #[cfg(feature = "dts")]
     fn corpus_path(variable: &str) -> Option<String> {
         let path = std::env::var(variable).ok()?;
         std::path::Path::new(&path).is_file().then_some(path)
@@ -1060,6 +1076,7 @@ mod raw_transport_tests {
         );
     }
 
+    #[cfg(feature = "dts")]
     #[test]
     fn alternate_profiles_emit_automatic_presentations() {
         let Some(d0_path) = corpus_path("HARLETTY_D0_CORPUS") else {
@@ -1271,16 +1288,19 @@ mod raw_transport_tests {
     #[cfg(not(feature = "dolby"))]
     #[test]
     fn a_dolby_stream_without_dolby_is_refused_by_name() {
-        let (first, second, after_reset, _) =
+        let (first, second, after_reset, family) =
             refused_twice_then_after_reset(&[0x0B, 0x77, 0, 0, 0, 0, 0, 0]);
         assert_eq!(first, "eac3: this bridge was built without E-AC-3 support");
         assert_eq!(second, "");
         assert_eq!(after_reset, first);
-        let (first, ..) = refused_twice_then_after_reset(&[0, 0, 0, 0, 0xF8, 0x72, 0x6F, 0xBA]);
+        assert_eq!(family, "dolby");
+        let (first, .., family) =
+            refused_twice_then_after_reset(&[0, 0, 0, 0, 0xF8, 0x72, 0x6F, 0xBA]);
         assert_eq!(
             first,
             "truehd: this bridge was built without TrueHD support"
         );
+        assert_eq!(family, "dolby");
     }
 
     #[cfg(not(feature = "iamf"))]
