@@ -362,21 +362,24 @@ fn extract_events(
     };
 
     if object_element.md_update_info.num_obj_info_blocks != 1 {
-        log::warn!(
+        bridge_log!(
+            log::Level::Warn,
             "atmos-bridge: unsupported OAMD with num_obj_info_blocks={} (expected 1); skipping metadata frame",
             object_element.md_update_info.num_obj_info_blocks
         );
         return ExtractedTruehdMetadata::empty();
     }
     if oamd.program_assignment.bed_assignment.len() != 1 {
-        log::warn!(
+        bridge_log!(
+            log::Level::Warn,
             "atmos-bridge: unsupported OAMD with bed_assignment_count={} (expected 1); skipping metadata frame",
             oamd.program_assignment.bed_assignment.len()
         );
         return ExtractedTruehdMetadata::empty();
     }
     if oamd.program_assignment.num_isf_objects != 0 {
-        log::warn!(
+        bridge_log!(
+            log::Level::Warn,
             "atmos-bridge: unsupported OAMD with num_isf_objects={} (expected 0); skipping metadata frame",
             oamd.program_assignment.num_isf_objects
         );
@@ -451,27 +454,31 @@ fn extract_events(
     }
 
     if missing_object_data > 0 {
-        log::warn!(
+        bridge_log!(
+            log::Level::Warn,
             "atmos-bridge: missing object_data for {} object(s) (object_count={}); skipped",
             missing_object_data,
             object_count
         );
     }
     if empty_object_blocks > 0 {
-        log::warn!(
+        bridge_log!(
+            log::Level::Warn,
             "atmos-bridge: empty object_data blocks for {} object(s); skipped",
             empty_object_blocks
         );
     }
     if bed_index_oob > 0 {
-        log::warn!(
+        bridge_log!(
+            log::Level::Warn,
             "atmos-bridge: bed index out-of-range for {} object(s) (bed_index_len={}); skipped",
             bed_index_oob,
             bed_index_vec.len()
         );
     }
     if missing_damf_pos > 0 {
-        log::warn!(
+        bridge_log!(
+            log::Level::Warn,
             "atmos-bridge: missing DAMF position for {} object(s); positions omitted",
             missing_damf_pos
         );

@@ -38,7 +38,7 @@ use iamf_dec::stream::{
 use iamf_obu::descriptors::{AudioElementConfig, CodecId, ElementGainOffset};
 
 use bridge_common::frame_builders::float_to_pcm_i32;
-use bridge_common::logging::panic_message;
+use bridge_common::logging::{bridge_diag_log, bridge_log, panic_message};
 use bridge_common::shared::{AfterPush, SharedState};
 
 /// System J in the decoder's IAMF channel order: L, R, C, LFE, Lss, Rss, Lrs,
@@ -516,7 +516,8 @@ impl IamfState {
         self.num_objects = decoder.num_objects();
         self.dialogue = find_dialogue(&self.descriptors, mix_id)
             .filter(|dialogue| decoder.split_element(dialogue.audio_element_id));
-        log::info!(
+        bridge_log!(
+            log::Level::Info,
             "atmos-bridge: iamf sequence: {description}, mix {mix_id}: {}{} at {} Hz",
             match (decoder.has_rendered_elements(), self.num_objects) {
                 (true, 0) => format!("rendered to {}", bed.name()),
@@ -568,7 +569,7 @@ impl IamfState {
             if strict {
                 return Err(msg);
             }
-            log::warn!("{msg}");
+            bridge_diag_log(log::Level::Warn, &msg);
             decoder.reset();
             return Ok(());
         }
@@ -1076,7 +1077,7 @@ pub fn push_iamf(
     match outcome {
         Ok(Ok(())) => AfterPush::Continue,
         Ok(Err(msg)) => {
-            log::warn!("{msg}");
+            bridge_diag_log(log::Level::Warn, &msg);
             // An unsupported sequence is reported once, then its audio is
             // dropped until the next sequence header.
             result.error_message = RString::from(msg);
@@ -1089,7 +1090,10 @@ pub fn push_iamf(
         }
         Err(panic_info) => {
             let msg = panic_message(&panic_info);
-            log::warn!("iamf: panic caught while decoding: {msg}. Resetting pipeline.");
+            bridge_log!(
+                log::Level::Warn,
+                "iamf: panic caught while decoding: {msg}. Resetting pipeline."
+            );
             // The decoder's state is unknown after a panic: rebuild it from
             // the next sequence header.
             *state = IamfState::default();

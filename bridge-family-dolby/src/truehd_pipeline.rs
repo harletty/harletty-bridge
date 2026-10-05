@@ -12,7 +12,7 @@ use truehd::structs::access_unit::AccessUnit;
 
 use crate::dolby::{DolbyPipeline, DrcMode};
 use crate::labels::{channel_label_to_r, oamd_speaker_to_label};
-use crate::logging::{bridge_log, drc_diag_log_enabled, panic_message};
+use crate::logging::{bridge_diag_log, bridge_log, drc_diag_log_enabled, panic_message};
 use crate::metadata::build_metadata_frame_from_oamd;
 use crate::perf::PerfStats;
 use crate::shared::{AfterPush, SharedState};
@@ -150,7 +150,8 @@ fn drain_frames(
                         continue;
                     }
 
-                    log::info!(
+                    bridge_log!(
+                        log::Level::Info,
                         "Major sync found at frame {}; resuming after parse recovery",
                         ctx.frame_count
                     );
@@ -175,7 +176,7 @@ fn drain_frames(
                     Ok(()) => {}
                     Err(e) => {
                         let msg = format!("Parse error at frame {}: {e}", ctx.frame_count);
-                        log::error!("{msg}");
+                        bridge_diag_log(log::Level::Error, &msg);
                         if ctx.strict {
                             error_msg = Some(msg);
                             return (frames, error_msg);
@@ -196,7 +197,8 @@ fn drain_frames(
                 // never does.
                 if ctx.parser.branches().len() > MAX_RETAINED_BRANCHES {
                     let dropped = ctx.parser.take_branches().len();
-                    log::debug!(
+                    bridge_log!(
+                        log::Level::Debug,
                         "dropped {dropped} recorded branch points at frame {}",
                         ctx.frame_count
                     );
@@ -207,7 +209,8 @@ fn drain_frames(
                 if let Some(major_sync) = &access_unit.major_sync_info {
                     match *ctx.current_substream_info {
                         Some(cur) if cur != major_sync.substream_info => {
-                            log::info!(
+                            bridge_log!(
+                                log::Level::Info,
                                 "substream_info changed: {:#02X} -> {:#02X}",
                                 cur,
                                 major_sync.substream_info
@@ -221,7 +224,8 @@ fn drain_frames(
                     }
                     match *ctx.current_extended_substream_info {
                         Some(cur) if cur != major_sync.extended_substream_info => {
-                            log::info!(
+                            bridge_log!(
+                                log::Level::Info,
                                 "extended_substream_info changed: {:#02X} -> {:#02X}",
                                 cur,
                                 major_sync.extended_substream_info
@@ -252,7 +256,8 @@ fn drain_frames(
                             _ => -(cm.eightch_dialogue_norm as i8),
                         };
                         *ctx.current_dialogue_level = Some(dialogue_level);
-                        log::debug!(
+                        bridge_log!(
+                            log::Level::Debug,
                             "Dialogue level: {} dBFS (presentation {})",
                             dialogue_level,
                             ctx.presentation
@@ -270,7 +275,7 @@ fn drain_frames(
                     Ok(()) => {}
                     Err(e) => {
                         let msg = format!("Decode error at frame {}: {e}", ctx.frame_count);
-                        log::error!("{msg}");
+                        bridge_diag_log(log::Level::Error, &msg);
                         if ctx.strict {
                             error_msg = Some(msg);
                         }
@@ -384,7 +389,7 @@ fn drain_frames(
                     "Extract error at frame {}: {extract_error}",
                     ctx.frame_count
                 );
-                log::error!("{msg}");
+                bridge_diag_log(log::Level::Error, &msg);
                 if ctx.strict {
                     error_msg = Some(msg);
                 }
@@ -560,7 +565,8 @@ pub(crate) fn process_extractor_input(
         }
         Err(panic_info) => {
             let msg = panic_message(&panic_info);
-            log::warn!(
+            bridge_log!(
+                log::Level::Warn,
                 "Panic caught during frame processing: {}. Resetting pipeline.",
                 msg
             );

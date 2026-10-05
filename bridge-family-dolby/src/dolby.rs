@@ -377,7 +377,7 @@ impl DolbyPipeline {
                         #[cfg(feature = "bridge-perf")]
                         self.perf
                             .record_mat_chunk_extract(chunk_extract_started.elapsed());
-                        log::warn!("{msg}");
+                        bridge_diag_log(log::Level::Warn, &msg);
                         result.did_reset = true;
                         if shared.strict {
                             result.error_message = msg.into();
@@ -415,7 +415,6 @@ impl DolbyPipeline {
                 }
                 Err(msg) => {
                     bridge_log!(log::Level::Warn, "eac3_error={msg}");
-                    log::warn!("{msg}");
                     result.did_reset = true;
                     result.error_message = msg.into();
                     return AfterPush::ResetPipeline;
@@ -468,14 +467,19 @@ impl DolbyPipeline {
                     s => match s.parse::<u8>() {
                         Ok(p) if p < MAX_PRESENTATIONS as u8 => p,
                         Ok(p) => {
-                            log::warn!(
+                            bridge_log!(
+                                log::Level::Warn,
                                 "atmos-bridge: presentation {p} out of range (0–{})",
                                 MAX_PRESENTATIONS - 1
                             );
                             return Some(false);
                         }
                         Err(_) => {
-                            log::warn!("atmos-bridge: cannot parse presentation value {:?}", s);
+                            bridge_log!(
+                                log::Level::Warn,
+                                "atmos-bridge: cannot parse presentation value {:?}",
+                                s
+                            );
                             return Some(false);
                         }
                     },
@@ -484,7 +488,7 @@ impl DolbyPipeline {
                 self.parser
                     .set_required_presentations(&required_presentations(p, self.drc_mode));
                 self.truehd_presentations_stale = false;
-                log::debug!("atmos-bridge: presentation set to {p}");
+                bridge_log!(log::Level::Debug, "atmos-bridge: presentation set to {p}");
                 true
             }
             #[cfg(feature = "bridge-perf")]
@@ -509,7 +513,11 @@ impl DolbyPipeline {
                     true
                 }
                 _ => {
-                    log::warn!("atmos-bridge: invalid perf_report_every value {:?}", value);
+                    bridge_log!(
+                        log::Level::Warn,
+                        "atmos-bridge: invalid perf_report_every value {:?}",
+                        value
+                    );
                     false
                 }
             },
@@ -587,7 +595,7 @@ impl DolbyPipeline {
         match self.resolve_pending_presentation(shared, result) {
             Ok(()) => Ok(()),
             Err(msg) => {
-                log::warn!("{msg}");
+                bridge_diag_log(log::Level::Warn, &msg);
                 result.did_reset = true;
                 result.error_message = msg.as_str().into();
                 Err(())
@@ -830,7 +838,7 @@ impl DolbyPipeline {
                 Ok(())
             }
             Err(msg) => {
-                log::warn!("{msg}");
+                bridge_diag_log(log::Level::Warn, &msg);
                 result.did_reset = true;
                 result.error_message = msg.as_str().into();
                 Err(())
@@ -907,7 +915,6 @@ impl DolbyPipeline {
                 Err(err) => {
                     let msg = format!("eac3_raw_extract_error={err:?}");
                     bridge_diag_log(log::Level::Warn, &msg);
-                    log::warn!("{msg}");
                     result.did_reset = true;
                     result.error_message = msg.into();
                     return AfterPush::ResetPipeline;

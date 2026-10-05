@@ -15,7 +15,7 @@ mod dts_spdif;
 mod labels;
 
 // What every family shares, under the `crate::` paths the modules use.
-use bridge_common::{frame_builders, shared};
+use bridge_common::{frame_builders, logging, shared};
 
 pub use dts_pipeline::{DtsPipeline, FAMILY_AURO, FAMILY_DTS};
 pub use dts_spdif::accepts_data_type;
