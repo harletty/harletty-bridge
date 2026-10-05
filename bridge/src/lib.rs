@@ -1,8 +1,5 @@
 mod ac3_native;
-mod auro_pipeline;
 mod bridge;
-mod dts_pipeline;
-mod dts_spdif;
 mod eac3_pipeline;
 mod eac3_spdif;
 mod labels;

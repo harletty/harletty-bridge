@@ -57,6 +57,7 @@ check harletty-bridge "realtime plugin" damf clap indicatif indicatif-log-bridge
 # (docs/plan-codec-family-crates.md).
 check bridge-common "shared by the codec families" truehd eac3 dca auro iamf-dec iamf-obu iamf-codecs
 check bridge-family-iamf "IAMF family" truehd eac3 dca auro
+check bridge-family-dts "DTS family" truehd eac3 iamf-dec iamf-obu iamf-codecs
 
 # ...and the offline CLI must never pull in the bridge ABI: it stays a pure
 # offline tool, buildable without the sibling Omniphony checkout.

@@ -34,8 +34,8 @@ use serde::Deserialize;
 use crate::auro_pipeline::DtsAuroState;
 use crate::frame_builders::float_to_pcm_i32;
 use crate::labels::{dca_bed_channel_to_r, dca_spatial_channel_to_r};
-use crate::metadata::declare_object_channels;
 use crate::shared::{AfterPush, SharedState};
+use bridge_common::objects::declare_object_channels;
 
 const CORE_SYNC: [u8; 4] = 0x7FFE_8001u32.to_be_bytes();
 const SUBSTREAM_SYNC: [u8; 4] = 0x6458_2025u32.to_be_bytes();
@@ -193,8 +193,8 @@ impl DtsXState {
 
 /// The source families this path reports (`FormatBridge::source_family`):
 /// DTS, or Auro-3D once a lossless carrier is confirmed and unfolded.
-pub(crate) const FAMILY_DTS: &str = "dts";
-pub(crate) const FAMILY_AURO: &str = "auro";
+pub const FAMILY_DTS: &str = "dts";
+pub const FAMILY_AURO: &str = "auro";
 
 /// Which DTS carrier the frames come in: what the demux found after the
 /// core. Named the way FFmpeg names the profiles, so a host's track
@@ -216,9 +216,9 @@ pub(crate) enum DtsProfile {
 /// buffer, the decoders, the DTS:X and Auro-3D stages, and the live stream
 /// facts the host asks about between packets.
 ///
-/// The decoders are boxed for the reason given on `AtmosBridge`: a host may
-/// create the bridge on a thread with a small stack.
-pub(crate) struct DtsPipeline {
+/// The decoders are boxed: a host may create the bridge on a thread with a
+/// small stack (see the bridge's `AtmosBridge`).
+pub struct DtsPipeline {
     /// Raw byte buffer for demuxing `[core][exss]` DTS-HD frames.
     pub(crate) buf: Vec<u8>,
     /// Plain DTS core (5.1) decoder.
@@ -247,7 +247,7 @@ pub(crate) struct DtsPipeline {
 }
 
 impl DtsPipeline {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             buf: Vec::new(),
             decoder: Box::new(dca::PcmDecoder::new()),
@@ -263,7 +263,7 @@ impl DtsPipeline {
     }
 
     /// Forget the stream (seek, sync loss): the fold configuration stays.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.buf.clear();
         self.decoder.reset();
         self.hd_decoder.reset();
@@ -276,7 +276,7 @@ impl DtsPipeline {
     }
 
     /// Raw transport: frames as they come in the elementary stream.
-    pub(crate) fn push_raw(
+    pub fn push_raw(
         &mut self,
         shared: &mut SharedState,
         data: &[u8],
@@ -288,7 +288,7 @@ impl DtsPipeline {
 
     /// IEC 61937 transport: one burst payload of one of the DTS data types
     /// (`dts_spdif::accepts_data_type`).
-    pub(crate) fn push_iec61937(
+    pub fn push_iec61937(
         &mut self,
         shared: &mut SharedState,
         data: &[u8],
@@ -308,11 +308,11 @@ impl DtsPipeline {
         self.push_raw(shared, payload, result)
     }
 
-    pub(crate) fn is_ready(&self) -> bool {
+    pub fn is_ready(&self) -> bool {
         self.frame_count > 0
     }
 
-    pub(crate) fn has_objects(&self) -> bool {
+    pub fn has_objects(&self) -> bool {
         // DTS core, and the presentations whose feeds are all fixed - the
         // standard height quartet and D0's five - are labeled fixed
         // channels. Whether those are placed directly or virtualized
@@ -323,7 +323,7 @@ impl DtsPipeline {
         self.objects_active
     }
 
-    pub(crate) fn source_family(&self) -> &'static str {
+    pub fn source_family(&self) -> &'static str {
         if self.auro.is_unfolding() {
             FAMILY_AURO
         } else {
@@ -332,7 +332,7 @@ impl DtsPipeline {
     }
 
     /// The carrier the demux found, then the spatial layer decoded over it.
-    pub(crate) fn source_label(&self, label: &mut String) {
+    pub fn source_label(&self, label: &mut String) {
         label.push_str(match self.profile {
             DtsProfile::Core => "DTS",
             DtsProfile::Hd => "DTS-HD HRA",
@@ -353,7 +353,7 @@ impl DtsPipeline {
     /// An unfolded Auro-3D carrier declares its whole layout from Auro's
     /// setup table; DTS declares its lower layer from the ETSI loudspeaker
     /// table.
-    pub(crate) fn fixed_channel_poses(&self) -> RVec<RChannelPose> {
+    pub fn fixed_channel_poses(&self) -> RVec<RChannelPose> {
         if self.auro.is_unfolding() {
             self.auro.declared_poses()
         } else {
@@ -915,6 +915,44 @@ fn build_core_frame(core: &CorePcmFrame) -> RDecodedFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The label names the carrier the demux found and the spatial layer
+    /// decoded over it.
+    #[test]
+    fn source_label_names_the_carrier_and_its_spatial_layer() {
+        let mut dts = DtsPipeline::new();
+        let label = |dts: &DtsPipeline| {
+            let mut label = String::new();
+            dts.source_label(&mut label);
+            label
+        };
+        assert_eq!(label(&dts), "DTS");
+        dts.profile = DtsProfile::Hd;
+        assert_eq!(label(&dts), "DTS-HD HRA");
+        dts.profile = DtsProfile::Ma;
+        assert_eq!(label(&dts), "DTS-HD MA");
+        dts.x.locked = Some(dca::XPresentation::Height);
+        assert_eq!(label(&dts), "DTS-HD MA + DTS:X 7.1.4");
+        dts.x.locked = Some(dca::XPresentation::ObjectsD3);
+        assert_eq!(label(&dts), "DTS-HD MA + DTS:X 7.1.4+4");
+    }
+
+    /// The surround pair is declared where the stream named it: ±110° for
+    /// Ls/Rs, ±90° for a side pair (Lss/Rss).
+    #[test]
+    fn the_surround_pair_is_declared_where_the_stream_names_it() {
+        let ls_azimuth = |dts: &DtsPipeline| {
+            dts.fixed_channel_poses()
+                .iter()
+                .find(|p| p.label == RChannelLabel::Ls)
+                .map(|p| p.azimuth_deg)
+        };
+        let mut dts = DtsPipeline::new();
+        assert_eq!(dts.source_family(), FAMILY_DTS);
+        assert_eq!(ls_azimuth(&dts), Some(-110.0));
+        dts.surrounds_on_side = true;
+        assert_eq!(ls_azimuth(&dts), Some(-90.0));
+    }
     use dca::{BedFold, SourceMetadata, SpatialChannel, gain_code_linear};
 
     const SAMPLE_COUNT: usize = 2;

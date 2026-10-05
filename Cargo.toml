@@ -8,6 +8,7 @@
 members = [
     "bridge",
     "bridge-common",
+    "bridge-family-dts",
     "bridge-family-iamf",
     "harletty",
     "eac3",
@@ -18,7 +19,7 @@ members = [
 # What a plain `cargo build` / `cargo test` at the root covers: everything but
 # the IAMF family, whose Opus path links libopus. Build or test it with
 # `-p bridge-family-iamf`, or through the bridge's `iamf` feature.
-default-members = ["bridge", "bridge-common", "harletty", "eac3", "dca", "damf", "auro"]
+default-members = ["bridge", "bridge-common", "bridge-family-dts", "harletty", "eac3", "dca", "damf", "auro"]
 resolver = "2"
 
 # What release.yml and build_bridge.sh ship. Thin LTO is the one setting that

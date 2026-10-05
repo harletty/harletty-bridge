@@ -13,7 +13,6 @@ use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, pa
 use truehd::structs::access_unit::AccessUnit;
 
 use crate::ac3_native::NativeAc3Decoder;
-use crate::dts_pipeline::{DtsPipeline, FAMILY_AURO, FAMILY_DTS};
 use crate::eac3_pipeline::{
     DecodedDependent, Eac3IndependentOutcome, PendingEac3Dependent,
     build_legacy_ac3_core_failure_silence, decode_eac3_independent, decode_eac3_inspected,
@@ -27,6 +26,7 @@ use crate::mat::MatStream;
 use crate::perf::PerfStats;
 use crate::shared::{AfterPush, SharedState};
 use crate::truehd_pipeline::{configure_parser, process_extractor_input, required_presentations};
+use bridge_family_dts::{DtsPipeline, FAMILY_AURO, FAMILY_DTS};
 
 /// The source families this bridge declares (`BridgeLib::source_families`),
 /// by the names `source_family` returns. The renderer knows none of them by
@@ -974,7 +974,7 @@ impl AtmosBridge {
                 }
 
                 // ── DTS (data types 0x0B/0x0C/0x0D/0x11) ──────────────
-                if crate::dts_spdif::accepts_data_type(data_type) {
+                if bridge_family_dts::accepts_data_type(data_type) {
                     self.eac3_active = false;
                     self.dts_active = true;
                     #[cfg(test)]
@@ -1323,7 +1323,6 @@ impl FormatBridge for AtmosBridge {
 #[cfg(test)]
 mod raw_transport_tests {
     use super::*;
-    use crate::dts_pipeline::DtsProfile;
     use bridge_api::RChannelLabel;
     use std::io::Read;
 
@@ -1514,16 +1513,6 @@ mod raw_transport_tests {
                 .any(|p| p.label == bridge_api::RChannelLabel::Ls && p.azimuth_deg == -110.0),
             "DTS declares its ETSI angles"
         );
-        // A stream that named the pair Lss/Rss is declared on the side.
-        bridge.dts.surrounds_on_side = true;
-        let poses = bridge.fixed_channel_poses();
-        assert!(
-            poses
-                .iter()
-                .any(|p| p.label == bridge_api::RChannelLabel::Ls && p.azimuth_deg == -90.0),
-            "a side-surround pair is declared at ±90°"
-        );
-        bridge.dts.surrounds_on_side = false;
         bridge.dts_active = false;
         bridge.eac3_active = true;
         assert_eq!(bridge.source_family().as_str(), "dolby");
@@ -1567,20 +1556,8 @@ mod raw_transport_tests {
         let mut bridge = AtmosBridge::new(false);
         assert_eq!(bridge.source_label().as_str(), "", "nothing before a frame");
 
-        bridge.dts_active = true;
-        bridge.dts.frame_count = 1;
-        assert_eq!(bridge.source_label().as_str(), "DTS");
-        bridge.dts.profile = DtsProfile::Hd;
-        assert_eq!(bridge.source_label().as_str(), "DTS-HD HRA");
-        bridge.dts.profile = DtsProfile::Ma;
-        assert_eq!(bridge.source_label().as_str(), "DTS-HD MA");
-        bridge.dts.x.locked = Some(dca::XPresentation::Height);
-        assert_eq!(bridge.source_label().as_str(), "DTS-HD MA + DTS:X 7.1.4");
-        bridge.dts.x.locked = Some(dca::XPresentation::ObjectsD3);
-        assert_eq!(bridge.source_label().as_str(), "DTS-HD MA + DTS:X 7.1.4+4");
-
-        bridge.dts_active = false;
-        bridge.dts.frame_count = 0;
+        // The DTS labels are the DTS family's (its own tests); the corpus
+        // tests below read them through the bridge.
         bridge.eac3_active = true;
         bridge.eac3_frame_count = 1;
         bridge.eac3_diag_stats.total_frames = 1;
@@ -1690,8 +1667,9 @@ mod raw_transport_tests {
             assert!(result.error_message.is_empty(), "{}", result.error_message);
             frames.extend(result.frames.into_iter());
         }
-        assert!(
-            bridge.dts.auro.is_unfolding(),
+        assert_eq!(
+            bridge.source_family().as_str(),
+            "auro",
             "the carrier was not confirmed"
         );
         assert!(!bridge.has_objects(), "Auro is fixed channels, not objects");
@@ -1787,7 +1765,6 @@ mod raw_transport_tests {
         assert!(result.error_message.is_empty(), "{}", result.error_message);
         assert!(!result.frames.is_empty(), "no HD frames decoded");
         assert!(!bridge.has_objects());
-        assert_eq!(bridge.dts.profile, DtsProfile::Hd);
         assert_eq!(bridge.source_family().as_str(), "dts");
         assert_eq!(bridge.source_label().as_str(), "DTS-HD HRA + DTS:X 7.1.4");
         let f = result

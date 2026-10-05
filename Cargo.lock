@@ -192,6 +192,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-family-dts"
+version = "0.8.0"
+dependencies = [
+ "abi_stable",
+ "auro",
+ "bridge-common",
+ "bridge_api",
+ "dca",
+ "log",
+ "serde",
+ "serde_yaml_ng",
+]
+
+[[package]]
 name = "bridge-family-iamf"
 version = "0.8.0"
 dependencies = [
@@ -661,17 +675,14 @@ name = "harletty-bridge"
 version = "0.8.0"
 dependencies = [
  "abi_stable",
- "auro",
  "bridge-common",
+ "bridge-family-dts",
  "bridge-family-iamf",
  "bridge_api",
- "dca",
  "eac3",
  "libc",
  "log",
- "serde",
  "serde_json",
- "serde_yaml_ng",
  "spdif",
  "truehd",
 ]
