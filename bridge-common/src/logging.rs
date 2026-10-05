@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// The target of the bridge's general diagnostics.
-pub(crate) const DIAG_TARGET: &str = "harletty-bridge::diag";
+pub const DIAG_TARGET: &str = "harletty-bridge::diag";
 
 /// The host's sink as a function address, 0 while none is registered.
 static HOST_LOG_SINK: AtomicUsize = AtomicUsize::new(0);
@@ -32,14 +32,16 @@ const LEVEL_UNSET: u8 = u8::MAX;
 const DEFAULT_LEVEL: log::LevelFilter = log::LevelFilter::Info;
 static DRC_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 
-/// Serialises the tests that change the process-wide level.
-#[cfg(test)]
-pub(crate) static LEVEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Serialises the tests that change the process-wide level, here and in the
+/// crates built on this one.
+#[doc(hidden)]
+pub static LEVEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Log through the host sink, formatting only when `level` is enabled.
 ///
 /// `bridge_log!(level, "fmt", args..)` logs to [`DIAG_TARGET`];
 /// `bridge_log!(target: "...", level, "fmt", args..)` picks the target.
+#[macro_export]
 macro_rules! bridge_log {
     (target: $target:expr, $level:expr, $($arg:tt)+) => {{
         let level: ::log::Level = $level;
@@ -48,18 +50,18 @@ macro_rules! bridge_log {
         }
     }};
     ($level:expr, $($arg:tt)+) => {
-        $crate::logging::bridge_log!(target: $crate::logging::DIAG_TARGET, $level, $($arg)+)
+        $crate::bridge_log!(target: $crate::logging::DIAG_TARGET, $level, $($arg)+)
     };
 }
-pub(crate) use bridge_log;
+pub use crate::bridge_log;
 
-pub(crate) extern "C" fn register_host_log_sink(sink: usize) {
+pub extern "C" fn register_host_log_sink(sink: usize) {
     HOST_LOG_SINK.store(sink, Ordering::Release);
 }
 
 /// Whether a message at `level` would be forwarded.
 #[inline]
-pub(crate) fn log_enabled(level: log::Level) -> bool {
+pub fn log_enabled(level: log::Level) -> bool {
     let max = match MAX_LEVEL.load(Ordering::Relaxed) {
         LEVEL_UNSET => max_level_from_env(),
         max => max,
@@ -81,18 +83,18 @@ fn max_level_from_env() -> u8 {
 }
 
 /// Set the most verbose level forwarded (the `log_level` configure key).
-pub(crate) fn set_max_level(level: log::LevelFilter) {
+pub fn set_max_level(level: log::LevelFilter) {
     MAX_LEVEL.store(level as u8, Ordering::Relaxed);
 }
 
 /// Log an already formatted message, if `level` is enabled.
-pub(crate) fn bridge_diag_log(level: log::Level, message: &str) {
+pub fn bridge_diag_log(level: log::Level, message: &str) {
     if log_enabled(level) {
         forward_log(level, DIAG_TARGET, message);
     }
 }
 
-pub(crate) fn drc_diag_log_enabled() -> bool {
+pub fn drc_diag_log_enabled() -> bool {
     *DRC_LOG_ENABLED.get_or_init(|| {
         std::env::var_os("HARLETTY_LOG_DRC")
             .map(|value| value != "0")
@@ -102,7 +104,7 @@ pub(crate) fn drc_diag_log_enabled() -> bool {
 
 /// Hand a message to the host sink, or stderr without one. The level check is
 /// the caller's: use [`bridge_log!`] or [`bridge_diag_log`].
-pub(crate) fn forward_log(level: log::Level, target: &str, message: &str) {
+pub fn forward_log(level: log::Level, target: &str, message: &str) {
     let trimmed = message.trim_end_matches('\n');
     match HOST_LOG_SINK.load(Ordering::Acquire) {
         0 => eprintln!("{trimmed}"),
@@ -120,7 +122,7 @@ pub(crate) fn forward_log(level: log::Level, target: &str, message: &str) {
 }
 
 /// Bytes as space-separated upper-case hex pairs, formatted only when shown.
-pub(crate) struct HexBytes<'a>(pub &'a [u8]);
+pub struct HexBytes<'a>(pub &'a [u8]);
 
 impl fmt::Display for HexBytes<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -134,7 +136,7 @@ impl fmt::Display for HexBytes<'_> {
     }
 }
 
-pub(crate) fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+pub fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         s.to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -188,15 +190,30 @@ mod tests {
         set_max_level(DEFAULT_LEVEL);
     }
 
+    /// Over every crate the bridge is built from: the plugin and the codec
+    /// families all log through here.
     #[test]
     fn no_source_logs_through_the_log_crate_macros() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let crates = [
+            "bridge",
+            "bridge-common",
+            "bridge-family-dolby",
+            "bridge-family-dts",
+            "bridge-family-iamf",
+        ];
         let macros: Vec<String> = ["error", "warn", "info", "debug", "trace"]
             .iter()
             .flat_map(|level| [format!("log::{level}!("), format!("use log::{level}")])
             .collect();
         let mut offenders = Vec::new();
-        for entry in std::fs::read_dir(&dir).unwrap() {
+        let files = crates.iter().flat_map(|name| {
+            std::fs::read_dir(workspace.join(name).join("src"))
+                .unwrap_or_else(|err| panic!("{name}/src: {err}"))
+        });
+        for entry in files {
             let path = entry.unwrap().path();
             if path.extension().is_none_or(|ext| ext != "rs") {
                 continue;

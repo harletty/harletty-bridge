@@ -37,13 +37,16 @@ use iamf_dec::stream::{
 };
 use iamf_obu::descriptors::{AudioElementConfig, CodecId, ElementGainOffset};
 
-use crate::bridge::AtmosBridge;
-use crate::frame_builders::float_to_pcm_i32;
-use crate::logging::{bridge_diag_log, bridge_log, panic_message};
+use bridge_common::frame_builders::float_to_pcm_i32;
+use bridge_common::logging::{bridge_diag_log, bridge_log, panic_message};
+use bridge_common::shared::{AfterPush, SharedState};
 
 /// System J in the decoder's IAMF channel order: L, R, C, LFE, Lss, Rss, Lrs,
 /// Rrs, Ltf, Rtf, Ltb, Rtb.
-const BED_714_LABELS: [RChannelLabel; 12] = [
+/// The channels of the 7.1.4 bed every channel- and scene-based element is
+/// rendered to, in output order. Public for the bridge's conformance tests.
+#[doc(hidden)]
+pub const BED_714_LABELS: [RChannelLabel; 12] = [
     RChannelLabel::L,
     RChannelLabel::R,
     RChannelLabel::C,
@@ -234,16 +237,18 @@ fn obu_kind(obu_type: u8) -> ObuKind {
 
 /// A complete OBU at the start of a buffer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct ObuFrame {
-    obu_type: u8,
+#[doc(hidden)]
+pub struct ObuFrame {
+    pub obu_type: u8,
     /// `obu_redundant_copy`: a repeat of a descriptor already sent.
-    redundant: bool,
+    pub redundant: bool,
     /// Header, size field and payload.
-    len: usize,
+    pub len: usize,
 }
 
 /// Frame the OBU at the start of `data`: `Ok(None)` while it is incomplete.
-fn frame_obu(data: &[u8]) -> Result<Option<ObuFrame>, String> {
+#[doc(hidden)]
+pub fn frame_obu(data: &[u8]) -> Result<Option<ObuFrame>, String> {
     let Some(&header) = data.first() else {
         return Ok(None);
     };
@@ -298,9 +303,9 @@ impl SendDecoder {
     }
 }
 
-/// Decoder state for one IAMF stream, boxed in [`AtmosBridge`].
+/// Decoder state for one IAMF stream, boxed in the bridge.
 #[derive(Default)]
-pub(crate) struct IamfState {
+pub struct IamfState {
     /// Bytes not yet framed into complete OBUs.
     buf: Vec<u8>,
     /// Descriptor OBUs of the IA sequence being opened, from its sequence
@@ -352,7 +357,7 @@ struct ObjectState {
 impl IamfState {
     /// Forget the stream position (seek, flush): buffered bytes and decoded
     /// state go, the sequence's configuration stays.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.buf.clear();
         self.frame_count = 0;
         // The renderer forgets the objects on a reset: declare them again.
@@ -362,29 +367,34 @@ impl IamfState {
         }
     }
 
+    /// A frame was decoded since the last reset.
+    pub fn is_ready(&self) -> bool {
+        self.frame_count > 0
+    }
+
     /// A sequence is configured: temporal units can be decoded as they come.
-    pub(crate) fn has_sequence(&self) -> bool {
+    pub fn has_sequence(&self) -> bool {
         self.decoder.is_some()
     }
 
     /// The decoded mix has objects (IAMF v2.0).
-    pub(crate) fn has_objects(&self) -> bool {
+    pub fn has_objects(&self) -> bool {
         self.decoder.is_some() && self.num_objects > 0
     }
 
     /// The bed's channel poses, as [`Bed::declared_poses`] states them.
-    pub(crate) fn declared_poses(&self) -> RVec<RChannelPose> {
+    pub fn declared_poses(&self) -> RVec<RChannelPose> {
         self.bed.declared_poses()
     }
 
     /// `IAMF (Opus) ambisonics + stereo`, once a sequence decodes.
-    pub(crate) fn description(&self) -> Option<&str> {
+    pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
     }
 
     /// The dialogue channels, when the mix codes its dialogue apart: they
     /// follow the bed (or open the frame when there is no bed).
-    pub(crate) fn channel_tags(&self) -> RVec<RChannelTag> {
+    pub fn channel_tags(&self) -> RVec<RChannelTag> {
         let (Some(decoder), Some(dialogue)) = (&self.decoder, &self.dialogue) else {
             return RVec::new();
         };
@@ -884,7 +894,7 @@ fn object_metadata(
             })
             .collect();
         (
-            crate::metadata::declare_object_channels(&mut state.declared, current),
+            bridge_common::objects::declare_object_channels(&mut state.declared, current),
             names,
         )
     } else {
@@ -1047,31 +1057,35 @@ fn ambisonics_name(channels: u8) -> String {
 
 /// Raw-transport entry point: buffer `data`, decode what completes, and apply
 /// the pipeline's failure policy (strict mode surfaces and resets).
-pub(crate) fn push_iamf(bridge: &mut AtmosBridge, data: &[u8], result: &mut RPushResult) {
-    #[cfg(test)]
-    crate::bridge::injected_panic::hit(crate::bridge::RawCodec::Iamf);
-    let strict = bridge.strict;
-    let state = &mut *bridge.iamf;
+pub fn push_iamf(
+    state: &mut IamfState,
+    shared: &mut SharedState,
+    data: &[u8],
+    result: &mut RPushResult,
+) -> AfterPush {
+    let strict = shared.strict;
     state.buf.extend_from_slice(data);
     // Metadata events are stamped on the bridge's running sample position.
-    state.sample_pos = bridge.total_samples;
+    state.sample_pos = shared.total_samples;
     let mut frames = RVec::new();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         state.drain(strict, &mut frames)
     }));
     let decoded: u64 = frames.iter().map(|f| u64::from(f.sample_count)).sum();
-    bridge.total_samples += decoded;
+    shared.total_samples += decoded;
     result.frames.extend(frames);
     match outcome {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => AfterPush::Continue,
         Ok(Err(msg)) => {
             bridge_diag_log(log::Level::Warn, &msg);
             // An unsupported sequence is reported once, then its audio is
             // dropped until the next sequence header.
             result.error_message = RString::from(msg);
             if strict {
-                bridge.reset_pipeline();
                 result.did_reset = true;
+                AfterPush::ResetPipeline
+            } else {
+                AfterPush::Continue
             }
         }
         Err(panic_info) => {
@@ -1082,12 +1096,12 @@ pub(crate) fn push_iamf(bridge: &mut AtmosBridge, data: &[u8], result: &mut RPus
             );
             // The decoder's state is unknown after a panic: rebuild it from
             // the next sequence header.
-            *bridge.iamf = IamfState::default();
-            bridge.reset_pipeline();
+            *state = IamfState::default();
             result.did_reset = true;
             if strict {
                 result.error_message = RString::from(msg);
             }
+            AfterPush::ResetPipeline
         }
     }
 }
@@ -1156,16 +1170,67 @@ mod tests {
         assert_eq!(ambisonics_name(25), "ambisonics 4th order");
     }
 
-    // ── Conformance vectors ─────────────────────────────────────────────
+    // ── Conformance vectors against the decoder itself ─────────────────
     //
-    // The libiamf test vectors (AOMediaCodec/libiamf, `tests/`) are not
-    // committed: point `HARLETTY_IAMF_VECTORS` at a directory holding them.
-    // Each `.iamf` comes with `<name>_rendered_id_<mix>_sub_mix_0_layout_<n>.wav`
-    // references, one per layout its mix declares.
+    // These compare what this path hands out with what iamf-rs decodes on
+    // its own, so they live beside the decoder; the rest of the conformance
+    // tests drive the whole bridge (`bridge/tests/iamf_conformance.rs`).
+    // Point `HARLETTY_IAMF_VECTORS` at the libiamf test vectors
+    // (AOMediaCodec/libiamf, `tests/`); without it they skip.
 
-    use crate::bridge::AtmosBridge;
-    use abi_stable::std_types::RSlice;
-    use bridge_api::{FormatBridge, RInputTransport};
+    use abi_stable::std_types::RString;
+
+    /// This path as the bridge drives it, with the same answers to the
+    /// host's questions an IAMF stream gets from the bridge.
+    struct Harness {
+        state: IamfState,
+        shared: SharedState,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                state: IamfState::default(),
+                shared: SharedState::new(false),
+            }
+        }
+
+        fn push(&mut self, data: &[u8]) -> RPushResult {
+            let mut result = RPushResult {
+                frames: RVec::new(),
+                error_message: RString::new(),
+                did_reset: false,
+            };
+            let after = push_iamf(&mut self.state, &mut self.shared, data, &mut result);
+            if after == AfterPush::ResetPipeline {
+                self.reset();
+            }
+            result
+        }
+
+        fn reset(&mut self) {
+            self.state.reset();
+        }
+
+        fn has_objects(&self) -> bool {
+            self.state.has_objects()
+        }
+
+        fn source_label(&self) -> RString {
+            if !self.state.is_ready() {
+                return RString::new();
+            }
+            RString::from(self.state.description().unwrap_or("IAMF"))
+        }
+
+        fn fixed_channel_poses(&self) -> RVec<RChannelPose> {
+            self.state.declared_poses()
+        }
+
+        fn channel_tags(&self) -> RVec<RChannelTag> {
+            self.state.channel_tags()
+        }
+    }
 
     fn vector(name: &str) -> Option<std::path::PathBuf> {
         let dir = std::env::var_os("HARLETTY_IAMF_VECTORS")?;
@@ -1197,12 +1262,12 @@ mod tests {
         panic!("no data chunk in {}", path.display());
     }
 
-    /// Push a whole stream through the raw transport in odd-sized chunks, so
-    /// OBUs straddle packet boundaries the way a pipe delivers them.
-    fn decode_raw(bridge: &mut AtmosBridge, stream: &[u8]) -> Vec<RDecodedFrame> {
+    /// Push a whole stream in odd-sized chunks, so OBUs straddle packet
+    /// boundaries the way a pipe delivers them.
+    fn decode_raw(harness: &mut Harness, stream: &[u8]) -> Vec<RDecodedFrame> {
         let mut frames = Vec::new();
         for chunk in stream.chunks(997) {
-            let result = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+            let result = harness.push(chunk);
             assert!(result.error_message.is_empty(), "{}", result.error_message);
             frames.extend(result.frames);
         }
@@ -1211,81 +1276,6 @@ mod tests {
 
     fn interleaved(frames: &[RDecodedFrame]) -> Vec<i32> {
         frames.iter().flat_map(|f| f.pcm.iter().copied()).collect()
-    }
-
-    fn psnr_db(ours: &[i32], reference: &[i32]) -> f64 {
-        let full_scale = f64::from(1 << 23);
-        let mse = ours
-            .iter()
-            .zip(reference)
-            .map(|(&a, &b)| ((f64::from(a) - f64::from(b)) / full_scale).powi(2))
-            .sum::<f64>()
-            / ours.len() as f64;
-        10.0 * (1.0 / mse).log10()
-    }
-
-    #[test]
-    fn lossless_714_decodes_bit_exact_through_the_raw_transport() {
-        // A 7.1.4 LPCM stream with demixing parameter blocks; its second
-        // declared layout is System J.
-        let (Some(stream), Some(reference)) = (
-            vector("test_000082.iamf"),
-            vector("test_000082_rendered_id_42_sub_mix_0_layout_1.wav"),
-        ) else {
-            eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
-            return;
-        };
-        let mut bridge = AtmosBridge::new(false);
-        let frames = decode_raw(&mut bridge, &std::fs::read(stream).unwrap());
-
-        assert!(bridge.is_ready());
-        assert!(!bridge.has_objects());
-        assert_eq!(bridge.source_family().as_str(), "iamf");
-        assert_eq!(bridge.source_label().as_str(), "IAMF (PCM) 7.1.4");
-        assert_eq!(bridge.fixed_channel_poses().len(), 11);
-        for frame in &frames {
-            assert_eq!(frame.channel_labels.as_slice(), BED_714_LABELS.as_slice());
-            assert_eq!(frame.sampling_frequency, 48_000);
-            assert!(frame.metadata.is_empty(), "a bed carries no metadata");
-        }
-        let (channels, expected) = read_wav_s16(&reference);
-        assert_eq!(usize::from(channels), BED_714_LABELS.len());
-        assert_eq!(interleaved(&frames), expected);
-    }
-
-    #[test]
-    fn an_expanded_7154_stream_renders_to_the_714_bed() {
-        // IAMF v2.0 expanded layout 16: a 7.1.5.4 LPCM element beside a
-        // stereo one (advanced profile), rendered to System J through
-        // 7.1.5.4's own matrix; its second declared layout is System J.
-        let (Some(stream), Some(reference)) = (
-            vector("test_000833.iamf"),
-            vector("test_000833_rendered_id_42_sub_mix_0_layout_1.wav"),
-        ) else {
-            eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
-            return;
-        };
-        let mut bridge = AtmosBridge::new(false);
-        let frames = decode_raw(&mut bridge, &std::fs::read(stream).unwrap());
-        assert_eq!(
-            bridge.source_label().as_str(),
-            "IAMF (PCM) 7.1.5.4 + stereo"
-        );
-        assert!(
-            frames
-                .iter()
-                .all(|f| f.channel_labels.as_slice() == BED_714_LABELS.as_slice())
-        );
-        let ours = interleaved(&frames);
-        let (_, expected) = read_wav_s16(&reference);
-        assert_eq!(ours.len(), expected.len());
-        // A matrix render, compared at the reference's 16 bits.
-        let max_diff = ours
-            .iter()
-            .zip(&expected)
-            .map(|(a, b)| ((a - b).abs() + 128) >> 8)
-            .max();
-        assert!(max_diff <= Some(1), "max diff {max_diff:?} (16-bit steps)");
     }
 
     #[test]
@@ -1300,7 +1290,7 @@ mod tests {
             eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
             return;
         };
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = Harness::new();
         let frames = decode_raw(&mut bridge, &std::fs::read(stream).unwrap());
         assert_eq!(
             bridge.source_label().as_str(),
@@ -1334,73 +1324,6 @@ mod tests {
         assert!(max_diff <= Some(1), "max diff {max_diff:?} (16-bit steps)");
     }
 
-    #[test]
-    fn opus_714_decodes_within_the_lossy_tolerance() {
-        let (Some(stream), Some(reference)) = (
-            vector("test_000220.iamf"),
-            vector("test_000220_rendered_id_42_sub_mix_0_layout_1.wav"),
-        ) else {
-            eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
-            return;
-        };
-        let mut bridge = AtmosBridge::new(false);
-        let frames = decode_raw(&mut bridge, &std::fs::read(stream).unwrap());
-        assert_eq!(bridge.source_label().as_str(), "IAMF (Opus) 7.1.4");
-        let ours = interleaved(&frames);
-        let (_, expected) = read_wav_s16(&reference);
-        assert_eq!(ours.len(), expected.len());
-        // The libiamf suite's bar for lossy codecs is an average PSNR above 30.
-        let psnr = psnr_db(&ours, &expected);
-        assert!(psnr > 30.0, "PSNR {psnr:.1} dB");
-    }
-
-    #[test]
-    fn a_reset_resumes_at_the_next_temporal_unit_without_a_sequence_header() {
-        let Some(stream) = vector("test_000220.iamf") else {
-            eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
-            return;
-        };
-        let stream = std::fs::read(stream).unwrap();
-        // Temporal-unit starts, where a host's packets begin after a seek.
-        // This vector carries no temporal delimiters (they are optional):
-        // each unit opens with the audio frame of substream 0 (OBU type 6).
-        let mut unit_starts = Vec::new();
-        let mut pos = 0;
-        while let Ok(Some(frame)) = frame_obu(&stream[pos..]) {
-            if frame.obu_type == 6 {
-                unit_starts.push(pos);
-            }
-            pos += frame.len;
-        }
-        assert_eq!(pos, stream.len(), "the vector frames end to end");
-        let seek_to = unit_starts[unit_starts.len() / 2];
-
-        let mut whole = AtmosBridge::new(false);
-        let all = interleaved(&decode_raw(&mut whole, &stream));
-
-        let mut bridge = AtmosBridge::new(false);
-        decode_raw(&mut bridge, &stream[..seek_to / 2]);
-        bridge.reset();
-        let resumed = interleaved(&decode_raw(&mut bridge, &stream[seek_to..]));
-        assert!(!resumed.is_empty(), "decoding resumed after the reset");
-        // The resumed stream lines up with the continuous one: every
-        // 960-sample unit from the seek point on, less the stream's end trim.
-        // The continuous decode also lost the Opus pre-skip, 312 samples
-        // trimmed from the first unit, which the resumed one never reaches.
-        const UNIT: usize = 960;
-        const PRE_SKIP: usize = 312;
-        let channels = BED_714_LABELS.len();
-        let units_after_seek = unit_starts.len() - unit_starts.len() / 2;
-        let end_trim = unit_starts.len() * UNIT - all.len() / channels - PRE_SKIP;
-        assert_eq!(resumed.len() / channels, units_after_seek * UNIT - end_trim);
-        // Opus restarts from a cleared state, so the first units differ and
-        // the rest reconverge to within rounding of the continuous decode.
-        let tail = resumed.len() / 2;
-        let psnr = psnr_db(&resumed[resumed.len() - tail..], &all[all.len() - tail..]);
-        assert!(psnr > 90.0, "resumed tail PSNR {psnr:.1} dB");
-    }
-
-    /// All metadata events of a decode, in order.
     fn events(frames: &[RDecodedFrame]) -> Vec<REvent> {
         frames
             .iter()
@@ -1421,7 +1344,7 @@ mod tests {
             eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
             return;
         };
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = Harness::new();
         let frames = decode_raw(&mut bridge, &std::fs::read(stream).unwrap());
         assert!(bridge.has_objects());
         assert_eq!(bridge.source_label().as_str(), "IAMF (PCM) 1 object");
@@ -1481,7 +1404,7 @@ mod tests {
             eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
             return;
         };
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = Harness::new();
         let stream = std::fs::read(stream).unwrap();
         let frames = decode_raw(&mut bridge, &stream);
         assert!(bridge.has_objects());
@@ -1538,7 +1461,7 @@ mod tests {
             return;
         };
         let stream = std::fs::read(path).unwrap();
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = Harness::new();
         let frames = decode_raw(&mut bridge, &stream);
         assert!(!frames.is_empty());
         assert!(!bridge.has_objects());
@@ -1602,21 +1525,6 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         assert!(worst < 4.0 * scale, "bed + dialogue differs by {worst}");
-    }
-
-    #[test]
-    fn a_mix_of_unmarked_elements_tags_nothing() {
-        // Two-layer 5.1 + stereo, neither annotated nor adjustable: the bed
-        // as before.
-        let Some(path) = vector("test_000087.iamf") else {
-            eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
-            return;
-        };
-        let stream = std::fs::read(path).unwrap();
-        let mut bridge = AtmosBridge::new(false);
-        let frames = decode_raw(&mut bridge, &stream);
-        assert_eq!(frames[0].channel_labels.as_slice(), BED_714_LABELS);
-        assert!(bridge.channel_tags().is_empty());
     }
 
     #[test]

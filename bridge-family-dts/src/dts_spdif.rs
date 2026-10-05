@@ -12,7 +12,7 @@ use std::borrow::Cow;
 
 /// IEC 61937 data types carrying DTS: type I (0x0B), II (0x0C), III (0x0D) and
 /// the DTS-HD substream (type IV, 0x11).
-pub(crate) fn accepts_data_type(data_type: u8) -> bool {
+pub fn accepts_data_type(data_type: u8) -> bool {
     matches!(data_type, 0x0B | 0x0C | 0x0D | 0x11)
 }
 

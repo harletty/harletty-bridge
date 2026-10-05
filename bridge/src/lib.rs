@@ -1,19 +1,13 @@
-mod ac3_native;
-mod auro_pipeline;
+//! The bridge a host loads: a router over the codec families, each in its
+//! own crate (`bridge-family-dolby`, `bridge-family-dts`,
+//! `bridge-family-iamf`), on what they share (`bridge-common`).
+
 mod bridge;
-mod dts_pipeline;
-mod dts_spdif;
-mod eac3_pipeline;
-mod eac3_spdif;
-mod frame_builders;
+
+// The `crate::` paths the router uses for what the families share.
+use bridge_common::{logging, shared};
 #[cfg(feature = "iamf")]
-mod iamf_pipeline;
-mod labels;
-mod logging;
-mod mat;
-mod metadata;
-mod perf;
-mod truehd_pipeline;
+use bridge_family_iamf as iamf_pipeline;
 
 use abi_stable::std_types::RVec;
 use abi_stable::{
@@ -54,4 +48,12 @@ extern "C" fn source_families() -> RVec<RSourceFamily> {
 #[doc(hidden)]
 pub fn new_bridge(strict: bool) -> FormatBridgeBox {
     create_bridge(strict)
+}
+
+/// Install a host log sink, for the same in-process callers as
+/// [`new_bridge`]: without one, every diagnostic down to `Debug` goes to
+/// stderr, which no real host does.
+#[doc(hidden)]
+pub fn set_log_sink(sink: bridge_api::BridgeHostLogSink) {
+    set_host_log_sink(sink as usize);
 }

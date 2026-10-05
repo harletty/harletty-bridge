@@ -5,22 +5,10 @@ use eac3::OamdPayload;
 use std::time::Instant;
 use truehd::structs::oamd::ObjectAudioMetadataPayload;
 
-use crate::bridge::AtmosBridge;
 use crate::logging::bridge_log;
+use crate::shared::SharedState;
 
-/// Sparse-emit an object↔channel declaration: return it only when it differs
-/// from the cached one (or after a cache clear, i.e. pipeline reset).
-pub(crate) fn declare_object_channels(
-    cache: &mut Option<RVec<bridge_api::RObjectChannel>>,
-    current: RVec<bridge_api::RObjectChannel>,
-) -> RVec<bridge_api::RObjectChannel> {
-    if cache.as_deref() == Some(current.as_slice()) {
-        RVec::new()
-    } else {
-        *cache = Some(current.clone());
-        current
-    }
-}
+pub(crate) use bridge_common::objects::declare_object_channels;
 
 /// Build an [`RMetadataFrame`] from an OAMD payload parsed from E-AC3.
 ///
@@ -36,7 +24,7 @@ pub(crate) fn build_eac3_metadata_frame(
     frame_sample_pos: u64,
     num_bed_channels: usize,
     object_channel_count: usize,
-    bridge: &mut AtmosBridge,
+    shared: &mut SharedState,
 ) -> RMetadataFrame {
     let events = extract_eac3_events(oamd, evo_base, object_channel_count);
 
@@ -50,7 +38,7 @@ pub(crate) fn build_eac3_metadata_frame(
             channel: (num_bed_channels + k) as u32,
         })
         .collect();
-    let object_channels = declare_object_channels(&mut bridge.declared_object_channels, current);
+    let object_channels = declare_object_channels(&mut shared.declared_object_channels, current);
 
     RMetadataFrame {
         events,
@@ -183,7 +171,7 @@ fn extract_eac3_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::AtmosBridge;
+    use crate::dolby::test_bridge::TestBridge;
 
     fn empty_oamd_payload() -> OamdPayload {
         OamdPayload {
@@ -204,14 +192,14 @@ mod tests {
 
     #[test]
     fn eac3_metadata_declares_objects_sparsely() {
-        let mut bridge = AtmosBridge::new(false);
+        let mut bridge = TestBridge::new(false);
         let mut payload = empty_oamd_payload();
         payload.object_count = 3;
         payload.dynamic_objects = 2;
 
         // Two dynamic objects after one fixed (LFE) channel: ids 10/11 on
         // channels 1/2, declared on the first frame only.
-        let meta = build_eac3_metadata_frame(&payload, 0, 0, 1, 2, &mut bridge);
+        let meta = build_eac3_metadata_frame(&payload, 0, 0, 1, 2, &mut bridge.shared);
         let decl: Vec<(u32, u32)> = meta
             .object_channels
             .iter()
@@ -221,7 +209,7 @@ mod tests {
         assert!(meta.name_updates.is_empty());
 
         // Unchanged declaration → sparse (empty) re-emission.
-        let again = build_eac3_metadata_frame(&payload, 0, 0, 1, 2, &mut bridge);
+        let again = build_eac3_metadata_frame(&payload, 0, 0, 1, 2, &mut bridge.shared);
         assert!(again.object_channels.is_empty());
     }
 

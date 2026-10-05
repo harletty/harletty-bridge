@@ -22,7 +22,7 @@
 use abi_stable::std_types::{RString, RVec};
 use bridge_api::RPushResult;
 use bridge_api::{
-    RChannelLabel, RDecodedFrame, REvent, RMetadataFrame, RNameUpdate, RObjectChannel,
+    RChannelLabel, RChannelPose, RDecodedFrame, REvent, RMetadataFrame, RNameUpdate, RObjectChannel,
 };
 use dca::{
     CorePcmFrame, ExssKind, FoldEstimator, FoldPlan, FoldRenderer, HdError, HdFrame, MAX_SOURCES,
@@ -31,11 +31,12 @@ use dca::{
 };
 use serde::Deserialize;
 
-use crate::bridge::{AtmosBridge, DtsProfile};
+use crate::auro_pipeline::DtsAuroState;
 use crate::frame_builders::float_to_pcm_i32;
 use crate::labels::{dca_bed_channel_to_r, dca_spatial_channel_to_r};
 use crate::logging::{bridge_diag_log, bridge_log};
-use crate::metadata::declare_object_channels;
+use crate::shared::{AfterPush, SharedState};
+use bridge_common::objects::declare_object_channels;
 
 const CORE_SYNC: [u8; 4] = 0x7FFE_8001u32.to_be_bytes();
 const SUBSTREAM_SYNC: [u8; 4] = 0x6458_2025u32.to_be_bytes();
@@ -194,13 +195,186 @@ impl DtsXState {
     }
 }
 
-/// Demux and decode all complete DTS frames buffered in `bridge.dts_buf`.
-pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
-    #[cfg(test)]
-    crate::bridge::injected_panic::hit(crate::bridge::RawCodec::Dts);
+/// The source families this path reports (`FormatBridge::source_family`):
+/// DTS, or Auro-3D once a lossless carrier is confirmed and unfolded.
+pub const FAMILY_DTS: &str = "dts";
+pub const FAMILY_AURO: &str = "auro";
+
+/// Which DTS carrier the frames come in: what the demux found after the
+/// core. Named the way FFmpeg names the profiles, so a host's track
+/// information reads the same on either decoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum DtsProfile {
+    /// A core frame alone (DTS, DTS-ES, DTS 96/24).
+    #[default]
+    Core,
+    /// An extension substream without a lossless asset — DTS-HD High
+    /// Resolution Audio and the other lossy extensions, of which only the
+    /// core is decoded.
+    Hd,
+    /// An extension substream with a lossless asset: DTS-HD Master Audio.
+    Ma,
+}
+
+/// Everything the DTS path keeps from one packet to the next: the demux
+/// buffer, the decoders, the DTS:X and Auro-3D stages, and the live stream
+/// facts the host asks about between packets.
+///
+/// The decoders are boxed: a host may create the bridge on a thread with a
+/// small stack (see the bridge's `AtmosBridge`).
+pub struct DtsPipeline {
+    /// Raw byte buffer for demuxing `[core][exss]` DTS-HD frames.
+    pub(crate) buf: Vec<u8>,
+    /// Plain DTS core (5.1) decoder.
+    pub(crate) decoder: Box<dca::PcmDecoder>,
+    /// DTS-HD Master Audio lossless (5.1/7.1) decoder.
+    pub(crate) hd_decoder: Box<dca::HdDecoder>,
+    pub(crate) frame_count: u64,
+    /// DTS:X extension state: latched presentation shape, last readable
+    /// metadata, announced object positions. Cleared with the pipeline.
+    pub(crate) x: DtsXState,
+    /// Live stream fact: the latest DTS frame's surround pair is the
+    /// carrier's side-surround pair (Lss/Rss, ±90°) rather than its surround
+    /// pair (Ls/Rs, ±110°). Both play through `Ls`/`Rs`; this picks the angle
+    /// the pair is declared at (`fixed_channel_poses`).
+    pub(crate) surrounds_on_side: bool,
+    pub(crate) fold_config: DtsFoldConfig,
+    /// Live stream fact: the latest DTS frame emitted object channels. Set
+    /// from what the frame presented rather than from its profile, so every
+    /// object-bearing presentation reaches it by the same route.
+    pub(crate) objects_active: bool,
+    /// The carrier of the latest DTS frame, for the source label.
+    pub(crate) profile: DtsProfile,
+    /// Auro-3D detection and unfolding over the lossless DTS-HD output.
+    /// Holds the first frames back until the carrier question is settled.
+    pub(crate) auro: DtsAuroState,
+}
+
+impl DtsPipeline {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            decoder: Box::new(dca::PcmDecoder::new()),
+            hd_decoder: Box::new(dca::HdDecoder::new()),
+            frame_count: 0,
+            x: DtsXState::default(),
+            surrounds_on_side: false,
+            fold_config: DtsFoldConfig::from_env(),
+            objects_active: false,
+            profile: DtsProfile::default(),
+            auro: DtsAuroState::default(),
+        }
+    }
+
+    /// Forget the stream (seek, sync loss): the fold configuration stays.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.decoder.reset();
+        self.hd_decoder.reset();
+        self.frame_count = 0;
+        self.x = DtsXState::default();
+        self.surrounds_on_side = false;
+        self.objects_active = false;
+        self.profile = DtsProfile::default();
+        self.auro.reset();
+    }
+
+    /// Raw transport: frames as they come in the elementary stream.
+    pub fn push_raw(
+        &mut self,
+        shared: &mut SharedState,
+        data: &[u8],
+        result: &mut RPushResult,
+    ) -> AfterPush {
+        self.buf.extend_from_slice(data);
+        drain_dts(self, shared, result)
+    }
+
+    /// IEC 61937 transport: one burst payload of one of the DTS data types
+    /// (`dts_spdif::accepts_data_type`).
+    pub fn push_iec61937(
+        &mut self,
+        shared: &mut SharedState,
+        data: &[u8],
+        data_type: u8,
+        result: &mut RPushResult,
+    ) -> AfterPush {
+        let payload = crate::dts_spdif::normalise_payload(data);
+        // Types I/II/III carry the frame directly; type IV wraps it
+        // in a start code plus a length, and pads the burst past it.
+        // Fed whole, the pipeline finds no sync word and decodes
+        // nothing at all.
+        let payload = if data_type == crate::dts_spdif::DTSHD_DATA_TYPE {
+            crate::dts_spdif::unwrap_hd_payload(&payload).unwrap_or(&payload)
+        } else {
+            &payload
+        };
+        self.push_raw(shared, payload, result)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.frame_count > 0
+    }
+
+    pub fn has_objects(&self) -> bool {
+        // DTS core, and the presentations whose feeds are all fixed - the
+        // standard height quartet and D0's five - are labeled fixed
+        // channels. Whether those are placed directly or virtualized
+        // remains the renderer's channel-mode decision. A presentation
+        // that declares objects labels those feeds as object channels
+        // instead: D1, D3 and D4 over the height quartet, and the
+        // object-only variant for the single one it carries alone.
+        self.objects_active
+    }
+
+    pub fn source_family(&self) -> &'static str {
+        if self.auro.is_unfolding() {
+            FAMILY_AURO
+        } else {
+            FAMILY_DTS
+        }
+    }
+
+    /// The carrier the demux found, then the spatial layer decoded over it.
+    pub fn source_label(&self, label: &mut String) {
+        label.push_str(match self.profile {
+            DtsProfile::Core => "DTS",
+            DtsProfile::Hd => "DTS-HD HRA",
+            DtsProfile::Ma => "DTS-HD MA",
+        });
+        if let Some(layout) = self.auro.unfolded_layout() {
+            label.push_str(" + Auro-3D");
+            if let Some(name) = layout.auro_name() {
+                label.push(' ');
+                label.push_str(name);
+            }
+        } else if let Some(presentation) = self.x.locked {
+            label.push_str(" + DTS:X ");
+            label.push_str(presentation.layout_label());
+        }
+    }
+
+    /// An unfolded Auro-3D carrier declares its whole layout from Auro's
+    /// setup table; DTS declares its lower layer from the ETSI loudspeaker
+    /// table.
+    pub fn fixed_channel_poses(&self) -> RVec<RChannelPose> {
+        if self.auro.is_unfolding() {
+            self.auro.declared_poses()
+        } else {
+            crate::labels::dts_declared_poses(self.surrounds_on_side)
+        }
+    }
+}
+
+/// Demux and decode all complete DTS frames buffered in `dts.buf`.
+fn drain_dts(
+    dts: &mut DtsPipeline,
+    shared: &mut SharedState,
+    result: &mut RPushResult,
+) -> AfterPush {
     let mut consumed = 0usize;
     loop {
-        let rest = &bridge.dts_buf[consumed..];
+        let rest = &dts.buf[consumed..];
         // Locate the next core syncword.
         let Some(sync_off) = find(rest, &CORE_SYNC) else {
             // Keep only a possible partial trailing syncword.
@@ -208,7 +382,7 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
             break;
         };
         consumed += sync_off;
-        let rest = &bridge.dts_buf[consumed..];
+        let rest = &dts.buf[consumed..];
 
         let info = match parse_header(rest) {
             Ok(i) => i,
@@ -234,30 +408,30 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
             }
             let kind = exss_kind(&rest[fs..fs + es]);
             if kind != ExssKind::Core {
-                bridge.dts_profile = if kind == ExssKind::Lossless {
+                dts.profile = if kind == ExssKind::Lossless {
                     DtsProfile::Ma
                 } else {
                     DtsProfile::Hd
                 };
-                let mut hd = std::mem::take(&mut bridge.dts_x.frame);
-                match bridge
-                    .dts_hd_decoder
+                let mut hd = std::mem::take(&mut dts.x.frame);
+                match dts
+                    .hd_decoder
                     .decode_into(&rest[..fs], &rest[fs..fs + es], &mut hd)
                 {
                     Ok(()) => {
                         let n = hd_samples(&hd);
-                        bridge.dts_surrounds_on_side = hd.surrounds_on_side();
+                        dts.surrounds_on_side = hd.surrounds_on_side();
                         if let Some(kind) = hd.xxch_decode_error {
-                            bridge.dts_x.note_bed_extension_dropout(kind);
+                            dts.x.note_bed_extension_dropout(kind);
                         }
                         if let Some((frame, emitted_objects)) = build_hd_frame_with_extensions(
                             &hd,
-                            &mut bridge.dts_x,
-                            &bridge.dts_fold_config,
-                            bridge.total_samples,
-                            &mut bridge.declared_object_channels,
+                            &mut dts.x,
+                            &dts.fold_config,
+                            shared.total_samples,
+                            &mut shared.declared_object_channels,
                         ) {
-                            bridge.dts_objects_active = emitted_objects;
+                            dts.objects_active = emitted_objects;
                             if kind == ExssKind::Lossless {
                                 // The Auro side channel lives in the low bits
                                 // of the lossless integers, read off the
@@ -267,85 +441,82 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
                                 let active: Vec<usize> = (0..hd.samples.len())
                                     .filter(|&s| hd.samples[s].is_some())
                                     .collect();
-                                bridge.dts_auro.route(
+                                dts.auro.route(
                                     frame,
                                     &active,
-                                    bridge.dts_hd_decoder.lossless_samples(),
+                                    dts.hd_decoder.lossless_samples(),
                                     &mut result.frames,
                                 );
                             } else {
                                 // A lossy carrier has no side channel to read.
-                                bridge.dts_auro.not_a_carrier(&mut result.frames);
+                                dts.auro.not_a_carrier(&mut result.frames);
                                 result.frames.push(frame);
                             }
                         }
-                        bridge.total_samples += n as u64;
-                        bridge.dts_frame_count += 1;
+                        shared.total_samples += n as u64;
+                        dts.frame_count += 1;
                     }
                     Err(HdError::Pending) => {} // PBR buffering; no frame this packet
                     Err(e) => {
                         let msg = format!("dts_hd_decode_error={e:?}");
                         bridge_diag_log(log::Level::Warn, &msg);
-                        if bridge.strict {
+                        if shared.strict {
                             result.error_message = RString::from(msg);
-                            bridge.reset_pipeline();
                             result.did_reset = true;
-                            return;
+                            return AfterPush::ResetPipeline;
                         }
                     }
                 }
-                bridge.dts_x.frame = hd;
+                dts.x.frame = hd;
             } else {
                 // Nothing the HD decoder reads beyond the core: an XBR-only
                 // DTS-HD HRA layers high-frequency detail on top of an
                 // ordinary DTS core, which is not decoded, so render the
                 // core (5.1) and drop it instead of failing the whole track.
-                bridge.dts_profile = DtsProfile::Hd;
-                let pcm = &mut bridge.dts_x.core_frame;
-                match bridge.dts_decoder.decode_into(&rest[..fs], pcm) {
+                dts.profile = DtsProfile::Hd;
+                let pcm = &mut dts.x.core_frame;
+                match dts.decoder.decode_into(&rest[..fs], pcm) {
                     Ok(_) => {
-                        bridge.dts_objects_active = false;
+                        dts.objects_active = false;
                         // A core names its surrounds Ls/Rs only.
-                        bridge.dts_surrounds_on_side = false;
-                        bridge.dts_auro.not_a_carrier(&mut result.frames);
+                        dts.surrounds_on_side = false;
+                        dts.auro.not_a_carrier(&mut result.frames);
                         result.frames.push(build_core_frame(pcm));
-                        bridge.total_samples += pcm.samples_per_channel() as u64;
-                        bridge.dts_frame_count += 1;
+                        shared.total_samples += pcm.samples_per_channel() as u64;
+                        dts.frame_count += 1;
                     }
                     Err(err) => {
                         let msg = format!("dts_decode_error={err}");
                         bridge_diag_log(log::Level::Warn, &msg);
-                        if bridge.strict {
+                        if shared.strict {
                             result.error_message = RString::from(msg);
-                            bridge.reset_pipeline();
                             result.did_reset = true;
-                            return;
+                            return AfterPush::ResetPipeline;
                         }
                     }
                 }
             }
             consumed += fs + es;
         } else {
-            bridge.dts_profile = DtsProfile::Core;
-            let pcm = &mut bridge.dts_x.core_frame;
-            match bridge.dts_decoder.decode_into(&rest[..fs], pcm) {
+            dts.profile = DtsProfile::Core;
+            let pcm = &mut dts.x.core_frame;
+            match dts.decoder.decode_into(&rest[..fs], pcm) {
                 Ok(_) => {
                     let frame = build_core_frame(pcm);
-                    bridge.dts_objects_active = false;
-                    bridge.dts_surrounds_on_side = false;
-                    bridge.dts_auro.not_a_carrier(&mut result.frames);
-                    bridge.total_samples += pcm.samples_per_channel() as u64;
-                    bridge.dts_frame_count += 1;
+                    dts.objects_active = false;
+                    dts.surrounds_on_side = false;
+                    dts.auro.not_a_carrier(&mut result.frames);
+                    shared.total_samples += pcm.samples_per_channel() as u64;
+                    dts.frame_count += 1;
                     result.frames.push(frame);
                 }
                 Err(err) => {
                     let msg = format!("dts_decode_error={err}");
                     bridge_diag_log(log::Level::Warn, &msg);
-                    if bridge.strict {
+                    if shared.strict {
                         result.error_message = RString::from(msg);
-                        bridge.reset_pipeline();
                         result.did_reset = true;
-                        return;
+                        return AfterPush::ResetPipeline;
                     }
                 }
             }
@@ -354,8 +525,9 @@ pub(crate) fn drain_dts(bridge: &mut AtmosBridge, result: &mut RPushResult) {
     }
 
     if consumed > 0 {
-        bridge.dts_buf.drain(..consumed.min(bridge.dts_buf.len()));
+        dts.buf.drain(..consumed.min(dts.buf.len()));
     }
+    AfterPush::Continue
 }
 
 fn find(data: &[u8], needle: &[u8; 4]) -> Option<usize> {
@@ -752,6 +924,44 @@ fn build_core_frame(core: &CorePcmFrame) -> RDecodedFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The label names the carrier the demux found and the spatial layer
+    /// decoded over it.
+    #[test]
+    fn source_label_names_the_carrier_and_its_spatial_layer() {
+        let mut dts = DtsPipeline::new();
+        let label = |dts: &DtsPipeline| {
+            let mut label = String::new();
+            dts.source_label(&mut label);
+            label
+        };
+        assert_eq!(label(&dts), "DTS");
+        dts.profile = DtsProfile::Hd;
+        assert_eq!(label(&dts), "DTS-HD HRA");
+        dts.profile = DtsProfile::Ma;
+        assert_eq!(label(&dts), "DTS-HD MA");
+        dts.x.locked = Some(dca::XPresentation::Height);
+        assert_eq!(label(&dts), "DTS-HD MA + DTS:X 7.1.4");
+        dts.x.locked = Some(dca::XPresentation::ObjectsD3);
+        assert_eq!(label(&dts), "DTS-HD MA + DTS:X 7.1.4+4");
+    }
+
+    /// The surround pair is declared where the stream named it: ±110° for
+    /// Ls/Rs, ±90° for a side pair (Lss/Rss).
+    #[test]
+    fn the_surround_pair_is_declared_where_the_stream_names_it() {
+        let ls_azimuth = |dts: &DtsPipeline| {
+            dts.fixed_channel_poses()
+                .iter()
+                .find(|p| p.label == RChannelLabel::Ls)
+                .map(|p| p.azimuth_deg)
+        };
+        let mut dts = DtsPipeline::new();
+        assert_eq!(dts.source_family(), FAMILY_DTS);
+        assert_eq!(ls_azimuth(&dts), Some(-110.0));
+        dts.surrounds_on_side = true;
+        assert_eq!(ls_azimuth(&dts), Some(-90.0));
+    }
     use dca::{BedFold, SourceMetadata, SpatialChannel, gain_code_linear};
 
     const SAMPLE_COUNT: usize = 2;

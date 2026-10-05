@@ -3,38 +3,36 @@ use bridge_api::{
     FormatBridge, RChannelPose, RCoordinateFormat, RInputTransport, RPushResult, RSourceFamily,
     RVbapCartesianDefaults, RVbapTableMode,
 };
-use eac3::{CorePcmFrame, Extractor as Eac3RawExtractor, FrameType, ObjectPcmDecoder, PcmDecoder};
-#[cfg(feature = "bridge-perf")]
-use std::env;
-#[cfg(feature = "bridge-perf")]
-use std::time::Instant;
-use truehd::process::decode::DecodedAccessUnit;
-use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, parse::Parser};
-use truehd::structs::access_unit::AccessUnit;
 
-use crate::ac3_native::NativeAc3Decoder;
-use crate::auro_pipeline::DtsAuroState;
-use crate::dts_pipeline::{DtsFoldConfig, DtsXState};
-use crate::eac3_pipeline::{
-    DecodedDependent, Eac3IndependentOutcome, PendingEac3Dependent,
-    build_legacy_ac3_core_failure_silence, decode_eac3_independent, decode_eac3_inspected,
-    diagnose_eac3_frame, eac3_frame_carries_joc, inspect_eac3_frame, is_legacy_ac3_frame,
-    is_temporary_eac3_silence_frame,
-};
-use crate::eac3_spdif::Eac3SpdifStream;
-use crate::frame_builders::validate_frame_shape;
 use crate::logging::{bridge_diag_log, bridge_log};
-use crate::mat::MatStream;
-use crate::perf::PerfStats;
-use crate::truehd_pipeline::{configure_parser, process_extractor_input, required_presentations};
+use crate::shared::{AfterPush, SharedState};
+#[cfg(feature = "dolby")]
+use bridge_family_dolby::{DolbyPipeline, FAMILY_DOLBY};
+#[cfg(feature = "dts")]
+use bridge_family_dts::{DtsPipeline, FAMILY_AURO, FAMILY_DTS};
 
-/// The source families this bridge declares (`BridgeLib::source_families`),
-/// by the names `source_family` returns. The renderer knows none of them by
-/// name: these entries are what it, and Studio, offer.
-const FAMILY_DOLBY: &str = "dolby";
-const FAMILY_DTS: &str = "dts";
-const FAMILY_AURO: &str = "auro";
+#[cfg(not(any(feature = "dolby", feature = "dts", feature = "iamf")))]
+compile_error!("harletty-bridge needs a codec family: enable `dolby`, `dts` or `iamf`");
+
+/// The source family IAMF streams report. The renderer knows no family by
+/// name: the catalogue below is what it, and Studio, offer.
 const FAMILY_IAMF: &str = "iamf";
+/// What a refused stream reports (its family's own name), in a build
+/// without that family.
+#[cfg(not(feature = "dts"))]
+const FAMILY_DTS: &str = "dts";
+#[cfg(not(feature = "dolby"))]
+const FAMILY_DOLBY: &str = "dolby";
+
+/// What the bridge reports before a stream is identified: Dolby, or with no
+/// Dolby in the build, the first family it has.
+const IDLE_FAMILY: &str = if cfg!(feature = "dolby") {
+    "dolby"
+} else if cfg!(feature = "dts") {
+    "dts"
+} else {
+    FAMILY_IAMF
+};
 
 /// The catalogue: Dolby's codecs share the room-cube bed; DTS states ITU
 /// angles but has always rendered in the room; an unfolded Auro-3D carrier
@@ -48,58 +46,17 @@ pub(crate) fn source_families() -> RVec<RSourceFamily> {
         default_mode: default_mode.into(),
     };
     let mut families = RVec::new();
+    #[cfg(feature = "dolby")]
     families.push(family(FAMILY_DOLBY, "Dolby", "room"));
-    families.push(family(FAMILY_DTS, "DTS", "room"));
-    families.push(family(FAMILY_AURO, "Auro-3D", "sphere"));
+    #[cfg(feature = "dts")]
+    {
+        families.push(family(FAMILY_DTS, "DTS", "room"));
+        families.push(family(FAMILY_AURO, "Auro-3D", "sphere"));
+    }
     if cfg!(feature = "iamf") {
         families.push(family(FAMILY_IAMF, "Eclipsa / IAMF", "sphere"));
     }
     families
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct Eac3DiagStats {
-    pub(crate) total_frames: u64,
-    pub(crate) legacy_ac3_frames: u64,
-    pub(crate) independent_frames: u64,
-    pub(crate) dependent_frames: u64,
-    pub(crate) ac3_convert_frames: u64,
-    pub(crate) joc_frames: u64,
-    pub(crate) oamd_frames: u64,
-    pub(crate) ac3_core_decoded: u64,
-    pub(crate) ac3_core_decode_failures: u64,
-    pub(crate) dependent_pair_attempts: u64,
-    pub(crate) dependent_pair_no_object: u64,
-    pub(crate) dependent_pair_failures: u64,
-    pub(crate) paired_object_frames: u64,
-    /// Non-JOC AC-3-core + dependent pairs emitted as plain channel beds.
-    pub(crate) dependent_pair_channel_beds: u64,
-    /// Dependents whose channels could not be overlaid onto the core.
-    pub(crate) dependent_merge_failures: u64,
-    /// Presentations whose JOC configuration declares a downmix the merged bed
-    /// is not: a 5-channel configuration reached with dependents overlaid.
-    pub(crate) joc_downmix_config_mismatch: u64,
-    /// Standalone AC-3 cores (plain AC-3, no dependent) emitted as 5.1 beds.
-    pub(crate) standalone_ac3_core_beds: u64,
-    pub(crate) short_packet_silence_frames: u64,
-    /// Dependent frames evicted because the pending queue hit its bound
-    /// (their AC-3 cores kept failing to decode).
-    pub(crate) dependent_frames_dropped: u64,
-    pub(crate) last_ac3_core_decode_error: Option<String>,
-    pub(crate) last_dependent_pair_error: Option<String>,
-}
-
-/// Upper bound on buffered dependent access units awaiting an AC-3 core
-/// partner. In a healthy stream the queue never holds more than one entry;
-/// it only grows while cores fail to decode, so keep a small window and drop
-/// the oldest beyond it.
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum DrcMode {
-    #[default]
-    Off,
-    Standard,
-    Heavy,
 }
 
 /// Codec carried by a [`RInputTransport::Raw`] packet, which (unlike the IEC
@@ -109,10 +66,23 @@ pub(crate) enum RawCodec {
     TrueHd,
     Eac3,
     Dts,
-    /// An IAMF OBU stream. Recognised whether or not the `iamf` feature is
-    /// built, so a stream the bridge cannot decode is refused by name instead
-    /// of being fed to the TrueHD fallback.
+    /// An IAMF OBU stream.
     Iamf,
+}
+
+impl RawCodec {
+    /// Every codec is recognised whatever the build, so a stream whose
+    /// family is not built is refused by name rather than fed to another
+    /// family's decoder. Said once per stream, not on every packet.
+    #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
+    fn refusal(self) -> &'static str {
+        match self {
+            RawCodec::TrueHd => "truehd: this bridge was built without TrueHD support",
+            RawCodec::Eac3 => "eac3: this bridge was built without E-AC-3 support",
+            RawCodec::Dts => "dts: this bridge was built without DTS support",
+            RawCodec::Iamf => "iamf: this bridge was built without IAMF support",
+        }
+    }
 }
 
 /// Test-only panic injection at the entry of each codec path, for the tests
@@ -142,22 +112,6 @@ pub(crate) mod injected_panic {
             panic!("injected panic in the {codec:?} path");
         }
     }
-}
-
-/// Which DTS carrier the frames come in: what the demux found after the
-/// core. Named the way FFmpeg names the profiles, so a host's track
-/// information reads the same on either decoder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum DtsProfile {
-    /// A core frame alone (DTS, DTS-ES, DTS 96/24).
-    #[default]
-    Core,
-    /// An extension substream without a lossless asset — DTS-HD High
-    /// Resolution Audio and the other lossy extensions, of which only the
-    /// core is decoded.
-    Hd,
-    /// An extension substream with a lossless asset: DTS-HD Master Audio.
-    Ma,
 }
 
 /// Best-effort codec detection on a raw access unit, used when the host did not
@@ -203,678 +157,129 @@ fn is_iamf_sequence_header(data: &[u8]) -> bool {
     size_len.is_some_and(|n| data.get(2 + n..6 + n) == Some(b"iamf".as_slice()))
 }
 
-/// Decoder state for every supported format, owned by one bridge instance.
-///
-/// Every decoder field is boxed on purpose. Their inline state is large (the
-/// TrueHD `Decoder` alone is ~126 KiB, the whole set ~210 KiB), and a host may
-/// well create the bridge on a thread with a small stack: mpv's macOS playback
-/// thread is a plain `pthread_create` with no attributes, so 512 KiB. Held by
-/// value, the struct is copied two to three times on the way to the heap
-/// (`new()`'s locals → the return temporary → `RBox::new` inside
-/// `FormatBridge_TO::from_value`) and overflows that stack before the first
-/// packet is ever pushed.
-///
-/// Boxing keeps `AtmosBridge` itself pointer-sized per field, so the largest
-/// transient is a single `Decoder` in a leaf frame. The cost is one pointer
-/// hop per pipeline entry — never per sample — so hot loops are unaffected.
-/// `tests::atmos_bridge_stack_footprint_stays_small` guards the invariant.
-/// A presentation being assembled: the core, and the dependents that have
-/// attached themselves to it so far.
-///
-/// An independent may be followed by up to eight dependents, and the JOC
-/// payload rides in the last of them, so the group is collected rather than
-/// resolved on the first arrival - taking the core away from the second
-/// dependent would orphan it and lose exactly the payload that matters.
-pub(crate) struct PendingEac3Presentation {
-    pub(crate) core: PendingEac3Core,
-    pub(crate) dependents: Vec<PendingEac3Dependent>,
-}
-
-/// ETSI TS 102 366 E.1.3.1.2 allows at most eight dependent substreams behind
-/// one independent. More than that is a malformed group, not a longer one.
-const MAX_EAC3_DEPENDENTS: usize = 8;
-
-/// A presentation's core, held until its dependent arrives or the next
-/// non-dependent access unit ends the presentation without one.
-pub(crate) enum PendingEac3Core {
-    /// A legacy AC-3 core. AC-3 carries no JOC, so this is only ever the
-    /// channel half of a pair. The access unit is kept so a standalone flush
-    /// can recover its DRC and dialnorm.
-    LegacyAc3 {
-        core: CorePcmFrame,
-        access_unit: Vec<u8>,
-    },
-    /// An independent E-AC-3 frame that carried no JOC payload of its own.
-    ///
-    /// Boxed to keep `AtmosBridge` pointer-sized per field, which
-    /// `tests::atmos_bridge_stack_footprint_stays_small` holds it to.
-    Independent(Box<eac3::PcmPushResult>),
-}
-
+/// The bridge a host holds: one path per codec family, and which of them
+/// the stream is on. It finds the codec (sniffed, declared, or the IEC 61937
+/// data type), hands each packet to that family, resets the whole pipeline
+/// when a family asks, and answers the host's questions from the family the
+/// stream is on.
 pub(crate) struct AtmosBridge {
-    // ── TrueHD pipeline ──────────────────────────────────────────────
-    pub(crate) mat_stream: MatStream,
-    pub(crate) extractor: Extractor,
-    pub(crate) parser: Box<Parser>,
-    /// The access unit every frame is parsed into. Kept from one to the next: a
-    /// new one allocates the blocks of each substream and the sample rows of
-    /// each block, to free them as soon as the frame is decoded.
-    pub(crate) truehd_access_unit: Box<AccessUnit>,
-    pub(crate) decoder: Box<Decoder>,
-    /// The access unit the decoder writes its samples into. Kept from one to the
-    /// next: a new one is 10 KiB to build and copy out for every 1/1200 s of
-    /// audio, most of it rows the access unit does not use.
-    pub(crate) truehd_decoded: Box<DecodedAccessUnit>,
-    // ── E-AC3 pipeline ───────────────────────────────────────────────
-    pub(crate) eac3_spdif: Eac3SpdifStream,
-    /// Raw E-AC3 syncframe extractor (used by the `Raw` transport, e.g. mpv).
-    pub(crate) eac3_raw_extractor: Eac3RawExtractor,
-    pub(crate) eac3_pcm_decoder: Box<PcmDecoder>,
-    /// Separate PCM decoder for the dependent substream of a non-JOC 7.1
-    /// channel-extension pair (kept apart from the core decoder so their
-    /// per-stream state never interferes).
-    pub(crate) eac3_dependent_pcm_decoder: Box<PcmDecoder>,
-    pub(crate) eac3_object_decoder: Box<ObjectPcmDecoder>,
-    /// Whether the last independent E-AC-3 frame carried JOC its own channels
-    /// satisfy, so the next one is decoded by the object decoder first. Only
-    /// a guess at the decoder to try: `decode_eac3_independent` confirms it on
-    /// every frame.
-    pub(crate) eac3_expect_self_contained_joc: bool,
-    pub(crate) ac3_decoder: Box<NativeAc3Decoder>,
-    /// The core of a presentation whose dependent has not arrived yet.
-    ///
-    /// A dependent substream belongs to the independent it immediately follows,
-    /// so at most one core is ever outstanding: the next non-dependent access
-    /// unit ends the presentation whether a dependent came or not. Holding it
-    /// as an `Option` rather than a queue is what makes a dependent that
-    /// arrives with nothing in front of it an orphan to drop, instead of one to
-    /// park until some later, unrelated core turns up.
-    pub(crate) pending_eac3_core: Option<PendingEac3Presentation>,
-    pub(crate) eac3_frame_count: u64,
-    pub(crate) eac3_total_samples: u64,
-    /// True when the most recent `push_packet` used the E-AC3 path.
-    pub(crate) eac3_active: bool,
+    // ── Dolby (TrueHD, E-AC-3) ───────────────────────────────────────
+    #[cfg(feature = "dolby")]
+    pub(crate) dolby: DolbyPipeline,
     /// Codec forced by the host for the `Raw` transport via
     /// `configure("input_codec", …)`. Persists across pipeline resets.
     pub(crate) forced_raw_codec: Option<RawCodec>,
     /// Codec locked for the current raw session (forced or sniffed). Cleared on
     /// reset so a re-sniff happens after a seek / stream change.
     pub(crate) raw_codec: Option<RawCodec>,
-    pub(crate) eac3_diag_stats: Eac3DiagStats,
     // ── DTS (DCA) pipeline ───────────────────────────────────────────
-    /// Raw byte buffer for demuxing `[core][exss]` DTS-HD frames.
-    pub(crate) dts_buf: Vec<u8>,
-    /// Plain DTS core (5.1) decoder.
-    pub(crate) dts_decoder: Box<dca::PcmDecoder>,
-    /// DTS-HD Master Audio lossless (5.1/7.1) decoder.
-    pub(crate) dts_hd_decoder: Box<dca::HdDecoder>,
-    pub(crate) dts_frame_count: u64,
-    /// DTS:X extension state: latched presentation shape, last readable
-    /// metadata, announced object positions. Cleared with the pipeline.
-    pub(crate) dts_x: DtsXState,
-    /// True when the most recent `push_packet` used the DTS path.
+    #[cfg(feature = "dts")]
+    pub(crate) dts: DtsPipeline,
+    /// True when the most recent `push_packet` carried DTS, decoded or
+    /// refused.
     pub(crate) dts_active: bool,
-    /// Live stream fact: the latest DTS frame's surround pair is the
-    /// carrier's side-surround pair (Lss/Rss, ±90°) rather than its surround
-    /// pair (Ls/Rs, ±110°). Both play through `Ls`/`Rs`; this picks the angle
-    /// the pair is declared at (`fixed_channel_poses`).
-    pub(crate) dts_surrounds_on_side: bool,
-    pub(crate) dts_fold_config: DtsFoldConfig,
-    /// Live stream fact: the latest DTS frame emitted object channels. Set
-    /// from what the frame presented rather than from its profile, so every
-    /// object-bearing presentation reaches it by the same route.
-    pub(crate) dts_objects_active: bool,
-    /// The carrier of the latest DTS frame, for the source label.
-    pub(crate) dts_profile: DtsProfile,
-    /// Auro-3D detection and unfolding over the lossless DTS-HD output.
-    /// Holds the first frames back until the carrier question is settled.
-    pub(crate) dts_auro: DtsAuroState,
     // ── IAMF pipeline ────────────────────────────────────────────────
     #[cfg(feature = "iamf")]
     pub(crate) iamf: Box<crate::iamf_pipeline::IamfState>,
-    /// An IAMF stream was refused because the feature is not built: said
-    /// once per stream rather than on every packet.
-    #[cfg(not(feature = "iamf"))]
-    pub(crate) iamf_refusal_reported: bool,
-    /// True when the most recent `push_packet` used the IAMF path.
+    /// True when the most recent `push_packet` carried IAMF, decoded or
+    /// refused.
     pub(crate) iamf_active: bool,
+    /// The codec of this stream that was refused, its family not being
+    /// built: said once per stream rather than on every packet.
+    #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
+    pub(crate) refused: Option<RawCodec>,
     // ── Shared ───────────────────────────────────────────────────────
-    pub(crate) presentation: u8,
-    pub(crate) strict: bool,
-    /// Running total of decoded samples (used for metadata timestamping).
-    pub(crate) total_samples: u64,
-    /// Current dialogue level from the last major sync.
-    pub(crate) current_dialogue_level: Option<i8>,
-    /// Substream info tracking for change detection (TrueHD only).
-    pub(crate) current_substream_info: Option<u8>,
-    pub(crate) current_extended_substream_info: Option<u8>,
-    pub(crate) recovering_until_major_sync: bool,
-    /// The DRC mode changed which presentations the TrueHD parser is to be asked
-    /// for, and it has not been asked yet: it is at the next major sync.
-    pub(crate) truehd_presentations_stale: bool,
-    pub(crate) drc_mode: DrcMode,
-    pub(crate) frame_count: u64,
-    /// Last object↔channel declaration emitted (sparse re-emission on change
-    /// and after reset). Shared by the TrueHD and E-AC3 metadata paths.
-    pub(crate) declared_object_channels:
-        Option<abi_stable::std_types::RVec<bridge_api::RObjectChannel>>,
-    /// Fixed-channel labels of the active TrueHD spatial presentation
-    /// (bed labels from the OAMD bed assignment, then `Object` fillers).
-    pub(crate) truehd_spatial_labels:
-        Option<abi_stable::std_types::RVec<bridge_api::RChannelLabel>>,
-    pub(crate) perf: PerfStats,
+    pub(crate) shared: SharedState,
 }
 
 impl AtmosBridge {
     pub(crate) fn new(strict: bool) -> Self {
-        // Default to presentation 3 (full Atmos/JOC); overridable via configure().
-        let presentation = 3u8;
-
-        // Boxed as they are built, never held by value: see `AtmosBridge`.
-        let mut parser = Box::new(Parser::default());
-        let mut decoder = Box::new(Decoder::default());
-
-        let fail_level = if strict {
-            log::Level::Warn
-        } else {
-            log::Level::Error
-        };
-        decoder.set_fail_level(fail_level);
-        configure_parser(&mut parser, fail_level, presentation, DrcMode::default());
-
-        let eac3_log_level = if strict {
-            log::Level::Warn
-        } else {
-            log::Level::Error
-        };
-        let mut eac3_pcm = Box::new(PcmDecoder::new());
-        eac3_pcm.set_debug_log_level(eac3_log_level);
-        let mut eac3_dependent_pcm = Box::new(PcmDecoder::new());
-        eac3_dependent_pcm.set_debug_log_level(eac3_log_level);
-        let mut eac3_obj = Box::new(ObjectPcmDecoder::new());
-        eac3_obj.set_debug_log_level(eac3_log_level);
-        #[allow(unused_mut)]
-        let mut bridge = Self {
-            mat_stream: MatStream::default(),
-            extractor: Extractor::default(),
-            parser,
-            truehd_access_unit: Box::default(),
-            decoder,
-            truehd_decoded: Box::default(),
-            eac3_spdif: Eac3SpdifStream::default(),
-            eac3_raw_extractor: Eac3RawExtractor::default(),
-            eac3_pcm_decoder: eac3_pcm,
-            eac3_dependent_pcm_decoder: eac3_dependent_pcm,
-            eac3_object_decoder: eac3_obj,
-            eac3_expect_self_contained_joc: false,
-            ac3_decoder: Box::new(NativeAc3Decoder::default()),
-            pending_eac3_core: None,
-            eac3_frame_count: 0,
-            eac3_total_samples: 0,
-            eac3_active: false,
+        let shared = SharedState::new(strict);
+        Self {
+            #[cfg(feature = "dolby")]
+            dolby: DolbyPipeline::new(&shared),
             forced_raw_codec: None,
             raw_codec: None,
-            eac3_diag_stats: Eac3DiagStats::default(),
-            dts_buf: Vec::new(),
-            dts_decoder: Box::new(dca::PcmDecoder::new()),
-            dts_hd_decoder: Box::new(dca::HdDecoder::new()),
-            dts_frame_count: 0,
-            dts_x: DtsXState::default(),
+            #[cfg(feature = "dts")]
+            dts: DtsPipeline::new(),
             dts_active: false,
-            dts_surrounds_on_side: false,
-            dts_fold_config: DtsFoldConfig::from_env(),
-            dts_objects_active: false,
-            dts_profile: DtsProfile::default(),
-            dts_auro: DtsAuroState::default(),
             #[cfg(feature = "iamf")]
             iamf: Box::default(),
-            #[cfg(not(feature = "iamf"))]
-            iamf_refusal_reported: false,
             iamf_active: false,
-            presentation,
-            strict,
-            total_samples: 0,
-            current_dialogue_level: None,
-            current_substream_info: None,
-            current_extended_substream_info: None,
-            recovering_until_major_sync: false,
-            truehd_presentations_stale: false,
-            drc_mode: DrcMode::Off,
-            frame_count: 0,
-            declared_object_channels: None,
-            truehd_spatial_labels: None,
-            perf: PerfStats::default(),
-        };
-
-        #[cfg(feature = "bridge-perf")]
-        {
-            let enabled = env::var("TRUEHD_BRIDGE_PERF_PROFILE")
-                .ok()
-                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "on" | "yes"));
-            let interval = env::var("TRUEHD_BRIDGE_PERF_REPORT_EVERY")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|&v| v > 0)
-                .unwrap_or(120);
-            bridge.perf.configure(enabled, interval);
+            #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
+            refused: None,
+            shared,
         }
-
-        bridge
     }
 
     pub(crate) fn reset_pipeline(&mut self) {
-        // TrueHD reset.
-        self.mat_stream.reset();
-        self.extractor = Extractor::default();
-        // Assign through the boxes: the fresh state lands in the existing
-        // allocations instead of being copied around the stack.
-        *self.parser = Parser::default();
-        *self.decoder = Decoder::default();
-
-        // E-AC3 reset.
-        self.eac3_spdif.reset();
-        self.eac3_raw_extractor = Eac3RawExtractor::default();
-        self.eac3_pcm_decoder.reset();
-        self.eac3_dependent_pcm_decoder.reset();
-        self.eac3_object_decoder.reset();
-        self.ac3_decoder.reset();
-        self.pending_eac3_core = None;
-        self.eac3_frame_count = 0;
-        self.eac3_active = false;
+        #[cfg(feature = "dolby")]
+        self.dolby.reset(&self.shared);
 
         // DTS reset.
-        self.dts_buf.clear();
-        self.dts_decoder.reset();
-        self.dts_hd_decoder.reset();
-        self.dts_frame_count = 0;
-        self.dts_x = DtsXState::default();
+        #[cfg(feature = "dts")]
+        self.dts.reset();
         self.dts_active = false;
-        self.dts_surrounds_on_side = false;
-        self.dts_objects_active = false;
-        self.dts_profile = DtsProfile::default();
-        self.dts_auro.reset();
 
         // IAMF reset: the stream position goes, the sequence's configuration
         // stays, so decoding resumes without waiting for a sequence header.
         #[cfg(feature = "iamf")]
         self.iamf.reset();
-        #[cfg(not(feature = "iamf"))]
-        {
-            self.iamf_refusal_reported = false;
-        }
         self.iamf_active = false;
+        #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
+        {
+            self.refused = None;
+        }
         // Re-sniff after reset, but keep any host-declared codec.
         self.raw_codec = None;
-
-        // Re-apply configuration to new parser/decoder instances.
-        let fail_level = if self.strict {
-            log::Level::Warn
-        } else {
-            log::Level::Error
-        };
-        self.decoder.set_fail_level(fail_level);
-        self.eac3_pcm_decoder.set_debug_log_level(fail_level);
-        self.eac3_object_decoder.set_debug_log_level(fail_level);
-        configure_parser(
-            &mut self.parser,
-            fail_level,
-            self.presentation,
-            self.drc_mode,
-        );
-        self.truehd_presentations_stale = false;
-        self.declared_object_channels = None;
-        self.truehd_spatial_labels = None;
-        self.recovering_until_major_sync = false;
-    }
-
-    /// Resolve the pending presentation, applying the pipeline's failure
-    /// policy: strict mode surfaces the error and resets, as every other decode
-    /// failure here does.
-    fn finish_presentation(&mut self, result: &mut RPushResult) -> Result<(), ()> {
-        match self.resolve_pending_presentation(result) {
-            Ok(()) => Ok(()),
-            Err(msg) => {
-                bridge_diag_log(log::Level::Warn, &msg);
-                self.reset_pipeline();
-                result.did_reset = true;
-                result.error_message = msg.as_str().into();
-                Err(())
-            }
-        }
-    }
-
-    /// Resolve the presentation in hand into exactly one emitted frame.
-    ///
-    /// Any non-dependent access unit ends the group, because a dependent
-    /// belongs to the unit it immediately follows. The dependents are merged
-    /// onto the core in bitstream order, and the last of them decides what
-    /// comes out: a JOC payload there means objects reconstructed from the
-    /// merged bed, and its absence means the bed itself.
-    ///
-    /// Returns the decode error rather than swallowing it, so strict mode can
-    /// reset the pipeline; the caller decides whether to fall back.
-    fn resolve_pending_presentation(&mut self, result: &mut RPushResult) -> Result<(), String> {
-        let Some(pending) = self.pending_eac3_core.take() else {
-            return Ok(());
-        };
-        let PendingEac3Presentation { core, dependents } = pending;
-
-        // A presentation with no JOC anywhere in it is a gap in object
-        // carriage, and the object decoder cannot see one from the inside: its
-        // sequence counter only advances on frames that carry a payload, so the
-        // next JOC frame would otherwise interpolate away from a matrix
-        // belonging to whatever played before the gap.
-        let joc_dependent = dependents
-            .last()
-            .filter(|dependent| eac3_frame_carries_joc(&dependent.info));
-        if joc_dependent.is_none() {
-            self.eac3_object_decoder.note_non_joc_presentation();
-        }
-
-        // Nothing attached: the core stands on its own.
-        if dependents.is_empty() {
-            match core {
-                PendingEac3Core::LegacyAc3 { core, access_unit } => {
-                    result
-                        .frames
-                        .push(crate::eac3_pipeline::build_standalone_ac3_core_frame(
-                            self,
-                            &core,
-                            &access_unit,
-                        ));
-                }
-                PendingEac3Core::Independent(push) => {
-                    result
-                        .frames
-                        .push(crate::eac3_pipeline::build_buffered_core_frame(self, &push));
-                }
-            }
-            return Ok(());
-        }
-
-        self.eac3_diag_stats.dependent_pair_attempts += 1;
-        let core_pcm = match core {
-            PendingEac3Core::LegacyAc3 { core, .. } => core,
-            PendingEac3Core::Independent(push) => push.pcm,
-        };
-        match crate::eac3_pipeline::resolve_eac3_presentation(self, core_pcm, &dependents) {
-            Ok(frame) => {
-                result.frames.push(frame);
-                Ok(())
-            }
-            Err(err) => {
-                self.eac3_diag_stats.dependent_pair_failures += 1;
-                self.eac3_diag_stats.last_dependent_pair_error = Some(err.clone());
-                Err(err)
-            }
-        }
+        self.shared.declared_object_channels = None;
     }
 
     /// Resolve the codec for a `Raw` packet. A host-declared codec
     /// (`configure("input_codec", …)`) wins; otherwise the first recognisable
     /// sync word locks the session. An unrecognised first packet falls back to
     /// TrueHD for that packet without locking, so a later syncful packet can
-    /// still pin the codec.
-    fn resolve_raw_codec(&mut self, data: &[u8]) -> RawCodec {
+    /// still pin the codec; with no Dolby in the build, it is dropped.
+    fn resolve_raw_codec(&mut self, data: &[u8]) -> Option<RawCodec> {
         if let Some(c) = self.raw_codec {
-            return c;
+            return Some(c);
         }
         if let Some(c) = self.forced_raw_codec {
             self.raw_codec = Some(c);
-            return c;
+            return Some(c);
         }
         if let Some(c) = sniff_raw_codec(data) {
             self.raw_codec = Some(c);
-            return c;
+            return Some(c);
         }
         // An IAMF stream only announces itself in its sequence header, so a
         // reset (a seek) is followed by temporal units with nothing to sniff.
         // While the sequence is still configured they are its continuation.
         #[cfg(feature = "iamf")]
         if self.iamf.has_sequence() {
-            return RawCodec::Iamf;
+            return Some(RawCodec::Iamf);
         }
-        RawCodec::TrueHd
+        cfg!(feature = "dolby").then_some(RawCodec::TrueHd)
     }
 
-    /// Process one extracted E-AC3 access unit, shared by the IEC 61937 and raw
-    /// transports. Returns `Err(())` on a fatal decode error, in which case the
-    /// pipeline has been reset and `result` already carries the error — the
-    /// caller must stop draining and return.
-    fn process_eac3_access_unit(
-        &mut self,
-        frame: &[u8],
-        result: &mut RPushResult,
-        temporary_silence_pushed: &mut bool,
-    ) -> Result<(), ()> {
-        #[cfg(test)]
-        injected_panic::hit(RawCodec::Eac3);
-        self.eac3_frame_count += 1;
-        // A dependent substream belongs to the access unit it immediately
-        // follows, so any other kind of unit ends the group in hand. Only a
-        // dependent is looked into here. One the presentation in hand can
-        // take is decoded at once and held with its channels and what the
-        // decode found - an inspection used to come first, and the merge then
-        // walked the same blocks again. One the decode rejects, or that has
-        // no presentation to join, is inspected as before: it is held (or
-        // dropped) on what the inspection found, and one whose inspection
-        // fails is handled as the frame of unknown type it then is.
-        let header = eac3::parse_header(frame).ok();
-        let is_legacy = is_legacy_ac3_frame(frame);
-        let is_dependent =
-            header.is_some_and(|header| header.stream_type == eac3::StreamType::Dependent);
-        if is_dependent
-            && !is_legacy
-            && self
-                .pending_eac3_core
-                .as_ref()
-                .is_some_and(|pending| pending.dependents.len() < MAX_EAC3_DEPENDENTS)
-        {
-            match self.eac3_dependent_pcm_decoder.push_access_unit(frame) {
-                Ok(push) if push.info.frame_type == FrameType::Dependent => {
-                    return self.push_eac3_dependent(
-                        frame,
-                        push.info,
-                        DecodedDependent::Channels(push.pcm),
-                        result,
-                    );
-                }
-                _ => {}
-            }
-        }
-        let inspection = if is_legacy || is_dependent {
-            match inspect_eac3_frame(frame) {
-                Ok(info) if info.frame_type == FrameType::Dependent => {
-                    // Either the decode above rejected it, or it has no
-                    // presentation to join and is dropped before its
-                    // channels are asked for.
-                    return self.push_eac3_dependent(frame, info, DecodedDependent::Failed, result);
-                }
-                inspection => Some(inspection),
-            }
-        } else {
-            None
-        };
-
-        if let Err(()) = self.finish_presentation(result) {
-            return Err(());
-        }
-
-        let decode_result = if is_legacy {
-            let inspection = inspection.unwrap_or_else(|| inspect_eac3_frame(frame));
-            match self.ac3_decoder.decode_frame(frame) {
-                Ok(core) => {
-                    diagnose_eac3_frame(self, frame, &inspection);
-                    self.eac3_diag_stats.ac3_core_decoded += 1;
-                    self.pending_eac3_core = Some(PendingEac3Presentation {
-                        core: PendingEac3Core::LegacyAc3 {
-                            core,
-                            access_unit: frame.to_vec(),
-                        },
-                        dependents: Vec::new(),
-                    });
-                    return Ok(());
-                }
-                Err(err) => {
-                    diagnose_eac3_frame(self, frame, &inspection);
-                    self.eac3_diag_stats.ac3_core_decode_failures += 1;
-                    self.eac3_diag_stats.last_ac3_core_decode_error = Some(err.clone());
-                    bridge_log!(
-                        log::Level::Warn,
-                        "ac3_core_decode_failed index={} error={}",
-                        self.eac3_frame_count,
-                        err
-                    );
-                    // Stand in one frame of silence for the core and stop here.
-                    // This used to fall through to the E-AC-3 decoders, which
-                    // can only reject an AC-3 syncframe ("not-eac3") and then
-                    // substituted silence labelled in WAV order (L R C LFE Ls
-                    // Rs) — a different channel list from the decoded frames
-                    // (fullband order, LFE last), so the renderer replanned
-                    // its bed on every dropped frame and Studio reordered its
-                    // virtual speakers. The silence now carries the labels
-                    // the core decoder would have produced for this header.
-                    build_legacy_ac3_core_failure_silence(self, frame)
-                        .ok_or_else(|| format!("AC-3 core decode error: {err}"))
-                }
-            }
-        } else {
-            // A plain independent core might be the first half of a group, and
-            // nothing in it says whether a dependent follows: it is held until
-            // the next access unit answers that. A converted-AC-3 frame cannot
-            // carry dependents (ETSI allows it none), and an independent whose
-            // JOC payload its own channels satisfy is a complete presentation:
-            // both are emitted at once, which keeps the common 5.1-core Atmos
-            // stream free of the access unit of latency buffering would add.
-            // An independent whose JOC declares a wider downmix than it carries
-            // is held like a plain core, so its dependents reach the bed.
-            let outcome = match &inspection {
-                Some(inspection) => decode_eac3_inspected(self, frame, inspection),
-                None => {
-                    let can_carry_dependents = header
-                        .is_some_and(|header| header.stream_type == eac3::StreamType::Independent);
-                    decode_eac3_independent(self, frame, can_carry_dependents)
-                }
-            };
-            match outcome {
-                Eac3IndependentOutcome::Hold(push) => {
-                    self.pending_eac3_core = Some(PendingEac3Presentation {
-                        core: PendingEac3Core::Independent(Box::new(push)),
-                        dependents: Vec::new(),
-                    });
-                    return Ok(());
-                }
-                Eac3IndependentOutcome::Emit(decoded) => decoded,
-            }
-        };
-
-        match decode_result {
-            Ok(decoded_frame) => {
-                if let Err(reason) = validate_frame_shape(&decoded_frame) {
-                    bridge_log!(
-                        log::Level::Warn,
-                        "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={}",
-                        self.eac3_frame_count,
-                        reason,
-                        decoded_frame.sampling_frequency,
-                        decoded_frame.sample_count,
-                        decoded_frame.channel_count,
-                        decoded_frame.pcm.len()
-                    );
-                    return Ok(());
-                }
-                if is_temporary_eac3_silence_frame(&decoded_frame) {
-                    if *temporary_silence_pushed {
-                        return Ok(());
-                    }
-                    *temporary_silence_pushed = true;
-                }
-                result.frames.push(decoded_frame);
-                Ok(())
-            }
-            Err(msg) => {
-                bridge_diag_log(log::Level::Warn, &msg);
-                self.reset_pipeline();
-                result.did_reset = true;
-                result.error_message = msg.as_str().into();
-                Err(())
-            }
-        }
+    /// The stream is a Dolby one this build refused, as opposed to no stream
+    /// identified yet: both leave the DTS and IAMF flags down.
+    fn refused_dolby(&self) -> bool {
+        #[cfg(not(feature = "dolby"))]
+        return matches!(self.refused, Some(RawCodec::TrueHd | RawCodec::Eac3));
+        #[cfg(feature = "dolby")]
+        return false;
     }
 
-    /// Attach a dependent access unit to the presentation in hand, resolving
-    /// the presentation once its group is complete.
-    fn push_eac3_dependent(
-        &mut self,
-        frame: &[u8],
-        info: eac3::AccessUnitInfo,
-        decoded: DecodedDependent,
-        result: &mut RPushResult,
-    ) -> Result<(), ()> {
-        let Some(pending) = self.pending_eac3_core.as_mut() else {
-            // Nothing in front of it: this dependent belongs to nothing. It
-            // used to be parked for some later, unrelated core to claim,
-            // which put one programme's extension channels on another's bed.
-            self.eac3_diag_stats.dependent_frames_dropped += 1;
-            bridge_diag_log(
-                log::Level::Warn,
-                "eac3_orphan_dependent no core precedes this dependent access unit",
-            );
-            return Ok(());
-        };
-        if pending.dependents.len() >= MAX_EAC3_DEPENDENTS {
-            // More than the eight ETSI allows behind one independent: the
-            // group is malformed rather than longer, so resolve what is
-            // valid and drop the excess instead of growing without bound.
-            self.eac3_diag_stats.dependent_frames_dropped += 1;
-            bridge_diag_log(
-                log::Level::Warn,
-                "eac3_dependent_group_overflow more than eight dependents behind one independent",
-            );
-            return self.finish_presentation(result);
-        }
-        let carries_joc = eac3_frame_carries_joc(&info);
-        pending.dependents.push(PendingEac3Dependent {
-            access_unit: frame.to_vec(),
-            info,
-            decoded,
-        });
-        // The JOC payload rides in the last dependent, so one that carries
-        // it ends the group with no need to wait for the next access unit.
-        if carries_joc {
-            return self.finish_presentation(result);
-        }
-        Ok(())
-    }
-
-    /// Drain all complete E-AC3 access units currently buffered in the raw
-    /// extractor, rendering each through [`Self::process_eac3_access_unit`].
-    fn drain_eac3_raw(&mut self, result: &mut RPushResult) {
-        let mut temporary_silence_pushed = false;
-        loop {
-            match self.eac3_raw_extractor.next_frame() {
-                Ok(Some(frame)) => {
-                    if self
-                        .process_eac3_access_unit(
-                            frame.as_bytes(),
-                            result,
-                            &mut temporary_silence_pushed,
-                        )
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    let msg = format!("eac3_raw_extract_error={err:?}");
-                    bridge_diag_log(log::Level::Warn, &msg);
-                    self.reset_pipeline();
-                    result.did_reset = true;
-                    result.error_message = msg.into();
-                    return;
-                }
-            }
+    /// Refuse a stream whose family this build does not decode: by name, and
+    /// once per stream.
+    #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
+    fn refuse(&mut self, codec: RawCodec, result: &mut RPushResult) {
+        if self.refused != Some(codec) {
+            self.refused = Some(codec);
+            let msg = codec.refusal();
+            bridge_diag_log(log::Level::Warn, msg);
+            result.error_message = msg.into();
         }
     }
 }
@@ -896,154 +301,90 @@ impl AtmosBridge {
 
         match transport {
             RInputTransport::Raw => {
-                #[cfg(feature = "bridge-perf")]
-                self.perf.note_raw_packet(data.len());
-                // One-shot diagnostic: log the first raw packet's first 64 bytes so we
-                // can correlate what the host (e.g. mpv-omniphony's ad_orender) feeds
-                // us against what the SPDIF path receives. Triggered only until the
-                // first frame is successfully decoded; cleared on reset so post-seek
-                // packets log again.
-                let codec = self.resolve_raw_codec(data.as_slice());
+                #[cfg(all(feature = "bridge-perf", feature = "dolby"))]
+                self.dolby.note_raw_packet(data.len());
+                let Some(codec) = self.resolve_raw_codec(data.as_slice()) else {
+                    // Nothing to sniff, and no Dolby to fall back to.
+                    self.iamf_active = false;
+                    return result;
+                };
                 self.iamf_active = codec == RawCodec::Iamf;
-                match codec {
+                if codec == RawCodec::Iamf || codec == RawCodec::Dts {
+                    #[cfg(feature = "dolby")]
+                    self.dolby.leave();
+                }
+                self.dts_active = codec == RawCodec::Dts;
+                #[cfg(test)]
+                injected_panic::hit(codec);
+                let after = match codec {
+                    #[cfg(feature = "dolby")]
                     RawCodec::Eac3 => {
-                        self.eac3_active = true;
-                        self.dts_active = false;
-                        self.eac3_raw_extractor.push_bytes(data.as_slice());
-                        self.drain_eac3_raw(&mut result);
+                        self.dolby
+                            .push_raw_eac3(&mut self.shared, data.as_slice(), &mut result)
                     }
+                    #[cfg(feature = "dolby")]
                     RawCodec::TrueHd => {
-                        self.eac3_active = false;
-                        self.dts_active = false;
-                        process_extractor_input(self, data.as_slice(), &mut result);
+                        self.dolby
+                            .push_raw_truehd(&mut self.shared, data.as_slice(), &mut result)
                     }
+                    #[cfg(feature = "dts")]
                     RawCodec::Dts => {
-                        self.eac3_active = false;
-                        self.dts_active = true;
-                        self.dts_buf.extend_from_slice(data.as_slice());
-                        crate::dts_pipeline::drain_dts(self, &mut result);
+                        self.dts
+                            .push_raw(&mut self.shared, data.as_slice(), &mut result)
                     }
-                    RawCodec::Iamf => {
-                        self.eac3_active = false;
-                        self.dts_active = false;
-                        #[cfg(feature = "iamf")]
-                        crate::iamf_pipeline::push_iamf(self, data.as_slice(), &mut result);
-                        #[cfg(not(feature = "iamf"))]
-                        if !self.iamf_refusal_reported {
-                            // Reported once per stream, not per packet.
-                            self.iamf_refusal_reported = true;
-                            let msg = "iamf: this bridge was built without IAMF support";
-                            bridge_diag_log(log::Level::Warn, msg);
-                            result.error_message = msg.into();
-                        }
+                    #[cfg(feature = "iamf")]
+                    RawCodec::Iamf => crate::iamf_pipeline::push_iamf(
+                        &mut self.iamf,
+                        &mut self.shared,
+                        data.as_slice(),
+                        &mut result,
+                    ),
+                    #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
+                    refused => {
+                        self.refuse(refused, &mut result);
+                        AfterPush::Continue
                     }
+                };
+                if after == AfterPush::ResetPipeline {
+                    self.reset_pipeline();
                 }
                 result
             }
             RInputTransport::Iec61937 => {
                 // IAMF has no IEC 61937 data type: it only comes raw.
                 self.iamf_active = false;
-                // ── TrueHD (data type 0x16) ───────────────────────────
-                if MatStream::accepts_data_type(data_type) {
-                    self.eac3_active = false;
-
-                    #[cfg(feature = "bridge-perf")]
-                    let mat_started = Instant::now();
-                    #[cfg(feature = "bridge-perf")]
-                    self.perf.note_mat_packet(data.len());
-                    self.mat_stream.push_payload(data.as_slice());
-                    loop {
-                        #[cfg(feature = "bridge-perf")]
-                        let chunk_extract_started = Instant::now();
-                        match self.mat_stream.next_chunk() {
-                            Ok(Some(chunk)) => {
-                                #[cfg(feature = "bridge-perf")]
-                                {
-                                    self.perf
-                                        .record_mat_chunk_extract(chunk_extract_started.elapsed());
-                                    self.perf.note_mat_chunk(chunk.len());
-                                }
-                                process_extractor_input(self, &chunk, &mut result);
-                                if result.did_reset {
-                                    break;
-                                }
-                            }
-                            Ok(None) => {
-                                #[cfg(feature = "bridge-perf")]
-                                self.perf
-                                    .record_mat_chunk_extract(chunk_extract_started.elapsed());
-                                break;
-                            }
-                            Err(msg) => {
-                                #[cfg(feature = "bridge-perf")]
-                                self.perf
-                                    .record_mat_chunk_extract(chunk_extract_started.elapsed());
-                                bridge_diag_log(log::Level::Warn, &msg);
-                                self.reset_pipeline();
-                                result.did_reset = true;
-                                if self.strict {
-                                    result.error_message = msg.into();
-                                }
-                                return result;
-                            }
-                        }
-                    }
-                    #[cfg(feature = "bridge-perf")]
-                    self.perf.record_mat(mat_started.elapsed());
-                    return result;
-                }
-
-                // ── E-AC3 (data type 0x15) ────────────────────────────
-                if Eac3SpdifStream::accepts_data_type(data_type) {
-                    self.eac3_active = true;
-
-                    self.eac3_spdif.push_payload(data.as_slice());
-                    let mut temporary_silence_pushed = false;
-                    loop {
-                        match self.eac3_spdif.next_frame() {
-                            Ok(Some(frame)) => {
-                                if self
-                                    .process_eac3_access_unit(
-                                        &frame,
-                                        &mut result,
-                                        &mut temporary_silence_pushed,
-                                    )
-                                    .is_err()
-                                {
-                                    return result;
-                                }
-                            }
-                            Ok(None) => {
-                                break;
-                            }
-                            Err(msg) => {
-                                bridge_log!(log::Level::Warn, "eac3_error={msg}");
-                                self.reset_pipeline();
-                                result.did_reset = true;
-                                result.error_message = msg.into();
-                                return result;
-                            }
-                        }
+                // ── Dolby: TrueHD in MAT (0x16), E-AC-3 (0x15) ────────
+                #[cfg(feature = "dolby")]
+                if DolbyPipeline::accepts_data_type(data_type) {
+                    let after = self.dolby.push_iec61937(
+                        &mut self.shared,
+                        data.as_slice(),
+                        data_type,
+                        &mut result,
+                    );
+                    if after == AfterPush::ResetPipeline {
+                        self.reset_pipeline();
                     }
                     return result;
                 }
 
                 // ── DTS (data types 0x0B/0x0C/0x0D/0x11) ──────────────
-                if crate::dts_spdif::accepts_data_type(data_type) {
-                    self.eac3_active = false;
+                #[cfg(feature = "dts")]
+                if bridge_family_dts::accepts_data_type(data_type) {
+                    #[cfg(feature = "dolby")]
+                    self.dolby.leave();
                     self.dts_active = true;
-                    let payload = crate::dts_spdif::normalise_payload(data.as_slice());
-                    // Types I/II/III carry the frame directly; type IV wraps it
-                    // in a start code plus a length, and pads the burst past it.
-                    // Fed whole, the pipeline finds no sync word and decodes
-                    // nothing at all.
-                    let payload = if data_type == crate::dts_spdif::DTSHD_DATA_TYPE {
-                        crate::dts_spdif::unwrap_hd_payload(&payload).unwrap_or(&payload)
-                    } else {
-                        &payload
-                    };
-                    self.dts_buf.extend_from_slice(payload);
-                    crate::dts_pipeline::drain_dts(self, &mut result);
+                    #[cfg(test)]
+                    injected_panic::hit(RawCodec::Dts);
+                    let after = self.dts.push_iec61937(
+                        &mut self.shared,
+                        data.as_slice(),
+                        data_type,
+                        &mut result,
+                    );
+                    if after == AfterPush::ResetPipeline {
+                        self.reset_pipeline();
+                    }
                     return result;
                 }
 
@@ -1051,7 +392,7 @@ impl AtmosBridge {
                 let msg =
                     format!("Unsupported IEC 61937 data type for this bridge: 0x{data_type:02X}");
                 bridge_diag_log(log::Level::Warn, &msg);
-                if self.strict {
+                if self.shared.strict {
                     result.error_message = msg.into();
                     self.reset_pipeline();
                     result.did_reset = true;
@@ -1097,7 +438,7 @@ impl FormatBridge for AtmosBridge {
                 frames: RVec::new(),
                 // A host that did not ask for strict decoding plays through a
                 // reset; an error message would fail its call instead.
-                error_message: if self.strict {
+                error_message: if self.shared.strict {
                     msg.into()
                 } else {
                     RString::new()
@@ -1116,10 +457,18 @@ impl FormatBridge for AtmosBridge {
 
     fn is_ready(&self) -> bool {
         #[cfg(feature = "iamf")]
-        if self.iamf.frame_count > 0 {
+        if self.iamf.is_ready() {
             return true;
         }
-        self.frame_count > 0 || self.eac3_frame_count > 0 || self.dts_frame_count > 0
+        #[cfg(feature = "dts")]
+        if self.dts.is_ready() {
+            return true;
+        }
+        #[cfg(feature = "dolby")]
+        if self.dolby.is_ready() {
+            return true;
+        }
+        false
     }
 
     fn has_objects(&self) -> bool {
@@ -1133,65 +482,19 @@ impl FormatBridge for AtmosBridge {
             return false;
         }
         if self.dts_active {
-            if self.dts_objects_active {
-                return true;
-            }
-            // DTS core, and the presentations whose feeds are all fixed - the
-            // standard height quartet and D0's five - are labeled fixed
-            // channels. Whether those are placed directly or virtualized
-            // remains the renderer's channel-mode decision. A presentation
-            // that declares objects labels those feeds as object channels
-            // instead: D1, D3 and D4 over the height quartet, and the
-            // object-only variant for the single one it carries alone.
+            #[cfg(feature = "dts")]
+            return self.dts.has_objects();
+            #[cfg(not(feature = "dts"))]
             return false;
         }
-        if self.eac3_active {
-            // E-AC3/AC-3 is spatial only when it actually carries JOC object
-            // payloads (Atmos). `frames_seen` counts every decoded frame, so it
-            // is true for plain AC-3 / E-AC3 multichannel too — gating on it
-            // would wrongly mark non-object streams as spatial, and host mode
-            // could then never hand them back to the native decoder (it would
-            // render silence instead). `joc_frames` only increments on frames
-            // with a JOC payload, so it is the correct "has real objects" probe.
-            self.eac3_diag_stats.joc_frames > 0
-        } else {
-            // Presentations 0–(MAX-2) are pure downmixes; the top presentation carries objects.
-            self.presentation >= (MAX_PRESENTATIONS as u8) - 1
-        }
+        #[cfg(feature = "dolby")]
+        return self.dolby.has_objects();
+        #[cfg(not(feature = "dolby"))]
+        return false;
     }
 
     fn configure(&mut self, key: RStr<'_>, value: RStr<'_>) -> bool {
         match key.as_str() {
-            "presentation" => {
-                let p = match value.as_str() {
-                    "best" => (MAX_PRESENTATIONS as u8) - 1,
-                    s => match s.parse::<u8>() {
-                        Ok(p) if p < MAX_PRESENTATIONS as u8 => p,
-                        Ok(p) => {
-                            bridge_log!(
-                                log::Level::Warn,
-                                "atmos-bridge: presentation {p} out of range (0–{})",
-                                MAX_PRESENTATIONS - 1
-                            );
-                            return false;
-                        }
-                        Err(_) => {
-                            bridge_log!(
-                                log::Level::Warn,
-                                "atmos-bridge: cannot parse presentation value {:?}",
-                                s
-                            );
-                            return false;
-                        }
-                    },
-                };
-                self.presentation = p;
-                self.parser
-                    .set_required_presentations(&required_presentations(p, self.drc_mode));
-                self.truehd_presentations_stale = false;
-                bridge_log!(log::Level::Debug, "atmos-bridge: presentation set to {p}");
-                true
-            }
             "input_codec" => {
                 self.forced_raw_codec = match value.as_str() {
                     "eac3" | "ec3" | "e-ac3" | "ac3" => Some(RawCodec::Eac3),
@@ -1229,43 +532,15 @@ impl FormatBridge for AtmosBridge {
                     false
                 }
             },
-            #[cfg(feature = "bridge-perf")]
-            "perf_profile" => {
-                let enabled = matches!(value.as_str(), "1" | "true" | "on" | "yes");
-                let report_every = self.perf.configure_profile(enabled);
-                eprintln!(
-                    "harletty-bridge perf profiling {} (report_every_frames={})",
-                    if enabled { "enabled" } else { "disabled" },
-                    report_every
-                );
-                true
-            }
-            #[cfg(feature = "bridge-perf")]
-            "perf_report_every" => match value.as_str().parse::<u64>() {
-                Ok(interval) if interval > 0 => {
-                    self.perf.configure_report_every(interval);
-                    eprintln!(
-                        "harletty-bridge perf reporting interval set to {} frames",
-                        interval
-                    );
-                    true
+            key => {
+                #[cfg(feature = "dolby")]
+                if let Some(taken) = self.dolby.configure(key, value.as_str()) {
+                    return taken;
                 }
-                _ => {
-                    bridge_log!(
-                        log::Level::Warn,
-                        "atmos-bridge: invalid perf_report_every value {:?}",
-                        value.as_str()
-                    );
-                    false
-                }
-            },
-            #[cfg(not(feature = "bridge-perf"))]
-            "perf_profile" | "perf_report_every" => false,
-            _ => {
                 bridge_log!(
                     log::Level::Debug,
                     "atmos-bridge: unknown configuration key {:?}",
-                    key.as_str()
+                    key
                 );
                 false
             }
@@ -1288,15 +563,11 @@ impl FormatBridge for AtmosBridge {
         if self.iamf_active {
             return self.iamf.declared_poses();
         }
+        #[cfg(feature = "dts")]
         if self.dts_active {
-            if self.dts_auro.is_unfolding() {
-                self.dts_auro.declared_poses()
-            } else {
-                crate::labels::dts_declared_poses(self.dts_surrounds_on_side)
-            }
-        } else {
-            RVec::new()
+            return self.dts.fixed_channel_poses();
         }
+        RVec::new()
     }
 
     fn source_family(&self) -> RString {
@@ -1305,13 +576,15 @@ impl FormatBridge for AtmosBridge {
         RString::from(if self.iamf_active {
             FAMILY_IAMF
         } else if self.dts_active {
-            if self.dts_auro.is_unfolding() {
-                FAMILY_AURO
-            } else {
-                FAMILY_DTS
-            }
-        } else {
+            #[cfg(feature = "dts")]
+            let family = self.dts.source_family();
+            #[cfg(not(feature = "dts"))]
+            let family = FAMILY_DTS;
+            family
+        } else if self.refused_dolby() {
             FAMILY_DOLBY
+        } else {
+            IDLE_FAMILY
         })
     }
 
@@ -1337,38 +610,14 @@ impl FormatBridge for AtmosBridge {
         if self.iamf_active {
             return RString::from(self.iamf.description().unwrap_or("IAMF"));
         }
+        #[cfg_attr(not(any(feature = "dolby", feature = "dts")), allow(unused_mut))]
         let mut label = String::with_capacity(40);
         if self.dts_active {
-            label.push_str(match self.dts_profile {
-                DtsProfile::Core => "DTS",
-                DtsProfile::Hd => "DTS-HD HRA",
-                DtsProfile::Ma => "DTS-HD MA",
-            });
-            if let Some(layout) = self.dts_auro.unfolded_layout() {
-                label.push_str(" + Auro-3D");
-                if let Some(name) = layout.auro_name() {
-                    label.push(' ');
-                    label.push_str(name);
-                }
-            } else if let Some(presentation) = self.dts_x.locked {
-                label.push_str(" + DTS:X ");
-                label.push_str(presentation.layout_label());
-            }
-        } else if self.eac3_active {
-            let stats = &self.eac3_diag_stats;
-            label.push_str(if stats.total_frames > stats.legacy_ac3_frames {
-                "Dolby Digital Plus"
-            } else {
-                "Dolby Digital"
-            });
-            if stats.joc_frames > 0 {
-                label.push_str(" + Dolby Atmos");
-            }
+            #[cfg(feature = "dts")]
+            self.dts.source_label(&mut label);
         } else {
-            label.push_str("Dolby TrueHD");
-            if self.truehd_spatial_labels.is_some() {
-                label.push_str(" + Dolby Atmos");
-            }
+            #[cfg(feature = "dolby")]
+            self.dolby.source_label(&mut label);
         }
         RString::from(label)
     }
@@ -1395,50 +644,32 @@ impl FormatBridge for AtmosBridge {
         RVbapTableMode::Cartesian
     }
 
+    /// DRC is Dolby's: a build without it offers none.
     fn supported_drc_modes(&self) -> RVec<RString> {
-        vec![
-            RString::from("Off"),
-            RString::from("standard/line"),
-            RString::from("heavy/RF"),
-        ]
-        .into()
+        #[cfg(feature = "dolby")]
+        return DolbyPipeline::supported_drc_modes();
+        #[cfg(not(feature = "dolby"))]
+        return RVec::new();
     }
 
     fn set_drc_mode(&mut self, mode: RStr<'_>) -> bool {
-        let new_mode = match mode.as_str() {
-            "Off" => DrcMode::Off,
-            "Standard" | "Line" | "standard/line" => DrcMode::Standard,
-            "Heavy" | "RF" | "heavy/RF" => DrcMode::Heavy,
-            _ => {
-                bridge_diag_log(
-                    log::Level::Warn,
-                    &format!("[harletty][drc] unknown drc_mode {:?}", mode.as_str()),
-                );
-                return false;
-            }
-        };
-        bridge_log!(
-            log::Level::Info,
-            "[harletty][drc] set_drc_mode {:?} -> {:?}",
-            self.drc_mode,
-            new_mode
-        );
-        if required_presentations(self.presentation, new_mode)
-            != required_presentations(self.presentation, self.drc_mode)
+        #[cfg(feature = "dolby")]
+        return self.dolby.set_drc_mode(mode.as_str());
+        #[cfg(not(feature = "dolby"))]
         {
-            self.truehd_presentations_stale = true;
+            let _ = mode;
+            false
         }
-        self.drc_mode = new_mode;
-        true
     }
 }
 
 #[cfg(test)]
 mod raw_transport_tests {
     use super::*;
-    use bridge_api::RChannelLabel;
+    #[cfg(feature = "dts")]
     use std::io::Read;
 
+    #[cfg(feature = "dts")]
     fn read_prefix(path: &str, bytes: u64) -> Option<Vec<u8>> {
         let mut input = std::fs::File::open(path).ok()?;
         let mut prefix = Vec::with_capacity(bytes as usize);
@@ -1446,57 +677,10 @@ mod raw_transport_tests {
         Some(prefix)
     }
 
+    #[cfg(feature = "dts")]
     fn corpus_path(variable: &str) -> Option<String> {
         let path = std::env::var(variable).ok()?;
         std::path::Path::new(&path).is_file().then_some(path)
-    }
-
-    #[test]
-    fn failed_legacy_ac3_core_becomes_silence_in_decoder_channel_order() {
-        // 44.1 kHz frmsizecod=29 header (1672-byte frame) handed over two
-        // bytes short: the core decoder rejects it, and the access unit must
-        // still advance the stream by one frame of silence whose channel list
-        // is the one decoded frames carry (fullband order, then LFE) — not a
-        // second, differently ordered list that would make the renderer
-        // replan the bed twice around every dropped frame.
-        let mut frame = vec![0u8; 1670];
-        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1]);
-        let mut bridge = AtmosBridge::new(false);
-        let mut result = RPushResult {
-            frames: RVec::new(),
-            error_message: RString::new(),
-            did_reset: false,
-        };
-        let mut temporary_silence_pushed = false;
-
-        bridge
-            .process_eac3_access_unit(&frame, &mut result, &mut temporary_silence_pushed)
-            .expect("a failed core is not a pipeline error");
-
-        assert!(result.error_message.is_empty(), "{}", result.error_message);
-        assert!(!result.did_reset);
-        assert_eq!(bridge.eac3_diag_stats.ac3_core_decode_failures, 1);
-        assert_eq!(bridge.eac3_diag_stats.legacy_ac3_frames, 1);
-        assert_eq!(bridge.eac3_total_samples, 1536);
-        assert_eq!(result.frames.len(), 1);
-        let silence = &result.frames[0];
-        assert_eq!(silence.sampling_frequency, 44_100);
-        assert_eq!(silence.sample_count, 1536);
-        assert_eq!(silence.channel_count, 6);
-        assert_eq!(
-            silence.channel_labels.as_slice(),
-            &[
-                RChannelLabel::L,
-                RChannelLabel::C,
-                RChannelLabel::R,
-                RChannelLabel::Ls,
-                RChannelLabel::Rs,
-                RChannelLabel::LFE,
-            ]
-        );
-        assert_eq!(silence.pcm.len(), 1536 * 6);
-        assert!(silence.pcm.iter().all(|sample| *sample == 0));
-        assert!(silence.metadata.is_empty());
     }
 
     #[test]
@@ -1568,7 +752,7 @@ mod raw_transport_tests {
         // Unrecognisable bytes, but the host-declared codec wins.
         assert_eq!(
             bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]),
-            RawCodec::Eac3
+            Some(RawCodec::Eac3)
         );
         assert_eq!(bridge.raw_codec, Some(RawCodec::Eac3));
     }
@@ -1576,15 +760,19 @@ mod raw_transport_tests {
     #[test]
     fn resolve_sniffs_when_unforced() {
         let mut eac3 = AtmosBridge::new(false);
-        assert_eq!(eac3.resolve_raw_codec(&[0x0B, 0x77, 0, 0]), RawCodec::Eac3);
+        assert_eq!(
+            eac3.resolve_raw_codec(&[0x0B, 0x77, 0, 0]),
+            Some(RawCodec::Eac3)
+        );
         assert_eq!(eac3.raw_codec, Some(RawCodec::Eac3));
 
         let mut thd = AtmosBridge::new(false);
         let buf = [0, 0, 0, 0, 0xF8, 0x72, 0x6F, 0xBA];
-        assert_eq!(thd.resolve_raw_codec(&buf), RawCodec::TrueHd);
+        assert_eq!(thd.resolve_raw_codec(&buf), Some(RawCodec::TrueHd));
         assert_eq!(thd.raw_codec, Some(RawCodec::TrueHd));
     }
 
+    #[cfg(feature = "dolby")]
     #[test]
     fn resolve_unknown_first_packet_defaults_truehd_without_locking() {
         let mut bridge = AtmosBridge::new(false);
@@ -1592,9 +780,26 @@ mod raw_transport_tests {
         // lock, so a later syncful packet can still pin the codec.
         assert_eq!(
             bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]),
-            RawCodec::TrueHd
+            Some(RawCodec::TrueHd)
         );
         assert_eq!(bridge.raw_codec, None);
+    }
+
+    /// With no Dolby to fall back to, a packet nothing recognises is dropped,
+    /// quietly, and the codec stays open.
+    #[cfg(not(feature = "dolby"))]
+    #[test]
+    fn an_unknown_packet_without_dolby_is_dropped_without_locking() {
+        let mut bridge = AtmosBridge::new(false);
+        assert_eq!(bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]), None);
+        assert_eq!(bridge.raw_codec, None);
+        let result = bridge.push_packet(
+            RSlice::from_slice(&[0x12, 0x34, 0x56, 0x78]),
+            RInputTransport::Raw,
+            0,
+        );
+        assert!(result.frames.is_empty());
+        assert!(result.error_message.is_empty());
     }
 
     #[test]
@@ -1622,6 +827,7 @@ mod raw_transport_tests {
     /// a DTS packet, DTS until an Auro carrier is confirmed. Before any
     /// packet the bridge is a Dolby bridge, which is also what an older host
     /// that never asks would assume.
+    #[cfg(all(feature = "dolby", feature = "dts"))]
     #[test]
     fn source_family_follows_the_active_codec() {
         let mut bridge = AtmosBridge::new(false);
@@ -1639,19 +845,17 @@ mod raw_transport_tests {
                 .any(|p| p.label == bridge_api::RChannelLabel::Ls && p.azimuth_deg == -110.0),
             "DTS declares its ETSI angles"
         );
-        // A stream that named the pair Lss/Rss is declared on the side.
-        bridge.dts_surrounds_on_side = true;
-        let poses = bridge.fixed_channel_poses();
-        assert!(
-            poses
-                .iter()
-                .any(|p| p.label == bridge_api::RChannelLabel::Ls && p.azimuth_deg == -90.0),
-            "a side-surround pair is declared at ±90°"
-        );
-        bridge.dts_surrounds_on_side = false;
         bridge.dts_active = false;
-        bridge.eac3_active = true;
         assert_eq!(bridge.source_family().as_str(), "dolby");
+    }
+
+    /// Nothing is named before a frame decoded: until then the codec path is
+    /// a guess, and the host has its own. The labels themselves are each
+    /// family's (their own tests; the corpus tests read them through here).
+    #[test]
+    fn source_label_is_empty_before_a_frame() {
+        let bridge = AtmosBridge::new(false);
+        assert_eq!(bridge.source_label().as_str(), "");
     }
 
     /// Every family a stream can name is in the catalogue the renderer
@@ -1666,12 +870,15 @@ mod raw_transport_tests {
         let mut bridge = AtmosBridge::new(false);
         let mut seen = vec![bridge.source_family().to_string()];
         bridge.dts_active = true;
-        seen.push(bridge.source_family().to_string());
+        if cfg!(feature = "dts") {
+            seen.push(bridge.source_family().to_string());
+        }
         bridge.dts_active = false;
         bridge.iamf_active = true;
         if cfg!(feature = "iamf") {
             seen.push(bridge.source_family().to_string());
         }
+        #[cfg(feature = "dts")]
         seen.push(FAMILY_AURO.to_owned());
         for name in seen {
             assert!(catalogue.contains(&name), "{name} not in {catalogue:?}");
@@ -1685,122 +892,10 @@ mod raw_transport_tests {
         }
     }
 
-    /// The label names the carrier the demux found and the spatial layer
-    /// decoded over it, once a frame decoded; nothing before.
-    #[test]
-    fn source_label_names_the_carrier_and_its_spatial_layer() {
-        let mut bridge = AtmosBridge::new(false);
-        assert_eq!(bridge.source_label().as_str(), "", "nothing before a frame");
-
-        bridge.dts_active = true;
-        bridge.dts_frame_count = 1;
-        assert_eq!(bridge.source_label().as_str(), "DTS");
-        bridge.dts_profile = DtsProfile::Hd;
-        assert_eq!(bridge.source_label().as_str(), "DTS-HD HRA");
-        bridge.dts_profile = DtsProfile::Ma;
-        assert_eq!(bridge.source_label().as_str(), "DTS-HD MA");
-        bridge.dts_x.locked = Some(dca::XPresentation::Height);
-        assert_eq!(bridge.source_label().as_str(), "DTS-HD MA + DTS:X 7.1.4");
-        bridge.dts_x.locked = Some(dca::XPresentation::ObjectsD3);
-        assert_eq!(bridge.source_label().as_str(), "DTS-HD MA + DTS:X 7.1.4+4");
-
-        bridge.dts_active = false;
-        bridge.dts_frame_count = 0;
-        bridge.eac3_active = true;
-        bridge.eac3_frame_count = 1;
-        bridge.eac3_diag_stats.total_frames = 1;
-        bridge.eac3_diag_stats.legacy_ac3_frames = 1;
-        assert_eq!(bridge.source_label().as_str(), "Dolby Digital");
-        bridge.eac3_diag_stats.total_frames = 2;
-        assert_eq!(bridge.source_label().as_str(), "Dolby Digital Plus");
-        bridge.eac3_diag_stats.joc_frames = 1;
-        assert_eq!(
-            bridge.source_label().as_str(),
-            "Dolby Digital Plus + Dolby Atmos"
-        );
-
-        bridge.eac3_active = false;
-        bridge.eac3_frame_count = 0;
-        bridge.frame_count = 1;
-        assert_eq!(bridge.source_label().as_str(), "Dolby TrueHD");
-        bridge.truehd_spatial_labels = Some(RVec::new());
-        assert_eq!(bridge.source_label().as_str(), "Dolby TrueHD + Dolby Atmos");
-    }
-
-    /// The presentations asked of the TrueHD parser follow the DRC mode, and a
-    /// mode set in mid-stream reaches the parser at the next major sync, where
-    /// every substream can be taken up, with the frames a bridge in that mode
-    /// from the start hands out.
-    #[test]
-    fn truehd_presentations_follow_the_drc_mode_at_a_major_sync() {
-        use crate::truehd_pipeline::required_presentations;
-
-        // The DRC log asks for every presentation whatever the mode.
-        if crate::logging::drc_diag_log_enabled() {
-            return;
-        }
-
-        assert_eq!(
-            required_presentations(2, DrcMode::Off),
-            [false, false, true, false]
-        );
-        assert_eq!(
-            required_presentations(2, DrcMode::Standard),
-            [false, false, true, false]
-        );
-        assert_eq!(
-            required_presentations(2, DrcMode::Heavy),
-            [true, true, true, false]
-        );
-
-        // One major sync and one access unit after it, four times over.
-        let unit = truehd::process::EXAMPLE_DATA;
-        let push = |bridge: &mut AtmosBridge, copies: usize| {
-            let bytes = unit.repeat(copies);
-            let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
-
-            assert!(result.error_message.is_empty(), "{}", result.error_message);
-            assert!(!result.did_reset);
-            result
-                .frames
-                .into_iter()
-                .map(|f| (f.pcm.to_vec(), f.drc_gain.to_bits(), f.drc_ramp_duration))
-                .collect::<Vec<_>>()
-        };
-
-        let mut heavy = AtmosBridge::new(false);
-        heavy.configure("input_codec".into(), "truehd".into());
-        assert!(heavy.set_drc_mode("heavy/RF".into()));
-        let mut expected = push(&mut heavy, 1);
-        expected.extend(push(&mut heavy, 3));
-        assert!(!heavy.truehd_presentations_stale);
-
-        let mut bridge = AtmosBridge::new(false);
-        bridge.configure("input_codec".into(), "truehd".into());
-        let mut frames = push(&mut bridge, 1);
-        assert!(!bridge.truehd_presentations_stale);
-
-        // Nothing is asked of the parser between two major syncs.
-        assert!(bridge.set_drc_mode("standard/line".into()));
-        assert!(!bridge.truehd_presentations_stale);
-        assert!(bridge.set_drc_mode("heavy/RF".into()));
-        assert!(bridge.truehd_presentations_stale);
-
-        frames.extend(push(&mut bridge, 3));
-        assert!(!bridge.truehd_presentations_stale);
-
-        assert!(frames.len() >= 6, "{} frames", frames.len());
-        assert_eq!(frames.len(), expected.len());
-        for (i, (frame, expected)) in frames.iter().zip(&expected).enumerate() {
-            assert_eq!(frame.0, expected.0, "samples of frame {i}");
-        }
-        // From the major sync after the mode was set, the gains too.
-        assert_eq!(frames[4..], expected[4..]);
-    }
-
     // End-to-end: feed a raw DTS core stream through the FormatBridge and check
     // it emits 5.1 bed frames with the expected channel labels. Skips when the
     // (uncommitted) corpus is absent.
+    #[cfg(feature = "dts")]
     #[test]
     fn dts_hd_auro_carrier_unfolds_into_its_layout() {
         let Some(dts) = corpus_path("HARLETTY_AURO_DTS_CORPUS") else {
@@ -1815,8 +910,9 @@ mod raw_transport_tests {
             assert!(result.error_message.is_empty(), "{}", result.error_message);
             frames.extend(result.frames.into_iter());
         }
-        assert!(
-            bridge.dts_auro.is_unfolding(),
+        assert_eq!(
+            bridge.source_family().as_str(),
+            "auro",
             "the carrier was not confirmed"
         );
         assert!(!bridge.has_objects(), "Auro is fixed channels, not objects");
@@ -1857,18 +953,19 @@ mod raw_transport_tests {
         // Output is one block behind input, and no more.
         let emitted: u64 = frames.iter().map(|f| u64::from(f.sample_count)).sum();
         assert!(
-            bridge.total_samples - emitted <= 4096,
+            bridge.shared.total_samples - emitted <= 4096,
             "{} held back",
-            bridge.total_samples - emitted
+            bridge.shared.total_samples - emitted
         );
         eprintln!(
             "{} frames, {} channels, {emitted}/{} samples out",
             frames.len(),
             channels,
-            bridge.total_samples
+            bridge.shared.total_samples
         );
     }
 
+    #[cfg(feature = "dts")]
     #[test]
     fn dts_raw_transport_emits_bed_frames() {
         let Some(dts) = corpus_path("HARLETTY_DTS_CORE_CORPUS") else {
@@ -1898,6 +995,7 @@ mod raw_transport_tests {
     // End-to-end lossy carrier (DTS-HD HRA + DTS:X): the core + XXCH bed and
     // the height quartet come out as the same fixed 7.1.4 shape as a
     // lossless carrier's, named for what it is.
+    #[cfg(feature = "dts")]
     #[test]
     fn lossy_carrier_raw_transport_emits_labeled_7_1_4_channels() {
         let Some(dump) = corpus_path("HARLETTY_LOSSY_X_CORPUS") else {
@@ -1912,7 +1010,6 @@ mod raw_transport_tests {
         assert!(result.error_message.is_empty(), "{}", result.error_message);
         assert!(!result.frames.is_empty(), "no HD frames decoded");
         assert!(!bridge.has_objects());
-        assert_eq!(bridge.dts_profile, DtsProfile::Hd);
         assert_eq!(bridge.source_family().as_str(), "dts");
         assert_eq!(bridge.source_label().as_str(), "DTS-HD HRA + DTS:X 7.1.4");
         let f = result
@@ -1939,6 +1036,7 @@ mod raw_transport_tests {
 
     // End-to-end DTS-HD MA: feed the raw 7.1 dump and check it emits 8-channel
     // lossless bed frames. Skips when the (uncommitted) dump is absent.
+    #[cfg(feature = "dts")]
     #[test]
     fn dtshd_raw_transport_emits_labeled_7_1_4_channels() {
         let Some(dump) = corpus_path("HARLETTY_DTSX_STANDARD_CORPUS") else {
@@ -1978,6 +1076,7 @@ mod raw_transport_tests {
         );
     }
 
+    #[cfg(feature = "dts")]
     #[test]
     fn alternate_profiles_emit_automatic_presentations() {
         let Some(d0_path) = corpus_path("HARLETTY_D0_CORPUS") else {
@@ -2102,9 +1201,122 @@ mod raw_transport_tests {
         );
         assert!(metadata.events.iter().all(|event| event.has_pos));
     }
+
+    /// Local-only end-to-end check: decode a real DTS (DTS-HD MA / DTS:X) stream
+    /// through the bridge's raw path and confirm it emits a non-silent
+    /// multichannel bed (the 2D core/HD path; DTS:X objects are ignored). Skips
+    /// when the local capture is absent; dumps PCM for `compare_pcm` vs ffmpeg.
+    #[cfg(feature = "dts")]
+    #[test]
+    fn dts_decodes_nonsilent_bed() {
+        use abi_stable::std_types::RSlice;
+        use bridge_api::{FormatBridge, RInputTransport};
+
+        let path = "/tmp/dts/sample.dts";
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skip: {path} not present");
+            return;
+        };
+
+        let mut bridge = AtmosBridge::new(false);
+        let mut pcm_f32: Vec<f32> = Vec::new();
+        let mut channels = 0u32;
+        let mut frames = 0u64;
+        let mut labels = String::new();
+        for chunk in bytes.chunks(4096) {
+            let r = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+            for f in r.frames.iter() {
+                frames += 1;
+                channels = f.channel_count;
+                if labels.is_empty() {
+                    labels = format!("{:?}", f.channel_labels);
+                }
+                for &s in f.pcm.iter() {
+                    pcm_f32.push(s as f32 / 8_388_608.0);
+                }
+            }
+        }
+        eprintln!("dts labels: {labels}");
+
+        assert!(frames > 0, "no frames decoded from the DTS stream");
+        assert!(channels >= 6, "expected >= 5.1, got {channels} channels");
+        let peak = pcm_f32.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(peak > 1e-4, "decoded DTS bed is silent (peak={peak})");
+        eprintln!("dts decoded {frames} frames, {channels} ch, peak={peak:.4}");
+        let _ = std::fs::write(
+            "/tmp/dts/harletty_bridge.f32",
+            pcm_f32
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+    }
+
+    /// Push one raw packet into a fresh bridge, or after a reset, and say
+    /// what came of it.
+    #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
+    fn refused_twice_then_after_reset(packet: &[u8]) -> (String, String, String, String) {
+        let mut bridge = AtmosBridge::new(false);
+        let push = |bridge: &mut AtmosBridge| {
+            let result = bridge.push_packet(RSlice::from_slice(packet), RInputTransport::Raw, 0);
+            assert!(result.frames.is_empty());
+            result.error_message.to_string()
+        };
+        let first = push(&mut bridge);
+        let second = push(&mut bridge);
+        let family = bridge.source_family().to_string();
+        bridge.reset();
+        let after_reset = push(&mut bridge);
+        (first, second, after_reset, family)
+    }
+
+    /// A stream whose family the build leaves out is refused by name: once
+    /// per stream rather than on every packet, and again after a reset. It
+    /// still names its own family.
+    #[cfg(not(feature = "dts"))]
+    #[test]
+    fn a_dts_stream_without_dts_is_refused_by_name() {
+        let msg = "dts: this bridge was built without DTS support";
+        let (first, second, after_reset, family) =
+            refused_twice_then_after_reset(&[0x7F, 0xFE, 0x80, 0x01, 0, 0, 0, 0]);
+        assert_eq!(first, msg);
+        assert_eq!(second, "");
+        assert_eq!(after_reset, msg);
+        assert_eq!(family, "dts");
+    }
+
+    #[cfg(not(feature = "dolby"))]
+    #[test]
+    fn a_dolby_stream_without_dolby_is_refused_by_name() {
+        let (first, second, after_reset, family) =
+            refused_twice_then_after_reset(&[0x0B, 0x77, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(first, "eac3: this bridge was built without E-AC-3 support");
+        assert_eq!(second, "");
+        assert_eq!(after_reset, first);
+        assert_eq!(family, "dolby");
+        let (first, .., family) =
+            refused_twice_then_after_reset(&[0, 0, 0, 0, 0xF8, 0x72, 0x6F, 0xBA]);
+        assert_eq!(
+            first,
+            "truehd: this bridge was built without TrueHD support"
+        );
+        assert_eq!(family, "dolby");
+    }
+
+    #[cfg(not(feature = "iamf"))]
+    #[test]
+    fn an_iamf_stream_without_iamf_is_refused_by_name() {
+        let msg = "iamf: this bridge was built without IAMF support";
+        let (first, second, after_reset, family) =
+            refused_twice_then_after_reset(&[0xF8, 0x06, b'i', b'a', b'm', b'f', 0x00, 0x00]);
+        assert_eq!(first, msg);
+        assert_eq!(second, "");
+        assert_eq!(after_reset, msg);
+        assert_eq!(family, "iamf");
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dts"))]
 mod dts_object_only_tests {
     use super::*;
     use abi_stable::std_types::RSlice;
@@ -2153,7 +1365,7 @@ mod dts_object_only_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dts"))]
 mod dts_object_motion_tests {
     use super::*;
     use abi_stable::std_types::RSlice;
@@ -2240,7 +1452,7 @@ mod stack_footprint_tests {
             .stack_size(MACOS_PLAYBACK_STACK)
             .spawn(|| {
                 let bridge = AtmosBridge::new(false);
-                assert_eq!(bridge.presentation, 3);
+                assert!(!bridge.is_ready());
             })
             .expect("spawn small-stack thread")
             .join()
@@ -2252,7 +1464,9 @@ mod stack_footprint_tests {
 mod panic_guard_tests {
     use super::*;
 
+    #[cfg(feature = "dolby")]
     const EAC3: &[u8] = include_bytes!("../../harletty/tests/fixtures/joc_atmos_1s.eac3");
+    #[cfg(feature = "dts")]
     const DTS: &[u8] = include_bytes!("../../harletty/tests/fixtures/dts_core_tone_10f.dts");
 
     fn push(bridge: &mut AtmosBridge, data: &[u8]) -> RPushResult {
@@ -2285,6 +1499,7 @@ mod panic_guard_tests {
     }
 
     /// Push `stream` in packets and count the frames it decodes.
+    #[cfg(any(feature = "dolby", feature = "dts"))]
     fn decoded_frames(bridge: &mut AtmosBridge, stream: &[u8]) -> usize {
         stream
             .chunks(4096)
@@ -2296,6 +1511,7 @@ mod panic_guard_tests {
             .sum()
     }
 
+    #[cfg(feature = "dolby")]
     #[test]
     fn a_panic_in_the_eac3_path_is_a_reset_and_the_stream_decodes_after_it() {
         let mut bridge = AtmosBridge::new(false);
@@ -2303,6 +1519,7 @@ mod panic_guard_tests {
         assert!(decoded_frames(&mut bridge, EAC3) > 0);
     }
 
+    #[cfg(feature = "dts")]
     #[test]
     fn a_panic_in_the_dts_path_is_a_reset_and_the_stream_decodes_after_it() {
         let mut bridge = AtmosBridge::new(false);
@@ -2311,6 +1528,7 @@ mod panic_guard_tests {
     }
 
     /// Over IEC 61937 too: the guard is around the whole of `push_packet`.
+    #[cfg(feature = "dts")]
     #[test]
     fn a_panic_in_the_iec61937_dts_path_is_a_reset() {
         let mut bridge = AtmosBridge::new(false);
@@ -2325,6 +1543,7 @@ mod panic_guard_tests {
 
     /// Strict mode gets the panic as an error as well, as it does every other
     /// decode failure.
+    #[cfg(feature = "dts")]
     #[test]
     fn a_strict_bridge_reports_the_panic_as_an_error() {
         let mut bridge = AtmosBridge::new(true);
@@ -2340,6 +1559,7 @@ mod panic_guard_tests {
 
     /// TrueHD has no small fixture here: the panic is caught, and the bridge
     /// takes the next packet without one.
+    #[cfg(feature = "dolby")]
     #[test]
     fn a_panic_in_the_truehd_path_is_a_reset() {
         let mut bridge = AtmosBridge::new(false);

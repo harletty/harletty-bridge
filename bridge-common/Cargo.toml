@@ -1,0 +1,14 @@
+[package]
+name = "bridge-common"
+version = "0.8.0"
+edition = "2024"
+# Links bridge_api, like ../bridge: see the note there.
+license = "GPL-3.0-or-later"
+description = "What the harletty-bridge codec families share: shared state, host logging, frame helpers"
+repository = "https://github.com/harletty/harletty-bridge"
+publish = false
+
+[dependencies]
+bridge_api = { version = "0.5.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
+abi_stable = "0.11"
+log = "0.4"
