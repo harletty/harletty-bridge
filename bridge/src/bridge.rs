@@ -25,6 +25,7 @@ use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::validate_frame_shape;
 use crate::logging::bridge_diag_log;
 use crate::mat::MatStream;
+use crate::perf::PerfStats;
 #[cfg(feature = "iamf")]
 use crate::shared::AfterPush;
 use crate::shared::SharedState;
@@ -358,6 +359,7 @@ pub(crate) struct AtmosBridge {
     /// (bed labels from the OAMD bed assignment, then `Object` fillers).
     pub(crate) truehd_spatial_labels:
         Option<abi_stable::std_types::RVec<bridge_api::RChannelLabel>>,
+    pub(crate) perf: PerfStats,
 }
 
 impl AtmosBridge {
@@ -429,6 +431,7 @@ impl AtmosBridge {
             drc_mode: DrcMode::Off,
             frame_count: 0,
             truehd_spatial_labels: None,
+            perf: PerfStats::default(),
         };
 
         #[cfg(feature = "bridge-perf")]
@@ -441,7 +444,7 @@ impl AtmosBridge {
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|&v| v > 0)
                 .unwrap_or(120);
-            bridge.shared.perf.configure(enabled, interval);
+            bridge.perf.configure(enabled, interval);
         }
 
         bridge
@@ -882,7 +885,7 @@ impl AtmosBridge {
         match transport {
             RInputTransport::Raw => {
                 #[cfg(feature = "bridge-perf")]
-                self.shared.perf.note_raw_packet(data.len());
+                self.perf.note_raw_packet(data.len());
                 // One-shot diagnostic: log the first raw packet's first 64 bytes so we
                 // can correlate what the host (e.g. mpv-omniphony's ad_orender) feeds
                 // us against what the SPDIF path receives. Triggered only until the
@@ -947,7 +950,7 @@ impl AtmosBridge {
                     #[cfg(feature = "bridge-perf")]
                     let mat_started = Instant::now();
                     #[cfg(feature = "bridge-perf")]
-                    self.shared.perf.note_mat_packet(data.len());
+                    self.perf.note_mat_packet(data.len());
                     self.mat_stream.push_payload(data.as_slice());
                     loop {
                         #[cfg(feature = "bridge-perf")]
@@ -956,10 +959,9 @@ impl AtmosBridge {
                             Ok(Some(chunk)) => {
                                 #[cfg(feature = "bridge-perf")]
                                 {
-                                    self.shared
-                                        .perf
+                                    self.perf
                                         .record_mat_chunk_extract(chunk_extract_started.elapsed());
-                                    self.shared.perf.note_mat_chunk(chunk.len());
+                                    self.perf.note_mat_chunk(chunk.len());
                                 }
                                 process_extractor_input(self, &chunk, &mut result);
                                 if result.did_reset {
@@ -968,15 +970,13 @@ impl AtmosBridge {
                             }
                             Ok(None) => {
                                 #[cfg(feature = "bridge-perf")]
-                                self.shared
-                                    .perf
+                                self.perf
                                     .record_mat_chunk_extract(chunk_extract_started.elapsed());
                                 break;
                             }
                             Err(msg) => {
                                 #[cfg(feature = "bridge-perf")]
-                                self.shared
-                                    .perf
+                                self.perf
                                     .record_mat_chunk_extract(chunk_extract_started.elapsed());
                                 log::warn!("{msg}");
                                 self.reset_pipeline();
@@ -989,7 +989,7 @@ impl AtmosBridge {
                         }
                     }
                     #[cfg(feature = "bridge-perf")]
-                    self.shared.perf.record_mat(mat_started.elapsed());
+                    self.perf.record_mat(mat_started.elapsed());
                     return result;
                 }
 
@@ -1118,7 +1118,7 @@ impl FormatBridge for AtmosBridge {
 
     fn is_ready(&self) -> bool {
         #[cfg(feature = "iamf")]
-        if self.iamf.frame_count > 0 {
+        if self.iamf.is_ready() {
             return true;
         }
         self.frame_count > 0 || self.eac3_frame_count > 0 || self.dts_frame_count > 0
@@ -1212,7 +1212,7 @@ impl FormatBridge for AtmosBridge {
             #[cfg(feature = "bridge-perf")]
             "perf_profile" => {
                 let enabled = matches!(value.as_str(), "1" | "true" | "on" | "yes");
-                let report_every = self.shared.perf.configure_profile(enabled);
+                let report_every = self.perf.configure_profile(enabled);
                 eprintln!(
                     "harletty-bridge perf profiling {} (report_every_frames={})",
                     if enabled { "enabled" } else { "disabled" },
@@ -1223,7 +1223,7 @@ impl FormatBridge for AtmosBridge {
             #[cfg(feature = "bridge-perf")]
             "perf_report_every" => match value.as_str().parse::<u64>() {
                 Ok(interval) if interval > 0 => {
-                    self.shared.perf.configure_report_every(interval);
+                    self.perf.configure_report_every(interval);
                     eprintln!(
                         "harletty-bridge perf reporting interval set to {} frames",
                         interval

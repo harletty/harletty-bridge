@@ -8,19 +8,7 @@ use truehd::structs::oamd::ObjectAudioMetadataPayload;
 use crate::bridge::AtmosBridge;
 use crate::logging::bridge_diag_log;
 
-/// Sparse-emit an object↔channel declaration: return it only when it differs
-/// from the cached one (or after a cache clear, i.e. pipeline reset).
-pub(crate) fn declare_object_channels(
-    cache: &mut Option<RVec<bridge_api::RObjectChannel>>,
-    current: RVec<bridge_api::RObjectChannel>,
-) -> RVec<bridge_api::RObjectChannel> {
-    if cache.as_deref() == Some(current.as_slice()) {
-        RVec::new()
-    } else {
-        *cache = Some(current.clone());
-        current
-    }
-}
+pub(crate) use bridge_common::objects::declare_object_channels;
 
 /// Build an [`RMetadataFrame`] from an OAMD payload parsed from E-AC3.
 ///

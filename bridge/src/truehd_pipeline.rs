@@ -511,10 +511,7 @@ pub(crate) fn process_extractor_input(
     let push_started = Instant::now();
     bridge.extractor.push_bytes(input);
     #[cfg(feature = "bridge-perf")]
-    bridge
-        .shared
-        .perf
-        .record_extractor_push(push_started.elapsed());
+    bridge.perf.record_extractor_push(push_started.elapsed());
 
     let panic_result = {
         let mut ctx = DrainContext {
@@ -533,7 +530,7 @@ pub(crate) fn process_extractor_input(
             total_samples: &mut bridge.shared.total_samples,
             declared_object_channels: &mut bridge.shared.declared_object_channels,
             spatial_labels: &mut bridge.truehd_spatial_labels,
-            perf: &mut bridge.shared.perf,
+            perf: &mut bridge.perf,
         };
         #[cfg(feature = "bridge-perf")]
         let drain_started = Instant::now();
@@ -545,7 +542,7 @@ pub(crate) fn process_extractor_input(
             )
         }));
         #[cfg(feature = "bridge-perf")]
-        bridge.shared.perf.record_drain(drain_started.elapsed());
+        bridge.perf.record_drain(drain_started.elapsed());
         result
     };
 

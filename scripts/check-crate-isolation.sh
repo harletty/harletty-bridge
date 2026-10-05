@@ -52,6 +52,12 @@ check() {
 # nor a logger of its own: its diagnostics go through the host's log sink.
 check harletty-bridge "realtime plugin" damf clap indicatif indicatif-log-bridge env_logger
 
+# What the codec families share holds no decoder, and a family holds no other
+# family's decoders: an IAMF-only bridge carries none of them
+# (docs/plan-codec-family-crates.md).
+check bridge-common "shared by the codec families" truehd eac3 dca auro iamf-dec iamf-obu iamf-codecs
+check bridge-family-iamf "IAMF family" truehd eac3 dca auro
+
 # ...and the offline CLI must never pull in the bridge ABI: it stays a pure
 # offline tool, buildable without the sibling Omniphony checkout.
 check harletty "offline CLI" bridge_api spdif abi_stable

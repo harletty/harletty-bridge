@@ -9,7 +9,7 @@ use bridge_api::RDecodedFrame;
 /// (`float_to_pcm_i32` clamps to +/-2^23), so no sample comes within a factor
 /// of 256 of that threshold: the scan could never reject anything, and it cost
 /// a tenth of the realtime E-AC-3 path.
-pub(crate) fn validate_frame_shape(frame: &RDecodedFrame) -> Result<(), String> {
+pub fn validate_frame_shape(frame: &RDecodedFrame) -> Result<(), String> {
     if frame.sample_count == 0 {
         return Err("sample_count_zero".to_string());
     }
@@ -40,7 +40,7 @@ pub(crate) fn validate_frame_shape(frame: &RDecodedFrame) -> Result<(), String> 
 /// lands one past the positive maximum, hence the clamp; -1.0 is exactly
 /// `I24_MIN`, which the decoders do emit, so it must survive.
 #[inline]
-pub(crate) fn float_to_pcm_i32(sample: f32) -> i32 {
+pub fn float_to_pcm_i32(sample: f32) -> i32 {
     if !sample.is_finite() {
         return 0;
     }

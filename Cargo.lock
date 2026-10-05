@@ -183,6 +183,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bridge-common"
+version = "0.8.0"
+dependencies = [
+ "abi_stable",
+ "bridge_api",
+ "log",
+]
+
+[[package]]
+name = "bridge-family-iamf"
+version = "0.8.0"
+dependencies = [
+ "abi_stable",
+ "bridge-common",
+ "bridge_api",
+ "iamf-codecs",
+ "iamf-dec",
+ "iamf-obu",
+ "log",
+]
+
+[[package]]
 name = "bridge_api"
 version = "0.4.0"
 dependencies = [
@@ -640,12 +662,11 @@ version = "0.8.0"
 dependencies = [
  "abi_stable",
  "auro",
+ "bridge-common",
+ "bridge-family-iamf",
  "bridge_api",
  "dca",
  "eac3",
- "iamf-codecs",
- "iamf-dec",
- "iamf-obu",
  "libc",
  "log",
  "serde",

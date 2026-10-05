@@ -95,13 +95,14 @@ jobs:
 
       # IAMF is opt-in (its Opus path links libopus, which the Windows and
       # macOS release builds do not provide yet), so the default build above
-      # never compiles it. The decode tests against the libiamf conformance
+      # never compiles it: bridge-family-iamf is left out of the workspace's
+      # default members. The decode tests against the libiamf conformance
       # vectors skip here: they need HARLETTY_IAMF_VECTORS.
       - name: Install libopus
         run: sudo apt-get update && sudo apt-get install -y libopus-dev
 
       - name: Test iamf feature
-        run: cargo test -p harletty-bridge --features iamf
+        run: cargo test -p harletty-bridge -p bridge-family-iamf --features harletty-bridge/iamf
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings

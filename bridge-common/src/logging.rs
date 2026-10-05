@@ -5,7 +5,7 @@ use std::sync::{Mutex, OnceLock};
 static HOST_LOG_SINK: Mutex<Option<BridgeHostLogSink>> = Mutex::new(None);
 static DRC_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 
-pub(crate) extern "C" fn register_host_log_sink(sink: usize) {
+pub extern "C" fn register_host_log_sink(sink: usize) {
     let mut slot = HOST_LOG_SINK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -16,11 +16,11 @@ pub(crate) extern "C" fn register_host_log_sink(sink: usize) {
     };
 }
 
-pub(crate) fn bridge_diag_log(level: log::Level, message: &str) {
+pub fn bridge_diag_log(level: log::Level, message: &str) {
     bridge_external_log(level, "harletty-bridge::diag", message);
 }
 
-pub(crate) fn drc_diag_log_enabled() -> bool {
+pub fn drc_diag_log_enabled() -> bool {
     *DRC_LOG_ENABLED.get_or_init(|| {
         std::env::var_os("HARLETTY_LOG_DRC")
             .map(|value| value != "0")
@@ -28,7 +28,7 @@ pub(crate) fn drc_diag_log_enabled() -> bool {
     })
 }
 
-pub(crate) fn bridge_external_log(level: log::Level, target: &str, message: &str) {
+pub fn bridge_external_log(level: log::Level, target: &str, message: &str) {
     let trimmed = message.trim_end_matches('\n');
     let sink = {
         let slot = HOST_LOG_SINK
@@ -47,7 +47,7 @@ pub(crate) fn bridge_external_log(level: log::Level, target: &str, message: &str
     }
 }
 
-pub(crate) fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+pub fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         s.to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {

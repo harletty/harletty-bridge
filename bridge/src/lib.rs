@@ -5,16 +5,17 @@ mod dts_pipeline;
 mod dts_spdif;
 mod eac3_pipeline;
 mod eac3_spdif;
-mod frame_builders;
-#[cfg(feature = "iamf")]
-mod iamf_pipeline;
 mod labels;
-mod logging;
 mod mat;
 mod metadata;
 mod perf;
-mod shared;
 mod truehd_pipeline;
+
+// The codec families and what they share live in their own crates; these
+// keep the `crate::` paths the remaining in-crate paths use.
+use bridge_common::{frame_builders, logging, shared};
+#[cfg(feature = "iamf")]
+use bridge_family_iamf as iamf_pipeline;
 
 use abi_stable::std_types::RVec;
 use abi_stable::{

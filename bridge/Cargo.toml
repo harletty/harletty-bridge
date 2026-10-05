@@ -18,17 +18,19 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 bridge-perf = ["truehd/perf"]
-# IAMF (AOMedia Immersive Audio Model and Formats) through iamf-rs. Off by
-# default: its Opus decoding links libopus (pkg-config, or OPUS_LIB_DIR), and
-# the Windows and macOS release builds do not provide one yet. The pure-Rust
-# Opus decoder iamf-rs also offers is far below realtime on real content.
-iamf = ["dep:iamf-obu", "dep:iamf-dec", "dep:iamf-codecs"]
+# IAMF (AOMedia Immersive Audio Model and Formats): the bridge-family-iamf
+# crate. Off by default: its Opus decoding links libopus (pkg-config, or
+# OPUS_LIB_DIR), and the Windows and macOS release builds do not provide one
+# yet.
+iamf = ["dep:bridge-family-iamf"]
 
 # Path deps reach out of the workspace to the sibling Omniphony checkout:
 # `bridge/../../Omniphony` is the workflow symlink locally and the second
 # checkout in CI.
 [dependencies]
 bridge_api = { version = "0.4.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
+bridge-common = { version = "0.8.0", path = "../bridge-common" }
+bridge-family-iamf = { version = "0.8.0", path = "../bridge-family-iamf", optional = true }
 truehd = { version = "0.7.2" }
 eac3 = { version = "0.8.0", path = "../eac3" }
 dca = { version = "0.8.0", path = "../dca" }
@@ -37,16 +39,6 @@ abi_stable = "0.11"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml_ng = "0.10"
-# iamf-rs is not on crates.io: pinned to a reviewed commit of harletty's fork,
-# which adds IAMF v2.0 object passthrough and an allocation-free f32 output
-# path to baylesj/iamf-rs, puts a parameter tick on one sample when the rates
-# agree, renders the expanded loudspeaker layouts (9.1.6, 10.2.9.3, 7.1.5.4
-# and their subsets), and hands a channel-based element out in its own
-# layout (the dialogue element, tagged for the renderer).
-iamf-obu = { git = "https://github.com/harletty/iamf-rs", rev = "dab1c71d0f7198dd5ac644bd6fafb62f49e2c160", optional = true }
-iamf-dec = { git = "https://github.com/harletty/iamf-rs", rev = "dab1c71d0f7198dd5ac644bd6fafb62f49e2c160", default-features = false, optional = true }
-iamf-codecs = { git = "https://github.com/harletty/iamf-rs", rev = "dab1c71d0f7198dd5ac644bd6fafb62f49e2c160", default-features = false, features = ["pcm", "flac", "aac", "opus-ffi"], optional = true }
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

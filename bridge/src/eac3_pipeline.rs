@@ -228,7 +228,7 @@ fn build_object_frame(
     let base_sample_pos = bridge.eac3_total_samples;
     bridge.eac3_total_samples += sample_count as u64;
     let rf = build_eac3_frame_from_object(result, base_sample_pos, bridge);
-    bridge.shared.perf.maybe_report(bridge.eac3_frame_count);
+    bridge.perf.maybe_report(bridge.eac3_frame_count);
     maybe_dump_ok_frame(frame, "obj");
     rf
 }
@@ -264,7 +264,7 @@ fn emit_core_frame(
             let base_sample_pos = bridge.eac3_total_samples;
             bridge.eac3_total_samples += sample_count as u64;
             let rf = build_eac3_frame_from_core(&pcm, &info, base_sample_pos, bridge);
-            bridge.shared.perf.maybe_report(bridge.eac3_frame_count);
+            bridge.perf.maybe_report(bridge.eac3_frame_count);
             maybe_dump_ok_frame(frame, "pcm");
             Ok(rf)
         }
@@ -401,7 +401,7 @@ pub(crate) fn resolve_eac3_presentation(
         let sample_count = bed.samples_per_channel();
         bridge.eac3_total_samples += sample_count as u64;
         bridge.eac3_diag_stats.dependent_pair_channel_beds += 1;
-        bridge.shared.perf.maybe_report(bridge.eac3_frame_count);
+        bridge.perf.maybe_report(bridge.eac3_frame_count);
         return Ok(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge));
     }
 
@@ -445,7 +445,7 @@ pub(crate) fn resolve_eac3_presentation(
             let base_sample_pos = bridge.eac3_total_samples;
             bridge.eac3_total_samples += sample_count as u64;
             bridge.eac3_diag_stats.paired_object_frames += 1;
-            bridge.shared.perf.maybe_report(bridge.eac3_frame_count);
+            bridge.perf.maybe_report(bridge.eac3_frame_count);
             maybe_dump_ok_frame(last, "depobj");
             Ok(build_eac3_frame_from_object(
                 result,
@@ -904,9 +904,8 @@ fn build_eac3_frame_from_object(
     #[cfg(feature = "bridge-perf")]
     {
         let elapsed = metadata_started.elapsed();
-        bridge.shared.perf.record_build_metadata(elapsed);
+        bridge.perf.record_build_metadata(elapsed);
         bridge
-            .shared
             .perf
             .note_built_frame(metadata.len(), metadata_events);
     }
@@ -1123,7 +1122,7 @@ pub(crate) fn build_standalone_ac3_core_frame(
     let sample_count = core.samples_per_channel();
     bridge.eac3_total_samples += sample_count as u64;
     bridge.eac3_diag_stats.standalone_ac3_core_beds += 1;
-    bridge.shared.perf.maybe_report(bridge.eac3_frame_count);
+    bridge.perf.maybe_report(bridge.eac3_frame_count);
     build_eac3_channel_bed_frame(core, info.as_ref(), bridge)
 }
 

@@ -96,7 +96,6 @@ pub struct SharedState {
     pub strict: bool,
     pub total_samples: u64,
     pub declared_object_channels: Option<RVec<RObjectChannel>>,
-    pub perf: PerfStats,
 }
 
 pub trait FamilyPipeline: Default {
@@ -119,6 +118,10 @@ pub trait FamilyPipeline: Default {
     fn declared_families(out: &mut RVec<RSourceFamily>);
 }
 ```
+
+`PerfStats` is not shared: under `bridge-perf` it records the TrueHD parser's
+own statistics, so it would put `truehd` into `bridge-common`. It stays with
+the router until the Dolby family takes it (step 6).
 
 Dolby-only knobs (`presentation`, DRC) stay family state: the router forwards
 `configure("presentation")` and `set_drc_mode` to the Dolby pipeline when it is
@@ -171,13 +174,18 @@ leaves output bit-identical.
    DTS:X, Auro carrier, IAMF) on `main`, to compare against at every step.
 2. **Prune dependencies.** Drop the unused `spdif`, `sys` and `anyhow` from
    `bridge/Cargo.toml`.
-3. **`SharedState` inside the crate.** Move `strict`, `total_samples`,
-   `declared_object_channels` and `perf` into one struct field; pipelines take
-   it explicitly. Mechanical, no file moves yet.
+3. **`SharedState` inside the crate.** Move `strict`, `total_samples` and
+   `declared_object_channels` into one struct field; pipelines take it
+   explicitly. Mechanical, no file moves yet.
 4. **IAMF first** (smallest coupling): `push_iamf` takes
-   `(&mut IamfState, &mut SharedState)` instead of `&mut AtmosBridge`; then the
-   module moves to `bridge-family-iamf` and `bridge-common` is created with
-   what it needs.
+   `(&mut IamfState, &mut SharedState)` instead of `&mut AtmosBridge` and
+   returns `AfterPush` (reset the pipeline or not) instead of resetting it;
+   then the module moves to `bridge-family-iamf` and `bridge-common` is
+   created with what it needs. The conformance tests that only use the host
+   API become `bridge/tests/iamf_conformance.rs`; those that compare against
+   a direct iamf-rs decode stay in the family crate, behind a harness that
+   answers like the router. `bridge-family-iamf` is not a default workspace
+   member, so a plain `cargo test` still needs no libopus.
 5. **DTS + Auro**: gather `dts_*` fields into `DtsPipeline`, split the DTS and
    Auro parts out of `labels.rs`, move the fold config (and serde) along, then
    move the crate.
