@@ -26,7 +26,7 @@ use crate::eac3_pipeline::{
 };
 use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::validate_frame_shape;
-use crate::logging::bridge_diag_log;
+use crate::logging::{bridge_diag_log, bridge_log};
 use crate::mat::MatStream;
 use crate::perf::PerfStats;
 use crate::shared::{AfterPush, SharedState};
@@ -414,7 +414,7 @@ impl DolbyPipeline {
                     break;
                 }
                 Err(msg) => {
-                    bridge_diag_log(log::Level::Warn, &format!("eac3_error={msg}"));
+                    bridge_log!(log::Level::Warn, "eac3_error={msg}");
                     log::warn!("{msg}");
                     result.did_reset = true;
                     result.error_message = msg.into();
@@ -528,12 +528,11 @@ impl DolbyPipeline {
                 return false;
             }
         };
-        bridge_diag_log(
+        bridge_log!(
             log::Level::Info,
-            &format!(
-                "[harletty][drc] set_drc_mode {:?} -> {:?}",
-                self.drc_mode, new_mode
-            ),
+            "[harletty][drc] set_drc_mode {:?} -> {:?}",
+            self.drc_mode,
+            new_mode
         );
         if required_presentations(self.presentation, new_mode)
             != required_presentations(self.presentation, self.drc_mode)
@@ -744,12 +743,11 @@ impl DolbyPipeline {
                     diagnose_eac3_frame(self, frame, &inspection);
                     self.eac3_diag_stats.ac3_core_decode_failures += 1;
                     self.eac3_diag_stats.last_ac3_core_decode_error = Some(err.clone());
-                    bridge_diag_log(
+                    bridge_log!(
                         log::Level::Warn,
-                        &format!(
-                            "ac3_core_decode_failed index={} error={}",
-                            self.eac3_frame_count, err
-                        ),
+                        "ac3_core_decode_failed index={} error={}",
+                        self.eac3_frame_count,
+                        err
                     );
                     // Stand in one frame of silence for the core and stop here.
                     // This used to fall through to the E-AC-3 decoders, which
@@ -797,17 +795,15 @@ impl DolbyPipeline {
         match decode_result {
             Ok(decoded_frame) => {
                 if let Err(reason) = validate_frame_shape(&decoded_frame) {
-                    bridge_diag_log(
+                    bridge_log!(
                         log::Level::Warn,
-                        &format!(
-                            "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={}",
-                            self.eac3_frame_count,
-                            reason,
-                            decoded_frame.sampling_frequency,
-                            decoded_frame.sample_count,
-                            decoded_frame.channel_count,
-                            decoded_frame.pcm.len()
-                        ),
+                        "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={}",
+                        self.eac3_frame_count,
+                        reason,
+                        decoded_frame.sampling_frequency,
+                        decoded_frame.sample_count,
+                        decoded_frame.channel_count,
+                        decoded_frame.pcm.len()
                     );
                     return Ok(());
                 }

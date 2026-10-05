@@ -28,7 +28,7 @@ iamf = ["dep:bridge-family-iamf"]
 # `bridge/../../Omniphony` is the workflow symlink locally and the second
 # checkout in CI.
 [dependencies]
-bridge_api = { version = "0.4.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
+bridge_api = { version = "0.5.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
 bridge-common = { version = "0.8.0", path = "../bridge-common" }
 bridge-family-dts = { version = "0.8.0", path = "../bridge-family-dts" }
 bridge-family-iamf = { version = "0.8.0", path = "../bridge-family-iamf", optional = true }

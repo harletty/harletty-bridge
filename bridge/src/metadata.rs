@@ -5,7 +5,7 @@ use eac3::OamdPayload;
 use std::time::Instant;
 use truehd::structs::oamd::ObjectAudioMetadataPayload;
 
-use crate::logging::bridge_diag_log;
+use crate::logging::bridge_log;
 use crate::shared::SharedState;
 
 pub(crate) use bridge_common::objects::declare_object_channels;
@@ -119,19 +119,17 @@ fn extract_eac3_events(
                 .unwrap_or(0);
 
             if size != [0.0, 0.0, 0.0] {
-                bridge_diag_log(
+                bridge_log!(
                     log::Level::Info,
-                    &format!(
-                        "[harletty][object-size] non-zero detected obj_idx={} dyn_idx={} id={} sample_pos={} sample_offset={} has_pos={} size={:?} ramp={}",
-                        obj_idx,
-                        dynamic_idx,
-                        id,
-                        base_sample_pos + sample_offset,
-                        sample_offset,
-                        has_pos,
-                        size,
-                        ramp_duration
-                    ),
+                    "[harletty][object-size] non-zero detected obj_idx={} dyn_idx={} id={} sample_pos={} sample_offset={} has_pos={} size={:?} ramp={}",
+                    obj_idx,
+                    dynamic_idx,
+                    id,
+                    base_sample_pos + sample_offset,
+                    sample_offset,
+                    has_pos,
+                    size,
+                    ramp_duration
                 );
             }
             if block.distance.is_some()
@@ -139,21 +137,19 @@ fn extract_eac3_events(
                 || block.depth_factor.is_some()
                 || block.anchor != eac3::ObjectAnchor::Room
             {
-                bridge_diag_log(
+                bridge_log!(
                     log::Level::Info,
-                    &format!(
-                        "[harletty][oamd] visual attrs obj_idx={} dyn_idx={} id={} sample_pos={} sample_offset={} anchor={:?} distance={:?} screen_factor={:?} depth_factor={:?} size={:?}",
-                        obj_idx,
-                        dynamic_idx,
-                        id,
-                        base_sample_pos + sample_offset,
-                        sample_offset,
-                        block.anchor,
-                        block.distance,
-                        block.screen_factor,
-                        block.depth_factor,
-                        size
-                    ),
+                    "[harletty][oamd] visual attrs obj_idx={} dyn_idx={} id={} sample_pos={} sample_offset={} anchor={:?} distance={:?} screen_factor={:?} depth_factor={:?} size={:?}",
+                    obj_idx,
+                    dynamic_idx,
+                    id,
+                    base_sample_pos + sample_offset,
+                    sample_offset,
+                    block.anchor,
+                    block.distance,
+                    block.screen_factor,
+                    block.depth_factor,
+                    size
                 );
             }
 

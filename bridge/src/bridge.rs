@@ -5,7 +5,7 @@ use bridge_api::{
 };
 
 use crate::dolby::{DolbyPipeline, FAMILY_DOLBY};
-use crate::logging::bridge_diag_log;
+use crate::logging::{bridge_diag_log, bridge_log};
 use crate::shared::{AfterPush, SharedState};
 use bridge_family_dts::{DtsPipeline, FAMILY_AURO, FAMILY_DTS};
 
@@ -460,6 +460,22 @@ impl FormatBridge for AtmosBridge {
                 );
                 true
             }
+            // Process-wide, like the host's own level: messages above it are
+            // never formatted nor handed to the sink (see `logging`).
+            "log_level" => match value.as_str().trim().parse::<log::LevelFilter>() {
+                Ok(level) => {
+                    crate::logging::set_max_level(level);
+                    true
+                }
+                Err(_) => {
+                    bridge_log!(
+                        log::Level::Warn,
+                        "atmos-bridge: unknown log_level {:?}",
+                        value.as_str()
+                    );
+                    false
+                }
+            },
             key => self
                 .dolby
                 .configure(key, value.as_str())
@@ -680,6 +696,19 @@ mod raw_transport_tests {
         assert_eq!(sniff_raw_codec(&thd), Some(RawCodec::TrueHd));
         // Truncated before the code.
         assert_eq!(sniff_raw_codec(&[0xF8, 0x06, b'i', b'a']), None);
+    }
+
+    #[test]
+    fn configure_log_level_sets_the_forwarded_level() {
+        let _guard = crate::logging::LEVEL_TEST_LOCK.lock().unwrap();
+        let mut bridge = AtmosBridge::new(false);
+        assert!(bridge.configure("log_level".into(), "debug".into()));
+        assert!(crate::logging::log_enabled(log::Level::Debug));
+        assert!(bridge.configure("log_level".into(), "WARN".into()));
+        assert!(!crate::logging::log_enabled(log::Level::Info));
+        assert!(!bridge.configure("log_level".into(), "loud".into()));
+        assert!(!crate::logging::log_enabled(log::Level::Info));
+        crate::logging::set_max_level(log::LevelFilter::Info);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use truehd::structs::access_unit::AccessUnit;
 
 use crate::dolby::{DolbyPipeline, DrcMode};
 use crate::labels::{channel_label_to_r, oamd_speaker_to_label};
-use crate::logging::{bridge_diag_log, drc_diag_log_enabled, panic_message};
+use crate::logging::{bridge_log, drc_diag_log_enabled, panic_message};
 use crate::metadata::build_metadata_frame_from_oamd;
 use crate::perf::PerfStats;
 use crate::shared::{AfterPush, SharedState};
@@ -332,12 +332,14 @@ fn drain_frames(
                             })
                         })
                         .collect();
-                    bridge_diag_log(
+                    bridge_log!(
                         log::Level::Info,
-                        &format!(
-                            "[harletty][drc] mode={:?} src_ss={:?} gain={:.4} ramp={} state={:?}",
-                            ctx.drc_mode, drc_source_ss, drc_gain, drc_ramp_duration, probe
-                        ),
+                        "[harletty][drc] mode={:?} src_ss={:?} gain={:.4} ramp={} state={:?}",
+                        ctx.drc_mode,
+                        drc_source_ss,
+                        drc_gain,
+                        drc_ramp_duration,
+                        probe
                     );
                 }
 
