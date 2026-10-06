@@ -242,6 +242,11 @@ pub struct DtsPipeline {
     /// Auro-3D detection and unfolding over the lossless DTS-HD output.
     /// Holds the first frames back until the carrier question is settled.
     pub(crate) auro: DtsAuroState,
+    /// Frames the core decoder rejected, plain or behind an extension
+    /// substream it does not read, since the last reset.
+    pub(crate) core_decode_errors: RepeatCounter,
+    /// Frames the DTS-HD decoder rejected since the last reset.
+    pub(crate) hd_decode_errors: RepeatCounter,
 }
 
 impl DtsPipeline {
@@ -257,6 +262,8 @@ impl DtsPipeline {
             objects_active: false,
             profile: DtsProfile::default(),
             auro: DtsAuroState::default(),
+            core_decode_errors: RepeatCounter::default(),
+            hd_decode_errors: RepeatCounter::default(),
         }
     }
 
@@ -271,6 +278,8 @@ impl DtsPipeline {
         self.objects_active = false;
         self.profile = DtsProfile::default();
         self.auro.reset();
+        self.core_decode_errors = RepeatCounter::default();
+        self.hd_decode_errors = RepeatCounter::default();
     }
 
     /// Raw transport: frames as they come in the elementary stream.
@@ -452,12 +461,13 @@ fn drain_dts(
                     }
                     Err(HdError::Pending) => {} // PBR buffering; no frame this packet
                     Err(e) => {
-                        let msg = format!("dts_hd_decode_error={e:?}");
-                        bridge_diag_log(log::Level::Warn, &msg);
-                        if shared.strict {
-                            result.error_message = RString::from(msg);
-                            result.did_reset = true;
-                            return AfterPush::ResetPipeline;
+                        if let Some(after) = decode_failed(
+                            &mut dts.hd_decode_errors,
+                            format_args!("dts_hd_decode_error={e:?}"),
+                            shared.strict,
+                            result,
+                        ) {
+                            return after;
                         }
                     }
                 }
@@ -480,12 +490,13 @@ fn drain_dts(
                         dts.frame_count += 1;
                     }
                     Err(err) => {
-                        let msg = format!("dts_decode_error={err}");
-                        bridge_diag_log(log::Level::Warn, &msg);
-                        if shared.strict {
-                            result.error_message = RString::from(msg);
-                            result.did_reset = true;
-                            return AfterPush::ResetPipeline;
+                        if let Some(after) = decode_failed(
+                            &mut dts.core_decode_errors,
+                            format_args!("dts_decode_error={err}"),
+                            shared.strict,
+                            result,
+                        ) {
+                            return after;
                         }
                     }
                 }
@@ -505,12 +516,13 @@ fn drain_dts(
                     result.frames.push(frame);
                 }
                 Err(err) => {
-                    let msg = format!("dts_decode_error={err}");
-                    bridge_diag_log(log::Level::Warn, &msg);
-                    if shared.strict {
-                        result.error_message = RString::from(msg);
-                        result.did_reset = true;
-                        return AfterPush::ResetPipeline;
+                    if let Some(after) = decode_failed(
+                        &mut dts.core_decode_errors,
+                        format_args!("dts_decode_error={err}"),
+                        shared.strict,
+                        result,
+                    ) {
+                        return after;
                     }
                 }
             }
@@ -522,6 +534,33 @@ fn drain_dts(
         dts.buf.drain(..consumed.min(dts.buf.len()));
     }
     AfterPush::Continue
+}
+
+/// A frame did not decode. Strict mode fails the push with the error and has
+/// the pipeline reset. Otherwise the frame is dropped and decoding goes on;
+/// the failure is counted in `errors` and logged only on its 1st, 2nd, 4th,
+/// 8th... occurrence, as a corrupt stream fails on every frame.
+fn decode_failed(
+    errors: &mut RepeatCounter,
+    error: std::fmt::Arguments<'_>,
+    strict: bool,
+    result: &mut RPushResult,
+) -> Option<AfterPush> {
+    let reported = errors.note();
+    if strict {
+        let msg = error.to_string();
+        bridge_diag_log(log::Level::Warn, &msg);
+        result.error_message = RString::from(msg);
+        result.did_reset = true;
+        return Some(AfterPush::ResetPipeline);
+    }
+    if let Some(count) = reported {
+        bridge_log!(
+            log::Level::Warn,
+            "{error} ({count} frame(s) dropped so far)"
+        );
+    }
+    None
 }
 
 fn find(data: &[u8], needle: &[u8; 4]) -> Option<usize> {
@@ -955,6 +994,105 @@ mod tests {
         assert_eq!(ls_azimuth(&dts), Some(-110.0));
         dts.surrounds_on_side = true;
         assert_eq!(ls_azimuth(&dts), Some(-90.0));
+    }
+
+    fn empty_result() -> RPushResult {
+        RPushResult {
+            frames: RVec::new(),
+            error_message: RString::new(),
+            did_reset: false,
+        }
+    }
+
+    /// A core frame whose header parses and whose audio does not decode,
+    /// followed by four bytes that end it (no extension substream).
+    fn corrupt_core_frame() -> Vec<u8> {
+        const FIXTURE: &[u8] =
+            include_bytes!("../../harletty/tests/fixtures/dts_core_tone_10f.dts");
+        let size = parse_header(FIXTURE).expect("fixture header").frame_size;
+        let mut frame = FIXTURE[..size].to_vec();
+        frame[16..].fill(0xFF);
+        frame.extend_from_slice(&[0; 4]);
+        frame
+    }
+
+    /// A stream whose every core frame fails is dropped frame by frame and
+    /// counted, so it is logged on the 1st, 2nd, 4th... failure rather than
+    /// on each; a reset starts the count over.
+    #[test]
+    fn core_decode_failures_are_counted_across_frames() {
+        let frame = corrupt_core_frame();
+        let mut dts = DtsPipeline::new();
+        let mut shared = SharedState::new(false);
+        for failures in 1..=20 {
+            let mut result = empty_result();
+            assert_eq!(
+                dts.push_raw(&mut shared, &frame, &mut result),
+                AfterPush::Continue
+            );
+            assert!(result.frames.is_empty());
+            assert!(result.error_message.is_empty(), "{}", result.error_message);
+            assert_eq!(dts.core_decode_errors.count(), failures);
+        }
+        assert_eq!(dts.hd_decode_errors.count(), 0);
+        dts.reset();
+        assert_eq!(dts.core_decode_errors.count(), 0);
+    }
+
+    /// Strict mode still fails every push whose frame does not decode.
+    #[test]
+    fn strict_mode_reports_every_core_decode_failure() {
+        let frame = corrupt_core_frame();
+        let mut dts = DtsPipeline::new();
+        let mut shared = SharedState::new(true);
+        for _ in 0..3 {
+            let mut result = empty_result();
+            assert_eq!(
+                dts.push_raw(&mut shared, &frame, &mut result),
+                AfterPush::ResetPipeline
+            );
+            assert!(result.did_reset);
+            assert!(
+                result.error_message.starts_with("dts_decode_error="),
+                "{}",
+                result.error_message
+            );
+            dts.reset();
+        }
+    }
+
+    /// The DTS-HD route counts its failures the same way. No committed
+    /// fixture carries an extension substream, so this drives the failure
+    /// handling the HD decode error goes through directly.
+    #[test]
+    fn hd_decode_failures_are_counted_and_strict_mode_reports_each() {
+        let mut dts = DtsPipeline::new();
+        for failures in 1..=20 {
+            let mut result = empty_result();
+            let after = decode_failed(
+                &mut dts.hd_decode_errors,
+                format_args!("dts_hd_decode_error={:?}", HdError::Core),
+                false,
+                &mut result,
+            );
+            assert_eq!(after, None);
+            assert!(result.error_message.is_empty());
+            assert_eq!(dts.hd_decode_errors.count(), failures);
+        }
+
+        let mut result = empty_result();
+        let after = decode_failed(
+            &mut dts.hd_decode_errors,
+            format_args!("dts_hd_decode_error={:?}", HdError::Core),
+            true,
+            &mut result,
+        );
+        assert_eq!(after, Some(AfterPush::ResetPipeline));
+        assert!(result.did_reset);
+        assert_eq!(result.error_message.as_str(), "dts_hd_decode_error=Core");
+
+        dts.reset();
+        assert_eq!(dts.hd_decode_errors.count(), 0);
     }
     use dca::{BedFold, SourceMetadata, SpatialChannel, gain_code_linear};
 
