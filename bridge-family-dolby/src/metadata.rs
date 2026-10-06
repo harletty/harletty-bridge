@@ -5,7 +5,7 @@ use eac3::OamdPayload;
 use std::time::Instant;
 use truehd::structs::oamd::ObjectAudioMetadataPayload;
 
-use crate::logging::bridge_log;
+use crate::logging::{RepeatCounter, bridge_log};
 use crate::shared::SharedState;
 
 pub(crate) use bridge_common::objects::declare_object_channels;
@@ -285,6 +285,29 @@ mod tests {
     }
 }
 
+/// The TrueHD object metadata the bridge could not use, since the last reset.
+///
+/// Object content the bridge does not support (ISF objects, say) shows the
+/// same condition on every OAMD frame, so each is logged on its 1st, 2nd,
+/// 4th, 8th... frame only.
+#[derive(Debug, Default)]
+pub(crate) struct OamdWarnings {
+    /// Frames skipped for a `num_obj_info_blocks` other than 1.
+    pub(crate) unsupported_obj_info_blocks: RepeatCounter,
+    /// Frames skipped for a bed assignment count other than 1.
+    pub(crate) unsupported_bed_assignments: RepeatCounter,
+    /// Frames skipped for carrying ISF objects.
+    pub(crate) unsupported_isf_objects: RepeatCounter,
+    /// Frames with objects missing their object data.
+    pub(crate) missing_object_data: RepeatCounter,
+    /// Frames with objects whose object data holds no block.
+    pub(crate) empty_object_blocks: RepeatCounter,
+    /// Frames with bed objects past the bed assignment.
+    pub(crate) bed_index_out_of_range: RepeatCounter,
+    /// Frames with objects that have no DAMF position.
+    pub(crate) missing_damf_positions: RepeatCounter,
+}
+
 /// Build an [`RMetadataFrame`] from a TrueHD OAMD payload.
 ///
 /// Fixed channels are described by the frame's channel labels; the metadata
@@ -297,11 +320,12 @@ pub(crate) fn build_metadata_frame_from_oamd(
     evo_base: u64,
     frame_sample_pos: u64,
     declared_object_channels: &mut Option<RVec<bridge_api::RObjectChannel>>,
+    warnings: &mut OamdWarnings,
     #[cfg(feature = "bridge-perf")] perf: &mut crate::perf::PerfStats,
 ) -> RMetadataFrame {
     #[cfg(feature = "bridge-perf")]
     let events_started = Instant::now();
-    let extracted = extract_events(oamd, evo_base);
+    let extracted = extract_events(oamd, evo_base, warnings);
     #[cfg(feature = "bridge-perf")]
     perf.record_build_metadata_events(events_started.elapsed());
 
@@ -355,6 +379,7 @@ impl ExtractedTruehdMetadata {
 fn extract_events(
     oamd: &ObjectAudioMetadataPayload,
     base_sample_pos: u64,
+    warnings: &mut OamdWarnings,
 ) -> ExtractedTruehdMetadata {
     let object_count = oamd.object_count;
     let Some(object_element) = &oamd.object_element else {
@@ -362,27 +387,33 @@ fn extract_events(
     };
 
     if object_element.md_update_info.num_obj_info_blocks != 1 {
-        bridge_log!(
-            log::Level::Warn,
-            "atmos-bridge: unsupported OAMD with num_obj_info_blocks={} (expected 1); skipping metadata frame",
-            object_element.md_update_info.num_obj_info_blocks
-        );
+        if let Some(frames) = warnings.unsupported_obj_info_blocks.note() {
+            bridge_log!(
+                log::Level::Warn,
+                "atmos-bridge: unsupported OAMD with num_obj_info_blocks={} (expected 1); skipping metadata frame ({frames} frame(s) so far)",
+                object_element.md_update_info.num_obj_info_blocks
+            );
+        }
         return ExtractedTruehdMetadata::empty();
     }
     if oamd.program_assignment.bed_assignment.len() != 1 {
-        bridge_log!(
-            log::Level::Warn,
-            "atmos-bridge: unsupported OAMD with bed_assignment_count={} (expected 1); skipping metadata frame",
-            oamd.program_assignment.bed_assignment.len()
-        );
+        if let Some(frames) = warnings.unsupported_bed_assignments.note() {
+            bridge_log!(
+                log::Level::Warn,
+                "atmos-bridge: unsupported OAMD with bed_assignment_count={} (expected 1); skipping metadata frame ({frames} frame(s) so far)",
+                oamd.program_assignment.bed_assignment.len()
+            );
+        }
         return ExtractedTruehdMetadata::empty();
     }
     if oamd.program_assignment.num_isf_objects != 0 {
-        bridge_log!(
-            log::Level::Warn,
-            "atmos-bridge: unsupported OAMD with num_isf_objects={} (expected 0); skipping metadata frame",
-            oamd.program_assignment.num_isf_objects
-        );
+        if let Some(frames) = warnings.unsupported_isf_objects.note() {
+            bridge_log!(
+                log::Level::Warn,
+                "atmos-bridge: unsupported OAMD with num_isf_objects={} (expected 0); skipping metadata frame ({frames} frame(s) so far)",
+                oamd.program_assignment.num_isf_objects
+            );
+        }
         return ExtractedTruehdMetadata::empty();
     }
 
@@ -453,33 +484,41 @@ fn extract_events(
         });
     }
 
-    if missing_object_data > 0 {
+    if missing_object_data > 0
+        && let Some(frames) = warnings.missing_object_data.note()
+    {
         bridge_log!(
             log::Level::Warn,
-            "atmos-bridge: missing object_data for {} object(s) (object_count={}); skipped",
+            "atmos-bridge: missing object_data for {} object(s) (object_count={}); skipped ({frames} frame(s) so far)",
             missing_object_data,
             object_count
         );
     }
-    if empty_object_blocks > 0 {
+    if empty_object_blocks > 0
+        && let Some(frames) = warnings.empty_object_blocks.note()
+    {
         bridge_log!(
             log::Level::Warn,
-            "atmos-bridge: empty object_data blocks for {} object(s); skipped",
+            "atmos-bridge: empty object_data blocks for {} object(s); skipped ({frames} frame(s) so far)",
             empty_object_blocks
         );
     }
-    if bed_index_oob > 0 {
+    if bed_index_oob > 0
+        && let Some(frames) = warnings.bed_index_out_of_range.note()
+    {
         bridge_log!(
             log::Level::Warn,
-            "atmos-bridge: bed index out-of-range for {} object(s) (bed_index_len={}); skipped",
+            "atmos-bridge: bed index out-of-range for {} object(s) (bed_index_len={}); skipped ({frames} frame(s) so far)",
             bed_index_oob,
             bed_index_vec.len()
         );
     }
-    if missing_damf_pos > 0 {
+    if missing_damf_pos > 0
+        && let Some(frames) = warnings.missing_damf_positions.note()
+    {
         bridge_log!(
             log::Level::Warn,
-            "atmos-bridge: missing DAMF position for {} object(s); positions omitted",
+            "atmos-bridge: missing DAMF position for {} object(s); positions omitted ({frames} frame(s) so far)",
             missing_damf_pos
         );
     }
@@ -488,5 +527,126 @@ fn extract_events(
         events,
         channel_gains,
         objects,
+    }
+}
+
+/// TrueHD object metadata the bridge cannot use is counted once per frame.
+#[cfg(test)]
+mod truehd_oamd_warnings {
+    use super::{OamdWarnings, extract_events};
+    use truehd::structs::oamd::{
+        BedAssignment, BlockUpdateInfo, MDUpdateInfo, ObjectAudioMetadataPayload, ObjectElement,
+        ObjectInfoBlock, ProgramAssignment,
+    };
+
+    /// One LFE bed object, then a dynamic one: what the bridge reads.
+    fn usable() -> ObjectAudioMetadataPayload {
+        let bed = ObjectInfoBlock {
+            b_object_in_bed_or_isf: true,
+            ..Default::default()
+        };
+        ObjectAudioMetadataPayload {
+            object_count: 2,
+            program_assignment: ProgramAssignment {
+                bed_assignment: vec![BedAssignment::with_lfe_only()],
+                ..Default::default()
+            },
+            object_element: Some(ObjectElement {
+                md_update_info: MDUpdateInfo {
+                    num_obj_info_blocks: 1,
+                    block_update_info: vec![BlockUpdateInfo::default()],
+                    ..Default::default()
+                },
+                object_data: vec![vec![bed], vec![ObjectInfoBlock::default()]],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn element(oamd: &mut ObjectAudioMetadataPayload) -> &mut ObjectElement {
+        oamd.object_element.as_mut().unwrap()
+    }
+
+    fn total(warnings: &OamdWarnings) -> u64 {
+        [
+            warnings.unsupported_obj_info_blocks,
+            warnings.unsupported_bed_assignments,
+            warnings.unsupported_isf_objects,
+            warnings.missing_object_data,
+            warnings.empty_object_blocks,
+            warnings.bed_index_out_of_range,
+            warnings.missing_damf_positions,
+        ]
+        .iter()
+        .map(|counter: &crate::logging::RepeatCounter| counter.count())
+        .sum()
+    }
+
+    /// Feed the same frame repeatedly: its condition is counted once per
+    /// frame, and nothing else is.
+    fn assert_counted_per_frame(
+        oamd: &ObjectAudioMetadataPayload,
+        counter: fn(&OamdWarnings) -> u64,
+    ) {
+        let mut warnings = OamdWarnings::default();
+        for frames in 1..=20 {
+            extract_events(oamd, 0, &mut warnings);
+            assert_eq!(counter(&warnings), frames);
+            assert_eq!(total(&warnings), frames, "{warnings:?}");
+        }
+    }
+
+    #[test]
+    fn a_usable_frame_counts_nothing() {
+        let mut warnings = OamdWarnings::default();
+        for _ in 0..3 {
+            let extracted = extract_events(&usable(), 0, &mut warnings);
+            assert_eq!(extracted.events.len(), 1);
+            assert_eq!(extracted.channel_gains.len(), 1);
+        }
+        assert_eq!(total(&warnings), 0);
+    }
+
+    #[test]
+    fn several_obj_info_blocks_are_counted_per_frame() {
+        let mut oamd = usable();
+        element(&mut oamd).md_update_info.num_obj_info_blocks = 2;
+        assert_counted_per_frame(&oamd, |w| w.unsupported_obj_info_blocks.count());
+    }
+
+    #[test]
+    fn a_bed_assignment_count_other_than_one_is_counted_per_frame() {
+        let mut oamd = usable();
+        oamd.program_assignment.bed_assignment.clear();
+        assert_counted_per_frame(&oamd, |w| w.unsupported_bed_assignments.count());
+    }
+
+    #[test]
+    fn isf_objects_are_counted_per_frame() {
+        let mut oamd = usable();
+        oamd.program_assignment.num_isf_objects = 4;
+        assert_counted_per_frame(&oamd, |w| w.unsupported_isf_objects.count());
+    }
+
+    #[test]
+    fn missing_object_data_is_counted_per_frame() {
+        let mut oamd = usable();
+        oamd.object_count = 3;
+        assert_counted_per_frame(&oamd, |w| w.missing_object_data.count());
+    }
+
+    #[test]
+    fn empty_object_data_blocks_are_counted_per_frame() {
+        let mut oamd = usable();
+        element(&mut oamd).object_data[1].clear();
+        assert_counted_per_frame(&oamd, |w| w.empty_object_blocks.count());
+    }
+
+    #[test]
+    fn a_bed_object_past_the_bed_assignment_is_counted_per_frame() {
+        let mut oamd = usable();
+        element(&mut oamd).object_data[1][0].b_object_in_bed_or_isf = true;
+        assert_counted_per_frame(&oamd, |w| w.bed_index_out_of_range.count());
     }
 }

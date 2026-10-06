@@ -4,7 +4,7 @@ use bridge_api::{
     RVbapCartesianDefaults, RVbapTableMode,
 };
 
-use crate::logging::{bridge_diag_log, bridge_log};
+use crate::logging::{RepeatCounter, bridge_diag_log, bridge_log};
 use crate::shared::{AfterPush, SharedState};
 #[cfg(feature = "dolby")]
 use bridge_family_dolby::{DolbyPipeline, FAMILY_DOLBY};
@@ -192,6 +192,10 @@ pub(crate) struct AtmosBridge {
     /// built: said once per stream rather than on every packet.
     #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
     pub(crate) refused: Option<RawCodec>,
+    /// IEC 61937 bursts of a data type this build does not decode, since the
+    /// last reset: a host keeps sending them, so only the 1st, 2nd, 4th...
+    /// are logged.
+    pub(crate) unsupported_data_types: RepeatCounter,
     // ── Shared ───────────────────────────────────────────────────────
     pub(crate) shared: SharedState,
 }
@@ -212,6 +216,7 @@ impl AtmosBridge {
             iamf_active: false,
             #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
             refused: None,
+            unsupported_data_types: RepeatCounter::default(),
             shared,
         }
     }
@@ -234,6 +239,7 @@ impl AtmosBridge {
         {
             self.refused = None;
         }
+        self.unsupported_data_types = RepeatCounter::default();
         // Re-sniff after reset, but keep any host-declared codec.
         self.raw_codec = None;
         self.shared.declared_object_channels = None;
@@ -393,13 +399,20 @@ impl AtmosBridge {
                 }
 
                 // Unsupported data type.
-                let msg =
-                    format!("Unsupported IEC 61937 data type for this bridge: 0x{data_type:02X}");
-                bridge_diag_log(log::Level::Warn, &msg);
+                let bursts = self.unsupported_data_types.note();
                 if self.shared.strict {
+                    let msg = format!(
+                        "Unsupported IEC 61937 data type for this bridge: 0x{data_type:02X}"
+                    );
+                    bridge_diag_log(log::Level::Warn, &msg);
                     result.error_message = msg.into();
                     self.reset_pipeline();
                     result.did_reset = true;
+                } else if let Some(bursts) = bursts {
+                    bridge_log!(
+                        log::Level::Warn,
+                        "Unsupported IEC 61937 data type for this bridge: 0x{data_type:02X} ({bursts} burst(s) so far)"
+                    );
                 }
                 result
             }
@@ -1336,6 +1349,50 @@ mod raw_transport_tests {
         assert_eq!(second, "");
         assert_eq!(after_reset, msg);
         assert_eq!(family, "iamf");
+    }
+}
+
+#[cfg(test)]
+mod unsupported_data_type_tests {
+    use super::*;
+    use bridge_api::RInputTransport;
+
+    /// No family takes IEC 61937 data type 0x07.
+    const UNSUPPORTED: u8 = 0x07;
+
+    /// A host that keeps sending bursts of a type no family decodes gets them
+    /// counted, not a warning for each; strict mode still fails every one.
+    #[test]
+    fn unsupported_bursts_are_counted_and_strict_mode_reports_each() {
+        let burst = [0u8; 64];
+        let mut bridge = AtmosBridge::new(false);
+        for bursts in 1..=20 {
+            let result = bridge.push_packet(
+                RSlice::from_slice(&burst),
+                RInputTransport::Iec61937,
+                UNSUPPORTED,
+            );
+            assert!(result.frames.is_empty());
+            assert!(result.error_message.is_empty(), "{}", result.error_message);
+            assert!(!result.did_reset);
+            assert_eq!(bridge.unsupported_data_types.count(), bursts);
+        }
+        bridge.reset_pipeline();
+        assert_eq!(bridge.unsupported_data_types.count(), 0);
+
+        let mut bridge = AtmosBridge::new(true);
+        for _ in 0..3 {
+            let result = bridge.push_packet(
+                RSlice::from_slice(&burst),
+                RInputTransport::Iec61937,
+                UNSUPPORTED,
+            );
+            assert!(result.did_reset);
+            assert_eq!(
+                result.error_message.as_str(),
+                "Unsupported IEC 61937 data type for this bridge: 0x07"
+            );
+        }
     }
 }
 

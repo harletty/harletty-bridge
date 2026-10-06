@@ -10,7 +10,7 @@
 //
 // Reference: ffmpeg libavformat/spdifenc.c
 
-use crate::logging::{HexBytes, bridge_log};
+use crate::logging::{HexBytes, RepeatCounter, bridge_log};
 
 /// IEC 61937 data type for E-AC-3.
 const IEC61937_EAC3_DATA_TYPE: u8 = 0x15;
@@ -104,6 +104,12 @@ pub struct Eac3SpdifStream {
     pending_frame_consumed: usize,
     /// Whether the pending frame was captured in 16-bit word-swapped order.
     pending_frame_needs_unswap: bool,
+    /// Frames that did not start with the syncword, since the last reset.
+    bad_syncwords: RepeatCounter,
+    /// Frames whose length code is smaller than their header's frame size,
+    /// since the last reset. Some senders state the length in bytes rather
+    /// than bits, on every frame.
+    length_code_mismatches: RepeatCounter,
 }
 
 impl Default for Eac3SpdifStream {
@@ -116,6 +122,8 @@ impl Default for Eac3SpdifStream {
             pending_frame_target: 0,
             pending_frame_consumed: 0,
             pending_frame_needs_unswap: false,
+            bad_syncwords: RepeatCounter::default(),
+            length_code_mismatches: RepeatCounter::default(),
         }
     }
 }
@@ -129,6 +137,28 @@ impl Eac3SpdifStream {
         self.pending_frame_target = 0;
         self.pending_frame_consumed = 0;
         self.pending_frame_needs_unswap = false;
+        self.bad_syncwords = RepeatCounter::default();
+        self.length_code_mismatches = RepeatCounter::default();
+    }
+
+    /// Report a frame that does not start with the syncword: a misframed
+    /// input does so on every burst, so only the 1st, 2nd, 4th... are logged.
+    fn note_frame_syncword(&mut self, frame: &[u8]) {
+        if frame.len() < 2 {
+            return;
+        }
+        let sync = u16::from_be_bytes([frame[0], frame[1]]);
+        if sync != EAC3_SYNCWORD
+            && let Some(frames) = self.bad_syncwords.note()
+        {
+            bridge_log!(
+                log::Level::Warn,
+                "E-AC-3 SPDIF: bad syncword 0x{:04X} (expected 0x{:04X}) in {}B frame ({frames} frame(s) so far)",
+                sync,
+                EAC3_SYNCWORD,
+                frame.len()
+            );
+        }
     }
 
     /// Returns `true` if this parser handles the given IEC 61937 data type.
@@ -224,18 +254,7 @@ impl Eac3SpdifStream {
                         self.pending_frame_needs_unswap = false;
 
                         // Verify syncword on the full frame.
-                        if frame.len() >= 2 {
-                            let sync = u16::from_be_bytes([frame[0], frame[1]]);
-                            if sync != EAC3_SYNCWORD {
-                                bridge_log!(
-                                    log::Level::Warn,
-                                    "E-AC3 SPDIF: bad syncword 0x{:04X} (expected 0x{:04X}) in {}B frame",
-                                    sync,
-                                    EAC3_SYNCWORD,
-                                    frame.len()
-                                );
-                            }
-                        }
+                        self.note_frame_syncword(&frame);
 
                         let new_remaining = bytes_remaining.saturating_sub(needed);
                         self.pending_frame_target = 0;
@@ -394,12 +413,14 @@ impl Eac3SpdifStream {
                     let frame_bytes = if header_frame_bytes > length_code_bytes
                         && header_frame_bytes <= remaining
                     {
-                        bridge_log!(
-                            target: "harletty-bridge::eac3_spdif",
-                            log::Level::Warn,
-                            "Eac3SpdifStream length_code disagrees with E-AC3 header: code={} as_bits={}B header={}B; using header size",
-                            length_code, length_code_bytes, header_frame_bytes
-                        );
+                        if let Some(frames) = self.length_code_mismatches.note() {
+                            bridge_log!(
+                                target: "harletty-bridge::eac3_spdif",
+                                log::Level::Warn,
+                                "Eac3SpdifStream length_code disagrees with E-AC3 header: code={} as_bits={}B header={}B; using header size ({frames} frame(s) so far)",
+                                length_code, length_code_bytes, header_frame_bytes
+                            );
+                        }
                         header_frame_bytes
                     } else {
                         length_code_bytes
@@ -429,18 +450,7 @@ impl Eac3SpdifStream {
                     }
 
                     // Verify syncword.
-                    if frame.len() >= 2 {
-                        let sync = u16::from_be_bytes([frame[0], frame[1]]);
-                        if sync != EAC3_SYNCWORD {
-                            bridge_log!(
-                                log::Level::Warn,
-                                "E-AC-3 SPDIF: bad syncword 0x{:04X} (expected 0x{:04X}) in {}B frame",
-                                sync,
-                                EAC3_SYNCWORD,
-                                frame.len()
-                            );
-                        }
-                    }
+                    self.note_frame_syncword(&frame);
 
                     if need_unswap {
                         bridge_log!(
@@ -738,6 +748,60 @@ mod tests {
         let result = stream.next_frame().unwrap();
         assert_eq!(result, Some(frame));
         assert_eq!(stream.next_frame().unwrap(), None);
+    }
+
+    /// A frame with a bad syncword, length-prefixed in bits.
+    fn misframed_payload() -> Vec<u8> {
+        let mut frame = build_minimal_eac3_frame(32);
+        frame[..2].copy_from_slice(&[0x12, 0x34]);
+        build_payload(&frame)
+    }
+
+    #[test]
+    fn bad_syncwords_are_counted_across_bursts() {
+        let payload = misframed_payload();
+        let mut stream = Eac3SpdifStream::default();
+        for frames in 1..=20 {
+            stream.push_payload(&payload);
+            assert!(stream.next_frame().unwrap().is_some());
+            assert_eq!(stream.next_frame().unwrap(), None);
+            assert_eq!(stream.bad_syncwords.count(), frames);
+        }
+        stream.reset();
+        assert_eq!(stream.bad_syncwords.count(), 0);
+    }
+
+    #[test]
+    fn bad_syncwords_of_frames_across_bursts_are_counted() {
+        let payload = misframed_payload();
+        let (first, second) = payload.split_at(payload.len() / 2);
+        let mut stream = Eac3SpdifStream::default();
+        for frames in 1..=20 {
+            stream.push_payload(first);
+            assert_eq!(stream.next_frame().unwrap(), None);
+            stream.push_payload(second);
+            assert!(stream.next_frame().unwrap().is_some());
+            assert_eq!(stream.next_frame().unwrap(), None);
+            assert_eq!(stream.bad_syncwords.count(), frames);
+        }
+    }
+
+    #[test]
+    fn byte_count_length_codes_are_counted_across_bursts() {
+        let frame = build_minimal_eac3_frame(896);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(frame.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&frame);
+
+        let mut stream = Eac3SpdifStream::default();
+        for frames in 1..=20 {
+            stream.push_payload(&payload);
+            assert_eq!(stream.next_frame().unwrap().as_deref(), Some(&frame[..]));
+            assert_eq!(stream.length_code_mismatches.count(), frames);
+        }
+        assert_eq!(stream.bad_syncwords.count(), 0);
+        stream.reset();
+        assert_eq!(stream.length_code_mismatches.count(), 0);
     }
 
     /// A payload, or the tail of one after its frame, shorter than a length
