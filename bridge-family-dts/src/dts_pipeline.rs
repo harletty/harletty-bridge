@@ -34,7 +34,7 @@ use serde::Deserialize;
 use crate::auro_pipeline::DtsAuroState;
 use crate::frame_builders::float_to_pcm_i32;
 use crate::labels::{dca_bed_channel_to_r, dca_spatial_channel_to_r};
-use crate::logging::{bridge_diag_log, bridge_log};
+use crate::logging::{RepeatCounter, bridge_diag_log, bridge_log};
 use crate::shared::{AfterPush, SharedState};
 use bridge_common::objects::declare_object_channels;
 
@@ -143,9 +143,9 @@ pub(crate) struct DtsXState {
     estimator: FoldEstimator,
     /// Whether the estimation has been announced for this stream.
     estimation_noted: bool,
-    parse_failures: u64,
-    feed_dropouts: u64,
-    bed_extension_dropouts: u64,
+    parse_failures: RepeatCounter,
+    feed_dropouts: RepeatCounter,
+    bed_extension_dropouts: RepeatCounter,
     /// The decoded frame, kept from packet to packet so the decoder refills
     /// its buffers instead of allocating new ones.
     frame: HdFrame,
@@ -155,12 +155,10 @@ pub(crate) struct DtsXState {
 
 impl DtsXState {
     fn note_parse_failure(&mut self, error: dca::XMetadataError) {
-        self.parse_failures += 1;
-        if self.parse_failures == 1 || self.parse_failures.is_power_of_two() {
+        if let Some(failures) = self.parse_failures.note() {
             bridge_log!(
                 log::Level::Warn,
-                "dts: extension metadata unreadable ({error:?}, {} frames so far); {}",
-                self.parse_failures,
+                "dts: extension metadata unreadable ({error:?}, {failures} frames so far); {}",
                 if self.last_metadata.is_some() {
                     "reusing the last readable frame"
                 } else {
@@ -173,23 +171,19 @@ impl DtsXState {
     /// A lossy carrier's XXCH channels did not decode this frame: the bed
     /// is the core alone for it.
     fn note_bed_extension_dropout(&mut self, reason: &str) {
-        self.bed_extension_dropouts += 1;
-        if self.bed_extension_dropouts == 1 || self.bed_extension_dropouts.is_power_of_two() {
+        if let Some(dropouts) = self.bed_extension_dropouts.note() {
             bridge_log!(
                 log::Level::Warn,
-                "dts: XXCH channels unavailable ({reason}, {} frames so far); playing the core bed",
-                self.bed_extension_dropouts
+                "dts: XXCH channels unavailable ({reason}, {dropouts} frames so far); playing the core bed"
             );
         }
     }
 
     fn note_feed_dropout(&mut self, reason: &str) {
-        self.feed_dropouts += 1;
-        if self.feed_dropouts == 1 || self.feed_dropouts.is_power_of_two() {
+        if let Some(dropouts) = self.feed_dropouts.note() {
             bridge_log!(
                 log::Level::Warn,
-                "dts: extension waveforms unavailable ({reason}, {} frames so far); emitting silent extension channels",
-                self.feed_dropouts
+                "dts: extension waveforms unavailable ({reason}, {dropouts} frames so far); emitting silent extension channels"
             );
         }
     }
@@ -1151,7 +1145,7 @@ mod tests {
         let mut state = DtsXState::default();
         let (frame, _) = build(&hd, &mut state);
         assert_eq!(frame.channel_count, 12);
-        assert_eq!(state.parse_failures, 1);
+        assert_eq!(state.parse_failures.count(), 1);
         for sample in 0..SAMPLE_COUNT {
             assert_pcm_close(frame.pcm[sample * 12 + 1], dry[sample]);
         }
@@ -1194,7 +1188,7 @@ mod tests {
         // a quartet) + silent height channels — the host never renegotiates.
         assert_eq!(frame.channel_count, 12);
         assert!(frame.metadata.is_empty());
-        assert_eq!(state.feed_dropouts, 1);
+        assert_eq!(state.feed_dropouts.count(), 1);
         for sample in 0..SAMPLE_COUNT {
             let row = &frame.pcm[sample * 12..(sample + 1) * 12];
             assert_eq!(row[1], float_to_pcm_i32(composite_left[sample]));
@@ -1787,7 +1781,7 @@ mod tests {
         let (frame, emitted) = build_without_estimation(&hd, &mut state);
         assert!(emitted);
         assert_eq!(frame.channel_count, 16);
-        assert_eq!(state.parse_failures, 1);
+        assert_eq!(state.parse_failures.count(), 1);
         for sample in 0..SAMPLE_COUNT {
             let row = &frame.pcm[sample * 16..(sample + 1) * 16];
             assert_eq!(row[1], float_to_pcm_i32(composite_left[sample]));
