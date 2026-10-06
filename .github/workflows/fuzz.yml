@@ -1,0 +1,145 @@
+name: Fuzz
+
+# Runs every fuzz target for a bounded time, weekly and on demand. ci.yml
+# only builds them; this is where they run. Each target starts from the
+# corpus it grew on its previous run (kept with actions/cache, minimised
+# before it is saved) plus the small checked-in seeds. A crash fails the
+# target's job and uploads the input that crashed as an artifact; reproduce
+# it in the target's fuzz crate with
+#
+#   cargo +nightly fuzz run <target> <file>
+#
+# A pull request that changes this file runs it too, for 60 s per target,
+# to show the workflow still works. A dispatch or a pull request builds
+# against the Omniphony ref its branch's `.omniphony-ref` names, as ci.yml
+# does.
+
+on:
+  schedule:
+    # Mondays, 03:17 UTC.
+    - cron: '17 3 * * 1'
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/fuzz.yml
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Fuzzing time per target, in seconds
+        required: false
+        default: '900'
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: eac3
+            target: push_access_unit
+            seeds: ../tests/data
+          - crate: eac3
+            target: push_legacy_ac3_access_unit
+            seeds: ../tests/data
+          - crate: dca
+            target: core_frame
+            seeds: seeds/core_frame
+          - crate: dca
+            target: exss_xll
+            seeds: seeds/exss_xll
+          - crate: bridge
+            target: push_packet
+            seeds: seeds/push_packet
+            features: --features iamf
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      FUZZ_SECONDS: ${{ inputs.seconds || (github.event_name == 'pull_request' && '60') || '900' }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: harletty-bridge/${{ matrix.crate }}/fuzz
+    steps:
+      - name: Checkout harletty-bridge
+        uses: actions/checkout@v4
+        with:
+          path: harletty-bridge
+
+      - name: Resolve the Omniphony ref
+        id: omniphony
+        working-directory: .
+        run: |
+          ref=main
+          if [ -f harletty-bridge/.omniphony-ref ]; then
+            ref=$(grep -v -E '^\s*(#|$)' harletty-bridge/.omniphony-ref | head -n 1 | tr -d '[:space:]')
+          fi
+          echo "ref=${ref:-main}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Omniphony (path dependencies)
+        uses: actions/checkout@v4
+        with:
+          repository: mgth/Omniphony
+          ref: ${{ steps.omniphony.outputs.ref }}
+          path: Omniphony
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo-fuzz
+        id: cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-0.13.2-${{ runner.os }}
+
+      - name: Install cargo-fuzz
+        if: steps.cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Install libopus
+        if: matrix.crate == 'bridge'
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev
+
+      # The newest corpus any earlier run of this target saved.
+      - name: Restore the corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: harletty-bridge/${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Build
+        run: |
+          cp ../../Cargo.lock Cargo.lock
+          cargo fuzz build ${{ matrix.features }} ${{ matrix.target }}
+
+      - name: Fuzz
+        run: |
+          mkdir -p corpus/${{ matrix.target }}
+          cargo fuzz run ${{ matrix.features }} ${{ matrix.target }} \
+            corpus/${{ matrix.target }} ${{ matrix.seeds }} -- \
+            -max_total_time="$FUZZ_SECONDS" -timeout=60 -print_final_stats=1
+
+      # Saved whether or not the run found a crash: what it learnt before
+      # then is kept for the next one.
+      - name: Minimise the corpus
+        if: always()
+        continue-on-error: true
+        run: cargo fuzz cmin ${{ matrix.features }} ${{ matrix.target }} corpus/${{ matrix.target }}
+
+      - name: Save the corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: harletty-bridge/${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload the crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: harletty-bridge/${{ matrix.crate }}/fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

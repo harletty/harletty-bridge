@@ -354,6 +354,13 @@ impl Eac3SpdifStream {
                     // ── Length-prefix mode ────────────────────────────
                     // Read the 16-bit length code. Some sources expose it
                     // as bits, others as bytes, so the E-AC3 header decides.
+                    // A tail too short to hold one carries no frame.
+                    if self.remaining_buffer_len() < 2 {
+                        self.buffer.clear();
+                        self.cursor = 0;
+                        self.state = ParserState::WaitingForPayload;
+                        continue;
+                    }
                     let length_code = u16::from_le_bytes([
                         self.buffer[self.cursor],
                         self.buffer[self.cursor + 1],
@@ -730,6 +737,23 @@ mod tests {
 
         let result = stream.next_frame().unwrap();
         assert_eq!(result, Some(frame));
+        assert_eq!(stream.next_frame().unwrap(), None);
+    }
+
+    /// A payload, or the tail of one after its frame, shorter than a length
+    /// code: no frame, and no read past the payload (found by the bridge's
+    /// `push_packet` fuzz target).
+    #[test]
+    fn tail_shorter_than_a_length_code_yields_no_frame() {
+        let mut stream = Eac3SpdifStream::default();
+        stream.push_payload(&[0xFE]);
+        assert_eq!(stream.next_frame().unwrap(), None);
+
+        let frame = build_minimal_eac3_frame(32);
+        let mut payload = build_payload(&frame);
+        payload.push(0);
+        stream.push_payload(&payload);
+        assert_eq!(stream.next_frame().unwrap(), Some(frame));
         assert_eq!(stream.next_frame().unwrap(), None);
     }
 
