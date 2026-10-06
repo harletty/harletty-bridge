@@ -146,6 +146,8 @@ pub(crate) struct DtsXState {
     parse_failures: RepeatCounter,
     feed_dropouts: RepeatCounter,
     bed_extension_dropouts: RepeatCounter,
+    /// Frames dropped for a bed channel of the wrong length.
+    bed_length_mismatches: RepeatCounter,
     /// The decoded frame, kept from packet to packet so the decoder refills
     /// its buffers instead of allocating new ones.
     frame: HdFrame,
@@ -634,11 +636,13 @@ fn build_hd_frame_with_extensions(
     for &spkr in &active {
         let channel = hd.samples[spkr].as_ref().expect("active speaker");
         if channel.len() != sample_count {
-            bridge_log!(
-                log::Level::Warn,
-                "dts: bed channel {spkr} length {} != {sample_count}; dropping frame",
-                channel.len()
-            );
+            if let Some(frames) = state.bed_length_mismatches.note() {
+                bridge_log!(
+                    log::Level::Warn,
+                    "dts: bed channel {spkr} length {} != {sample_count}; dropping frame ({frames} frame(s) so far)",
+                    channel.len()
+                );
+            }
             return None;
         }
         bed.push(channel.as_slice());
@@ -1950,5 +1954,26 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn mismatched_bed_channel_lengths_are_counted_across_frames() {
+        let mut samples: Vec<Option<Vec<f32>>> = (0..9).map(|_| None).collect();
+        samples[0] = Some(vec![0.0; SAMPLE_COUNT]);
+        samples[1] = Some(vec![0.0; SAMPLE_COUNT + 1]);
+        let hd = hd_frame(samples, Vec::new());
+        let mut state = DtsXState::default();
+        let mut declared = None;
+        for frames in 1..=20 {
+            let built = build_hd_frame_with_extensions(
+                &hd,
+                &mut state,
+                &DtsFoldConfig::default(),
+                0,
+                &mut declared,
+            );
+            assert!(built.is_none());
+            assert_eq!(state.bed_length_mismatches.count(), frames);
+        }
     }
 }
