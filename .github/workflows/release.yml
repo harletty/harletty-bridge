@@ -202,8 +202,10 @@ jobs:
 
   release:
     needs: [omniphony, build-linux, build-windows, build-macos]
-    # A manual run is a dry run: it stops after the builds.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # A manual run is a dry run: it stops after the builds, even when
+    # dispatched on a tag (`gh workflow run release.yml --ref v…` gives it
+    # `refs/tags/v…`), so only the tag push itself publishes.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
