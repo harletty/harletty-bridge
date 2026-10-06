@@ -9,13 +9,19 @@ name: Fuzz
 #
 #   cargo +nightly fuzz run <target> <file>
 #
-# A dispatch on a branch builds against the Omniphony ref its
-# `.omniphony-ref` names, as ci.yml does.
+# A pull request that changes this file runs it too, for 60 s per target,
+# to show the workflow still works. A dispatch or a pull request builds
+# against the Omniphony ref its branch's `.omniphony-ref` names, as ci.yml
+# does.
 
 on:
   schedule:
     # Mondays, 03:17 UTC.
     - cron: '17 3 * * 1'
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/fuzz.yml
   workflow_dispatch:
     inputs:
       seconds:
@@ -50,7 +56,7 @@ jobs:
             features: --features iamf
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-      FUZZ_SECONDS: ${{ inputs.seconds || '900' }}
+      FUZZ_SECONDS: ${{ inputs.seconds || (github.event_name == 'pull_request' && '60') || '900' }}
     defaults:
       run:
         shell: bash
