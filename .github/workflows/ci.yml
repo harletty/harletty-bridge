@@ -92,6 +92,22 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
 
+      # dca picks its vector code from the CPU it runs on, so the run above
+      # tests whatever the runner has (AVX2, or AVX-512 on some hosts). Test
+      # the portable and the AVX2 code on every run as well (`dca/src/cpu.rs`);
+      # `tests/fixture_decode.rs` checks they decode to the same samples.
+      - name: Test dca on its portable code
+        run: cargo test --locked -p dca
+        working-directory: harletty-bridge
+        env:
+          RUSTFLAGS: -D warnings --cfg dca_force_scalar
+
+      - name: Test dca on its AVX2 code
+        run: cargo test --locked -p dca
+        working-directory: harletty-bridge
+        env:
+          RUSTFLAGS: -D warnings --cfg dca_force_avx2
+
       # The bridge-perf timing path is compiled by nothing else — it rotted
       # unnoticed once already (#31) — so keep it building.
       - name: Check bridge-perf feature
@@ -149,3 +165,69 @@ jobs:
         working-directory: harletty-bridge
         env:
           GH_TOKEN: ${{ github.token }}
+
+  # The fuzz crates (eac3/fuzz, dca/fuzz, bridge/fuzz) are workspaces of
+  # their own, so nothing above compiles them: build every target here so
+  # they cannot rot. `fuzz.yml` runs them, weekly. Each crate is built
+  # against the root Cargo.lock, the dependency versions the bridge ships;
+  # not `--locked`, since the copy lacks the fuzz crate's own entries.
+  fuzz-build:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout harletty-bridge
+        uses: actions/checkout@v4
+        with:
+          path: harletty-bridge
+
+      # As in test-linux: the pin, or Omniphony's `main` for the scheduled run.
+      - name: Resolve the Omniphony ref
+        id: omniphony
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.omniphony-ref }}
+        run: |
+          case "$EVENT" in
+            schedule) ref=main ;;
+            workflow_dispatch) ref=${INPUT_REF:-$(harletty-bridge/scripts/omniphony-ref.sh)} ;;
+            *) ref=$(harletty-bridge/scripts/omniphony-ref.sh) ;;
+          esac
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Omniphony (path dependencies)
+        uses: actions/checkout@v4
+        with:
+          repository: mgth/Omniphony
+          ref: ${{ steps.omniphony.outputs.ref }}
+          path: Omniphony
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo-fuzz
+        id: cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-0.13.2-${{ runner.os }}
+
+      - name: Install cargo-fuzz
+        if: steps.cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      # The IAMF family's Opus path links libopus.
+      - name: Install libopus
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev
+
+      - name: Build fuzz targets
+        shell: bash
+        working-directory: harletty-bridge
+        run: |
+          for crate in eac3 dca bridge; do
+            cp Cargo.lock "$crate/fuzz/Cargo.lock"
+          done
+          (cd eac3/fuzz && cargo fuzz build)
+          (cd dca/fuzz && cargo fuzz build)
+          (cd bridge/fuzz && cargo fuzz build --features iamf)

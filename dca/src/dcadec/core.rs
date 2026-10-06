@@ -192,8 +192,13 @@ fn dequantize(output: &mut [i32], input: &[i32], step_size: i32, scale: i32) {
         shift = (63 - (step_scale >> 23).leading_zeros()) + 1; // av_log2(x)+1
         step_scale >>= shift;
     }
+    // A step scale past 2^45 shifts by more than the 22 bits there are to
+    // drop (ffmpeg's shift goes negative there): what is left moves back
+    // into the scale. No change below that.
+    let bits = 22u32.saturating_sub(shift);
+    step_scale <<= shift.saturating_sub(22);
     for n in 0..output.len() {
-        output[n] = clip23(norm(input[n] as i64 * step_scale, 22 - shift));
+        output[n] = clip23(norm(input[n] as i64 * step_scale, bits));
     }
 }
 
@@ -1390,5 +1395,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The largest step size times the largest scale factor needs a shift
+    /// past 22 bits; the samples still come out scaled, then clipped,
+    /// instead of an overflowed shift.
+    #[test]
+    fn dequantize_past_22_bits_of_shift_clips() {
+        let step_size = LOSSY_QUANT[1] as i32;
+        let scale = (1 << 23) - 1;
+        let mut output = [7i32; 4];
+        dequantize(&mut output, &[1, -1, 0, 3], step_size, scale);
+        assert_eq!(output, [(1 << 23) - 1, -(1 << 23), 0, (1 << 23) - 1]);
+    }
+
+    /// A core frame that reaches that shift (found by the `core_frame` fuzz
+    /// target): it must decode or fail, not panic.
+    #[test]
+    fn core_frame_with_an_oversized_step_scale_does_not_panic() {
+        const FRAME: [u8; 124] = [
+            0x7f, 0xfe, 0x80, 0x01, 0xfc, 0x3c, 0x1a, 0xb0, 0xb5, 0x20, 0x01, 0x38, 0x00, 0x03,
+            0xef, 0x7f, 0xe0, 0x06, 0xc9, 0x1e, 0x00, 0x12, 0x49, 0xf7, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x72, 0x55, 0x7e, 0x3f, 0xff,
+            0xc0, 0xe7, 0x8c, 0x72, 0x55, 0x7e, 0x3f, 0xff, 0xc0, 0x72, 0x55, 0x7e, 0x3f, 0xff,
+            0xc0, 0x11, 0x67, 0x5c, 0x69, 0xa0, 0xe7, 0x99, 0x66, 0x48, 0xbd, 0xd6, 0x72, 0x7e,
+            0x3f, 0xff, 0x72, 0x55, 0x7e, 0x3f, 0xff, 0xc0, 0xff, 0x7e, 0x3f, 0xff, 0x72, 0x55,
+            0x7e, 0x3f, 0xff, 0xc0, 0xff, 0xc0, 0xa0, 0xe7, 0x99, 0x66, 0x48, 0xbd, 0xd6, 0x72,
+            0x7e, 0x3f, 0xff, 0x72, 0x55, 0x7e, 0x3f, 0xff, 0xc0, 0xff, 0xc0, 0x66, 0x48, 0xbd,
+            0xd6, 0x72, 0x3f, 0xff, 0x72, 0x55, 0x7e, 0x3f, 0xff, 0xc0, 0xff, 0xc0,
+        ];
+        let _ = crate::PcmDecoder::new().push_access_unit(&FRAME);
     }
 }

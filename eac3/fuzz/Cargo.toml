@@ -1,8 +1,10 @@
 # Fuzz targets for the stateful E-AC-3/AC-3 decoders. Not part of the root
-# workspace (the empty [workspace] table below keeps it standalone) and not
-# built by CI; run locally with a nightly toolchain:
+# workspace (the empty [workspace] table below keeps it standalone). CI builds
+# every target on each push and pull request, and `.github/workflows/fuzz.yml`
+# runs them weekly with a cached corpus, seeded from `../tests/data`. Run
+# locally with a nightly toolchain:
 #
-#   cargo +nightly fuzz run push_access_unit
+#   cargo +nightly fuzz run push_access_unit corpus/push_access_unit ../tests/data
 #   cargo +nightly fuzz run push_legacy_ac3_access_unit
 [package]
 name = "eac3-fuzz"
