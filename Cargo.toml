@@ -51,5 +51,7 @@ strip = "symbols"
 # decodes in a quarter of the time of 0.7.2 with the same output. The crates
 # keep asking for the crates.io version, so dropping this section goes back
 # to it. Move the pin only to a commit that stays reachable on the fork.
+# bridge/fuzz/Cargo.toml, a workspace of its own, repeats this section: move
+# both together.
 [patch.crates-io]
 truehd = { git = "https://github.com/harletty/truehdd", rev = "1fa8b034bdddd6f15e7f8876b4a6755ed8772e69" }
