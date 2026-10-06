@@ -1,0 +1,17 @@
+# The mgth/Omniphony commit this bridge builds against: its path dependencies
+# (bridge_api, spdif) come from a checkout of it next to this repository, as
+# ../Omniphony. CI, the release workflow and anyone rebuilding a tag of this
+# repository build against this one ref; the library records the commit
+# (`build_id`, logged when a host loads it).
+#
+# The first line that is neither blank nor a comment is the ref. On main it
+# must be a release pin: a tag of mgth/Omniphony, or a full commit SHA on its
+# main (scripts/omniphony-ref.sh --check). A pull request whose Omniphony side
+# is not merged yet may name its branch or commit here; CI builds against it,
+# then fails its last step until the pin is moved to a release pin.
+#
+# Move it deliberately, with the change that needs it: a bridge loads only in
+# a host built against the same bridge_api minor, so this decides which
+# Omniphony releases can load what this repository ships. No Omniphony release
+# carries bridge_api 0.5 yet (v0.6.0 has 0.4), hence a commit of main.
+43006ee2a9b6a840f0366fe26c172a9de3f63b52

@@ -10,9 +10,9 @@ name: Fuzz
 #   cargo +nightly fuzz run <target> <file>
 #
 # A pull request that changes this file runs it too, for 60 s per target,
-# to show the workflow still works. A dispatch or a pull request builds
-# against the Omniphony ref its branch's `.omniphony-ref` names, as ci.yml
-# does.
+# to show the workflow still works. Every run builds against the Omniphony
+# ref `.omniphony-ref` pins, read by `scripts/omniphony-ref.sh` as ci.yml
+# and release.yml do.
 
 on:
   schedule:
@@ -70,12 +70,7 @@ jobs:
       - name: Resolve the Omniphony ref
         id: omniphony
         working-directory: .
-        run: |
-          ref=main
-          if [ -f harletty-bridge/.omniphony-ref ]; then
-            ref=$(grep -v -E '^\s*(#|$)' harletty-bridge/.omniphony-ref | head -n 1 | tr -d '[:space:]')
-          fi
-          echo "ref=${ref:-main}" >> "$GITHUB_OUTPUT"
+        run: echo "ref=$(harletty-bridge/scripts/omniphony-ref.sh)" >> "$GITHUB_OUTPUT"
 
       - name: Checkout Omniphony (path dependencies)
         uses: actions/checkout@v4
@@ -97,6 +92,18 @@ jobs:
       - name: Install cargo-fuzz
         if: steps.cargo-fuzz.outputs.cache-hit != 'true'
         run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      # rustc peaks at about 17 GB compiling the `truehd` crate with the fuzz
+      # flags (13 GB in a plain release build), more than the runner's 16 GB
+      # of RAM: without more swap the job is killed (exit 143) on some runs.
+      - name: Add swap
+        if: matrix.crate == 'bridge'
+        run: |
+          sudo fallocate -l 8G /swapfile-fuzz
+          sudo chmod 600 /swapfile-fuzz
+          sudo mkswap /swapfile-fuzz
+          sudo swapon /swapfile-fuzz
+          free -h
 
       - name: Install libopus
         if: matrix.crate == 'bridge'

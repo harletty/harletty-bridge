@@ -32,11 +32,41 @@ fn get_library() -> BridgeLibRef {
 }
 
 extern "C" fn create_bridge(strict: bool) -> FormatBridgeBox {
+    log_build_id_once();
     FormatBridge_TO::from_value(AtmosBridge::new(strict), TD_Opaque)
 }
 
 extern "C" fn set_host_log_sink(sink: usize) {
     logging::register_host_log_sink(sink);
+    if sink != 0 {
+        log_build_id_once();
+    }
+}
+
+/// This bridge's version.
+pub const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The mgth/Omniphony commit this library's `bridge_api` was built from
+/// (`.omniphony-ref` in a release build), or `unknown` when the sibling
+/// checkout was not a git one (build.rs).
+pub const OMNIPHONY_COMMIT: &str = env!("HARLETTY_BUILD_OMNIPHONY_COMMIT");
+
+/// What this library was built from, as logged when a host loads it: compare
+/// it with the host's `bridge_api` when a bridge will not load.
+pub fn build_id() -> String {
+    format!(
+        "harletty-bridge {BRIDGE_VERSION} (bridge_api {}, Omniphony {OMNIPHONY_COMMIT})",
+        bridge_api::VERSION
+    )
+}
+
+/// Log [`build_id`] once per process: when the host installs its log sink at
+/// load, or at the first bridge if it never does.
+fn log_build_id_once() {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        bridge_common::bridge_log!(log::Level::Info, "{}", build_id());
+    });
 }
 
 extern "C" fn source_families() -> RVec<RSourceFamily> {
