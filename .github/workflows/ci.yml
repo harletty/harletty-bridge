@@ -217,17 +217,6 @@ jobs:
         if: steps.cargo-fuzz.outputs.cache-hit != 'true'
         run: cargo install cargo-fuzz --version 0.13.2 --locked
 
-      # rustc peaks at about 17 GB compiling the `truehd` crate with the fuzz
-      # flags (13 GB in a plain release build), more than the runner's 16 GB
-      # of RAM: without more swap the job is killed (exit 143) on some runs.
-      - name: Add swap
-        run: |
-          sudo fallocate -l 8G /swapfile-fuzz
-          sudo chmod 600 /swapfile-fuzz
-          sudo mkswap /swapfile-fuzz
-          sudo swapon /swapfile-fuzz
-          free -h
-
       # The IAMF family's Opus path links libopus.
       - name: Install libopus
         run: sudo apt-get update && sudo apt-get install -y libopus-dev

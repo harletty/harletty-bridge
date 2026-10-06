@@ -48,10 +48,11 @@ strip = "symbols"
 
 # The TrueHD decoder is built from our fork of the `truehd` crate, pinned to a
 # commit: upstream's unreleased main plus the decode-speed series, which
-# decodes in a quarter of the time of 0.7.2 with the same output. The crates
+# decodes in a quarter of the time of 0.7.2 with the same output, and a fix
+# that takes compiling it from over 13 GB of memory to under 1 GB. The crates
 # keep asking for the crates.io version, so dropping this section goes back
 # to it. Move the pin only to a commit that stays reachable on the fork.
 # bridge/fuzz/Cargo.toml, a workspace of its own, repeats this section: move
 # both together.
 [patch.crates-io]
-truehd = { git = "https://github.com/harletty/truehdd", rev = "1fa8b034bdddd6f15e7f8876b4a6755ed8772e69" }
+truehd = { git = "https://github.com/harletty/truehdd", rev = "5c8b880405946e7ff1aee884cf9988415fe2c3a9" }
