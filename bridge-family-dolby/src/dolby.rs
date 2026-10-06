@@ -28,6 +28,7 @@ use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::validate_frame_shape;
 use crate::logging::{bridge_diag_log, bridge_log};
 use crate::mat::MatStream;
+use crate::metadata::OamdWarnings;
 use crate::perf::PerfStats;
 use crate::shared::{AfterPush, SharedState};
 use crate::truehd_pipeline::{configure_parser, process_extractor_input, required_presentations};
@@ -192,6 +193,8 @@ pub struct DolbyPipeline {
     /// (bed labels from the OAMD bed assignment, then `Object` fillers).
     pub(crate) truehd_spatial_labels:
         Option<abi_stable::std_types::RVec<bridge_api::RChannelLabel>>,
+    /// TrueHD object metadata the bridge could not use, since the last reset.
+    pub(crate) truehd_oamd_warnings: OamdWarnings,
     pub(crate) perf: PerfStats,
 }
 
@@ -244,6 +247,7 @@ impl DolbyPipeline {
             drc_mode: DrcMode::Off,
             frame_count: 0,
             truehd_spatial_labels: None,
+            truehd_oamd_warnings: OamdWarnings::default(),
             perf: PerfStats::default(),
         };
 
@@ -298,6 +302,7 @@ impl DolbyPipeline {
         );
         self.truehd_presentations_stale = false;
         self.truehd_spatial_labels = None;
+        self.truehd_oamd_warnings = OamdWarnings::default();
         self.recovering_until_major_sync = false;
     }
 
