@@ -12,7 +12,7 @@ use std::time::Instant;
 use crate::dolby::DolbyPipeline;
 use crate::frame_builders::float_to_pcm_i32;
 use crate::labels::bed_channel_to_r;
-use crate::logging::{bridge_diag_log, bridge_log};
+use crate::logging::bridge_log;
 use crate::metadata::build_eac3_metadata_frame;
 use crate::shared::SharedState;
 
@@ -395,10 +395,12 @@ pub(crate) fn resolve_eac3_presentation(
                 // presentation, but silently is how this used to hide a
                 // dependent whose layout the mapper does not cover.
                 bridge.eac3_diag_stats.dependent_merge_failures += 1;
-                bridge_diag_log(
-                    log::Level::Warn,
-                    "eac3_dependent_merge_failed dependent channels not overlaid onto the core",
-                );
+                if let Some(failures) = bridge.eac3_warnings.dependent_merge_failures.note() {
+                    bridge_log!(
+                        log::Level::Warn,
+                        "eac3_dependent_merge_failed dependent channels not overlaid onto the core ({failures} so far)"
+                    );
+                }
             }
         }
     }
@@ -439,7 +441,9 @@ pub(crate) fn resolve_eac3_presentation(
         if shared.strict {
             return Err(message);
         }
-        bridge_diag_log(log::Level::Warn, &message);
+        if let Some(frames) = bridge.eac3_warnings.joc_downmix_mismatches.note() {
+            bridge_log!(log::Level::Warn, "{message} ({frames} frame(s) so far)");
+        }
         bridge.eac3_diag_stats.joc_downmix_config_mismatch += 1;
         bridge.eac3_diag_stats.last_dependent_pair_error = Some(message);
         bridge.eac3_object_decoder.note_non_joc_presentation();
@@ -488,7 +492,9 @@ pub(crate) fn resolve_eac3_presentation(
             }
             // Non-strict playback keeps going on the bed rather than losing a
             // whole interval, and the reconstruction starts clean next time.
-            bridge_diag_log(log::Level::Warn, &message);
+            if let Some(frames) = bridge.eac3_warnings.dependent_object_decode_errors.note() {
+                bridge_log!(log::Level::Warn, "{message} ({frames} frame(s) so far)");
+            }
             bridge.eac3_diag_stats.last_dependent_pair_error = Some(message);
             bridge.eac3_object_decoder.reset();
             let sample_count = bed.samples_per_channel();
@@ -1918,6 +1924,56 @@ mod presentation_assembly {
             bridge.dolby.pending_eac3_core.is_none(),
             "an orphan dependent must not become a pending core"
         );
+    }
+
+    /// A stream of orphan dependents is counted, not logged on each one.
+    #[test]
+    fn orphan_dependents_are_counted_across_access_units() {
+        let mut bridge = TestBridge::new(false);
+        for orphans in 1..=20 {
+            assert_eq!(push(&mut bridge, &dependent()), 0);
+            assert_eq!(
+                bridge.dolby.eac3_warnings.orphan_dependents.count(),
+                orphans
+            );
+        }
+        bridge.dolby.reset(&bridge.shared);
+        assert_eq!(bridge.dolby.eac3_warnings.orphan_dependents.count(), 0);
+    }
+
+    /// Every group with more than eight dependents is counted, not logged on
+    /// each one.
+    #[test]
+    fn dependent_group_overflows_are_counted_across_groups() {
+        let mut bridge = TestBridge::new(false);
+        for groups in 1..=5 {
+            push(&mut bridge, INDEPENDENT);
+            for _ in 0..9 {
+                push(&mut bridge, &dependent());
+            }
+            assert_eq!(
+                bridge.dolby.eac3_warnings.dependent_group_overflows.count(),
+                groups
+            );
+        }
+    }
+
+    /// A dependent whose channels cannot be overlaid onto the core (the
+    /// stand-in dependent of these tests is one) is counted on every group,
+    /// not logged on each.
+    #[test]
+    fn dependent_merge_failures_are_counted_across_groups() {
+        let mut bridge = TestBridge::new(false);
+        push(&mut bridge, INDEPENDENT);
+        for groups in 1..=20 {
+            push(&mut bridge, &dependent());
+            assert_eq!(push(&mut bridge, INDEPENDENT), 1);
+            assert_eq!(
+                bridge.dolby.eac3_warnings.dependent_merge_failures.count(),
+                groups
+            );
+        }
+        assert_eq!(bridge.dolby.eac3_diag_stats.dependent_merge_failures, 20);
     }
 
     /// The timeline advances once per resolved presentation, not once per

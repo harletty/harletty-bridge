@@ -1,4 +1,4 @@
-use crate::logging::bridge_log;
+use crate::logging::{RepeatCounter, bridge_log};
 
 const IEC61937_TRUEHD_DATA_TYPE: u8 = 0x16;
 
@@ -40,7 +40,7 @@ pub struct MatStream {
     zero_size_chunks: usize,
     /// Payloads that held any, since the last reset; only the 1st, 2nd, 4th,
     /// 8th... are reported.
-    payloads_with_zero_size_chunks: u64,
+    payloads_with_zero_size_chunks: RepeatCounter,
 }
 
 impl Default for MatStream {
@@ -52,7 +52,7 @@ impl Default for MatStream {
             pending_chunk_bytes: None,
             perf_stats: None,
             zero_size_chunks: 0,
-            payloads_with_zero_size_chunks: 0,
+            payloads_with_zero_size_chunks: RepeatCounter::default(),
         }
     }
 }
@@ -97,7 +97,7 @@ impl MatStream {
         self.state = ParserState::WaitingForPayload;
         self.pending_chunk_bytes = None;
         self.zero_size_chunks = 0;
-        self.payloads_with_zero_size_chunks = 0;
+        self.payloads_with_zero_size_chunks = RepeatCounter::default();
     }
 
     /// Report the zero-size chunk headers of the payload just finished.
@@ -105,9 +105,7 @@ impl MatStream {
         if self.zero_size_chunks == 0 {
             return;
         }
-        self.payloads_with_zero_size_chunks += 1;
-        let payloads = self.payloads_with_zero_size_chunks;
-        if payloads == 1 || payloads.is_power_of_two() {
+        if let Some(payloads) = self.payloads_with_zero_size_chunks.note() {
             bridge_log!(
                 log::Level::Warn,
                 "Invalid MAT chunk size (0) {} time(s) in a payload, skipping 2 bytes each ({payloads} payload(s) so far)",
@@ -623,9 +621,9 @@ mod tests {
             stream.push_payload(&payload);
             while stream.next_chunk().unwrap().is_some() {}
             assert_eq!(stream.zero_size_chunks, 0);
-            assert_eq!(stream.payloads_with_zero_size_chunks, pushed);
+            assert_eq!(stream.payloads_with_zero_size_chunks.count(), pushed);
         }
         stream.reset();
-        assert_eq!(stream.payloads_with_zero_size_chunks, 0);
+        assert_eq!(stream.payloads_with_zero_size_chunks.count(), 0);
     }
 }

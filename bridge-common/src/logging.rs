@@ -121,6 +121,33 @@ pub fn forward_log(level: log::Level, target: &str, message: &str) {
     }
 }
 
+/// Occurrences of one condition that can come back on every frame, and which
+/// of them to report: the 1st, 2nd, 4th, 8th… since the last reset.
+///
+/// A corrupt or unsupported stream would otherwise log once per frame, each
+/// message formatted and handed to the host's sink from the decode path. This
+/// is a plain integer: noting an occurrence allocates and formats nothing, and
+/// the caller formats a message only when [`Self::note`] says to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepeatCounter(u64);
+
+impl RepeatCounter {
+    /// Count one occurrence. Returns the count so far when this occurrence is
+    /// one to report, `None` otherwise.
+    #[inline]
+    #[must_use = "the count says whether to report this occurrence"]
+    pub fn note(&mut self) -> Option<u64> {
+        self.0 = self.0.saturating_add(1);
+        self.0.is_power_of_two().then_some(self.0)
+    }
+
+    /// Occurrences since the last reset.
+    #[inline]
+    pub fn count(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Bytes as space-separated upper-case hex pairs, formatted only when shown.
 pub struct HexBytes<'a>(pub &'a [u8]);
 
@@ -229,6 +256,16 @@ mod tests {
             offenders.is_empty(),
             "the bridge's `log` records reach no host; use bridge_log! or bridge_diag_log: {offenders:?}"
         );
+    }
+
+    #[test]
+    fn a_repeat_counter_reports_powers_of_two() {
+        let mut counter = RepeatCounter::default();
+        let reported: Vec<u64> = (0..1000).filter_map(|_| counter.note()).collect();
+        assert_eq!(reported, [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]);
+        assert_eq!(counter.count(), 1000);
+        counter = RepeatCounter::default();
+        assert_eq!(counter.note(), Some(1));
     }
 
     #[test]

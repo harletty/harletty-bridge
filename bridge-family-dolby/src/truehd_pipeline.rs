@@ -13,7 +13,7 @@ use truehd::structs::access_unit::AccessUnit;
 use crate::dolby::{DolbyPipeline, DrcMode};
 use crate::labels::{channel_label_to_r, oamd_speaker_to_label};
 use crate::logging::{bridge_diag_log, bridge_log, drc_diag_log_enabled, panic_message};
-use crate::metadata::build_metadata_frame_from_oamd;
+use crate::metadata::{OamdWarnings, build_metadata_frame_from_oamd};
 use crate::perf::PerfStats;
 use crate::shared::{AfterPush, SharedState};
 
@@ -93,6 +93,7 @@ struct DrainContext<'a> {
     total_samples: &'a mut u64,
     declared_object_channels: &'a mut Option<RVec<bridge_api::RObjectChannel>>,
     spatial_labels: &'a mut Option<RVec<RChannelLabel>>,
+    oamd_warnings: &'a mut OamdWarnings,
     perf: &'a mut PerfStats,
 }
 
@@ -459,6 +460,7 @@ fn build_thd_frame(
             evo_base,
             base_sample_pos,
             ctx.declared_object_channels,
+            ctx.oamd_warnings,
             #[cfg(feature = "bridge-perf")]
             ctx.perf,
         );
@@ -537,6 +539,7 @@ pub(crate) fn process_extractor_input(
             total_samples: &mut shared.total_samples,
             declared_object_channels: &mut shared.declared_object_channels,
             spatial_labels: &mut bridge.truehd_spatial_labels,
+            oamd_warnings: &mut bridge.truehd_oamd_warnings,
             perf: &mut bridge.perf,
         };
         #[cfg(feature = "bridge-perf")]
