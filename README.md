@@ -48,6 +48,17 @@ and follow the three steps for your OS below.
 > | **Linux** | `libharletty_bridge.so` |
 > | **macOS** | `libharletty_bridge.dylib` |
 
+> **Match the bridge to your Omniphony.** A bridge loads only in an
+> Omniphony built against the same `bridge_api` minor version, so each
+> release says at the top of its notes which Omniphony it requires
+> ("Requires Omniphony ≥ …"). The current `main` requires **Omniphony
+> with `bridge_api` 0.5**: Omniphony `main` since
+> [mgth/Omniphony#695](https://github.com/mgth/Omniphony/pull/695), and
+> the first Omniphony release after 0.6.0. Omniphony 0.6.0 carries
+> `bridge_api` 0.4 and refuses it. When a host loads the bridge, its log
+> shows what the bridge was built from, e.g.
+> `harletty-bridge 0.8.0 (bridge_api 0.5.0, Omniphony 43006ee2…)`.
+
 ### 🪟 Windows
 
 Download **`harletty_bridge.dll`** from the releases page, then pick
@@ -206,7 +217,21 @@ bridge (`*_bridge.so` / `.dll` / `.dylib`).
 ## Build from source
 
 Only needed if you want to hack on the bridge or there's no prebuilt
-artifact for your platform. Requires a Rust toolchain.
+artifact for your platform. Requires a Rust toolchain **and a checkout of
+[Omniphony](https://github.com/mgth/Omniphony) next to this repository, as
+`../Omniphony`**: `bridge/Cargo.toml` takes `bridge_api` (and, for the
+bench, `spdif`) from it by path. [`.omniphony-ref`](.omniphony-ref) names the
+Omniphony commit CI and the releases build against; check that one out to
+build what a release would:
+
+```sh
+git clone https://github.com/harletty/harletty-bridge
+git clone https://github.com/mgth/Omniphony
+git -C Omniphony checkout "$(harletty-bridge/scripts/omniphony-ref.sh)"
+cd harletty-bridge
+```
+
+Then:
 
 ```sh
 ./build_bridge.sh       # Linux / macOS / MSYS — runs `cargo build --release`
@@ -219,6 +244,11 @@ build_bridge.bat        :: Windows native
 The build produces `target/release/libharletty_bridge.{so,dylib}` on
 unix and `target\release\harletty_bridge.dll` on Windows. Point
 `bridge_path` at that file exactly as in the install steps above.
+
+The library records the Omniphony commit it was built against (`git
+rev-parse HEAD` in `../Omniphony`, or `HARLETTY_OMNIPHONY_COMMIT` when set,
+`unknown` when neither is available) and logs it with its own version and
+the `bridge_api` version when a host loads it.
 
 ### Choosing the codec families
 
@@ -304,7 +334,8 @@ auro/                # Auro-Codec side channel: detection and unfold
 docs/                # protocol notes (IEC61937, OAMD shape, …)
 EAC3_PATCH_NOTES.md  # upstream patches to the E-AC-3 decoder
 OBJECT_SIZE_NOTES.md # notes on OAMD object_size handling
-.github/workflows/   # CI: release builds (Linux + Windows) on `v*` tags
+.omniphony-ref       # the Omniphony commit CI and releases build against
+.github/workflows/   # CI on pushes and pull requests; release builds on `v*` tags
 ```
 
 ## Credits
