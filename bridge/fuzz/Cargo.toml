@@ -1,0 +1,46 @@
+# Fuzz target for the bridge's public entry point, `push_packet`, where codec
+# sniffing and the per-codec state machines meet. Not part of the root
+# workspace (the empty [workspace] table below keeps it standalone). CI builds
+# it on each push and pull request, and `.github/workflows/fuzz.yml` runs it
+# weekly with a cached corpus. Run locally with a nightly toolchain:
+#
+#   cargo +nightly fuzz run push_packet corpus/push_packet seeds/push_packet
+#
+# The first corpus directory collects what the fuzzer finds; `seeds/` holds
+# the small checked-in starting inputs and is only read. `--features iamf`
+# adds the IAMF family, which links libopus.
+#
+# Copy the root Cargo.lock here before building to fuzz the dependency
+# versions the bridge ships with; CI does.
+[package]
+name = "harletty-bridge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+iamf = ["harletty-bridge/iamf"]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+abi_stable = "0.11"
+harletty-bridge = { path = ".." }
+bridge_api = { path = "../../../Omniphony/omniphony-renderer/bridge_api" }
+
+[[bin]]
+name = "push_packet"
+path = "fuzz_targets/push_packet.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+
+# The root workspace's patch, which a standalone workspace does not inherit:
+# without it the bridge would be fuzzed against another TrueHD decoder than
+# the one it ships with.
+[patch.crates-io]
+truehd = { git = "https://github.com/harletty/truehdd", rev = "1fa8b034bdddd6f15e7f8876b4a6755ed8772e69" }
