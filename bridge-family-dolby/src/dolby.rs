@@ -26,7 +26,7 @@ use crate::eac3_pipeline::{
 };
 use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::validate_frame_shape;
-use crate::logging::{bridge_diag_log, bridge_log};
+use crate::logging::{RepeatCounter, bridge_diag_log, bridge_log};
 use crate::mat::MatStream;
 use crate::metadata::OamdWarnings;
 use crate::perf::PerfStats;
@@ -67,6 +67,27 @@ pub(crate) struct Eac3DiagStats {
     pub(crate) dependent_frames_dropped: u64,
     pub(crate) last_ac3_core_decode_error: Option<String>,
     pub(crate) last_dependent_pair_error: Option<String>,
+}
+
+/// E-AC-3 / AC-3 conditions a damaged or unusual stream can show on every
+/// access unit, since the last reset. Each is logged on its 1st, 2nd, 4th,
+/// 8th... occurrence only; the running totals in [`Eac3DiagStats`] stay.
+#[derive(Debug, Default)]
+pub(crate) struct Eac3Warnings {
+    /// Legacy AC-3 cores that did not decode (silence stands in).
+    pub(crate) ac3_core_decode_failures: RepeatCounter,
+    /// Decoded frames dropped for an inconsistent shape.
+    pub(crate) rejected_frames: RepeatCounter,
+    /// Dependents with no core in front of them.
+    pub(crate) orphan_dependents: RepeatCounter,
+    /// Dependents past the eight one independent may carry.
+    pub(crate) dependent_group_overflows: RepeatCounter,
+    /// Dependents whose channels could not be overlaid onto the core.
+    pub(crate) dependent_merge_failures: RepeatCounter,
+    /// JOC payloads declaring a five-channel downmix over a merged bed.
+    pub(crate) joc_downmix_mismatches: RepeatCounter,
+    /// Dependent object reconstructions that failed (non-strict).
+    pub(crate) dependent_object_decode_errors: RepeatCounter,
 }
 
 /// Upper bound on buffered dependent access units awaiting an AC-3 core
@@ -176,6 +197,7 @@ pub struct DolbyPipeline {
     /// than TrueHD's.
     pub(crate) eac3_active: bool,
     pub(crate) eac3_diag_stats: Eac3DiagStats,
+    pub(crate) eac3_warnings: Eac3Warnings,
     // ── Shared by TrueHD and E-AC-3 ──────────────────────────────────
     pub(crate) presentation: u8,
     /// Current dialogue level from the last major sync.
@@ -238,6 +260,7 @@ impl DolbyPipeline {
             eac3_total_samples: 0,
             eac3_active: false,
             eac3_diag_stats: Eac3DiagStats::default(),
+            eac3_warnings: Eac3Warnings::default(),
             presentation,
             current_dialogue_level: None,
             current_substream_info: None,
@@ -288,6 +311,7 @@ impl DolbyPipeline {
         self.pending_eac3_core = None;
         self.eac3_frame_count = 0;
         self.eac3_active = false;
+        self.eac3_warnings = Eac3Warnings::default();
 
         // Re-apply configuration to new parser/decoder instances.
         let fail_level = shared.fail_level();
@@ -768,13 +792,15 @@ impl DolbyPipeline {
                 Err(err) => {
                     diagnose_eac3_frame(self, frame, &inspection);
                     self.eac3_diag_stats.ac3_core_decode_failures += 1;
+                    if let Some(failures) = self.eac3_warnings.ac3_core_decode_failures.note() {
+                        bridge_log!(
+                            log::Level::Warn,
+                            "ac3_core_decode_failed index={} error={} ({failures} frame(s) so far)",
+                            self.eac3_frame_count,
+                            err
+                        );
+                    }
                     self.eac3_diag_stats.last_ac3_core_decode_error = Some(err.clone());
-                    bridge_log!(
-                        log::Level::Warn,
-                        "ac3_core_decode_failed index={} error={}",
-                        self.eac3_frame_count,
-                        err
-                    );
                     // Stand in one frame of silence for the core and stop here.
                     // This used to fall through to the E-AC-3 decoders, which
                     // can only reject an AC-3 syncframe ("not-eac3") and then
@@ -821,16 +847,18 @@ impl DolbyPipeline {
         match decode_result {
             Ok(decoded_frame) => {
                 if let Err(reason) = validate_frame_shape(&decoded_frame) {
-                    bridge_log!(
-                        log::Level::Warn,
-                        "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={}",
-                        self.eac3_frame_count,
-                        reason,
-                        decoded_frame.sampling_frequency,
-                        decoded_frame.sample_count,
-                        decoded_frame.channel_count,
-                        decoded_frame.pcm.len()
-                    );
+                    if let Some(frames) = self.eac3_warnings.rejected_frames.note() {
+                        bridge_log!(
+                            log::Level::Warn,
+                            "eac3_frame_rejected index={} reason={} sr={} samples={} ch={} pcm_len={} ({frames} frame(s) so far)",
+                            self.eac3_frame_count,
+                            reason,
+                            decoded_frame.sampling_frequency,
+                            decoded_frame.sample_count,
+                            decoded_frame.channel_count,
+                            decoded_frame.pcm.len()
+                        );
+                    }
                     return Ok(());
                 }
                 if is_temporary_eac3_silence_frame(&decoded_frame) {
@@ -866,10 +894,12 @@ impl DolbyPipeline {
             // used to be parked for some later, unrelated core to claim,
             // which put one programme's extension channels on another's bed.
             self.eac3_diag_stats.dependent_frames_dropped += 1;
-            bridge_diag_log(
-                log::Level::Warn,
-                "eac3_orphan_dependent no core precedes this dependent access unit",
-            );
+            if let Some(orphans) = self.eac3_warnings.orphan_dependents.note() {
+                bridge_log!(
+                    log::Level::Warn,
+                    "eac3_orphan_dependent no core precedes this dependent access unit ({orphans} so far)"
+                );
+            }
             return Ok(());
         };
         if pending.dependents.len() >= MAX_EAC3_DEPENDENTS {
@@ -877,10 +907,12 @@ impl DolbyPipeline {
             // group is malformed rather than longer, so resolve what is
             // valid and drop the excess instead of growing without bound.
             self.eac3_diag_stats.dependent_frames_dropped += 1;
-            bridge_diag_log(
-                log::Level::Warn,
-                "eac3_dependent_group_overflow more than eight dependents behind one independent",
-            );
+            if let Some(groups) = self.eac3_warnings.dependent_group_overflows.note() {
+                bridge_log!(
+                    log::Level::Warn,
+                    "eac3_dependent_group_overflow more than eight dependents behind one independent ({groups} so far)"
+                );
+            }
             return self.finish_presentation(shared, result);
         }
         let carries_joc = eac3_frame_carries_joc(&info);
@@ -1121,6 +1153,43 @@ mod tests {
         assert_eq!(silence.pcm.len(), 1536 * 6);
         assert!(silence.pcm.iter().all(|sample| *sample == 0));
         assert!(silence.metadata.is_empty());
+    }
+
+    /// A stream of AC-3 cores that do not decode plays silence for each and
+    /// is counted, not logged on every frame; a reset starts the count over.
+    #[test]
+    fn failed_legacy_ac3_cores_are_counted_across_frames() {
+        let mut frame = vec![0u8; 1670];
+        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1]);
+        let mut bridge = TestBridge::new(false);
+        for failures in 1..=20 {
+            let mut result = RPushResult {
+                frames: RVec::new(),
+                error_message: RString::new(),
+                did_reset: false,
+            };
+            let mut temporary_silence_pushed = false;
+            bridge
+                .dolby
+                .process_eac3_access_unit(
+                    &mut bridge.shared,
+                    &frame,
+                    &mut result,
+                    &mut temporary_silence_pushed,
+                )
+                .expect("a failed core is not a pipeline error");
+            assert_eq!(result.frames.len(), 1);
+            assert_eq!(
+                bridge.dolby.eac3_warnings.ac3_core_decode_failures.count(),
+                failures
+            );
+        }
+        bridge.dolby.reset(&bridge.shared);
+        assert_eq!(
+            bridge.dolby.eac3_warnings.ac3_core_decode_failures.count(),
+            0
+        );
+        assert_eq!(bridge.dolby.eac3_diag_stats.ac3_core_decode_failures, 20);
     }
 
     /// The presentations asked of the TrueHD parser follow the DRC mode, and a
