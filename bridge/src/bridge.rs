@@ -23,6 +23,10 @@ const FAMILY_IAMF: &str = "iamf";
 const FAMILY_DTS: &str = "dts";
 #[cfg(not(feature = "dolby"))]
 const FAMILY_DOLBY: &str = "dolby";
+/// TrueHD's presentation count (`truehd::process::MAX_PRESENTATIONS`): a
+/// build without Dolby checks `presentation` as one with Dolby does.
+#[cfg(not(feature = "dolby"))]
+const TRUEHD_PRESENTATIONS: u8 = 4;
 
 /// What the bridge reports before a stream is identified: Dolby, or with no
 /// Dolby in the build, the first family it has.
@@ -531,6 +535,25 @@ impl FormatBridge for AtmosBridge {
                     );
                     false
                 }
+            },
+            // TrueHD's presentation. Hosts send it once at start-up (default
+            // `best`) and stop when it is refused, so a build without Dolby
+            // takes the values a Dolby build takes, as a no-op: it has no
+            // TrueHD to apply them to.
+            #[cfg(not(feature = "dolby"))]
+            "presentation" => match value.as_str() {
+                "best" => true,
+                s => match s.parse::<u8>() {
+                    Ok(p) if p < TRUEHD_PRESENTATIONS => true,
+                    _ => {
+                        bridge_log!(
+                            log::Level::Warn,
+                            "atmos-bridge: invalid presentation value {:?}",
+                            s
+                        );
+                        false
+                    }
+                },
             },
             key => {
                 #[cfg(feature = "dolby")]
@@ -1457,6 +1480,51 @@ mod stack_footprint_tests {
             .expect("spawn small-stack thread")
             .join()
             .expect("bridge construction overflowed a 512 KiB stack");
+    }
+}
+
+/// What a host sends a bridge it has just created, through the same entry
+/// point (`get_library().new_bridge`) and in the same order: Omniphony's CLI,
+/// live input and engine all stop when `presentation` is refused, before any
+/// audio. Every family set must get through it.
+#[cfg(test)]
+mod host_initialization_tests {
+    use bridge_api::FormatBridgeBox;
+
+    fn host_bridge() -> FormatBridgeBox {
+        crate::new_bridge(false)
+    }
+
+    #[test]
+    fn the_default_presentation_is_accepted_by_every_build() {
+        let mut bridge = host_bridge();
+        assert!(bridge.configure("presentation".into(), "best".into()));
+    }
+
+    #[test]
+    fn every_build_takes_the_same_presentation_values() {
+        let mut bridge = host_bridge();
+        for p in ["0", "1", "2", "3"] {
+            assert!(
+                bridge.configure("presentation".into(), p.into()),
+                "presentation {p} refused"
+            );
+        }
+        for p in ["4", "255", "-1", "highest", ""] {
+            assert!(
+                !bridge.configure("presentation".into(), p.into()),
+                "presentation {p:?} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_presentation_leaves_the_bridge_idle_and_ready_for_audio() {
+        let mut bridge = host_bridge();
+        assert!(bridge.configure("presentation".into(), "best".into()));
+        assert!(bridge.configure("input_codec".into(), "auto".into()));
+        assert!(!bridge.is_ready());
+        assert_eq!(bridge.source_family().as_str(), super::IDLE_FAMILY);
     }
 }
 
