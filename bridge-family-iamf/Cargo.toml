@@ -11,7 +11,7 @@ publish = false
 # Its Opus decoding links libopus (pkg-config, or OPUS_LIB_DIR). The pure-Rust
 # Opus decoder iamf-rs also offers is far below realtime on real content.
 [dependencies]
-bridge_api = { version = "0.5.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
+bridge_api = { version = "0.6.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
 bridge-common = { version = "0.8.0", path = "../bridge-common" }
 abi_stable = "0.11"
 log = "0.4"

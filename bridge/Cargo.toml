@@ -37,7 +37,7 @@ bridge-perf = ["bridge-family-dolby?/bridge-perf"]
 # checkout in CI, at the commit `.omniphony-ref` (repository root) pins.
 # build.rs records which commit that was in the library.
 [dependencies]
-bridge_api = { version = "0.5.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
+bridge_api = { version = "0.6.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
 bridge-common = { version = "0.8.0", path = "../bridge-common" }
 bridge-family-dolby = { version = "0.8.0", path = "../bridge-family-dolby", optional = true }
 bridge-family-dts = { version = "0.8.0", path = "../bridge-family-dts", optional = true }
