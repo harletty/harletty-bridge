@@ -14,4 +14,4 @@
 # a host built against the same bridge_api minor, so this decides which
 # Omniphony releases can load what this repository ships. No Omniphony release
 # carries bridge_api 0.5 yet (v0.6.0 has 0.4), hence a commit of main.
-feat/bridge-api-probe
+1582a9836c68195df8d6433e5d054512e2a2650c
