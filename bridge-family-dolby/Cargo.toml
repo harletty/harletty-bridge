@@ -13,7 +13,7 @@ publish = false
 bridge-perf = ["truehd/perf"]
 
 [dependencies]
-bridge_api = { version = "0.5.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
+bridge_api = { version = "0.6.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
 bridge-common = { version = "0.8.0", path = "../bridge-common" }
 truehd = { version = "0.7.2" }
 eac3 = { version = "0.8.0", path = "../eac3" }

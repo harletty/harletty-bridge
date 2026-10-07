@@ -1,7 +1,7 @@
 use abi_stable::std_types::{RSlice, RStr, RString, RVec};
 use bridge_api::{
-    FormatBridge, RChannelPose, RCoordinateFormat, RInputTransport, RPushResult, RSourceFamily,
-    RVbapCartesianDefaults, RVbapTableMode,
+    FormatBridge, RChannelPose, RCoordinateFormat, RInputTransport, RProbe, RPushResult,
+    RSourceFamily, RVbapCartesianDefaults, RVbapTableMode,
 };
 
 use crate::logging::{RepeatCounter, bridge_diag_log, bridge_log};
@@ -145,6 +145,64 @@ fn sniff_raw_codec(data: &[u8]) -> Option<RawCodec> {
         return Some(RawCodec::Eac3);
     }
     None
+}
+
+/// The codec family behind `codec` is compiled into this build.
+fn is_built(codec: RawCodec) -> bool {
+    match codec {
+        RawCodec::TrueHd | RawCodec::Eac3 => cfg!(feature = "dolby"),
+        RawCodec::Dts => cfg!(feature = "dts"),
+        RawCodec::Iamf => cfg!(feature = "iamf"),
+    }
+}
+
+/// `BridgeLib::probe` for this build. IEC 61937: the burst types the built
+/// families decode. Raw: the router's own sniff, at offset 0 only, as
+/// `push_packet` detects a stream today. The per-family plugins replace it
+/// with validated starts anywhere in the window (docs/multi-bridge.md in
+/// Omniphony); a host with this bridge alone does not need it.
+pub(crate) fn probe(data: &[u8], transport: RInputTransport, data_type: u8) -> RProbe {
+    let claimed = match transport {
+        RInputTransport::Iec61937 => accepts_data_type(data_type),
+        RInputTransport::Raw => sniff_raw_codec(data).is_some_and(is_built),
+    };
+    if claimed {
+        RProbe::claim(0)
+    } else {
+        RProbe::none(0)
+    }
+}
+
+/// An IEC 61937 burst type one of the built families decodes.
+fn accepts_data_type(data_type: u8) -> bool {
+    #[cfg(feature = "dolby")]
+    if DolbyPipeline::accepts_data_type(data_type) {
+        return true;
+    }
+    #[cfg(feature = "dts")]
+    if bridge_family_dts::accepts_data_type(data_type) {
+        return true;
+    }
+    let _ = data_type;
+    false
+}
+
+/// `BridgeLib::input_codecs` for this build: the names a player gives the
+/// codecs of the built families, each one `configure("input_codec")` takes.
+pub(crate) fn input_codecs() -> RVec<RString> {
+    let mut codecs = RVec::new();
+    if cfg!(feature = "dolby") {
+        for name in ["truehd", "mlp", "eac3", "ac3"] {
+            codecs.push(name.into());
+        }
+    }
+    if cfg!(feature = "dts") {
+        codecs.push("dts".into());
+    }
+    if cfg!(feature = "iamf") {
+        codecs.push("iamf".into());
+    }
+    codecs
 }
 
 /// An IA sequence header OBU (type 31) at offset 0 whose payload starts with
@@ -666,6 +724,9 @@ impl FormatBridge for AtmosBridge {
             x_size: 62,
             y_size: 62,
             z_size: 15,
+            // Nothing below the floor in the grid: those positions render at
+            // their true place with realtime and polar evaluation (above).
+            z_neg_size: 0,
             // The OAMD position decode carries z in [-1, 1] — the bitstream
             // has an explicit sign bit for below-floor objects — so the
             // renderer must not clamp z at the panner. Grids without
@@ -736,6 +797,55 @@ mod raw_transport_tests {
     fn sniff_detects_truehd_major_sync() {
         let buf = [0x00, 0x00, 0x00, 0x00, 0xF8, 0x72, 0x6F, 0xBA];
         assert_eq!(sniff_raw_codec(&buf), Some(RawCodec::TrueHd));
+    }
+
+    /// The root module's probe claims what this build decodes, at offset 0,
+    /// and nothing else: a codec whose family is not built is not claimed.
+    #[test]
+    fn probe_claims_the_built_families_only() {
+        use bridge_api::RProbeVerdict::{Claim, None as Nothing};
+        let verdict = |data: &[u8], transport, data_type| probe(data, transport, data_type).verdict;
+        let truehd = [0x00, 0x00, 0x00, 0x00, 0xF8, 0x72, 0x6F, 0xBA];
+        let eac3 = [0x0B, 0x77, 0x00, 0x00];
+        let dts = [0x7F, 0xFE, 0x80, 0x01];
+        let iamf = [0xF8, 0x06, b'i', b'a', b'm', b'f', 0x00, 0x00];
+        let built = |yes: bool| if yes { Claim } else { Nothing };
+        let dolby = cfg!(feature = "dolby");
+        let dts_built = cfg!(feature = "dts");
+        assert_eq!(verdict(&truehd, RInputTransport::Raw, 0), built(dolby));
+        assert_eq!(verdict(&eac3, RInputTransport::Raw, 0), built(dolby));
+        assert_eq!(verdict(&dts, RInputTransport::Raw, 0), built(dts_built));
+        assert_eq!(
+            verdict(&iamf, RInputTransport::Raw, 0),
+            built(cfg!(feature = "iamf"))
+        );
+        assert_eq!(verdict(&[0x12, 0x34], RInputTransport::Raw, 0), Nothing);
+        assert_eq!(verdict(&[], RInputTransport::Iec61937, 0x16), built(dolby));
+        assert_eq!(verdict(&[], RInputTransport::Iec61937, 0x15), built(dolby));
+        assert_eq!(
+            verdict(&[], RInputTransport::Iec61937, 0x0B),
+            built(dts_built)
+        );
+        assert_eq!(verdict(&[], RInputTransport::Iec61937, 0x07), Nothing);
+    }
+
+    /// Every codec name the root module lists is one `configure` takes.
+    #[test]
+    fn every_listed_input_codec_is_accepted() {
+        let codecs = input_codecs();
+        assert_eq!(
+            codecs.iter().any(|c| c == "truehd"),
+            cfg!(feature = "dolby")
+        );
+        assert_eq!(codecs.iter().any(|c| c == "dts"), cfg!(feature = "dts"));
+        assert_eq!(codecs.iter().any(|c| c == "iamf"), cfg!(feature = "iamf"));
+        for codec in codecs.iter() {
+            let mut bridge = AtmosBridge::new(false);
+            assert!(
+                bridge.configure("input_codec".into(), codec.as_str().into()),
+                "input_codec {codec} is listed but refused"
+            );
+        }
     }
 
     #[test]

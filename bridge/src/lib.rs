@@ -9,12 +9,15 @@ use bridge_common::{logging, shared};
 #[cfg(feature = "iamf")]
 use bridge_family_iamf as iamf_pipeline;
 
-use abi_stable::std_types::RVec;
+use abi_stable::std_types::{RSlice, RString, RVec};
 use abi_stable::{
     export_root_module, prefix_type::PrefixTypeTrait, sabi_trait::prelude::TD_Opaque,
 };
 use bridge::AtmosBridge;
-use bridge_api::{BridgeLib, BridgeLibRef, FormatBridge_TO, FormatBridgeBox, RSourceFamily};
+use bridge_api::{
+    BridgeLib, BridgeLibRef, FormatBridge_TO, FormatBridgeBox, RInputTransport, RProbe,
+    RSourceFamily,
+};
 
 // Silence unused import warning — FormatBridge is used via the proc-macro generated impl.
 #[allow(unused_imports)]
@@ -27,6 +30,8 @@ fn get_library() -> BridgeLibRef {
         new_bridge: create_bridge,
         set_host_log_sink,
         source_families,
+        probe,
+        input_codecs,
     }
     .leak_into_prefix()
 }
@@ -71,6 +76,14 @@ fn log_build_id_once() {
 
 extern "C" fn source_families() -> RVec<RSourceFamily> {
     bridge::source_families()
+}
+
+extern "C" fn probe(data: RSlice<'_, u8>, transport: RInputTransport, data_type: u8) -> RProbe {
+    bridge::probe(data.as_slice(), transport, data_type)
+}
+
+extern "C" fn input_codecs() -> RVec<RString> {
+    bridge::input_codecs()
 }
 
 /// A bridge as the host gets one, for in-process callers linking the rlib —
