@@ -13,5 +13,8 @@
 # Move it deliberately, with the change that needs it: a bridge loads only in
 # a host built against the same bridge_api minor, so this decides which
 # Omniphony releases can load what this repository ships. No Omniphony release
-# carries bridge_api 0.5 yet (v0.6.0 has 0.4), hence a commit of main.
-1582a9836c68195df8d6433e5d054512e2a2650c
+# carries bridge_api 0.6 yet (v0.6.0 has 0.4), hence a commit of main: the
+# merge of mgth/Omniphony#785, the first host that loads several bridges at
+# once (render.bridge_paths, discovery of every bridge in a folder), which the
+# per-family plugins need. bridge_api itself is the 0.6 of #782.
+25369b9f8c9abdd8905ec02d66fdca6ce5115c19

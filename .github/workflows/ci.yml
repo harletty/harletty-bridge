@@ -111,21 +111,22 @@ jobs:
       # The bridge-perf timing path is compiled by nothing else — it rotted
       # unnoticed once already (#31) — so keep it building.
       - name: Check bridge-perf feature
-        run: cargo check --locked -p harletty-bridge --features bridge-perf --all-targets
+        run: cargo check --locked -p harletty-bridge -p harletty-dolby-bridge --features harletty-bridge/bridge-perf,harletty-dolby-bridge/bridge-perf --all-targets
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
 
-      # IAMF is opt-in (its Opus path links libopus, which the Windows and
-      # macOS release builds do not provide yet), so the default build above
-      # never compiles it: bridge-family-iamf is left out of the workspace's
-      # default members. The decode tests against the libiamf conformance
-      # vectors skip here: they need HARLETTY_IAMF_VECTORS.
+      # IAMF links libopus (the system's here; Windows and macOS build it
+      # from source, see the iamf-static-opus job), so the default build
+      # above never compiles it: bridge-family-iamf and the IAMF plugin are
+      # left out of the workspace's default members. The decode tests
+      # against the libiamf conformance vectors skip here: they need
+      # HARLETTY_IAMF_VECTORS.
       - name: Install libopus
         run: sudo apt-get update && sudo apt-get install -y libopus-dev
 
       - name: Test iamf feature
-        run: cargo test --locked -p harletty-bridge -p bridge-family-iamf --features harletty-bridge/iamf
+        run: cargo test --locked -p harletty-bridge -p bridge-family-iamf -p harletty-iamf-bridge --features harletty-bridge/iamf
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -165,6 +166,136 @@ jobs:
         working-directory: harletty-bridge
         env:
           GH_TOKEN: ${{ github.token }}
+
+  # Each plugin on its own, against its own crates only: a test of one
+  # family that needed another family's code built in would pass in the
+  # workspace run above and fail here. Then the release library itself.
+  plugin:
+    name: plugin (${{ matrix.family }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        family: [dolby, dts, iamf]
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Checkout harletty-bridge
+        uses: actions/checkout@v4
+        with:
+          path: harletty-bridge
+
+      # As in test-linux: the pin, or Omniphony's `main` for the scheduled run.
+      - name: Resolve the Omniphony ref
+        id: omniphony
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.omniphony-ref }}
+        run: |
+          case "$EVENT" in
+            schedule) ref=main ;;
+            workflow_dispatch) ref=${INPUT_REF:-$(harletty-bridge/scripts/omniphony-ref.sh)} ;;
+            *) ref=$(harletty-bridge/scripts/omniphony-ref.sh) ;;
+          esac
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Omniphony (path dependencies)
+        uses: actions/checkout@v4
+        with:
+          repository: mgth/Omniphony
+          ref: ${{ steps.omniphony.outputs.ref }}
+          path: Omniphony
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libopus
+        if: matrix.family == 'iamf'
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev
+
+      - name: Test the plugin and its family
+        run: cargo test --locked -p harletty-${{ matrix.family }}-bridge -p bridge-family-${{ matrix.family }}
+        working-directory: harletty-bridge
+
+      - name: Build the plugin library
+        run: |
+          cargo build --release --locked -p harletty-${{ matrix.family }}-bridge
+          test -f target/release/libharletty_${{ matrix.family }}_bridge.so
+        working-directory: harletty-bridge
+
+  # The IAMF plugin on the platforms with no system libopus: libopus built
+  # from source and linked in statically, as release.yml does, checked on
+  # every change rather than first at a release. The test binaries link the
+  # same static library, and no libopus is installed: a plugin that needed a
+  # shared one would not run its tests.
+  iamf-static-opus:
+    name: iamf plugin, static libopus (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            library: harletty_iamf_bridge.dll
+            python: python
+            # +crt-static: see .cargo/config.toml, which RUSTFLAGS replaces.
+            rustflags: -D warnings -C target-feature=+crt-static
+          - os: macos-14
+            library: libharletty_iamf_bridge.dylib
+            python: python3
+            rustflags: -D warnings
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - name: Checkout harletty-bridge
+        uses: actions/checkout@v4
+        with:
+          path: harletty-bridge
+
+      - name: Resolve the Omniphony ref
+        id: omniphony
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.omniphony-ref }}
+        run: |
+          case "$EVENT" in
+            schedule) ref=main ;;
+            workflow_dispatch) ref=${INPUT_REF:-$(harletty-bridge/scripts/omniphony-ref.sh)} ;;
+            *) ref=$(harletty-bridge/scripts/omniphony-ref.sh) ;;
+          esac
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Omniphony (path dependencies)
+        uses: actions/checkout@v4
+        with:
+          repository: mgth/Omniphony
+          ref: ${{ steps.omniphony.outputs.ref }}
+          path: Omniphony
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build libopus (static)
+        shell: bash
+        run: scripts/build-static-opus.sh
+        working-directory: harletty-bridge
+
+      - name: Test the IAMF plugin and its family
+        run: cargo test --locked -p harletty-iamf-bridge -p bridge-family-iamf
+        working-directory: harletty-bridge
+
+      - name: Build the plugin library
+        run: cargo build --release --locked -p harletty-iamf-bridge
+        working-directory: harletty-bridge
+
+      - name: Check libopus is linked in
+        shell: bash
+        run: ${{ matrix.python }} scripts/check-static-opus.py target/release/${{ matrix.library }}
+        working-directory: harletty-bridge
 
   # The fuzz crates (eac3/fuzz, dca/fuzz, bridge/fuzz) are workspaces of
   # their own, so nothing above compiles them: build every target here so
