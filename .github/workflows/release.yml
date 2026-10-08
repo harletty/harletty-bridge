@@ -124,18 +124,32 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # +crt-static: see .cargo/config.toml, which this RUSTFLAGS replaces.
       - name: Build (release)
         run: cargo build --release --locked -p harletty-bridge -p harletty
         working-directory: harletty-bridge
         env:
-          RUSTFLAGS: -D warnings
+          RUSTFLAGS: -D warnings -C target-feature=+crt-static
 
       # Same profile and flags as the build, so it reuses its artifacts.
       - name: Test (release)
         run: cargo test --release --locked
         working-directory: harletty-bridge
         env:
-          RUSTFLAGS: -D warnings
+          RUSTFLAGS: -D warnings -C target-feature=+crt-static
+
+      # Fails if the DLL or the CLI imports the Visual C++ runtime. The script
+      # comes with the Omniphony checkout when its commit has it.
+      - name: Check the binaries need no Visual C++ runtime
+        shell: bash
+        run: |
+          if [ -f Omniphony/scripts/check_windows_crt_imports.py ]; then
+            python Omniphony/scripts/check_windows_crt_imports.py \
+              harletty-bridge/target/release/harletty_bridge.dll \
+              harletty-bridge/target/release/harletty.exe
+          else
+            echo "check_windows_crt_imports.py not in this Omniphony commit: check skipped"
+          fi
 
       - name: Package (zip)
         run: |
