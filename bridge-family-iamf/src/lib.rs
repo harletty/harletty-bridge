@@ -42,6 +42,7 @@ use bridge_common::logging::{bridge_diag_log, bridge_log, panic_message};
 use bridge_common::shared::{AfterPush, SharedState};
 
 mod family;
+pub mod probe;
 pub use family::{FAMILY_IAMF, IamfCodec, IamfPipeline};
 
 /// System J in the decoder's IAMF channel order: L, R, C, LFE, Lss, Rss, Lrs,

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Assert the two artifacts this workspace builds stay in separate crate graphs.
+# Assert the artifacts this workspace builds stay in separate crate graphs.
 #
-# The repo produces a realtime plugin (harletty-bridge) and an offline CLI
-# (truehdd) from one decoder lineage. The whole point of splitting them into
+# The repo produces realtime plugins, one per codec family
+# (harletty-{dolby,dts,iamf}-bridge), and an offline CLI (harletty) from one
+# decoder lineage. The whole point of splitting them into
 # sibling packages instead of feature-gating one inside the other is that the
 # bridge's compile time, binary size and runtime cost are unaffected by the
 # CLI's existence. That property is invisible in review — someone adds a
@@ -54,9 +55,18 @@ check() {
   fi
 }
 
-# The realtime plugin must never pull in the offline writers or CLI machinery,
-# nor a logger of its own: its diagnostics go through the host's log sink.
-check harletty-bridge "realtime plugin" damf clap indicatif indicatif-log-bridge env_logger
+# What no bridge may hold: the offline writers and CLI machinery, and a logger
+# of its own (its diagnostics go through the host's log sink).
+cli=(damf clap indicatif indicatif-log-bridge env_logger)
+
+# The plugins, one per codec family: each holds its own family's decoders and
+# no other's (the IAMF plugin none but iamf-rs), nor anything of the CLI.
+check harletty-dolby-bridge "Dolby plugin" dca auro iamf-dec iamf-obu iamf-codecs "${cli[@]}"
+check harletty-dts-bridge "DTS plugin" truehd eac3 iamf-dec iamf-obu iamf-codecs "${cli[@]}"
+check harletty-iamf-bridge "IAMF plugin" truehd eac3 dca auro "${cli[@]}"
+
+# The combined bridge (an rlib for the fuzz target, the bench and the kit).
+check harletty-bridge "combined bridge" "${cli[@]}"
 
 # What the codec families share holds no decoder, and a family holds no other
 # family's decoders: an IAMF-only bridge carries none of them
@@ -64,7 +74,7 @@ check harletty-bridge "realtime plugin" damf clap indicatif indicatif-log-bridge
 check bridge-common "shared by the codec families" truehd eac3 dca auro iamf-dec iamf-obu iamf-codecs
 check bridge-family-iamf "IAMF family" truehd eac3 dca auro
 check bridge-family-dolby "Dolby family" dca auro iamf-dec iamf-obu iamf-codecs
-FEATURES=iamf check harletty-bridge "IAMF-only plugin" truehd eac3 dca auro
+FEATURES=iamf check harletty-bridge "IAMF-only combined build" truehd eac3 dca auro
 check bridge-family-dts "DTS family" truehd eac3 iamf-dec iamf-obu iamf-codecs
 
 # ...and the offline CLI must never pull in the bridge ABI: it stays a pure

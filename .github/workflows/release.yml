@@ -4,9 +4,16 @@ name: Release
 # pins (the same file CI builds with, read by `scripts/omniphony-ref.sh`), so
 # rebuilding a tag later builds against the same Omniphony tree. The pin must
 # be a tag of Omniphony or a commit of its `main`; it is resolved to a commit
-# once, and every platform builds that commit. The library records it
-# (`HARLETTY_OMNIPHONY_COMMIT`, read by bridge/build.rs) and logs it when a
-# host loads it.
+# once, and every platform builds that commit. Each library records it
+# (`HARLETTY_OMNIPHONY_COMMIT`, read by bridge-common/build.rs) and logs it
+# when a host loads it.
+#
+# Each platform archive holds the three bridge plugins, one per codec family
+# (harletty_dolby_bridge, harletty_dts_bridge, harletty_iamf_bridge); a host
+# loads them together (Omniphony docs/multi-bridge.md). The IAMF plugin links
+# libopus: the system's on Linux (libopus0 at run time), built from source
+# and linked in statically on Windows and macOS (scripts/build-static-opus.sh),
+# so that each plugin is one file there.
 #
 # A manual run builds and tests the three platforms and publishes nothing: a
 # dry run before tagging.
@@ -75,15 +82,22 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # The IAMF plugin's Opus decoding links the system libopus.
+      - name: Install libopus
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev
+
       - name: Build (release)
-        run: cargo build --release --locked -p harletty-bridge -p harletty
+        run: cargo build --release --locked -p harletty-dolby-bridge -p harletty-dts-bridge -p harletty-iamf-bridge -p harletty
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
 
-      # Same profile and flags as the build, so it reuses its artifacts.
+      # Same profile and flags as the build, so it reuses its artifacts. The
+      # IAMF family is not a default member: tested on its own.
       - name: Test (release)
-        run: cargo test --release --locked
+        run: |
+          cargo test --release --locked
+          cargo test --release --locked -p bridge-family-iamf -p harletty-iamf-bridge
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -91,7 +105,8 @@ jobs:
       - name: Package (zip)
         run: |
           cd harletty-bridge/target/release
-          zip "harletty-bridge-${GITHUB_REF_NAME}-linux-x86_64.zip" libharletty_bridge.so
+          zip "harletty-bridge-${GITHUB_REF_NAME}-linux-x86_64.zip" \
+            libharletty_dolby_bridge.so libharletty_dts_bridge.so libharletty_iamf_bridge.so
           zip "harletty-cli-${GITHUB_REF_NAME}-linux-x86_64.zip" harletty
 
       - name: Upload artifact
@@ -124,37 +139,54 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # libopus from source, static and on the static C runtime, linked into
+      # the IAMF plugin (sets OPUS_LIB_DIR and OPUS_STATIC for what follows).
+      - name: Build libopus (static)
+        shell: bash
+        run: scripts/build-static-opus.sh
+        working-directory: harletty-bridge
+
       # +crt-static: see .cargo/config.toml, which this RUSTFLAGS replaces.
       - name: Build (release)
-        run: cargo build --release --locked -p harletty-bridge -p harletty
+        run: cargo build --release --locked -p harletty-dolby-bridge -p harletty-dts-bridge -p harletty-iamf-bridge -p harletty
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings -C target-feature=+crt-static
 
-      # Same profile and flags as the build, so it reuses its artifacts.
+      # Same profile and flags as the build, so it reuses its artifacts. The
+      # IAMF family is not a default member: tested on its own.
       - name: Test (release)
-        run: cargo test --release --locked
+        run: |
+          cargo test --release --locked
+          cargo test --release --locked -p bridge-family-iamf -p harletty-iamf-bridge
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings -C target-feature=+crt-static
 
-      # Fails if the DLL or the CLI imports the Visual C++ runtime. The script
+      # Fails if a DLL or the CLI imports the Visual C++ runtime. The script
       # comes with the Omniphony checkout when its commit has it.
       - name: Check the binaries need no Visual C++ runtime
         shell: bash
         run: |
           if [ -f Omniphony/scripts/check_windows_crt_imports.py ]; then
             python Omniphony/scripts/check_windows_crt_imports.py \
-              harletty-bridge/target/release/harletty_bridge.dll \
+              harletty-bridge/target/release/harletty_dolby_bridge.dll \
+              harletty-bridge/target/release/harletty_dts_bridge.dll \
+              harletty-bridge/target/release/harletty_iamf_bridge.dll \
               harletty-bridge/target/release/harletty.exe
           else
             echo "check_windows_crt_imports.py not in this Omniphony commit: check skipped"
           fi
 
+      - name: Check libopus is linked in
+        shell: bash
+        run: python scripts/check-static-opus.py target/release/harletty_iamf_bridge.dll
+        working-directory: harletty-bridge
+
       - name: Package (zip)
         run: |
           cd harletty-bridge/target/release
-          Compress-Archive -Path harletty_bridge.dll -DestinationPath "harletty-bridge-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
+          Compress-Archive -Path harletty_dolby_bridge.dll,harletty_dts_bridge.dll,harletty_iamf_bridge.dll -DestinationPath "harletty-bridge-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
           Compress-Archive -Path harletty.exe -DestinationPath "harletty-cli-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
 
       - name: Upload artifact
@@ -187,23 +219,37 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # libopus from source, static, linked into the IAMF plugin (sets
+      # OPUS_LIB_DIR and OPUS_STATIC for what follows).
+      - name: Build libopus (static)
+        run: scripts/build-static-opus.sh
+        working-directory: harletty-bridge
+
       - name: Build (release)
-        run: cargo build --release --locked -p harletty-bridge -p harletty
+        run: cargo build --release --locked -p harletty-dolby-bridge -p harletty-dts-bridge -p harletty-iamf-bridge -p harletty
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
 
-      # Same profile and flags as the build, so it reuses its artifacts.
+      # Same profile and flags as the build, so it reuses its artifacts. The
+      # IAMF family is not a default member: tested on its own.
       - name: Test (release)
-        run: cargo test --release --locked
+        run: |
+          cargo test --release --locked
+          cargo test --release --locked -p bridge-family-iamf -p harletty-iamf-bridge
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
+
+      - name: Check libopus is linked in
+        run: python3 scripts/check-static-opus.py target/release/libharletty_iamf_bridge.dylib
+        working-directory: harletty-bridge
 
       - name: Package (zip)
         run: |
           cd harletty-bridge/target/release
-          zip "harletty-bridge-${GITHUB_REF_NAME}-macos-arm64.zip" libharletty_bridge.dylib
+          zip "harletty-bridge-${GITHUB_REF_NAME}-macos-arm64.zip" \
+            libharletty_dolby_bridge.dylib libharletty_dts_bridge.dylib libharletty_iamf_bridge.dylib
           zip "harletty-cli-${GITHUB_REF_NAME}-macos-arm64.zip" harletty
 
       - name: Upload artifact
@@ -270,9 +316,11 @@ jobs:
           {
             echo "## ${heading}"
             echo
-            echo "The bridge is built against \`bridge_api\` ${BRIDGE_API}, from ${link} (\`.omniphony-ref\`: \`${REF}\`). A host loads it only when built against the same \`bridge_api\` minor, ${minor}.x: ${since}, up to the release that moves \`bridge_api\` past ${minor}. Other hosts refuse it. The CLI has no such dependency."
+            echo "Each platform archive holds three bridge plugins, one per codec family, to install together: \`harletty_dolby_bridge\` (TrueHD, E-AC-3, AC-3), \`harletty_dts_bridge\` (DTS, DTS-HD, DTS:X, Auro-3D) and \`harletty_iamf_bridge\` (IAMF; on Linux it needs the system libopus). They replace the single \`harletty_bridge\` library of earlier releases, which should be removed."
             echo
-            echo "When a host loads it, the bridge logs what it was built from: \`harletty-bridge <version> (bridge_api ${BRIDGE_API}, Omniphony ${COMMIT})\`."
+            echo "The bridges are built against \`bridge_api\` ${BRIDGE_API}, from ${link} (\`.omniphony-ref\`: \`${REF}\`). A host loads them only when built against the same \`bridge_api\` minor, ${minor}.x: ${since}, up to the release that moves \`bridge_api\` past ${minor}. Other hosts refuse them. The CLI has no such dependency."
+            echo
+            echo "When a host loads one, it logs what it was built from: \`harletty-dolby-bridge <version> (bridge_api ${BRIDGE_API}, Omniphony ${COMMIT})\`, and likewise for the other two."
           } > omniphony-requirement.md
           echo "path=omniphony-requirement.md" >> "$GITHUB_OUTPUT"
 

@@ -17,6 +17,7 @@ mod dts_pipeline;
 mod dts_spdif;
 mod family;
 mod labels;
+pub mod probe;
 
 // What every family shares, under the `crate::` paths the modules use.
 use bridge_common::{frame_builders, logging, shared};

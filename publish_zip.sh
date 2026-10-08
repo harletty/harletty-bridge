@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Zip the sources (every crate, the three bridge plugins included), without
+# build outputs or git metadata. Build the plugins with build_bridge.sh.
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +26,7 @@ rsync -a \
   --exclude '.gitmodules' \
   --exclude '.github/' \
   --exclude 'target/' \
+  --exclude 'tools/host-baseline/Cargo.lock' \
   --exclude '.idea/' \
   --exclude '*.zip' \
   "$repo_dir/" "$stage_dir/"

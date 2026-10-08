@@ -1,9 +1,12 @@
-# Virtual workspace: the repo produces two independent artifacts from one
-# decoder lineage — `bridge` (the realtime cdylib plugin) and, from phase 2 on,
-# `truehdd` (the offline ADM/DAMF CLI). Isolation between them is by crate
-# graph, not feature flags: `bridge` must never pull in CLI-side crates and the
-# CLI must never pull in the Omniphony bridge ABI. See
-# docs/plan-truehdd-resurrection-in-harletty.md.
+# Virtual workspace: the repo produces two kinds of artifacts from one
+# decoder lineage — the realtime bridge plugins, one per codec family
+# (`plugin-dolby`, `plugin-dts`, `plugin-iamf`, each a cdylib over its
+# `bridge-family-*` crate), and the offline `harletty` CLI. Isolation between
+# them is by crate graph, not feature flags: a plugin must never pull in
+# CLI-side crates nor another family's decoders, and the CLI must never pull
+# in the Omniphony bridge ABI (scripts/check-crate-isolation.sh). `bridge` is
+# the combined router over every family, an rlib kept for the fuzz target,
+# the bench and the bit-exactness kit.
 [workspace]
 members = [
     "bridge",
@@ -11,6 +14,9 @@ members = [
     "bridge-family-dolby",
     "bridge-family-dts",
     "bridge-family-iamf",
+    "plugin-dolby",
+    "plugin-dts",
+    "plugin-iamf",
     "harletty",
     "eac3",
     "dca",
@@ -18,13 +24,16 @@ members = [
     "auro",
 ]
 # What a plain `cargo build` / `cargo test` at the root covers: everything but
-# the IAMF family, whose Opus path links libopus. Build or test it with
-# `-p bridge-family-iamf`, or through the bridge's `iamf` feature.
+# the IAMF family and its plugin, whose Opus path links libopus. Build or test
+# them with `-p bridge-family-iamf -p harletty-iamf-bridge`, or through the
+# bridge's `iamf` feature.
 default-members = [
     "bridge",
     "bridge-common",
     "bridge-family-dolby",
     "bridge-family-dts",
+    "plugin-dolby",
+    "plugin-dts",
     "harletty",
     "eac3",
     "dca",

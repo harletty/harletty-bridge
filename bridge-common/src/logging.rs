@@ -217,8 +217,8 @@ mod tests {
         set_max_level(DEFAULT_LEVEL);
     }
 
-    /// Over every crate the bridge is built from: the plugin and the codec
-    /// families all log through here.
+    /// Over every crate the bridges are built from: the plugins, the
+    /// combined bridge and the codec families all log through here.
     #[test]
     fn no_source_logs_through_the_log_crate_macros() {
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -230,6 +230,9 @@ mod tests {
             "bridge-family-dolby",
             "bridge-family-dts",
             "bridge-family-iamf",
+            "plugin-dolby",
+            "plugin-dts",
+            "plugin-iamf",
         ];
         let macros: Vec<String> = ["error", "warn", "info", "debug", "trace"]
             .iter()

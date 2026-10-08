@@ -20,6 +20,7 @@ mod labels;
 mod mat;
 mod metadata;
 mod perf;
+pub mod probe;
 mod truehd_pipeline;
 
 // What every family shares, under the `crate::` paths the modules use.
