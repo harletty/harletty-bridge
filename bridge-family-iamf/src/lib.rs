@@ -41,6 +41,9 @@ use bridge_common::frame_builders::float_to_pcm_i32;
 use bridge_common::logging::{bridge_diag_log, bridge_log, panic_message};
 use bridge_common::shared::{AfterPush, SharedState};
 
+mod family;
+pub use family::{FAMILY_IAMF, IamfCodec, IamfPipeline};
+
 /// System J in the decoder's IAMF channel order: L, R, C, LFE, Lss, Rss, Lrs,
 /// Rrs, Ltf, Rtf, Ltb, Rtb.
 /// The channels of the 7.1.4 bed every channel- and scene-based element is

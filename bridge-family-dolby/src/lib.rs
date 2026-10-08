@@ -4,7 +4,11 @@
 //! [`DolbyPipeline`] holds the whole family's state, decodes what a packet
 //! completes, and answers the host's questions about the stream (label,
 //! objects, the `presentation` key, DRC). Resetting the whole bridge is the
-//! router's job: a path says when it is needed ([`AfterPush`]).
+//! router's job: a path says when it is needed ([`AfterPush`]). As a
+//! [`FamilyPipeline`], it is a bridge of its own:
+//! `PluginBridge<DolbyPipeline>`.
+//!
+//! [`FamilyPipeline`]: bridge_common::family::FamilyPipeline
 //!
 //! [`AfterPush`]: bridge_common::shared::AfterPush
 
@@ -21,4 +25,4 @@ mod truehd_pipeline;
 // What every family shares, under the `crate::` paths the modules use.
 use bridge_common::{frame_builders, logging, shared};
 
-pub use dolby::{DolbyPipeline, FAMILY_DOLBY};
+pub use dolby::{DolbyCodec, DolbyPipeline, FAMILY_DOLBY};

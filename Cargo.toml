@@ -56,3 +56,11 @@ strip = "symbols"
 # both together.
 [patch.crates-io]
 truehd = { git = "https://github.com/harletty/truehdd", rev = "5c8b880405946e7ff1aee884cf9988415fe2c3a9" }
+
+# The IAMF family in one codegen unit: split in several, how its code (and
+# the FLAC and Opus decoding monomorphised into it) is partitioned moves with
+# any item added to the crate, and the FLAC path measured up to 9% slower
+# from one partition to the next. One unit decodes at the speed of the best
+# partition seen, and keeps doing so.
+[profile.release.package.bridge-family-iamf]
+codegen-units = 1
