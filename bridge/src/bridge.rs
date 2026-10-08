@@ -1,8 +1,11 @@
 use abi_stable::std_types::{RString, RVec};
-use bridge_api::{RChannelPose, RChannelTag, RInputTransport, RProbe, RPushResult, RSourceFamily};
-use bridge_common::family::{FamilyPipeline, PluginBridge};
+use bridge_api::{RChannelPose, RChannelTag, RProbe, RPushResult, RSourceFamily};
+use bridge_common::family::FamilyPipeline;
 #[cfg(test)]
-use {abi_stable::std_types::RSlice, bridge_api::FormatBridge};
+use {
+    abi_stable::std_types::RSlice, bridge_api::FormatBridge, bridge_api::RInputTransport,
+    bridge_common::family::PluginBridge,
+};
 
 #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
 use crate::logging::bridge_diag_log;
@@ -59,7 +62,7 @@ pub(crate) fn source_families() -> RVec<RSourceFamily> {
     families
 }
 
-/// Codec carried by a [`RInputTransport::Raw`] packet, which (unlike the IEC
+/// Codec carried by a [`bridge_api::RInputTransport::Raw`] packet, which (unlike the IEC
 /// 61937 transport) has no `data_type` to disambiguate TrueHD from E-AC3.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RawCodec {
@@ -152,23 +155,6 @@ fn is_built(codec: RawCodec) -> bool {
     }
 }
 
-/// `BridgeLib::probe` for this build. IEC 61937: the burst types the built
-/// families decode. Raw: the router's own sniff, at offset 0 only, as
-/// `push_packet` detects a stream today. The per-family plugins replace it
-/// with validated starts anywhere in the window (docs/multi-bridge.md in
-/// Omniphony); a host with this bridge alone does not need it.
-pub(crate) fn probe(data: &[u8], transport: RInputTransport, data_type: u8) -> RProbe {
-    let claimed = match transport {
-        RInputTransport::Iec61937 => accepts_data_type(data_type),
-        RInputTransport::Raw => sniff_raw_codec(data).is_some_and(is_built),
-    };
-    if claimed {
-        RProbe::claim(0)
-    } else {
-        RProbe::none(0)
-    }
-}
-
 /// An IEC 61937 burst type one of the built families decodes.
 fn accepts_data_type(data_type: u8) -> bool {
     #[cfg(feature = "dolby")]
@@ -181,24 +167,6 @@ fn accepts_data_type(data_type: u8) -> bool {
     }
     let _ = data_type;
     false
-}
-
-/// `BridgeLib::input_codecs` for this build: the names a player gives the
-/// codecs of the built families, each one `configure("input_codec")` takes.
-pub(crate) fn input_codecs() -> RVec<RString> {
-    let mut codecs = RVec::new();
-    if cfg!(feature = "dolby") {
-        for name in ["truehd", "mlp", "eac3", "ac3"] {
-            codecs.push(name.into());
-        }
-    }
-    if cfg!(feature = "dts") {
-        codecs.push("dts".into());
-    }
-    if cfg!(feature = "iamf") {
-        codecs.push("iamf".into());
-    }
-    codecs
 }
 
 /// An IA sequence header OBU (type 31) at offset 0 whose payload starts with
@@ -220,7 +188,7 @@ fn is_iamf_sequence_header(data: &[u8]) -> bool {
 /// each packet to that family, and answers the host's questions from the
 /// family the stream is on. What every bridge does besides (the panic guard,
 /// resets, the raw codec lock, `input_codec`, `log_level`) is
-/// [`PluginBridge`]'s.
+/// [`bridge_common::family::PluginBridge`]'s.
 pub(crate) struct Families {
     // ── Dolby (TrueHD, E-AC-3) ───────────────────────────────────────
     #[cfg(feature = "dolby")]
@@ -244,6 +212,7 @@ pub(crate) struct Families {
 }
 
 /// The bridge a host holds: the families of this build, as one bridge.
+#[cfg(test)]
 pub(crate) type AtmosBridge = PluginBridge<Families>;
 
 impl Families {
@@ -271,6 +240,22 @@ impl Families {
 
 impl FamilyPipeline for Families {
     type Codec = RawCodec;
+    /// Every name `input_codec` takes, whatever the build.
+    const INPUT_CODECS: &'static [&'static str] = &[
+        "truehd", "mlp", "eac3", "ac3", "ec3", "e-ac3", "dts", "dca", "dtshd", "dts-hd", "dtsx",
+        "dts:x", "iamf",
+    ];
+
+    /// The router's own sniff, at offset 0 only, as `push_packet` detects a
+    /// stream: what the combined bridge answered as a plugin. The family
+    /// plugins claim validated starts anywhere in the window.
+    fn probe_raw(data: &[u8]) -> RProbe {
+        if sniff_raw_codec(data).is_some_and(is_built) {
+            RProbe::claim(0)
+        } else {
+            RProbe::none(0)
+        }
+    }
 
     fn new(shared: &SharedState) -> Self {
         #[cfg(not(feature = "dolby"))]
@@ -599,12 +584,14 @@ mod raw_transport_tests {
         assert_eq!(sniff_raw_codec(&buf), Some(RawCodec::TrueHd));
     }
 
-    /// The root module's probe claims what this build decodes, at offset 0,
-    /// and nothing else: a codec whose family is not built is not claimed.
+    /// The router's probe claims what this build decodes, at offset 0, and
+    /// nothing else: a codec whose family is not built is not claimed.
     #[test]
     fn probe_claims_the_built_families_only() {
         use bridge_api::RProbeVerdict::{Claim, None as Nothing};
-        let verdict = |data: &[u8], transport, data_type| probe(data, transport, data_type).verdict;
+        let verdict = |data: &[u8], transport, data_type| {
+            bridge_common::plugin::probe::<Families>(data.into(), transport, data_type).verdict
+        };
         let truehd = [0x00, 0x00, 0x00, 0x00, 0xF8, 0x72, 0x6F, 0xBA];
         let eac3 = [0x0B, 0x77, 0x00, 0x00];
         let dts = [0x7F, 0xFE, 0x80, 0x01];
@@ -629,23 +616,10 @@ mod raw_transport_tests {
         assert_eq!(verdict(&[], RInputTransport::Iec61937, 0x07), Nothing);
     }
 
-    /// Every codec name the root module lists is one `configure` takes.
+    /// Every codec name the router lists is one `configure` takes.
     #[test]
     fn every_listed_input_codec_is_accepted() {
-        let codecs = input_codecs();
-        assert_eq!(
-            codecs.iter().any(|c| c == "truehd"),
-            cfg!(feature = "dolby")
-        );
-        assert_eq!(codecs.iter().any(|c| c == "dts"), cfg!(feature = "dts"));
-        assert_eq!(codecs.iter().any(|c| c == "iamf"), cfg!(feature = "iamf"));
-        for codec in codecs.iter() {
-            let mut bridge = AtmosBridge::new(false);
-            assert!(
-                bridge.configure("input_codec".into(), codec.as_str().into()),
-                "input_codec {codec} is listed but refused"
-            );
-        }
+        bridge_common::family::assert_input_codecs_are_taken::<Families>();
     }
 
     #[test]

@@ -14,8 +14,8 @@
 
 use abi_stable::std_types::{RSlice, RStr, RString, RVec};
 use bridge_api::{
-    FormatBridge, RChannelPose, RChannelTag, RCoordinateFormat, RInputTransport, RPushResult,
-    RSourceFamily, RVbapCartesianDefaults, RVbapTableMode,
+    FormatBridge, RChannelPose, RChannelTag, RCoordinateFormat, RInputTransport, RProbe,
+    RPushResult, RSourceFamily, RVbapCartesianDefaults, RVbapTableMode,
 };
 
 use crate::logging::{RepeatCounter, bridge_diag_log, bridge_log, panic_message};
@@ -34,7 +34,17 @@ pub trait FamilyPipeline: Send + Sync + 'static {
     /// in the Dolby family; a single one elsewhere).
     type Codec: Copy + Eq + core::fmt::Debug + Send + Sync + 'static;
 
+    /// The `input_codec` names a host routes to this family by, lower case
+    /// (`BridgeLib::input_codecs`): each one [`Self::input_codec`] takes.
+    const INPUT_CODECS: &'static [&'static str];
+
     fn new(shared: &SharedState) -> Self;
+
+    /// `BridgeLib::probe` for the raw transport: where, if anywhere, a
+    /// stream of this family starts in `data`, validated by the family's own
+    /// criteria within its bounded header length ([`crate::probe`]).
+    /// Stateless; the host calls it before any instance sees the bytes.
+    fn probe_raw(data: &[u8]) -> RProbe;
 
     /// The codec `configure("input_codec", name)` selects, `None` for a name
     /// this family does not take. `auto` and the empty name are the
@@ -129,6 +139,21 @@ pub fn source_families<F: FamilyPipeline>() -> RVec<RSourceFamily> {
     let mut families = RVec::new();
     F::source_families(&mut families);
     families
+}
+
+/// Test support: every name [`FamilyPipeline::INPUT_CODECS`] lists is one
+/// `configure("input_codec")` takes, lower case.
+#[doc(hidden)]
+pub fn assert_input_codecs_are_taken<F: FamilyPipeline>() {
+    assert!(!F::INPUT_CODECS.is_empty());
+    for &name in F::INPUT_CODECS {
+        assert_eq!(name, name.to_ascii_lowercase());
+        let mut bridge = PluginBridge::<F>::new(false);
+        assert!(
+            bridge.configure("input_codec".into(), name.into()),
+            "input_codec {name} is listed but refused"
+        );
+    }
 }
 
 /// A [`FormatBridge`] around one [`FamilyPipeline`]: what a plugin's
@@ -490,6 +515,17 @@ mod tests {
 
     impl FamilyPipeline for Fake {
         type Codec = u8;
+        const INPUT_CODECS: &'static [&'static str] = &["fake"];
+
+        fn probe_raw(data: &[u8]) -> RProbe {
+            crate::probe::scan_raw(data, |s| {
+                if s[0] == SYNC {
+                    crate::probe::Start::Claim
+                } else {
+                    crate::probe::Start::Reject
+                }
+            })
+        }
 
         fn new(_shared: &SharedState) -> Self {
             Self {
@@ -707,6 +743,11 @@ mod tests {
         assert!(!crate::logging::log_enabled(log::Level::Info));
         assert!(!bridge.configure("log_level".into(), "loud".into()));
         crate::logging::set_max_level(log::LevelFilter::Info);
+    }
+
+    #[test]
+    fn every_listed_input_codec_is_taken() {
+        assert_input_codecs_are_taken::<Fake>();
     }
 
     #[test]

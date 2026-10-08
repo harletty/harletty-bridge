@@ -1,0 +1,20 @@
+# Bit-exactness through the host: the baseline corpus decoded by Omniphony's
+# own bridge loader and router (`orender_engine`'s `BridgeSet`), with any set
+# of bridge libraries, in reads of any size. Not part of the root workspace
+# (the empty [workspace] table keeps it standalone): it links the engine,
+# which nothing in the bridge does. See README.md.
+[package]
+name = "host-baseline"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+orender_engine = { path = "../../../Omniphony/omniphony-renderer/orender_engine" }
+bridge_api = { path = "../../../Omniphony/omniphony-renderer/bridge_api" }
+spdif = { path = "../../../Omniphony/omniphony-renderer/spdif" }
+abi_stable = "0.11"
+serde_json = "1"
+
+[workspace]
