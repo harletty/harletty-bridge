@@ -1,0 +1,10 @@
+# Windows (MSVC): link the C runtime statically, so harletty_bridge.dll and
+# harletty.exe start on a Windows without the Visual C++ Redistributable.
+# Hosts load the bridge into their own process; their builds do the same.
+# Linux and macOS builds are not affected.
+#
+# A RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS environment variable replaces this
+# file entirely: a build that sets one must add -C target-feature=+crt-static
+# itself (the release workflow does).
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
