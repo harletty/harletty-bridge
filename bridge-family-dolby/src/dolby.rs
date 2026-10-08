@@ -7,7 +7,8 @@
 //! ([`AfterPush`]).
 
 use abi_stable::std_types::{RString, RVec};
-use bridge_api::RPushResult;
+use bridge_api::{RPushResult, RSourceFamily};
+use bridge_common::family::{FamilyPipeline, source_family};
 use eac3::{CorePcmFrame, Extractor as Eac3RawExtractor, FrameType, ObjectPcmDecoder, PcmDecoder};
 #[cfg(feature = "bridge-perf")]
 use std::env;
@@ -1261,5 +1262,117 @@ mod tests {
         }
         // From the major sync after the mode was set, the gains too.
         assert_eq!(frames[4..], expected[4..]);
+    }
+}
+
+/// The two raw-transport codecs of the Dolby family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DolbyCodec {
+    TrueHd,
+    /// E-AC-3, and AC-3 frames among or instead of them.
+    Eac3,
+}
+
+/// The TrueHD (FBA) and MLP (FBB) major sync words, four bytes into the
+/// access unit that carries one.
+const MAJOR_SYNC_PREFIX: [u8; 3] = [0xF8, 0x72, 0x6F];
+
+impl FamilyPipeline for DolbyPipeline {
+    type Codec = DolbyCodec;
+
+    fn new(shared: &SharedState) -> Self {
+        DolbyPipeline::new(shared)
+    }
+
+    fn input_codec(name: &str) -> Option<DolbyCodec> {
+        match name {
+            "truehd" | "mlp" => Some(DolbyCodec::TrueHd),
+            "eac3" | "ec3" | "e-ac3" | "ac3" => Some(DolbyCodec::Eac3),
+            _ => None,
+        }
+    }
+
+    /// A major sync four bytes in is TrueHD (or MLP); the E-AC-3 / AC-3 sync
+    /// word at the first byte, in either byte order, is E-AC-3.
+    fn sniff(data: &[u8]) -> Option<DolbyCodec> {
+        if data.len() >= 8 && data[4..7] == MAJOR_SYNC_PREFIX && matches!(data[7], 0xBA | 0xBB) {
+            return Some(DolbyCodec::TrueHd);
+        }
+        if data.len() >= 2 && matches!((data[0], data[1]), (0x0B, 0x77) | (0x77, 0x0B)) {
+            return Some(DolbyCodec::Eac3);
+        }
+        None
+    }
+
+    /// TrueHD access units without a major sync carry nothing to sniff: an
+    /// unrecognised packet is TrueHD's, for that packet only.
+    fn unsniffed(&self) -> Option<DolbyCodec> {
+        Some(DolbyCodec::TrueHd)
+    }
+
+    fn push_raw(
+        &mut self,
+        codec: Option<DolbyCodec>,
+        shared: &mut SharedState,
+        data: &[u8],
+        out: &mut RPushResult,
+    ) -> AfterPush {
+        #[cfg(feature = "bridge-perf")]
+        self.note_raw_packet(data.len());
+        match codec {
+            Some(DolbyCodec::Eac3) => self.push_raw_eac3(shared, data, out),
+            Some(DolbyCodec::TrueHd) | None => self.push_raw_truehd(shared, data, out),
+        }
+    }
+
+    fn accepts_data_type(data_type: u8) -> bool {
+        DolbyPipeline::accepts_data_type(data_type)
+    }
+
+    fn push_iec61937(
+        &mut self,
+        shared: &mut SharedState,
+        data: &[u8],
+        data_type: u8,
+        out: &mut RPushResult,
+    ) -> AfterPush {
+        DolbyPipeline::push_iec61937(self, shared, data, data_type, out)
+    }
+
+    fn reset(&mut self, shared: &SharedState) {
+        DolbyPipeline::reset(self, shared);
+    }
+
+    fn configure(&mut self, key: &str, value: &str) -> Option<bool> {
+        DolbyPipeline::configure(self, key, value)
+    }
+
+    fn is_ready(&self) -> bool {
+        DolbyPipeline::is_ready(self)
+    }
+
+    fn has_objects(&self) -> bool {
+        DolbyPipeline::has_objects(self)
+    }
+
+    fn source_family(&self) -> &'static str {
+        FAMILY_DOLBY
+    }
+
+    fn source_label(&self, label: &mut String) {
+        DolbyPipeline::source_label(self, label);
+    }
+
+    fn supported_drc_modes() -> RVec<RString> {
+        DolbyPipeline::supported_drc_modes()
+    }
+
+    fn set_drc_mode(&mut self, mode: &str) -> bool {
+        DolbyPipeline::set_drc_mode(self, mode)
+    }
+
+    /// Dolby's codecs share the room-cube bed.
+    fn source_families(out: &mut RVec<RSourceFamily>) {
+        out.push(source_family(FAMILY_DOLBY, "Dolby", "room"));
     }
 }

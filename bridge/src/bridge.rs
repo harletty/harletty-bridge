@@ -1,10 +1,11 @@
-use abi_stable::std_types::{RSlice, RStr, RString, RVec};
-use bridge_api::{
-    FormatBridge, RChannelPose, RCoordinateFormat, RInputTransport, RProbe, RPushResult,
-    RSourceFamily, RVbapCartesianDefaults, RVbapTableMode,
-};
+use abi_stable::std_types::{RString, RVec};
+use bridge_api::{RChannelPose, RChannelTag, RInputTransport, RProbe, RPushResult, RSourceFamily};
+use bridge_common::family::{FamilyPipeline, PluginBridge};
+#[cfg(test)]
+use {abi_stable::std_types::RSlice, bridge_api::FormatBridge};
 
-use crate::logging::{RepeatCounter, bridge_diag_log, bridge_log};
+#[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
+use crate::logging::bridge_diag_log;
 use crate::shared::{AfterPush, SharedState};
 #[cfg(feature = "dolby")]
 use bridge_family_dolby::{DolbyPipeline, FAMILY_DOLBY};
@@ -23,11 +24,6 @@ const FAMILY_IAMF: &str = "iamf";
 const FAMILY_DTS: &str = "dts";
 #[cfg(not(feature = "dolby"))]
 const FAMILY_DOLBY: &str = "dolby";
-/// TrueHD's presentation count (`truehd::process::MAX_PRESENTATIONS`): a
-/// build without Dolby checks `presentation` as one with Dolby does.
-#[cfg(not(feature = "dolby"))]
-const TRUEHD_PRESENTATIONS: u8 = 4;
-
 /// What the bridge reports before a stream is identified: Dolby, or with no
 /// Dolby in the build, the first family it has.
 const IDLE_FAMILY: &str = if cfg!(feature = "dolby") {
@@ -219,21 +215,16 @@ fn is_iamf_sequence_header(data: &[u8]) -> bool {
     size_len.is_some_and(|n| data.get(2 + n..6 + n) == Some(b"iamf".as_slice()))
 }
 
-/// The bridge a host holds: one path per codec family, and which of them
-/// the stream is on. It finds the codec (sniffed, declared, or the IEC 61937
-/// data type), hands each packet to that family, resets the whole pipeline
-/// when a family asks, and answers the host's questions from the family the
-/// stream is on.
-pub(crate) struct AtmosBridge {
+/// Every codec family this build holds, behind one bridge: the router. It
+/// finds the codec (sniffed, declared, or the IEC 61937 data type), hands
+/// each packet to that family, and answers the host's questions from the
+/// family the stream is on. What every bridge does besides (the panic guard,
+/// resets, the raw codec lock, `input_codec`, `log_level`) is
+/// [`PluginBridge`]'s.
+pub(crate) struct Families {
     // ── Dolby (TrueHD, E-AC-3) ───────────────────────────────────────
     #[cfg(feature = "dolby")]
     pub(crate) dolby: DolbyPipeline,
-    /// Codec forced by the host for the `Raw` transport via
-    /// `configure("input_codec", …)`. Persists across pipeline resets.
-    pub(crate) forced_raw_codec: Option<RawCodec>,
-    /// Codec locked for the current raw session (forced or sniffed). Cleared on
-    /// reset so a re-sniff happens after a seek / stream change.
-    pub(crate) raw_codec: Option<RawCodec>,
     // ── DTS (DCA) pipeline ───────────────────────────────────────────
     #[cfg(feature = "dts")]
     pub(crate) dts: DtsPipeline,
@@ -250,86 +241,12 @@ pub(crate) struct AtmosBridge {
     /// built: said once per stream rather than on every packet.
     #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
     pub(crate) refused: Option<RawCodec>,
-    /// IEC 61937 bursts of a data type this build does not decode, since the
-    /// last reset: a host keeps sending them, so only the 1st, 2nd, 4th...
-    /// are logged.
-    pub(crate) unsupported_data_types: RepeatCounter,
-    // ── Shared ───────────────────────────────────────────────────────
-    pub(crate) shared: SharedState,
 }
 
-impl AtmosBridge {
-    pub(crate) fn new(strict: bool) -> Self {
-        let shared = SharedState::new(strict);
-        Self {
-            #[cfg(feature = "dolby")]
-            dolby: DolbyPipeline::new(&shared),
-            forced_raw_codec: None,
-            raw_codec: None,
-            #[cfg(feature = "dts")]
-            dts: DtsPipeline::new(),
-            dts_active: false,
-            #[cfg(feature = "iamf")]
-            iamf: Box::default(),
-            iamf_active: false,
-            #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
-            refused: None,
-            unsupported_data_types: RepeatCounter::default(),
-            shared,
-        }
-    }
+/// The bridge a host holds: the families of this build, as one bridge.
+pub(crate) type AtmosBridge = PluginBridge<Families>;
 
-    pub(crate) fn reset_pipeline(&mut self) {
-        #[cfg(feature = "dolby")]
-        self.dolby.reset(&self.shared);
-
-        // DTS reset.
-        #[cfg(feature = "dts")]
-        self.dts.reset();
-        self.dts_active = false;
-
-        // IAMF reset: the stream position goes, the sequence's configuration
-        // stays, so decoding resumes without waiting for a sequence header.
-        #[cfg(feature = "iamf")]
-        self.iamf.reset();
-        self.iamf_active = false;
-        #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
-        {
-            self.refused = None;
-        }
-        self.unsupported_data_types = RepeatCounter::default();
-        // Re-sniff after reset, but keep any host-declared codec.
-        self.raw_codec = None;
-        self.shared.declared_object_channels = None;
-    }
-
-    /// Resolve the codec for a `Raw` packet. A host-declared codec
-    /// (`configure("input_codec", …)`) wins; otherwise the first recognisable
-    /// sync word locks the session. An unrecognised first packet falls back to
-    /// TrueHD for that packet without locking, so a later syncful packet can
-    /// still pin the codec; with no Dolby in the build, it is dropped.
-    fn resolve_raw_codec(&mut self, data: &[u8]) -> Option<RawCodec> {
-        if let Some(c) = self.raw_codec {
-            return Some(c);
-        }
-        if let Some(c) = self.forced_raw_codec {
-            self.raw_codec = Some(c);
-            return Some(c);
-        }
-        if let Some(c) = sniff_raw_codec(data) {
-            self.raw_codec = Some(c);
-            return Some(c);
-        }
-        // An IAMF stream only announces itself in its sequence header, so a
-        // reset (a seek) is followed by temporal units with nothing to sniff.
-        // While the sequence is still configured they are its continuation.
-        #[cfg(feature = "iamf")]
-        if self.iamf.has_sequence() {
-            return Some(RawCodec::Iamf);
-        }
-        cfg!(feature = "dolby").then_some(RawCodec::TrueHd)
-    }
-
+impl Families {
     /// The stream is a Dolby one this build refused, as opposed to no stream
     /// identified yet: both leave the DTS and IAMF flags down.
     fn refused_dolby(&self) -> bool {
@@ -352,182 +269,173 @@ impl AtmosBridge {
     }
 }
 
-impl AtmosBridge {
-    /// The body of [`FormatBridge::push_packet`], which runs it under its
-    /// panic guard.
-    fn push_packet_unguarded(
+impl FamilyPipeline for Families {
+    type Codec = RawCodec;
+
+    fn new(shared: &SharedState) -> Self {
+        #[cfg(not(feature = "dolby"))]
+        let _ = shared;
+        Self {
+            #[cfg(feature = "dolby")]
+            dolby: DolbyPipeline::new(shared),
+            #[cfg(feature = "dts")]
+            dts: DtsPipeline::new(),
+            dts_active: false,
+            #[cfg(feature = "iamf")]
+            iamf: Box::default(),
+            iamf_active: false,
+            #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
+            refused: None,
+        }
+    }
+
+    /// Every name is taken whatever the build, so a stream declared of a
+    /// family left out is refused by name rather than sniffed.
+    fn input_codec(name: &str) -> Option<RawCodec> {
+        match name {
+            "eac3" | "ec3" | "e-ac3" | "ac3" => Some(RawCodec::Eac3),
+            "truehd" | "mlp" => Some(RawCodec::TrueHd),
+            "dts" | "dca" | "dtsx" | "dts:x" | "dts-hd" | "dtshd" => Some(RawCodec::Dts),
+            "iamf" => Some(RawCodec::Iamf),
+            _ => None,
+        }
+    }
+
+    fn sniff(data: &[u8]) -> Option<RawCodec> {
+        sniff_raw_codec(data)
+    }
+
+    /// An unrecognised first packet falls back to TrueHD for that packet
+    /// without locking, so a later syncful packet can still pin the codec;
+    /// with no Dolby in the build, it is dropped.
+    fn unsniffed(&self) -> Option<RawCodec> {
+        // An IAMF stream only announces itself in its sequence header, so a
+        // reset (a seek) is followed by temporal units with nothing to sniff.
+        // While the sequence is still configured they are its continuation.
+        #[cfg(feature = "iamf")]
+        if self.iamf.has_sequence() {
+            return Some(RawCodec::Iamf);
+        }
+        cfg!(feature = "dolby").then_some(RawCodec::TrueHd)
+    }
+
+    fn push_raw(
         &mut self,
-        data: RSlice<'_, u8>,
-        transport: RInputTransport,
-        data_type: u8,
-    ) -> RPushResult {
-        let mut result = RPushResult {
-            frames: RVec::new(),
-            error_message: RString::new(),
-            did_reset: false,
+        codec: Option<RawCodec>,
+        shared: &mut SharedState,
+        data: &[u8],
+        result: &mut RPushResult,
+    ) -> AfterPush {
+        #[cfg(all(feature = "bridge-perf", feature = "dolby"))]
+        self.dolby.note_raw_packet(data.len());
+        let Some(codec) = codec else {
+            // Nothing to sniff, and no Dolby to fall back to.
+            self.iamf_active = false;
+            return AfterPush::Continue;
         };
-
-        match transport {
-            RInputTransport::Raw => {
-                #[cfg(all(feature = "bridge-perf", feature = "dolby"))]
-                self.dolby.note_raw_packet(data.len());
-                let Some(codec) = self.resolve_raw_codec(data.as_slice()) else {
-                    // Nothing to sniff, and no Dolby to fall back to.
-                    self.iamf_active = false;
-                    return result;
-                };
-                self.iamf_active = codec == RawCodec::Iamf;
-                if codec == RawCodec::Iamf || codec == RawCodec::Dts {
-                    #[cfg(feature = "dolby")]
-                    self.dolby.leave();
-                }
-                self.dts_active = codec == RawCodec::Dts;
-                #[cfg(test)]
-                injected_panic::hit(codec);
-                let after = match codec {
-                    #[cfg(feature = "dolby")]
-                    RawCodec::Eac3 => {
-                        self.dolby
-                            .push_raw_eac3(&mut self.shared, data.as_slice(), &mut result)
-                    }
-                    #[cfg(feature = "dolby")]
-                    RawCodec::TrueHd => {
-                        self.dolby
-                            .push_raw_truehd(&mut self.shared, data.as_slice(), &mut result)
-                    }
-                    #[cfg(feature = "dts")]
-                    RawCodec::Dts => {
-                        self.dts
-                            .push_raw(&mut self.shared, data.as_slice(), &mut result)
-                    }
-                    #[cfg(feature = "iamf")]
-                    RawCodec::Iamf => crate::iamf_pipeline::push_iamf(
-                        &mut self.iamf,
-                        &mut self.shared,
-                        data.as_slice(),
-                        &mut result,
-                    ),
-                    #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
-                    refused => {
-                        self.refuse(refused, &mut result);
-                        AfterPush::Continue
-                    }
-                };
-                if after == AfterPush::ResetPipeline {
-                    self.reset_pipeline();
-                }
-                result
-            }
-            RInputTransport::Iec61937 => {
-                // IAMF has no IEC 61937 data type: it only comes raw.
-                self.iamf_active = false;
-                // ── Dolby: TrueHD in MAT (0x16), E-AC-3 (0x15) ────────
-                #[cfg(feature = "dolby")]
-                if DolbyPipeline::accepts_data_type(data_type) {
-                    let after = self.dolby.push_iec61937(
-                        &mut self.shared,
-                        data.as_slice(),
-                        data_type,
-                        &mut result,
-                    );
-                    if after == AfterPush::ResetPipeline {
-                        self.reset_pipeline();
-                    }
-                    return result;
-                }
-
-                // ── DTS (data types 0x0B/0x0C/0x0D/0x11) ──────────────
-                #[cfg(feature = "dts")]
-                if bridge_family_dts::accepts_data_type(data_type) {
-                    #[cfg(feature = "dolby")]
-                    self.dolby.leave();
-                    self.dts_active = true;
-                    #[cfg(test)]
-                    injected_panic::hit(RawCodec::Dts);
-                    let after = self.dts.push_iec61937(
-                        &mut self.shared,
-                        data.as_slice(),
-                        data_type,
-                        &mut result,
-                    );
-                    if after == AfterPush::ResetPipeline {
-                        self.reset_pipeline();
-                    }
-                    return result;
-                }
-
-                // Unsupported data type.
-                let bursts = self.unsupported_data_types.note();
-                if self.shared.strict {
-                    let msg = format!(
-                        "Unsupported IEC 61937 data type for this bridge: 0x{data_type:02X}"
-                    );
-                    bridge_diag_log(log::Level::Warn, &msg);
-                    result.error_message = msg.into();
-                    self.reset_pipeline();
-                    result.did_reset = true;
-                } else if let Some(bursts) = bursts {
-                    bridge_log!(
-                        log::Level::Warn,
-                        "Unsupported IEC 61937 data type for this bridge: 0x{data_type:02X} ({bursts} burst(s) so far)"
-                    );
-                }
-                result
+        self.iamf_active = codec == RawCodec::Iamf;
+        if codec == RawCodec::Iamf || codec == RawCodec::Dts {
+            #[cfg(feature = "dolby")]
+            self.dolby.leave();
+        }
+        self.dts_active = codec == RawCodec::Dts;
+        #[cfg(test)]
+        injected_panic::hit(codec);
+        match codec {
+            #[cfg(feature = "dolby")]
+            RawCodec::Eac3 => self.dolby.push_raw_eac3(shared, data, result),
+            #[cfg(feature = "dolby")]
+            RawCodec::TrueHd => self.dolby.push_raw_truehd(shared, data, result),
+            #[cfg(feature = "dts")]
+            RawCodec::Dts => self.dts.push_raw(shared, data, result),
+            #[cfg(feature = "iamf")]
+            RawCodec::Iamf => crate::iamf_pipeline::push_iamf(&mut self.iamf, shared, data, result),
+            #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
+            refused => {
+                let _ = (shared, data);
+                self.refuse(refused, result);
+                AfterPush::Continue
             }
         }
     }
-}
 
-impl FormatBridge for AtmosBridge {
-    /// Every packet goes through one panic guard. A panic escaping a
-    /// `#[sabi_trait]` method does not unwind into the host: abi_stable
-    /// prints "Attempted to panic across the ffi boundary" and exits the
-    /// process — the player, mid-film. Here it resets the pipeline and comes
-    /// back as a reset, and the next packet decodes from a clean state. Only
-    /// strict mode gets the message as an error, as with every other decode
-    /// failure here. The finer guards of the TrueHD and IAMF paths stay: they
-    /// keep the frames decoded before the panic.
-    fn push_packet(
-        &mut self,
-        data: RSlice<'_, u8>,
-        transport: RInputTransport,
-        data_type: u8,
-    ) -> RPushResult {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.push_packet_unguarded(data, transport, data_type)
-        }));
-        outcome.unwrap_or_else(|payload| {
-            let msg = format!(
-                "decoder panic: {}; pipeline reset",
-                crate::logging::panic_message(&payload)
-            );
-            bridge_diag_log(log::Level::Error, &msg);
-            // The panicking decoder's state is unknown: IAMF keeps its
-            // sequence configuration across a reset, so it is rebuilt.
-            #[cfg(feature = "iamf")]
-            if self.iamf_active {
-                *self.iamf = crate::iamf_pipeline::IamfState::default();
-            }
-            self.reset_pipeline();
-            RPushResult {
-                frames: RVec::new(),
-                // A host that did not ask for strict decoding plays through a
-                // reset; an error message would fail its call instead.
-                error_message: if self.shared.strict {
-                    msg.into()
-                } else {
-                    RString::new()
-                },
-                did_reset: true,
-            }
-        })
+    fn accepts_data_type(data_type: u8) -> bool {
+        accepts_data_type(data_type)
     }
 
-    fn reset(&mut self) {
-        bridge_log!(log::Level::Info, "Bridge reset requested");
-        self.reset_pipeline();
-        // Note: total_samples is NOT reset — it tracks the global position for
-        // continuous-mode timestamping. The handler manages segment offsets.
+    fn enter_iec61937(&mut self) {
+        // IAMF has no IEC 61937 data type: it only comes raw.
+        self.iamf_active = false;
+    }
+
+    fn push_iec61937(
+        &mut self,
+        shared: &mut SharedState,
+        data: &[u8],
+        data_type: u8,
+        result: &mut RPushResult,
+    ) -> AfterPush {
+        // ── Dolby: TrueHD in MAT (0x16), E-AC-3 (0x15) ────────────────
+        #[cfg(feature = "dolby")]
+        if DolbyPipeline::accepts_data_type(data_type) {
+            return self.dolby.push_iec61937(shared, data, data_type, result);
+        }
+
+        // ── DTS (data types 0x0B/0x0C/0x0D/0x11) ──────────────────────
+        #[cfg(feature = "dts")]
+        if bridge_family_dts::accepts_data_type(data_type) {
+            #[cfg(feature = "dolby")]
+            self.dolby.leave();
+            self.dts_active = true;
+            #[cfg(test)]
+            injected_panic::hit(RawCodec::Dts);
+            return self.dts.push_iec61937(shared, data, data_type, result);
+        }
+
+        // Only called for a type `accepts_data_type` takes.
+        let _ = (shared, data, data_type, result);
+        AfterPush::Continue
+    }
+
+    fn reset(&mut self, shared: &SharedState) {
+        #[cfg(feature = "dolby")]
+        self.dolby.reset(shared);
+        #[cfg(not(feature = "dolby"))]
+        let _ = shared;
+
+        // DTS reset.
+        #[cfg(feature = "dts")]
+        self.dts.reset();
+        self.dts_active = false;
+
+        // IAMF reset: the stream position goes, the sequence's configuration
+        // stays, so decoding resumes without waiting for a sequence header.
+        #[cfg(feature = "iamf")]
+        self.iamf.reset();
+        self.iamf_active = false;
+        #[cfg(not(all(feature = "dolby", feature = "dts", feature = "iamf")))]
+        {
+            self.refused = None;
+        }
+    }
+
+    /// IAMF keeps its sequence configuration across a reset: after a panic in
+    /// its path, it is rebuilt from the next sequence header.
+    fn discard_after_panic(&mut self) {
+        #[cfg(feature = "iamf")]
+        if self.iamf_active {
+            *self.iamf = crate::iamf_pipeline::IamfState::default();
+        }
+    }
+
+    fn configure(&mut self, key: &str, value: &str) -> Option<bool> {
+        #[cfg(feature = "dolby")]
+        return self.dolby.configure(key, value);
+        #[cfg(not(feature = "dolby"))]
+        {
+            let _ = (key, value);
+            None
+        }
     }
 
     fn is_ready(&self) -> bool {
@@ -568,81 +476,36 @@ impl FormatBridge for AtmosBridge {
         return false;
     }
 
-    fn configure(&mut self, key: RStr<'_>, value: RStr<'_>) -> bool {
-        match key.as_str() {
-            "input_codec" => {
-                self.forced_raw_codec = match value.as_str() {
-                    "eac3" | "ec3" | "e-ac3" | "ac3" => Some(RawCodec::Eac3),
-                    "truehd" | "mlp" => Some(RawCodec::TrueHd),
-                    "dts" | "dca" | "dtsx" | "dts:x" | "dts-hd" | "dtshd" => Some(RawCodec::Dts),
-                    "iamf" => Some(RawCodec::Iamf),
-                    "auto" | "" => None,
-                    s => {
-                        bridge_log!(log::Level::Warn, "atmos-bridge: unknown input_codec {s:?}");
-                        return false;
-                    }
-                };
-                // Force re-resolution against the new codec on the next packet.
-                self.raw_codec = None;
-                bridge_log!(
-                    log::Level::Debug,
-                    "atmos-bridge: input_codec set to {:?}",
-                    self.forced_raw_codec
-                );
-                true
-            }
-            // Process-wide, like the host's own level: messages above it are
-            // never formatted nor handed to the sink (see `logging`).
-            "log_level" => match value.as_str().trim().parse::<log::LevelFilter>() {
-                Ok(level) => {
-                    crate::logging::set_max_level(level);
-                    true
-                }
-                Err(_) => {
-                    bridge_log!(
-                        log::Level::Warn,
-                        "atmos-bridge: unknown log_level {:?}",
-                        value.as_str()
-                    );
-                    false
-                }
-            },
-            // TrueHD's presentation. Hosts send it once at start-up (default
-            // `best`) and stop when it is refused, so a build without Dolby
-            // takes the values a Dolby build takes, as a no-op: it has no
-            // TrueHD to apply them to.
-            #[cfg(not(feature = "dolby"))]
-            "presentation" => match value.as_str() {
-                "best" => true,
-                s => match s.parse::<u8>() {
-                    Ok(p) if p < TRUEHD_PRESENTATIONS => true,
-                    _ => {
-                        bridge_log!(
-                            log::Level::Warn,
-                            "atmos-bridge: invalid presentation value {:?}",
-                            s
-                        );
-                        false
-                    }
-                },
-            },
-            key => {
-                #[cfg(feature = "dolby")]
-                if let Some(taken) = self.dolby.configure(key, value.as_str()) {
-                    return taken;
-                }
-                bridge_log!(
-                    log::Level::Debug,
-                    "atmos-bridge: unknown configuration key {:?}",
-                    key
-                );
-                false
-            }
+    fn source_family(&self) -> &'static str {
+        if self.iamf_active {
+            FAMILY_IAMF
+        } else if self.dts_active {
+            #[cfg(feature = "dts")]
+            let family = self.dts.source_family();
+            #[cfg(not(feature = "dts"))]
+            let family = FAMILY_DTS;
+            family
+        } else if self.refused_dolby() {
+            FAMILY_DOLBY
+        } else {
+            IDLE_FAMILY
         }
     }
 
-    fn coordinate_format(&self) -> RCoordinateFormat {
-        RCoordinateFormat::Cartesian
+    fn source_label(&self, label: &mut String) {
+        #[cfg(feature = "iamf")]
+        if self.iamf_active {
+            label.push_str(self.iamf.description().unwrap_or("IAMF"));
+            return;
+        }
+        if self.dts_active {
+            #[cfg(feature = "dts")]
+            self.dts.source_label(label);
+        } else {
+            #[cfg(feature = "dolby")]
+            self.dolby.source_label(label);
+        }
+        let _ = label;
     }
 
     fn fixed_channel_poses(&self) -> RVec<RChannelPose> {
@@ -664,25 +527,7 @@ impl FormatBridge for AtmosBridge {
         RVec::new()
     }
 
-    fn source_family(&self) -> RString {
-        // One of the families `source_families` declares: the renderer's
-        // placement policy is chosen per family (`renderer::placement`).
-        RString::from(if self.iamf_active {
-            FAMILY_IAMF
-        } else if self.dts_active {
-            #[cfg(feature = "dts")]
-            let family = self.dts.source_family();
-            #[cfg(not(feature = "dts"))]
-            let family = FAMILY_DTS;
-            family
-        } else if self.refused_dolby() {
-            FAMILY_DOLBY
-        } else {
-            IDLE_FAMILY
-        })
-    }
-
-    fn channel_tags(&self) -> RVec<bridge_api::RChannelTag> {
+    fn channel_tags(&self) -> RVec<RChannelTag> {
         // IAMF's dialogue element, when a mix codes it apart; no other
         // format here tags anything.
         #[cfg(feature = "iamf")]
@@ -692,71 +537,26 @@ impl FormatBridge for AtmosBridge {
         RVec::new()
     }
 
-    fn source_label(&self) -> RString {
-        // What the host's track information calls the stream: the carrier
-        // the demux found, then the spatial layer actually decoded over it.
-        // Nothing until a frame decoded — before that the codec path is a
-        // guess, and the host has its own.
-        if !self.is_ready() {
-            return RString::new();
-        }
-        #[cfg(feature = "iamf")]
-        if self.iamf_active {
-            return RString::from(self.iamf.description().unwrap_or("IAMF"));
-        }
-        #[cfg_attr(not(any(feature = "dolby", feature = "dts")), allow(unused_mut))]
-        let mut label = String::with_capacity(40);
-        if self.dts_active {
-            #[cfg(feature = "dts")]
-            self.dts.source_label(&mut label);
-        } else {
-            #[cfg(feature = "dolby")]
-            self.dolby.source_label(&mut label);
-        }
-        RString::from(label)
-    }
-
-    fn vbap_cartesian_defaults(&self) -> RVbapCartesianDefaults {
-        // Balanced default grid size for runtime cartesian VBAP table
-        // generation. The axis sizes mirror the OAMD position quantisation
-        // (x, y on 6 bits / 62, z magnitude on 4 bits / 15).
-        RVbapCartesianDefaults {
-            x_size: 62,
-            y_size: 62,
-            z_size: 15,
-            // Nothing below the floor in the grid: those positions render at
-            // their true place with realtime and polar evaluation (above).
-            z_neg_size: 0,
-            // The OAMD position decode carries z in [-1, 1] — the bitstream
-            // has an explicit sign bit for below-floor objects — so the
-            // renderer must not clamp z at the panner. Grids without
-            // negative-z cells (the default) clamp such requests onto the
-            // z = 0 plane, which is the pre-existing behaviour; realtime and
-            // polar evaluation render them at their true position.
-            allow_negative_z: true,
-        }
-    }
-
-    fn preferred_vbap_table_mode(&self) -> RVbapTableMode {
-        RVbapTableMode::Cartesian
-    }
-
     /// DRC is Dolby's: a build without it offers none.
-    fn supported_drc_modes(&self) -> RVec<RString> {
+    fn supported_drc_modes() -> RVec<RString> {
         #[cfg(feature = "dolby")]
         return DolbyPipeline::supported_drc_modes();
         #[cfg(not(feature = "dolby"))]
         return RVec::new();
     }
 
-    fn set_drc_mode(&mut self, mode: RStr<'_>) -> bool {
+    fn set_drc_mode(&mut self, mode: &str) -> bool {
         #[cfg(feature = "dolby")]
-        return self.dolby.set_drc_mode(mode.as_str());
+        return self.dolby.set_drc_mode(mode);
         #[cfg(not(feature = "dolby"))]
         {
             let _ = mode;
             false
         }
+    }
+
+    fn source_families(out: &mut RVec<RSourceFamily>) {
+        out.extend(source_families());
     }
 }
 
@@ -888,19 +688,19 @@ mod raw_transport_tests {
     fn configure_input_codec_accepts_iamf() {
         let mut bridge = AtmosBridge::new(false);
         assert!(bridge.configure("input_codec".into(), "iamf".into()));
-        assert_eq!(bridge.forced_raw_codec, Some(RawCodec::Iamf));
+        assert_eq!(bridge.forced_codec(), Some(RawCodec::Iamf));
     }
 
     #[test]
     fn resolve_prefers_forced_codec_and_locks() {
         let mut bridge = AtmosBridge::new(false);
-        bridge.forced_raw_codec = Some(RawCodec::Eac3);
+        assert!(bridge.configure("input_codec".into(), "eac3".into()));
         // Unrecognisable bytes, but the host-declared codec wins.
         assert_eq!(
             bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]),
             Some(RawCodec::Eac3)
         );
-        assert_eq!(bridge.raw_codec, Some(RawCodec::Eac3));
+        assert_eq!(bridge.locked_codec(), Some(RawCodec::Eac3));
     }
 
     #[test]
@@ -910,12 +710,12 @@ mod raw_transport_tests {
             eac3.resolve_raw_codec(&[0x0B, 0x77, 0, 0]),
             Some(RawCodec::Eac3)
         );
-        assert_eq!(eac3.raw_codec, Some(RawCodec::Eac3));
+        assert_eq!(eac3.locked_codec(), Some(RawCodec::Eac3));
 
         let mut thd = AtmosBridge::new(false);
         let buf = [0, 0, 0, 0, 0xF8, 0x72, 0x6F, 0xBA];
         assert_eq!(thd.resolve_raw_codec(&buf), Some(RawCodec::TrueHd));
-        assert_eq!(thd.raw_codec, Some(RawCodec::TrueHd));
+        assert_eq!(thd.locked_codec(), Some(RawCodec::TrueHd));
     }
 
     #[cfg(feature = "dolby")]
@@ -928,7 +728,7 @@ mod raw_transport_tests {
             bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]),
             Some(RawCodec::TrueHd)
         );
-        assert_eq!(bridge.raw_codec, None);
+        assert_eq!(bridge.locked_codec(), None);
     }
 
     /// With no Dolby to fall back to, a packet nothing recognises is dropped,
@@ -938,7 +738,7 @@ mod raw_transport_tests {
     fn an_unknown_packet_without_dolby_is_dropped_without_locking() {
         let mut bridge = AtmosBridge::new(false);
         assert_eq!(bridge.resolve_raw_codec(&[0x12, 0x34, 0x56, 0x78]), None);
-        assert_eq!(bridge.raw_codec, None);
+        assert_eq!(bridge.locked_codec(), None);
         let result = bridge.push_packet(
             RSlice::from_slice(&[0x12, 0x34, 0x56, 0x78]),
             RInputTransport::Raw,
@@ -966,7 +766,7 @@ mod raw_transport_tests {
     fn configure_input_codec_accepts_dts() {
         let mut bridge = AtmosBridge::new(false);
         assert!(bridge.configure("input_codec".into(), "dts".into()));
-        assert_eq!(bridge.forced_raw_codec, Some(RawCodec::Dts));
+        assert_eq!(bridge.forced_codec(), Some(RawCodec::Dts));
     }
 
     /// The family follows the codec path the last packet took: Dolby until
@@ -982,7 +782,7 @@ mod raw_transport_tests {
             bridge.fixed_channel_poses().is_empty(),
             "Dolby declares no angles"
         );
-        bridge.dts_active = true;
+        bridge.family_mut().dts_active = true;
         assert_eq!(bridge.source_family().as_str(), "dts");
         let poses = bridge.fixed_channel_poses();
         assert!(
@@ -991,7 +791,7 @@ mod raw_transport_tests {
                 .any(|p| p.label == bridge_api::RChannelLabel::Ls && p.azimuth_deg == -110.0),
             "DTS declares its ETSI angles"
         );
-        bridge.dts_active = false;
+        bridge.family_mut().dts_active = false;
         assert_eq!(bridge.source_family().as_str(), "dolby");
     }
 
@@ -1015,12 +815,12 @@ mod raw_transport_tests {
             .collect();
         let mut bridge = AtmosBridge::new(false);
         let mut seen = vec![bridge.source_family().to_string()];
-        bridge.dts_active = true;
+        bridge.family_mut().dts_active = true;
         if cfg!(feature = "dts") {
             seen.push(bridge.source_family().to_string());
         }
-        bridge.dts_active = false;
-        bridge.iamf_active = true;
+        bridge.family_mut().dts_active = false;
+        bridge.family_mut().iamf_active = true;
         if cfg!(feature = "iamf") {
             seen.push(bridge.source_family().to_string());
         }
@@ -1099,15 +899,15 @@ mod raw_transport_tests {
         // Output is one block behind input, and no more.
         let emitted: u64 = frames.iter().map(|f| u64::from(f.sample_count)).sum();
         assert!(
-            bridge.shared.total_samples - emitted <= 4096,
+            bridge.shared().total_samples - emitted <= 4096,
             "{} held back",
-            bridge.shared.total_samples - emitted
+            bridge.shared().total_samples - emitted
         );
         eprintln!(
             "{} frames, {} channels, {emitted}/{} samples out",
             frames.len(),
             channels,
-            bridge.shared.total_samples
+            bridge.shared().total_samples
         );
     }
 
@@ -1485,10 +1285,10 @@ mod unsupported_data_type_tests {
             assert!(result.frames.is_empty());
             assert!(result.error_message.is_empty(), "{}", result.error_message);
             assert!(!result.did_reset);
-            assert_eq!(bridge.unsupported_data_types.count(), bursts);
+            assert_eq!(bridge.unsupported_bursts(), bursts);
         }
         bridge.reset_pipeline();
-        assert_eq!(bridge.unsupported_data_types.count(), 0);
+        assert_eq!(bridge.unsupported_bursts(), 0);
 
         let mut bridge = AtmosBridge::new(true);
         for _ in 0..3 {

@@ -695,6 +695,7 @@ dependencies = [
  "log",
  "serde_json",
  "spdif",
+ "truehd",
 ]
 
 [[package]]
