@@ -302,16 +302,10 @@ fn obus(data: &[u8]) -> Vec<(iamf_obu::ObuType, &[u8])> {
     out
 }
 
-#[test]
-fn a_new_sequence_puts_the_objects_where_it_evaluates_them() {
-    // The first three units of the object vector (the object at the
-    // front, then on its way to the left), then the same descriptors again
-    // as a second IA sequence whose units carry no position block: the
-    // object is at the second sequence's default, the front, from its
-    // first sample on, though nothing moves it there.
-    let stream = vector_or_skip!("test_000800.iamf");
-    let data = std::fs::read(&stream).unwrap();
-    let obus = obus(&data);
+/// The object vector cut into what a splice needs: its descriptors, and
+/// its temporal units, each the parameter blocks before an audio frame and
+/// that frame (the vector has no temporal delimiters and one substream).
+fn descriptors_and_units(obus: &[(iamf_obu::ObuType, &[u8])]) -> (Vec<u8>, Vec<Vec<Vec<u8>>>) {
     let descriptor = |kind: &iamf_obu::ObuType| {
         matches!(
             kind,
@@ -329,35 +323,133 @@ fn a_new_sequence_puts_the_objects_where_it_evaluates_them() {
         .iter()
         .flat_map(|(_, bytes)| bytes.iter().copied())
         .collect();
-    // The vector has no temporal delimiters and one substream: a unit is
-    // the parameter blocks before an audio frame, and that frame.
-    let mut units: Vec<Vec<(iamf_obu::ObuType, &[u8])>> = vec![Vec::new()];
+    let is_frame = |kind: &iamf_obu::ObuType| {
+        matches!(
+            kind,
+            iamf_obu::ObuType::AudioFrame | iamf_obu::ObuType::AudioFrameId(_)
+        )
+    };
+    let mut units: Vec<Vec<Vec<u8>>> = vec![Vec::new()];
+    let mut closed = false;
     for &(kind, bytes) in &obus[first_unit..] {
-        if units.last().unwrap().iter().any(|(kind, _)| {
-            matches!(
-                kind,
-                iamf_obu::ObuType::AudioFrame | iamf_obu::ObuType::AudioFrameId(_)
-            )
-        }) {
+        if closed {
             units.push(Vec::new());
         }
-        units.last_mut().unwrap().push((kind, bytes));
+        units.last_mut().unwrap().push(bytes.to_vec());
+        closed = is_frame(&kind);
     }
     assert!(units.len() > 6, "{} units", units.len());
-    let mut spliced = descriptors.clone();
-    for unit in &units[..3] {
-        for (_, bytes) in unit {
-            spliced.extend_from_slice(bytes);
+    (descriptors, units)
+}
+
+fn is_parameter_block(obu: &[u8]) -> bool {
+    obu[0] >> 3 == 3
+}
+
+fn leb128(mut v: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return out;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// An OBU of the vector (no trimming, no extension header) with its
+/// payload replaced, trimmed at its start and end as an audio frame says.
+fn rebuilt(obu: &[u8], trim: Option<(u32, u32)>, payload: &[u8]) -> Vec<u8> {
+    assert_eq!(obu[0] & 0b11, 0, "an OBU without trimming or extension");
+    let mut out = vec![obu[0]];
+    let mut fields = Vec::new();
+    if let Some((start, end)) = trim {
+        out[0] |= 0b10;
+        fields.extend(leb128(end));
+        fields.extend(leb128(start));
+    }
+    out.extend(leb128((fields.len() + payload.len()) as u32));
+    out.extend(fields);
+    out.extend_from_slice(payload);
+    out
+}
+
+/// The payload of an OBU of the vector (no trimming, no extension header).
+fn payload_of(obu: &[u8]) -> &[u8] {
+    assert_eq!(obu[0] & 0b11, 0, "an OBU without trimming or extension");
+    let mut i = 1;
+    while obu[i] & 0x80 != 0 {
+        i += 1;
+    }
+    &obu[i + 1..]
+}
+
+/// The audio frame of a unit of the vector, trimmed by `start` samples at
+/// its start and `end` at its end.
+fn trimmed(unit: &[Vec<u8>], start: u32, end: u32) -> Vec<Vec<u8>> {
+    unit.iter()
+        .map(|obu| {
+            if is_parameter_block(obu) {
+                obu.clone()
+            } else {
+                rebuilt(obu, Some((start, end)), payload_of(obu))
+            }
+        })
+        .collect()
+}
+
+/// Two IA sequences in one stream: the object vector's descriptors over
+/// `first`, then the same descriptors again over `second`, whose parameter
+/// blocks are dropped, so its object sits at the default, the front.
+fn two_sequences(descriptors: &[u8], first: &[Vec<Vec<u8>>], second: &[Vec<Vec<u8>>]) -> Vec<u8> {
+    let mut spliced = descriptors.to_vec();
+    for unit in first {
+        for obu in unit {
+            spliced.extend_from_slice(obu);
         }
     }
-    spliced.extend_from_slice(&descriptors);
-    for unit in &units[3..6] {
-        for &(kind, bytes) in unit {
-            if !matches!(kind, iamf_obu::ObuType::ParameterBlock) {
-                spliced.extend_from_slice(bytes);
+    spliced.extend_from_slice(descriptors);
+    for unit in second {
+        for obu in unit {
+            if !is_parameter_block(obu) {
+                spliced.extend_from_slice(obu);
             }
         }
     }
+    spliced
+}
+
+/// The object is at the front from `from` on, put there by a jump at
+/// `from`, and nothing moves it after.
+fn assert_front_from(events: &[PositionEvent], from: u64) {
+    let at = position_at(events, 10, from);
+    assert!(close(at, [0.0, 1.0, 0.0]), "{at:?}");
+    let at = position_at(events, 10, from + 2000);
+    assert!(close(at, [0.0, 1.0, 0.0]), "{at:?}");
+    let jump = events
+        .iter()
+        .find(|e| e.0 == 10 && e.1 == from)
+        .expect("an event at the second sequence's start");
+    assert_eq!(jump.3, Some(0), "{jump:?}");
+    assert!(
+        events.iter().all(|e| e.1 <= from || e.0 != 10),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_new_sequence_puts_the_objects_where_it_evaluates_them() {
+    // The first three units of the object vector (the object at the
+    // front, then on its way to the left), then the same descriptors again
+    // as a second IA sequence whose units carry no position block: the
+    // object is at the second sequence's default, the front, from its
+    // first sample on, though nothing moves it there.
+    let stream = vector_or_skip!("test_000800.iamf");
+    let data = std::fs::read(&stream).unwrap();
+    let (descriptors, units) = descriptors_and_units(&obus(&data));
+    let spliced = two_sequences(&descriptors, &units[..3], &units[3..6]);
     let base = out_base("iamf_two_sequences");
     let input = sibling(&base, "iamf");
     std::fs::write(&input, &spliced).unwrap();
@@ -365,21 +457,74 @@ fn a_new_sequence_puts_the_objects_where_it_evaluates_them() {
 
     let events = events(&sibling(&base, "atmos.metadata"));
     assert!(close(position_at(&events, 10, 2048), [-1.0, 0.0, 0.0]));
-    // The second sequence starts at 3072: the object is at the front from
-    // there on, by a jump, and stays.
-    let at = position_at(&events, 10, 3072);
-    assert!(close(at, [0.0, 1.0, 0.0]), "{at:?}");
-    let at = position_at(&events, 10, 5000);
-    assert!(close(at, [0.0, 1.0, 0.0]), "{at:?}");
-    let jump = events
-        .iter()
-        .find(|e| e.0 == 10 && e.1 == 3072)
-        .expect("an event at the second sequence's start");
-    assert_eq!(jump.3, Some(0), "{jump:?}");
-    assert!(
-        events.iter().all(|e| e.1 <= 3072 || e.0 != 10),
-        "{events:?}"
-    );
+    // The second sequence starts at 3072.
+    assert_front_from(&events, 3072);
+}
+
+#[test]
+fn a_new_sequence_trimmed_away_at_first_still_puts_the_objects_where_it_evaluates_them() {
+    // The same, the second sequence's first unit wholly trimmed away (a
+    // codec's pre-skip longer than a unit): it has no sample and no
+    // position, so the one after it, at 3072, is where the object is put
+    // at the front.
+    let stream = vector_or_skip!("test_000800.iamf");
+    let data = std::fs::read(&stream).unwrap();
+    let (descriptors, units) = descriptors_and_units(&obus(&data));
+    let mut second = units[3..6].to_vec();
+    second[0] = trimmed(&second[0], 1024, 0);
+    let spliced = two_sequences(&descriptors, &units[..3], &second);
+    let base = out_base("iamf_two_sequences_preskip");
+    let input = sibling(&base, "iamf");
+    std::fs::write(&input, &spliced).unwrap();
+    decode(&input, &base, &[]);
+
+    let events = events(&sibling(&base, "atmos.metadata"));
+    assert!(close(position_at(&events, 10, 2048), [-1.0, 0.0, 0.0]));
+    assert_front_from(&events, 3072);
+}
+
+#[test]
+fn a_new_sequence_cuts_the_move_before_it_where_it_takes_over() {
+    // The first sequence's third block brought back to the front (azimuth
+    // 0 instead of 180: an arc from the left, where the second block left
+    // the object, back to where the second sequence will put it), and its
+    // frame trimmed by 512 samples at its end: the second sequence starts
+    // at 2560, before the arc gets there. The arc ends where the stream
+    // last evaluated it, at 2304, and the object jumps to the front at
+    // 2560: no event ramps on into the second sequence's samples.
+    let stream = vector_or_skip!("test_000800.iamf");
+    let data = std::fs::read(&stream).unwrap();
+    let (descriptors, units) = descriptors_and_units(&obus(&data));
+    let mut first = units[..3].to_vec();
+    first[2] = trimmed(&first[2], 0, 512);
+    let block = first[2]
+        .iter_mut()
+        .find(|obu| is_parameter_block(obu))
+        .expect("the third position block");
+    let mut payload = payload_of(block).to_vec();
+    // parameter_id, animation_type, azimuth, elevation, distance.
+    assert_eq!(payload, [0x01, 0x03, 0x5a, 0x00, 0x7f]);
+    payload[2] = 0;
+    *block = rebuilt(block, None, &payload);
+    let spliced = two_sequences(&descriptors, &first, &units[3..6]);
+    let base = out_base("iamf_two_sequences_cut");
+    let input = sibling(&base, "iamf");
+    std::fs::write(&input, &spliced).unwrap();
+    decode(&input, &base, &[]);
+
+    let events = events(&sibling(&base, "atmos.metadata"));
+    assert!(close(position_at(&events, 10, 2048), [-1.0, 0.0, 0.0]));
+    // 256 samples into the arc from +90 to 0: azimuth 67.5.
+    let az = 67.5f64.to_radians();
+    let at = position_at(&events, 10, 2304);
+    assert!(close(at, [-az.sin(), az.cos(), 0.0]), "{at:?}");
+    assert_front_from(&events, 2560);
+    for &(id, start, _, ramp) in &events {
+        if id == 10 && start < 2560 {
+            let end = start + u64::from(ramp.unwrap_or(0));
+            assert!(end <= 2560, "{events:?}");
+        }
+    }
 }
 
 #[test]

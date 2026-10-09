@@ -312,6 +312,36 @@ impl ObjectPath {
         self.close_sampled(id, out);
         self.close_open(id, out);
     }
+
+    /// Another sequence takes over at `at`: the path ends there, where it
+    /// got to, not where its last move was going. A ramp still running is
+    /// cut at `at`, where its line has got by then; a followed subblock
+    /// still running ends at the last position evaluated in it, the last
+    /// place the stream put the object before `at`. A move that ended
+    /// before `at` ends where it said.
+    fn cut(&mut self, id: u32, at: u64, out: &mut Vec<Move>) {
+        if let Some(mut sampled) = self.sampled.take() {
+            if sampled.until <= at {
+                sampled.follower.point(id, sampled.until, sampled.end, out);
+            }
+            sampled.follower.close(id, out);
+            self.position = sampled.follower.anchor;
+        }
+        if let Some(mut ramp) = self.open.take() {
+            if ramp.end_at > at && ramp.end_at > ramp.start_at {
+                let end_at = at.max(ramp.start_at);
+                let along = (end_at - ramp.start_at) as f64 / (ramp.end_at - ramp.start_at) as f64;
+                ramp.to = std::array::from_fn(|axis| {
+                    ramp.from[axis] + (ramp.to[axis] - ramp.from[axis]) * along
+                });
+                ramp.end_at = end_at;
+            }
+            if ramp.end_at > ramp.start_at {
+                out.push(ramp.event(id));
+            }
+            self.position = ramp.to;
+        }
+    }
 }
 
 /// Follow one object through a unit starting at sample `base`: its
@@ -464,8 +494,9 @@ pub struct IamfDecodeHandler {
     /// Interleaving scratch, reused across units.
     interleaved: Vec<i32>,
     warned_layout: bool,
-    /// A sequence opened after the first: its first unit puts every object
-    /// where it evaluates it, the paths of the sequence before closed.
+    /// A sequence opened after the first: its first unit with samples puts
+    /// every object where it evaluates it, the paths of the sequence before
+    /// cut where they got to.
     resync: bool,
     discontinuities: u64,
 }
@@ -614,16 +645,25 @@ impl IamfDecodeHandler {
     /// nothing still pending can come before.
     fn track_objects(&mut self, unit: &Unit<'_>) -> Result<()> {
         let base = self.decoded_samples;
-        let resync = std::mem::take(&mut self.resync);
+        // A new sequence takes over at its first kept sample: a unit the
+        // trimming leaves empty states nothing and evaluates nothing, so
+        // the one after it is where the paths are resynchronised.
+        let resync = self.resync && unit.samples > 0;
+        if resync {
+            self.resync = false;
+        }
         for (rank, path) in self.paths.iter_mut().enumerate() {
             let id = 10 + rank as u32;
+            if resync {
+                // The sequence before ends here, where its moves got to:
+                // the new one puts the object where it evaluates it, which
+                // the old one's last move may still have been heading for.
+                path.cut(id, base, &mut self.moves);
+            }
             // A sequence with fewer objects than the file: the missing ones
             // stay where they were.
             if let Some(object) = unit.objects.get(rank) {
                 if resync {
-                    // A new sequence: its moves start from where it puts
-                    // the object, which the one before did not state.
-                    path.finish(id, &mut self.moves);
                     if let Some(&(_, position)) = object.positions.first() {
                         path.jump(id, base, adm_position(position), &mut self.moves);
                     }
@@ -1128,5 +1168,113 @@ mod tests {
         let last = moves.last().unwrap();
         assert_eq!(last.pos, adm_position(polar(90.0)));
         assert_eq!(last.sample_pos + u64::from(last.ramp), 1024);
+    }
+
+    /// The unit a ramp runs over is cut short (its sequence's last, trimmed
+    /// at its end) and another sequence takes over: the ramp ends where its
+    /// line has got by then, and the object jumps to where the new sequence
+    /// puts it, though that is where the ramp was heading.
+    #[test]
+    fn a_sequence_cuts_the_ramp_before_it_where_it_got() {
+        let a = [-1.0, 0.0, 0.0];
+        let b = [1.0, 0.0, 0.0];
+        let mut out = Vec::new();
+        let mut path = ObjectPath::new(adm_position(cart(a)));
+        let object = DecodedObject {
+            audio_element_id: 300,
+            index: 0,
+            samples: Vec::new(),
+            positions: vec![(0, cart(a)), (256, cart([-0.5, 0.0, 0.0]))],
+            position_kind: PositionKind::Cart16,
+            moves: vec![line(0, 1024, cart(a), cart(b))],
+        };
+        follow_unit(&mut path, 10, 0, &object, 512, &mut out);
+        path.cut(10, 512, &mut out);
+        path.jump(10, 512, adm_position(cart(b)), &mut out);
+        assert_eq!(
+            out,
+            [
+                Move {
+                    sample_pos: 0,
+                    id: 10,
+                    pos: [0.0, 0.0, 0.0],
+                    ramp: 512
+                },
+                Move {
+                    sample_pos: 512,
+                    id: 10,
+                    pos: adm_position(cart(b)),
+                    ramp: 0
+                },
+            ]
+        );
+        assert_eq!(path.pending_from(), None);
+    }
+
+    /// The same for an arc: it ends at the last position evaluated in it,
+    /// and the jump to the new sequence's position follows, though the arc
+    /// was heading there.
+    #[test]
+    fn a_sequence_cuts_a_followed_arc_at_its_last_evaluated_point() {
+        let mut out = Vec::new();
+        let mut path = ObjectPath::new(adm_position(polar(0.0)));
+        let object = DecodedObject {
+            audio_element_id: 300,
+            index: 0,
+            samples: Vec::new(),
+            positions: vec![(0, polar(0.0)), (256, polar(22.5))],
+            position_kind: PositionKind::Polar,
+            moves: vec![line(0, 1024, polar(0.0), polar(90.0))],
+        };
+        follow_unit(&mut path, 10, 0, &object, 512, &mut out);
+        path.cut(10, 512, &mut out);
+        path.jump(10, 512, adm_position(polar(90.0)), &mut out);
+        assert_eq!(
+            out,
+            [
+                Move {
+                    sample_pos: 0,
+                    id: 10,
+                    pos: adm_position(polar(22.5)),
+                    ramp: 256
+                },
+                Move {
+                    sample_pos: 512,
+                    id: 10,
+                    pos: adm_position(polar(90.0)),
+                    ramp: 0
+                },
+            ]
+        );
+    }
+
+    /// A move that ended before the next sequence takes over ends where it
+    /// said, and the object there is not told again.
+    #[test]
+    fn a_sequence_leaves_a_move_that_ended_before_it_whole() {
+        let a = [-1.0, 0.0, 0.0];
+        let b = [1.0, 0.0, 0.0];
+        let mut out = Vec::new();
+        let mut path = ObjectPath::new(adm_position(cart(a)));
+        let object = DecodedObject {
+            audio_element_id: 300,
+            index: 0,
+            samples: Vec::new(),
+            positions: Vec::new(),
+            position_kind: PositionKind::Cart16,
+            moves: vec![line(0, 1024, cart(a), cart(b))],
+        };
+        follow_unit(&mut path, 10, 0, &object, 1024, &mut out);
+        path.cut(10, 1024, &mut out);
+        path.jump(10, 1024, adm_position(cart(b)), &mut out);
+        assert_eq!(
+            out,
+            [Move {
+                sample_pos: 0,
+                id: 10,
+                pos: adm_position(cart(b)),
+                ramp: 1024
+            }]
+        );
     }
 }
