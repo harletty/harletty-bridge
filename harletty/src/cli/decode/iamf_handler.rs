@@ -312,6 +312,27 @@ impl ObjectPath {
         self.close_sampled(id, out);
         self.close_open(id, out);
     }
+
+    /// The sequence ends at sample `at`, before the object's moves did: a
+    /// ramp still running is cut there, to where it had got, and a followed
+    /// subblock ends where it was last evaluated. The object is then where
+    /// the audio left it, not where the moves were taking it.
+    fn cut(&mut self, id: u32, at: u64, out: &mut Vec<Move>) {
+        if let Some(mut sampled) = self.sampled.take() {
+            sampled.follower.close(id, out);
+            self.position = sampled.follower.anchor;
+        }
+        if let Some(mut ramp) = self.open.take() {
+            if at > ramp.start_at && at < ramp.end_at {
+                let along = (at - ramp.start_at) as f64 / (ramp.end_at - ramp.start_at) as f64;
+                ramp.to = [0, 1, 2]
+                    .map(|axis| ramp.from[axis] + (ramp.to[axis] - ramp.from[axis]) * along);
+                ramp.end_at = at;
+            }
+            out.push(ramp.event(id));
+            self.position = ramp.to;
+        }
+    }
 }
 
 /// Follow one object through a unit starting at sample `base`: its
@@ -614,16 +635,23 @@ impl IamfDecodeHandler {
     /// nothing still pending can come before.
     fn track_objects(&mut self, unit: &Unit<'_>) -> Result<()> {
         let base = self.decoded_samples;
-        let resync = std::mem::take(&mut self.resync);
+        // A new sequence resynchronises the paths at its first unit with
+        // samples: one its trimming empties says nothing of where it puts
+        // the objects.
+        let resync = self.resync && unit.samples > 0;
+        if resync {
+            self.resync = false;
+        }
         for (rank, path) in self.paths.iter_mut().enumerate() {
             let id = 10 + rank as u32;
             // A sequence with fewer objects than the file: the missing ones
             // stay where they were.
             if let Some(object) = unit.objects.get(rank) {
                 if resync {
-                    // A new sequence: its moves start from where it puts
-                    // the object, which the one before did not state.
-                    path.finish(id, &mut self.moves);
+                    // The sequence before ended at `base`, where its moves
+                    // were, and the new one starts from where it puts the
+                    // object, which it does not state as a move.
+                    path.cut(id, base, &mut self.moves);
                     if let Some(&(_, position)) = object.positions.first() {
                         path.jump(id, base, adm_position(position), &mut self.moves);
                     }
@@ -1072,6 +1100,40 @@ mod tests {
         assert_eq!(path.pending_from(), None);
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].sample_pos, out[0].ramp), (0, 1024));
+    }
+
+    /// A sequence ending before a ramp does: the ramp is cut where the
+    /// audio stops, and the object is there, not at the ramp's end, so the
+    /// next sequence's position is a jump even when it is that end.
+    #[test]
+    fn a_ramp_a_sequence_cuts_short_ends_where_the_audio_does() {
+        let a = [-1.0, 1.0, 0.0];
+        let b = [1.0, 1.0, 0.0];
+        let mut out = Vec::new();
+        let mut path = ObjectPath::new(adm_position(cart(a)));
+        let object = DecodedObject {
+            audio_element_id: 300,
+            index: 0,
+            samples: Vec::new(),
+            positions: Vec::new(),
+            position_kind: PositionKind::Cart16,
+            moves: vec![line(0, 1024, cart(a), cart(b))],
+        };
+        follow_unit(&mut path, 10, 0, &object, 512, &mut out);
+        path.cut(10, 512, &mut out);
+        assert_eq!(
+            out,
+            [Move {
+                sample_pos: 0,
+                id: 10,
+                pos: [0.0, 1.0, 0.0],
+                ramp: 512
+            }]
+        );
+        path.jump(10, 512, adm_position(cart(b)), &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[1].sample_pos, out[1].ramp), (512, 0));
+        assert_eq!(out[1].pos, adm_position(cart(b)));
     }
 
     /// A curve is followed through the evaluated positions, and ends
