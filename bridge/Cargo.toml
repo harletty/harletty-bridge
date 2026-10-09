@@ -1,6 +1,6 @@
 [package]
 name = "harletty-bridge"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 # The sources in this crate are Apache-2.0 like the rest of the workspace, but
 # the built library links bridge_api from Omniphony, which is
@@ -40,10 +40,10 @@ bridge-perf = ["bridge-family-dolby?/bridge-perf"]
 # bridge-common/build.rs records which commit that was in the library.
 [dependencies]
 bridge_api = { version = "0.6.0", path = "../../Omniphony/omniphony-renderer/bridge_api" }
-bridge-common = { version = "0.8.0", path = "../bridge-common" }
-bridge-family-dolby = { version = "0.8.0", path = "../bridge-family-dolby", optional = true }
-bridge-family-dts = { version = "0.8.0", path = "../bridge-family-dts", optional = true }
-bridge-family-iamf = { version = "0.8.0", path = "../bridge-family-iamf", optional = true }
+bridge-common = { version = "0.9.0", path = "../bridge-common" }
+bridge-family-dolby = { version = "0.9.0", path = "../bridge-family-dolby", optional = true }
+bridge-family-dts = { version = "0.9.0", path = "../bridge-family-dts", optional = true }
+bridge-family-iamf = { version = "0.9.0", path = "../bridge-family-iamf", optional = true }
 abi_stable = "0.11"
 log = "0.4"
 [dev-dependencies]

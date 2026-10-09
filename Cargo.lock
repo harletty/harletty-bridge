@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "auro"
-version = "0.8.0"
+version = "0.9.0"
 
 [[package]]
 name = "autocfg"
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-common"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "bridge_api",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-family-dolby"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "bridge-common",
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-family-dts"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "auro",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-family-iamf"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "bridge-common",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "damf"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_yaml_ng",
@@ -487,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "dca"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "log",
  "rustfft",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "eac3"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "log",
  "rustfft",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "harletty"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "auro",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "harletty-bridge"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "bridge-common",
@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "harletty-dolby-bridge"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "bridge-common",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "harletty-dts-bridge"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "bridge-common",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "harletty-iamf-bridge"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "abi_stable",
  "bridge-common",
