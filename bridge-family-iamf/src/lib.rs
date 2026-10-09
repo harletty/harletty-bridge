@@ -841,14 +841,45 @@ fn adm_position(position: ObjectPosition) -> [f64; 3] {
     }
 }
 
+/// Tell the object to go to `pos` over `ramp` samples from `offset`, unless
+/// it is a step to where it was last told to go (`last`), which says
+/// nothing.
+fn say(last: &mut Option<[f64; 3]>, offset: u32, pos: [f64; 3], ramp: u32, out: &mut Vec<Said>) {
+    if *last != Some(pos) || ramp > 0 {
+        out.push(Said { offset, pos, ramp });
+        *last = Some(pos);
+    }
+}
+
+/// A position the decoder evaluated at `offset`: a ramp over the interval
+/// to it, inside a followed subblock (one ending at `sampled_until`) —
+/// except at the sample that subblock started at in this unit
+/// (`followed_from`), where it is the start the subblock said already.
+fn evaluated(
+    last: &mut Option<[f64; 3]>,
+    offset: u32,
+    position: ObjectPosition,
+    frame_pos: u64,
+    sampled_until: u64,
+    followed_from: Option<u32>,
+    out: &mut Vec<Said>,
+) {
+    let at = frame_pos + u64::from(offset);
+    if at < sampled_until && followed_from != Some(offset) {
+        say(last, offset, adm_position(position), POSITION_INTERVAL, out);
+    }
+}
+
 /// What one object says over a unit, in time order: each position subblock
 /// starting in it as the renderer plays it — a jump where a step lands, a
-/// ramp to where a cartesian line ends over its length — and, through a
-/// subblock no ramp states (a curve, a polar line, which is an arc), the
-/// positions the decoder evaluated along it, each a ramp over the interval.
+/// ramp to where a cartesian line ends over its length, after a jump to
+/// where it starts when the object is not there — and, through a subblock
+/// no ramp states (a curve, a polar line, which is an arc), the positions
+/// the decoder evaluated along it, each a ramp over the interval.
 /// `sampled_until` is the end of such a subblock being followed, carried
 /// across units; `last` is where the object was last told to go, which a
-/// step there does not restate.
+/// step there does not restate. Two things said at one sample are two
+/// frames, in this order.
 fn object_says(
     object: &DecodedObject,
     frame_pos: u64,
@@ -860,50 +891,57 @@ fn object_says(
         object.position_kind,
         PositionKind::Cart8 | PositionKind::Cart16
     );
-    let mut say = |offset: u32, pos: [f64; 3], ramp: u32, out: &mut Vec<Said>| {
-        if last != Some(pos) || ramp > 0 {
-            out.push(Said { offset, pos, ramp });
-            last = Some(pos);
-        }
-    };
+    let mut followed_from = None;
     let mut points = object.positions.iter().peekable();
     for subblock in &object.moves {
         while let Some(&&(offset, position)) = points.peek() {
             if offset >= subblock.offset {
                 break;
             }
-            if frame_pos + u64::from(offset) < *sampled_until {
-                say(offset, adm_position(position), POSITION_INTERVAL, out);
-            }
+            evaluated(
+                &mut last,
+                offset,
+                position,
+                frame_pos,
+                *sampled_until,
+                followed_from,
+                out,
+            );
             points.next();
         }
         let at = frame_pos + u64::from(subblock.offset);
+        let from = adm_position(subblock.from);
+        let to = adm_position(subblock.to);
         match subblock.animation {
             PositionAnimationType::Step => {
                 *sampled_until = 0;
-                say(subblock.offset, adm_position(subblock.to), 0, out);
+                say(&mut last, subblock.offset, to, 0, out);
             }
             PositionAnimationType::Linear | PositionAnimationType::InterLinear if exact => {
                 *sampled_until = 0;
-                let to = adm_position(subblock.to);
-                let ramp = if to == adm_position(subblock.from) {
-                    // A standstill coded as a line.
-                    0
-                } else {
-                    subblock.duration
-                };
-                say(subblock.offset, to, ramp, out);
+                // Where the line starts, when the object is not there.
+                say(&mut last, subblock.offset, from, 0, out);
+                if to != from {
+                    say(&mut last, subblock.offset, to, subblock.duration, out);
+                }
             }
             _ => {
                 *sampled_until = at + u64::from(subblock.duration);
-                say(subblock.offset, adm_position(subblock.from), 0, out);
+                followed_from = Some(subblock.offset);
+                say(&mut last, subblock.offset, from, 0, out);
             }
         }
     }
     for &(offset, position) in points {
-        if frame_pos + u64::from(offset) < *sampled_until {
-            say(offset, adm_position(position), POSITION_INTERVAL, out);
-        }
+        evaluated(
+            &mut last,
+            offset,
+            position,
+            frame_pos,
+            *sampled_until,
+            followed_from,
+            out,
+        );
     }
 }
 
@@ -1021,31 +1059,42 @@ fn object_metadata(
     let mut next: Vec<usize> = vec![0; objects.len()];
     for offset in at {
         let sample_pos = frame_pos + u64::from(offset);
-        let events: RVec<REvent> = (0..objects.len())
-            .map(|id| {
-                let says = &said[id];
-                let sent = state.sent[id].as_mut().expect("sent at the first sighting");
-                match says.get(next[id]) {
-                    Some(s) if s.offset == offset => {
-                        next[id] += 1;
-                        *sent = Sent {
-                            pos: s.pos,
-                            end_at: sample_pos + u64::from(s.ramp),
-                        };
-                        event(id, sample_pos, s.pos, s.ramp)
+        // One frame per thing said at this sample: an object saying two
+        // (a jump, then a ramp from there) is heard in that order.
+        let mut first = true;
+        loop {
+            let mut consumed = false;
+            let events: RVec<REvent> = (0..objects.len())
+                .map(|id| {
+                    let says = &said[id];
+                    let sent = state.sent[id].as_mut().expect("sent at the first sighting");
+                    match says.get(next[id]) {
+                        Some(s) if s.offset == offset => {
+                            next[id] += 1;
+                            consumed = true;
+                            *sent = Sent {
+                                pos: s.pos,
+                                end_at: sample_pos + u64::from(s.ramp),
+                            };
+                            event(id, sample_pos, s.pos, s.ramp)
+                        }
+                        // Not moving now: where it is going, and how long
+                        // it still has to get there.
+                        _ => event(
+                            id,
+                            sample_pos,
+                            sent.pos,
+                            sent.end_at.saturating_sub(sample_pos) as u32,
+                        ),
                     }
-                    // Not moving now: where it is going, and how long it
-                    // still has to get there.
-                    _ => event(
-                        id,
-                        sample_pos,
-                        sent.pos,
-                        sent.end_at.saturating_sub(sample_pos) as u32,
-                    ),
-                }
-            })
-            .collect();
-        batch(events, sample_pos, state, &mut frames);
+                })
+                .collect();
+            if !(consumed || first) {
+                break;
+            }
+            batch(events, sample_pos, state, &mut frames);
+            first = false;
+        }
     }
     frames
 }
@@ -1588,6 +1637,61 @@ mod tests {
         let rest = event_of(&frames[0], 0);
         assert_eq!(rest.ramp_duration, 0);
         assert!(close(rest.pos, [1.0, 1.0, 0.0]));
+    }
+
+    /// A line starting away from where the object is: a jump there, then
+    /// the ramp, two frames at the one sample in that order.
+    #[test]
+    fn a_line_starting_elsewhere_jumps_there_first() {
+        let mut state = ObjectState::default();
+        let a = cart(0.0, 1.0, 0.0);
+        let b = cart(-1.0, 0.0, 0.0);
+        let c = cart(1.0, 0.0, 0.0);
+        let objects = [object(300, vec![(0, a)], vec![line(100, 1000, b, c)])];
+        let frames = object_metadata(&objects, 0, 0, 48_000, 4096, &mut state);
+        assert_eq!(frames.len(), 3, "{}", frames.len());
+        assert_eq!(frames[1].sample_pos, 100);
+        let jump = event_of(&frames[1], 0);
+        assert_eq!(jump.ramp_duration, 0);
+        assert!(close(jump.pos, [-1.0, 0.0, 0.0]));
+        assert_eq!(frames[2].sample_pos, 100);
+        let ramp = event_of(&frames[2], 0);
+        assert_eq!(ramp.ramp_duration, 1000);
+        assert!(close(ramp.pos, [1.0, 0.0, 0.0]));
+    }
+
+    /// A subblock followed through the evaluated positions (a curve): its
+    /// start is said once, though the decoder evaluated a position at that
+    /// sample too, and every position after it is heard.
+    #[test]
+    fn a_followed_subblock_is_heard_at_every_evaluated_position() {
+        let mut state = ObjectState::default();
+        let a = cart(0.0, 0.0, 0.0);
+        let b = cart(1.0, 1.0, 0.0);
+        let positions: Vec<(u32, ObjectPosition)> = (0..4)
+            .map(|k| {
+                let t = k as f32 / 4.0;
+                (k * 256, cart(t, t * t, 0.0))
+            })
+            .collect();
+        let objects = [object(
+            300,
+            positions,
+            vec![PositionMove {
+                offset: 0,
+                duration: 1024,
+                animation: PositionAnimationType::Bezier,
+                from: a,
+                to: b,
+            }],
+        )];
+        let frames = object_metadata(&objects, 0, 0, 48_000, 1024, &mut state);
+        // The sighting at 0, then the three positions after the start.
+        let at: Vec<u64> = frames.iter().map(|f| f.sample_pos).collect();
+        assert_eq!(at, [0, 256, 512, 768], "{at:?}");
+        let last = event_of(&frames[3], 0);
+        assert!(close(last.pos, [0.75, 0.5625, 0.0]), "{:?}", last.pos);
+        assert_eq!(last.ramp_duration, POSITION_INTERVAL);
     }
 
     /// An object still on its way when another moves is told the rest of

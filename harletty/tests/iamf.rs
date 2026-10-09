@@ -290,6 +290,98 @@ fn a_moving_polar_object_is_followed_by_its_events() {
     assert_eq!(channels, 1);
 }
 
+/// The OBUs of a standalone stream, each with its bytes.
+fn obus(data: &[u8]) -> Vec<(iamf_obu::ObuType, &[u8])> {
+    let mut reader = iamf_obu::ByteReader::new(data);
+    let mut out = Vec::new();
+    while !reader.is_empty() {
+        let start = reader.position();
+        let obu = iamf_obu::Obu::parse(&mut reader).expect("a well-formed vector");
+        out.push((obu.header.obu_type, &data[start..reader.position()]));
+    }
+    out
+}
+
+#[test]
+fn a_new_sequence_puts_the_objects_where_it_evaluates_them() {
+    // The first three units of the object vector (the object at the
+    // front, then on its way to the left), then the same descriptors again
+    // as a second IA sequence whose units carry no position block: the
+    // object is at the second sequence's default, the front, from its
+    // first sample on, though nothing moves it there.
+    let stream = vector_or_skip!("test_000800.iamf");
+    let data = std::fs::read(&stream).unwrap();
+    let obus = obus(&data);
+    let descriptor = |kind: &iamf_obu::ObuType| {
+        matches!(
+            kind,
+            iamf_obu::ObuType::SequenceHeader
+                | iamf_obu::ObuType::CodecConfig
+                | iamf_obu::ObuType::AudioElement
+                | iamf_obu::ObuType::MixPresentation
+        )
+    };
+    let first_unit = obus
+        .iter()
+        .position(|(kind, _)| !descriptor(kind))
+        .expect("a temporal unit");
+    let descriptors: Vec<u8> = obus[..first_unit]
+        .iter()
+        .flat_map(|(_, bytes)| bytes.iter().copied())
+        .collect();
+    // The vector has no temporal delimiters and one substream: a unit is
+    // the parameter blocks before an audio frame, and that frame.
+    let mut units: Vec<Vec<(iamf_obu::ObuType, &[u8])>> = vec![Vec::new()];
+    for &(kind, bytes) in &obus[first_unit..] {
+        if units.last().unwrap().iter().any(|(kind, _)| {
+            matches!(
+                kind,
+                iamf_obu::ObuType::AudioFrame | iamf_obu::ObuType::AudioFrameId(_)
+            )
+        }) {
+            units.push(Vec::new());
+        }
+        units.last_mut().unwrap().push((kind, bytes));
+    }
+    assert!(units.len() > 6, "{} units", units.len());
+    let mut spliced = descriptors.clone();
+    for unit in &units[..3] {
+        for (_, bytes) in unit {
+            spliced.extend_from_slice(bytes);
+        }
+    }
+    spliced.extend_from_slice(&descriptors);
+    for unit in &units[3..6] {
+        for &(kind, bytes) in unit {
+            if !matches!(kind, iamf_obu::ObuType::ParameterBlock) {
+                spliced.extend_from_slice(bytes);
+            }
+        }
+    }
+    let base = out_base("iamf_two_sequences");
+    let input = sibling(&base, "iamf");
+    std::fs::write(&input, &spliced).unwrap();
+    decode(&input, &base, &[]);
+
+    let events = events(&sibling(&base, "atmos.metadata"));
+    assert!(close(position_at(&events, 10, 2048), [-1.0, 0.0, 0.0]));
+    // The second sequence starts at 3072: the object is at the front from
+    // there on, by a jump, and stays.
+    let at = position_at(&events, 10, 3072);
+    assert!(close(at, [0.0, 1.0, 0.0]), "{at:?}");
+    let at = position_at(&events, 10, 5000);
+    assert!(close(at, [0.0, 1.0, 0.0]), "{at:?}");
+    let jump = events
+        .iter()
+        .find(|e| e.0 == 10 && e.1 == 3072)
+        .expect("an event at the second sequence's start");
+    assert_eq!(jump.3, Some(0), "{jump:?}");
+    assert!(
+        events.iter().all(|e| e.1 <= 3072 || e.0 != 10),
+        "{events:?}"
+    );
+}
+
 #[test]
 fn a_bed_and_static_objects_make_one_event_each() {
     // IAMF v2.0 advanced-1: a 5.1 element and four static polar objects.

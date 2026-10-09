@@ -464,6 +464,9 @@ pub struct IamfDecodeHandler {
     /// Interleaving scratch, reused across units.
     interleaved: Vec<i32>,
     warned_layout: bool,
+    /// A sequence opened after the first: its first unit puts every object
+    /// where it evaluates it, the paths of the sequence before closed.
+    resync: bool,
     discontinuities: u64,
 }
 
@@ -486,6 +489,7 @@ impl IamfDecodeHandler {
             moves: Vec::new(),
             interleaved: Vec::new(),
             warned_layout: false,
+            resync: false,
             discontinuities: 0,
         }
     }
@@ -610,18 +614,21 @@ impl IamfDecodeHandler {
     /// nothing still pending can come before.
     fn track_objects(&mut self, unit: &Unit<'_>) -> Result<()> {
         let base = self.decoded_samples;
+        let resync = std::mem::take(&mut self.resync);
         for (rank, path) in self.paths.iter_mut().enumerate() {
+            let id = 10 + rank as u32;
             // A sequence with fewer objects than the file: the missing ones
             // stay where they were.
             if let Some(object) = unit.objects.get(rank) {
-                follow_unit(
-                    path,
-                    10 + rank as u32,
-                    base,
-                    object,
-                    unit.samples,
-                    &mut self.moves,
-                );
+                if resync {
+                    // A new sequence: its moves start from where it puts
+                    // the object, which the one before did not state.
+                    path.finish(id, &mut self.moves);
+                    if let Some(&(_, position)) = object.positions.first() {
+                        path.jump(id, base, adm_position(position), &mut self.moves);
+                    }
+                }
+                follow_unit(path, id, base, object, unit.samples, &mut self.moves);
             }
         }
         let pending = self.paths.iter().filter_map(ObjectPath::pending_from).min();
@@ -704,6 +711,7 @@ fn fill_column<'a>(
 impl Sink for IamfDecodeHandler {
     fn sequence(&mut self, sequence: &Sequence) -> Result<()> {
         let layout = FileLayout::of(sequence, self.bed_conform);
+        self.resync = self.layout.is_some();
         match &self.layout {
             None => self.layout = Some(layout),
             Some(file) if *file != layout && !self.warned_layout => {
