@@ -278,12 +278,322 @@ fn a_moving_polar_object_is_followed_by_its_events() {
     assert!(close(at, [-h, h, 0.0]), "{at:?}");
     assert!(close(position_at(&events, 10, 2048), [-1.0, 0.0, 0.0]));
     assert!(close(position_at(&events, 10, 3072), [0.0, -1.0, 0.0]));
-    // Moves ramp over the 256 samples the decoder evaluates positions at;
-    // the first event states where the object starts.
+    // A polar line is an arc: followed through the positions the decoder
+    // evaluates every 256 samples, each a ramp over them. The first event
+    // states where the object starts, and the default past the blocks is
+    // where the stream puts the object at once, not a move: a jump.
     assert_eq!(events[0].3, Some(0));
-    assert!(events[1..].iter().all(|e| e.3 == Some(256)));
+    let last = events.last().unwrap();
+    assert_eq!((last.1, last.3), (4096, Some(0)), "{last:?}");
+    assert!(events[1..events.len() - 1].iter().all(|e| e.3 == Some(256)));
     let (channels, _) = read_caf(&sibling(&base, "atmos.audio"));
     assert_eq!(channels, 1);
+}
+
+/// The OBUs of a standalone stream, each with its bytes.
+fn obus(data: &[u8]) -> Vec<(iamf_obu::ObuType, &[u8])> {
+    let mut reader = iamf_obu::ByteReader::new(data);
+    let mut out = Vec::new();
+    while !reader.is_empty() {
+        let start = reader.position();
+        let obu = iamf_obu::Obu::parse(&mut reader).expect("a well-formed vector");
+        out.push((obu.header.obu_type, &data[start..reader.position()]));
+    }
+    out
+}
+
+/// A standalone stream of leb128 `value`.
+fn leb128(mut value: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return out;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// The OBU `bytes` (one with no trimming or extension fields) with its
+/// trimming status set: `start` samples off its start, `end` off its end.
+fn trimmed(bytes: &[u8], start: u32, end: u32) -> Vec<u8> {
+    assert_eq!(bytes[0] & 0x03, 0, "no trimming or extension yet");
+    let mut reader = iamf_obu::ByteReader::new(bytes);
+    let obu = iamf_obu::Obu::parse(&mut reader).unwrap();
+    let fields = [leb128(end), leb128(start)].concat();
+    let mut out = vec![bytes[0] | 0x02];
+    out.extend(leb128((obu.payload.len() + fields.len()) as u32));
+    out.extend(fields);
+    out.extend_from_slice(obu.payload);
+    out
+}
+
+fn is_audio(kind: &iamf_obu::ObuType) -> bool {
+    matches!(
+        kind,
+        iamf_obu::ObuType::AudioFrame | iamf_obu::ObuType::AudioFrameId(_)
+    )
+}
+
+/// The object vector as its descriptors and its units: it has no temporal
+/// delimiters and one substream, so a unit is the parameter blocks before
+/// an audio frame, and that frame.
+fn object_vector_units(data: &[u8]) -> (Vec<u8>, Vec<Vec<(iamf_obu::ObuType, &[u8])>>) {
+    let obus = obus(data);
+    let descriptor = |kind: &iamf_obu::ObuType| {
+        matches!(
+            kind,
+            iamf_obu::ObuType::SequenceHeader
+                | iamf_obu::ObuType::CodecConfig
+                | iamf_obu::ObuType::AudioElement
+                | iamf_obu::ObuType::MixPresentation
+        )
+    };
+    let first_unit = obus
+        .iter()
+        .position(|(kind, _)| !descriptor(kind))
+        .expect("a temporal unit");
+    let descriptors: Vec<u8> = obus[..first_unit]
+        .iter()
+        .flat_map(|(_, bytes)| bytes.iter().copied())
+        .collect();
+    let mut units: Vec<Vec<(iamf_obu::ObuType, &[u8])>> = vec![Vec::new()];
+    for &(kind, bytes) in &obus[first_unit..] {
+        if units.last().unwrap().iter().any(|(kind, _)| is_audio(kind)) {
+            units.push(Vec::new());
+        }
+        units.last_mut().unwrap().push((kind, bytes));
+    }
+    assert!(units.len() > 6, "{} units", units.len());
+    (descriptors, units)
+}
+
+#[test]
+fn a_new_sequence_puts_the_objects_where_it_evaluates_them() {
+    // The first three units of the object vector (the object at the
+    // front, then on its way to the left), then the same descriptors again
+    // as a second IA sequence whose units carry no position block: the
+    // object is at the second sequence's default, the front, from its
+    // first sample on, though nothing moves it there.
+    let stream = vector_or_skip!("test_000800.iamf");
+    let data = std::fs::read(&stream).unwrap();
+    let obus = obus(&data);
+    let descriptor = |kind: &iamf_obu::ObuType| {
+        matches!(
+            kind,
+            iamf_obu::ObuType::SequenceHeader
+                | iamf_obu::ObuType::CodecConfig
+                | iamf_obu::ObuType::AudioElement
+                | iamf_obu::ObuType::MixPresentation
+        )
+    };
+    let first_unit = obus
+        .iter()
+        .position(|(kind, _)| !descriptor(kind))
+        .expect("a temporal unit");
+    let descriptors: Vec<u8> = obus[..first_unit]
+        .iter()
+        .flat_map(|(_, bytes)| bytes.iter().copied())
+        .collect();
+    // The vector has no temporal delimiters and one substream: a unit is
+    // the parameter blocks before an audio frame, and that frame.
+    let mut units: Vec<Vec<(iamf_obu::ObuType, &[u8])>> = vec![Vec::new()];
+    for &(kind, bytes) in &obus[first_unit..] {
+        if units.last().unwrap().iter().any(|(kind, _)| {
+            matches!(
+                kind,
+                iamf_obu::ObuType::AudioFrame | iamf_obu::ObuType::AudioFrameId(_)
+            )
+        }) {
+            units.push(Vec::new());
+        }
+        units.last_mut().unwrap().push((kind, bytes));
+    }
+    assert!(units.len() > 6, "{} units", units.len());
+    let mut spliced = descriptors.clone();
+    for unit in &units[..3] {
+        for (_, bytes) in unit {
+            spliced.extend_from_slice(bytes);
+        }
+    }
+    spliced.extend_from_slice(&descriptors);
+    for unit in &units[3..6] {
+        for &(kind, bytes) in unit {
+            if !matches!(kind, iamf_obu::ObuType::ParameterBlock) {
+                spliced.extend_from_slice(bytes);
+            }
+        }
+    }
+    let base = out_base("iamf_two_sequences");
+    let input = sibling(&base, "iamf");
+    std::fs::write(&input, &spliced).unwrap();
+    decode(&input, &base, &[]);
+
+    let events = events(&sibling(&base, "atmos.metadata"));
+    assert!(close(position_at(&events, 10, 2048), [-1.0, 0.0, 0.0]));
+    // The second sequence starts at 3072: the object is at the front from
+    // there on, by a jump, and stays.
+    let at = position_at(&events, 10, 3072);
+    assert!(close(at, [0.0, 1.0, 0.0]), "{at:?}");
+    let at = position_at(&events, 10, 5000);
+    assert!(close(at, [0.0, 1.0, 0.0]), "{at:?}");
+    let jump = events
+        .iter()
+        .find(|e| e.0 == 10 && e.1 == 3072)
+        .expect("an event at the second sequence's start");
+    assert_eq!(jump.3, Some(0), "{jump:?}");
+    assert!(
+        events.iter().all(|e| e.1 <= 3072 || e.0 != 10),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_new_sequence_whose_first_unit_is_trimmed_away_still_puts_the_objects_there() {
+    // As above, but the second sequence's first unit is wholly trimmed off
+    // its start: it has no sample and no evaluated position, and the
+    // object is put at the front at the first unit that has.
+    let stream = vector_or_skip!("test_000800.iamf");
+    let data = std::fs::read(&stream).unwrap();
+    let (descriptors, units) = object_vector_units(&data);
+    let mut spliced = descriptors.clone();
+    for unit in &units[..3] {
+        for (_, bytes) in unit {
+            spliced.extend_from_slice(bytes);
+        }
+    }
+    spliced.extend_from_slice(&descriptors);
+    for (k, unit) in units[3..7].iter().enumerate() {
+        for &(kind, bytes) in unit {
+            if is_audio(&kind) && k == 0 {
+                spliced.extend(trimmed(bytes, 1024, 0));
+            } else if is_audio(&kind) {
+                spliced.extend_from_slice(bytes);
+            }
+        }
+    }
+    let base = out_base("iamf_two_sequences_trimmed_first");
+    let input = sibling(&base, "iamf");
+    std::fs::write(&input, &spliced).unwrap();
+    decode(&input, &base, &[]);
+
+    let events = events(&sibling(&base, "atmos.metadata"));
+    let at = position_at(&events, 10, 3072);
+    assert!(close(at, [0.0, 1.0, 0.0]), "{at:?}");
+    let at = position_at(&events, 10, 5000);
+    assert!(close(at, [0.0, 1.0, 0.0]), "{at:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.0 == 10 && e.1 == 3072 && e.3 == Some(0)),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_sequence_cut_short_ends_where_its_audio_does() {
+    // The third unit (the arc from the left to the rear) trimmed to its
+    // first 512 samples, then a second sequence without position blocks:
+    // the first sequence ends at 2560, mid-arc, so the object is where the
+    // arc had got, and jumps to the front there. No move of the first
+    // sequence reaches past 2560.
+    let stream = vector_or_skip!("test_000800.iamf");
+    let data = std::fs::read(&stream).unwrap();
+    let (descriptors, units) = object_vector_units(&data);
+    let mut spliced = descriptors.clone();
+    for (k, unit) in units[..3].iter().enumerate() {
+        for &(kind, bytes) in unit {
+            if is_audio(&kind) && k == 2 {
+                spliced.extend(trimmed(bytes, 0, 512));
+            } else {
+                spliced.extend_from_slice(bytes);
+            }
+        }
+    }
+    spliced.extend_from_slice(&descriptors);
+    for unit in &units[3..6] {
+        for &(kind, bytes) in unit {
+            if is_audio(&kind) {
+                spliced.extend_from_slice(bytes);
+            }
+        }
+    }
+    let base = out_base("iamf_two_sequences_cut");
+    let input = sibling(&base, "iamf");
+    std::fs::write(&input, &spliced).unwrap();
+    decode(&input, &base, &[]);
+
+    let events = events(&sibling(&base, "atmos.metadata"));
+    let before: Vec<_> = events.iter().filter(|e| e.0 == 10 && e.1 < 2560).collect();
+    assert!(
+        before
+            .iter()
+            .all(|e| e.1 + u64::from(e.3.unwrap_or(0)) <= 2560),
+        "{before:?}"
+    );
+    let jump = events
+        .iter()
+        .find(|e| e.0 == 10 && e.1 == 2560)
+        .expect("a jump where the second sequence starts");
+    assert_eq!(jump.3, Some(0), "{jump:?}");
+    assert!(close(jump.2, [0.0, 1.0, 0.0]), "{jump:?}");
+    let at = position_at(&events, 10, 2560);
+    assert!(close(at, [0.0, 1.0, 0.0]), "{at:?}");
+    assert!(
+        events.iter().all(|e| e.1 <= 2560 || e.0 != 10),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_sequence_followed_by_another_keeps_every_move_before_the_boundary() {
+    // The first three units of the object vector decoded alone, and
+    // followed by a second sequence without position blocks: the object's
+    // events before the boundary are the same — the arc that ends exactly
+    // on the boundary keeps its exact end, rather than being cut at the
+    // last evaluated position.
+    let stream = vector_or_skip!("test_000800.iamf");
+    let data = std::fs::read(&stream).unwrap();
+    let (descriptors, units) = object_vector_units(&data);
+    let mut alone = descriptors.clone();
+    for unit in &units[..3] {
+        for (_, bytes) in unit {
+            alone.extend_from_slice(bytes);
+        }
+    }
+    let mut followed = alone.clone();
+    followed.extend_from_slice(&descriptors);
+    for unit in &units[3..6] {
+        for &(kind, bytes) in unit {
+            if is_audio(&kind) {
+                followed.extend_from_slice(bytes);
+            }
+        }
+    }
+    let base_alone = out_base("iamf_sequence_alone");
+    let input = sibling(&base_alone, "iamf");
+    std::fs::write(&input, &alone).unwrap();
+    decode(&input, &base_alone, &[]);
+    let base_followed = out_base("iamf_sequence_followed");
+    let input = sibling(&base_followed, "iamf");
+    std::fs::write(&input, &followed).unwrap();
+    decode(&input, &base_followed, &[]);
+
+    let before = |base: &Path| -> Vec<PositionEvent> {
+        events(&sibling(base, "atmos.metadata"))
+            .into_iter()
+            .filter(|e| e.0 == 10 && e.1 < 3072)
+            .collect()
+    };
+    let alone = before(&base_alone);
+    let followed = before(&base_followed);
+    assert_eq!(alone, followed);
+    // The last move of the first sequence ends on the boundary, at the rear.
+    let last = alone.last().unwrap();
+    assert_eq!(last.1 + u64::from(last.3.unwrap_or(0)), 3072, "{last:?}");
+    assert!(close(last.2, [0.0, -1.0, 0.0]), "{last:?}");
 }
 
 #[test]

@@ -153,8 +153,9 @@ pub struct Unit<'a> {
     /// The rendered bed, interleaved in System J's [`BED_CHANNELS`]; `None`
     /// when the mix has nothing but objects.
     pub bed: Option<&'a [f32]>,
-    /// The objects, in mix order: mono samples, and positions at sample
-    /// offsets into them every [`POSITION_INTERVAL`].
+    /// The objects, in mix order: mono samples, positions at sample offsets
+    /// into them every [`POSITION_INTERVAL`], and the position subblocks
+    /// that start in the unit.
     pub objects: &'a [DecodedObject],
     /// Samples per channel.
     pub samples: usize,

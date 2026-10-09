@@ -30,11 +30,12 @@ use bridge_api::{
 };
 use iamf_codecs::DefaultFactory;
 use iamf_dec::layout::SoundSystem;
-use iamf_dec::position::ObjectPosition;
+use iamf_dec::position::{ObjectPosition, PositionAnimationType};
 use iamf_dec::presentation::Descriptors;
 use iamf_dec::stream::{
     DecodedElement, DecodedObject, MixSelection, OutputSampleType, StreamDecoder, StreamSettings,
 };
+use iamf_obu::descriptors::PositionKind;
 use iamf_obu::descriptors::{AudioElementConfig, CodecId, ElementGainOffset};
 
 use bridge_common::frame_builders::float_to_pcm_i32;
@@ -354,8 +355,30 @@ struct Dialogue {
 struct ObjectState {
     /// The last object↔channel declaration sent.
     declared: Option<RVec<RObjectChannel>>,
-    /// The last position sent per object (ADM cartesian).
-    emitted: Vec<Option<[f64; 3]>>,
+    /// Per object, where it was last told to go: `None` before the first
+    /// metadata frame.
+    sent: Vec<Option<Sent>>,
+    /// Per object, the end of a subblock no ramp states (a curve, a polar
+    /// line, which is an arc), which is followed through the evaluated
+    /// positions until then; 0 when it is not following one.
+    sampled_until: Vec<u64>,
+}
+
+/// Where an object was last told to go (ADM cartesian), and the sample its
+/// ramp there ends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Sent {
+    pos: [f64; 3],
+    end_at: u64,
+}
+
+/// Something an object is told at a sample of a unit: where to go, and over
+/// how many samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Said {
+    offset: u32,
+    pos: [f64; 3],
+    ramp: u32,
 }
 
 impl IamfState {
@@ -818,11 +841,119 @@ fn adm_position(position: ObjectPosition) -> [f64; 3] {
     }
 }
 
-/// The metadata frame of one unit's objects: the object↔channel
-/// declaration when it changed (or after a reset), and their positions at
-/// every point where one of them moved, plus a heartbeat. Every batch of
-/// events carries all the objects, since the renderer clears the ones a
-/// metadata frame leaves out. A bed-only unit has none.
+/// Tell the object to go to `pos` over `ramp` samples from `offset`, unless
+/// it is a step to where it was last told to go (`last`), which says
+/// nothing.
+fn say(last: &mut Option<[f64; 3]>, offset: u32, pos: [f64; 3], ramp: u32, out: &mut Vec<Said>) {
+    if *last != Some(pos) || ramp > 0 {
+        out.push(Said { offset, pos, ramp });
+        *last = Some(pos);
+    }
+}
+
+/// A position the decoder evaluated at `offset`: a ramp over the interval
+/// to it, inside a followed subblock (one ending at `sampled_until`) —
+/// except at the sample that subblock started at in this unit
+/// (`followed_from`), where it is the start the subblock said already.
+fn evaluated(
+    last: &mut Option<[f64; 3]>,
+    offset: u32,
+    position: ObjectPosition,
+    frame_pos: u64,
+    sampled_until: u64,
+    followed_from: Option<u32>,
+    out: &mut Vec<Said>,
+) {
+    let at = frame_pos + u64::from(offset);
+    if at < sampled_until && followed_from != Some(offset) {
+        say(last, offset, adm_position(position), POSITION_INTERVAL, out);
+    }
+}
+
+/// What one object says over a unit, in time order: each position subblock
+/// starting in it as the renderer plays it — a jump where a step lands, a
+/// ramp to where a cartesian line ends over its length, after a jump to
+/// where it starts when the object is not there — and, through a subblock
+/// no ramp states (a curve, a polar line, which is an arc), the positions
+/// the decoder evaluated along it, each a ramp over the interval.
+/// `sampled_until` is the end of such a subblock being followed, carried
+/// across units; `last` is where the object was last told to go, which a
+/// step there does not restate. Two things said at one sample are two
+/// frames, in this order.
+fn object_says(
+    object: &DecodedObject,
+    frame_pos: u64,
+    sampled_until: &mut u64,
+    mut last: Option<[f64; 3]>,
+    out: &mut Vec<Said>,
+) {
+    let exact = matches!(
+        object.position_kind,
+        PositionKind::Cart8 | PositionKind::Cart16
+    );
+    let mut followed_from = None;
+    let mut points = object.positions.iter().peekable();
+    for subblock in &object.moves {
+        while let Some(&&(offset, position)) = points.peek() {
+            if offset >= subblock.offset {
+                break;
+            }
+            evaluated(
+                &mut last,
+                offset,
+                position,
+                frame_pos,
+                *sampled_until,
+                followed_from,
+                out,
+            );
+            points.next();
+        }
+        let at = frame_pos + u64::from(subblock.offset);
+        let from = adm_position(subblock.from);
+        let to = adm_position(subblock.to);
+        match subblock.animation {
+            PositionAnimationType::Step => {
+                *sampled_until = 0;
+                say(&mut last, subblock.offset, to, 0, out);
+            }
+            PositionAnimationType::Linear | PositionAnimationType::InterLinear if exact => {
+                *sampled_until = 0;
+                // Where the line starts, when the object is not there.
+                say(&mut last, subblock.offset, from, 0, out);
+                if to != from {
+                    say(&mut last, subblock.offset, to, subblock.duration, out);
+                }
+            }
+            _ => {
+                *sampled_until = at + u64::from(subblock.duration);
+                followed_from = Some(subblock.offset);
+                say(&mut last, subblock.offset, from, 0, out);
+            }
+        }
+    }
+    for &(offset, position) in points {
+        evaluated(
+            &mut last,
+            offset,
+            position,
+            frame_pos,
+            *sampled_until,
+            followed_from,
+            out,
+        );
+    }
+}
+
+/// The metadata frames of one unit's objects: the object↔channel
+/// declaration when it changed (or after a reset), and their moves — each
+/// position subblock the stream starts in the unit, as the ramp it states
+/// (see [`object_says`]), so the renderer plays the mix's own moves — plus a
+/// heartbeat. Every batch of events carries all the objects, since the
+/// renderer clears the ones a metadata frame leaves out: an object that says
+/// nothing then is told again where it is going and how long it still has to
+/// get there. The first frame of a stream puts every object where the
+/// decoder evaluated it, before any move. A bed-only unit has none.
 fn object_metadata(
     objects: &[DecodedObject],
     first_channel: usize,
@@ -840,80 +971,146 @@ fn object_metadata(
             channel: (first_channel + i) as u32,
         })
         .collect();
-    let declaration_changed = state.declared.as_deref() != Some(current.as_slice());
-    if state.emitted.len() != objects.len() {
-        state.emitted = vec![None; objects.len()];
+    let mut declaration_changed = state.declared.as_deref() != Some(current.as_slice());
+    if state.sent.len() != objects.len() {
+        state.sent = vec![None; objects.len()];
+        state.sampled_until = vec![0; objects.len()];
     }
     let heartbeat_period = u64::from(sample_rate) / HEARTBEAT_HZ;
     let heartbeat_due = heartbeat_period > 0 && frame_pos % heartbeat_period < frame_len as u64;
+    let announce = declaration_changed || heartbeat_due;
 
-    let mut events: RVec<REvent> = RVec::new();
-    for k in 0..objects[0].positions.len() {
-        let offset = objects[0].positions[k].0;
-        let at: Vec<[f64; 3]> = objects
-            .iter()
-            .map(|o| {
-                o.positions
-                    .get(k)
-                    .map_or([0.0, 1.0, 0.0], |p| adm_position(p.1))
-            })
-            .collect();
-        let moved = at
-            .iter()
-            .zip(&state.emitted)
-            .any(|(p, last)| last.is_none_or(|l| (0..3).any(|i| (p[i] - l[i]).abs() > 1e-6)));
-        let announce = k == 0 && (declaration_changed || heartbeat_due);
-        if !(moved || announce) {
-            continue;
-        }
-        for (id, (pos, last)) in at.iter().zip(state.emitted.iter_mut()).enumerate() {
-            events.push(REvent {
-                id: id as u32,
-                sample_pos: frame_pos + u64::from(offset),
-                has_pos: true,
-                pos: *pos,
-                gain_db: 0,
-                size: [0.0; 3],
-                // A first sighting jumps there; a move ramps over the
-                // interval the decoder evaluated it at.
-                ramp_duration: if last.is_some() { POSITION_INTERVAL } else { 0 },
-            });
-            *last = Some(*pos);
-        }
-    }
-    if !declaration_changed && events.is_empty() {
-        return RVec::new();
-    }
-    let (object_channels, name_updates) = if declaration_changed {
-        let names = objects
+    let mut frames = RVec::new();
+    let mut batch = |events: RVec<REvent>,
+                     at: u64,
+                     state: &mut ObjectState,
+                     frames: &mut RVec<RMetadataFrame>| {
+        let (object_channels, name_updates) = if declaration_changed {
+            declaration_changed = false;
+            let names = objects
+                .iter()
+                .enumerate()
+                .map(|(i, o)| RNameUpdate {
+                    id: i as u32,
+                    name: RString::from(if o.index == 0 {
+                        format!("IAMF {}", o.audio_element_id)
+                    } else {
+                        format!("IAMF {}.{}", o.audio_element_id, o.index)
+                    }),
+                })
+                .collect();
+            (
+                bridge_common::objects::declare_object_channels(
+                    &mut state.declared,
+                    current.clone(),
+                ),
+                names,
+            )
+        } else {
+            (RVec::new(), RVec::new())
+        };
+        frames.push(RMetadataFrame {
+            events,
+            object_channels,
+            channel_gains: RVec::new(),
+            name_updates,
+            sample_pos: at,
+            ramp_duration: 0,
+        });
+    };
+
+    // A first sighting: every object where the decoder evaluated it at the
+    // unit's start, before its moves.
+    if state.sent.iter().any(Option::is_none) {
+        let events: RVec<REvent> = objects
             .iter()
             .enumerate()
-            .map(|(i, o)| RNameUpdate {
-                id: i as u32,
-                name: RString::from(if o.index == 0 {
-                    format!("IAMF {}", o.audio_element_id)
-                } else {
-                    format!("IAMF {}.{}", o.audio_element_id, o.index)
-                }),
+            .map(|(id, o)| {
+                let pos = o
+                    .positions
+                    .first()
+                    .map_or([0.0, 1.0, 0.0], |p| adm_position(p.1));
+                state.sent[id] = Some(Sent {
+                    pos,
+                    end_at: frame_pos,
+                });
+                event(id, frame_pos, pos, 0)
             })
             .collect();
-        (
-            bridge_common::objects::declare_object_channels(&mut state.declared, current),
-            names,
-        )
-    } else {
-        (RVec::new(), RVec::new())
-    };
-    let mut frames = RVec::with_capacity(1);
-    frames.push(RMetadataFrame {
-        events,
-        object_channels,
-        channel_gains: RVec::new(),
-        name_updates,
-        sample_pos: frame_pos,
-        ramp_duration: 0,
-    });
+        batch(events, frame_pos, state, &mut frames);
+    }
+
+    // What each object says over the unit, then the samples anything is
+    // said at, each a batch of every object.
+    let mut said: Vec<Vec<Said>> = Vec::with_capacity(objects.len());
+    let mut at: Vec<u32> = Vec::new();
+    if announce && frames.is_empty() {
+        at.push(0);
+    }
+    for (id, o) in objects.iter().enumerate() {
+        let mut says = Vec::new();
+        let last = state.sent[id].map(|sent| sent.pos);
+        object_says(o, frame_pos, &mut state.sampled_until[id], last, &mut says);
+        at.extend(says.iter().map(|s| s.offset));
+        said.push(says);
+    }
+    at.sort_unstable();
+    at.dedup();
+    let mut next: Vec<usize> = vec![0; objects.len()];
+    for offset in at {
+        let sample_pos = frame_pos + u64::from(offset);
+        // One frame per thing said at this sample: an object saying two
+        // (a jump, then a ramp from there) is heard in that order.
+        let mut first = true;
+        loop {
+            let mut consumed = false;
+            let events: RVec<REvent> = (0..objects.len())
+                .map(|id| {
+                    let says = &said[id];
+                    let sent = state.sent[id].as_mut().expect("sent at the first sighting");
+                    match says.get(next[id]) {
+                        Some(s) if s.offset == offset => {
+                            next[id] += 1;
+                            consumed = true;
+                            *sent = Sent {
+                                pos: s.pos,
+                                end_at: sample_pos + u64::from(s.ramp),
+                            };
+                            event(id, sample_pos, s.pos, s.ramp)
+                        }
+                        // Not moving now: where it is going, and how long
+                        // it still has to get there.
+                        _ => event(
+                            id,
+                            sample_pos,
+                            sent.pos,
+                            sent.end_at.saturating_sub(sample_pos) as u32,
+                        ),
+                    }
+                })
+                .collect();
+            if !(consumed || first) {
+                break;
+            }
+            batch(events, sample_pos, state, &mut frames);
+            first = false;
+        }
+    }
     frames
+}
+
+/// A position event: object `id` goes to `pos`, over `ramp` samples from
+/// `sample_pos`.
+fn event(id: usize, sample_pos: u64, pos: [f64; 3], ramp: u32) -> REvent {
+    REvent {
+        id: id as u32,
+        sample_pos,
+        has_pos: true,
+        pos,
+        gain_db: 0,
+        size: [0.0; 3],
+        ramp_duration: ramp,
+    }
 }
 
 /// The mix's dialogue element, if it codes one apart: a channel-based
@@ -1113,6 +1310,7 @@ pub fn push_iamf(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iamf_dec::position::PositionMove;
 
     #[test]
     fn frames_a_complete_obu() {
@@ -1337,6 +1535,200 @@ mod tests {
 
     fn close(a: [f64; 3], b: [f64; 3]) -> bool {
         (0..3).all(|i| (a[i] - b[i]).abs() < 1e-3)
+    }
+
+    // The objects' moves, as the decoder reports them.
+
+    fn cart(x: f32, y: f32, z: f32) -> ObjectPosition {
+        ObjectPosition::Cartesian { x, y, z }
+    }
+
+    fn step(offset: u32, duration: u32, at: ObjectPosition) -> PositionMove {
+        PositionMove {
+            offset,
+            duration,
+            animation: PositionAnimationType::Step,
+            from: at,
+            to: at,
+        }
+    }
+
+    fn line(offset: u32, duration: u32, from: ObjectPosition, to: ObjectPosition) -> PositionMove {
+        PositionMove {
+            offset,
+            duration,
+            animation: PositionAnimationType::Linear,
+            from,
+            to,
+        }
+    }
+
+    fn object(
+        id: u32,
+        positions: Vec<(u32, ObjectPosition)>,
+        moves: Vec<PositionMove>,
+    ) -> DecodedObject {
+        DecodedObject {
+            audio_element_id: id,
+            index: 0,
+            samples: Vec::new(),
+            positions,
+            position_kind: PositionKind::Cart16,
+            moves,
+        }
+    }
+
+    fn event_of(frame: &RMetadataFrame, id: u32) -> &REvent {
+        frame
+            .events
+            .iter()
+            .find(|e| e.id == id)
+            .unwrap_or_else(|| panic!("no event for object {id} at {}", frame.sample_pos))
+    }
+
+    /// A line the stream states is the ramp the renderer gets: at its
+    /// sample, over its length, to its end. The objects not moving then are
+    /// told again where they are going and how long they still have.
+    #[test]
+    fn a_move_is_the_ramp_the_stream_states() {
+        let mut state = ObjectState::default();
+        let a = cart(-1.0, 1.0, 0.0);
+        let b = cart(1.0, 1.0, 0.0);
+        let c = cart(0.0, 0.0, 1.0);
+        let objects = [
+            object(
+                300,
+                vec![(0, a)],
+                vec![step(0, 500, a), line(500, 1519, a, b), step(2019, 2077, b)],
+            ),
+            object(301, vec![(0, c)], vec![step(0, 4096, c)]),
+        ];
+        let frames = object_metadata(&objects, 0, 0, 48_000, 4096, &mut state);
+        // The first sighting: the declaration, both objects where they are.
+        assert_eq!(frames.len(), 2, "{}", frames.len());
+        assert_eq!(frames[0].sample_pos, 0);
+        assert_eq!(frames[0].object_channels.len(), 2);
+        assert_eq!(frames[0].events.len(), 2);
+        assert!(frames[0].events.iter().all(|e| e.ramp_duration == 0));
+        assert!(close(event_of(&frames[0], 0).pos, [-1.0, 1.0, 0.0]));
+        // Then the ramp, with the other object restated at rest.
+        let moved = &frames[1];
+        assert_eq!(moved.sample_pos, 500);
+        assert!(moved.object_channels.is_empty());
+        let ramp = event_of(moved, 0);
+        assert_eq!((ramp.sample_pos, ramp.ramp_duration), (500, 1519));
+        assert!(close(ramp.pos, [1.0, 1.0, 0.0]));
+        let still = event_of(moved, 1);
+        assert_eq!((still.sample_pos, still.ramp_duration), (500, 0));
+        assert!(close(still.pos, [0.0, 0.0, 1.0]));
+
+        // The next unit: a step of the second object, the first restated
+        // where its ramp ended.
+        let objects = [
+            object(300, vec![(0, b)], vec![]),
+            object(301, vec![(0, c)], vec![step(100, 3996, a)]),
+        ];
+        let frames = object_metadata(&objects, 0, 4096, 48_000, 4096, &mut state);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].sample_pos, 4196);
+        let jump = event_of(&frames[0], 1);
+        assert_eq!(jump.ramp_duration, 0);
+        assert!(close(jump.pos, [-1.0, 1.0, 0.0]));
+        let rest = event_of(&frames[0], 0);
+        assert_eq!(rest.ramp_duration, 0);
+        assert!(close(rest.pos, [1.0, 1.0, 0.0]));
+    }
+
+    /// A line starting away from where the object is: a jump there, then
+    /// the ramp, two frames at the one sample in that order.
+    #[test]
+    fn a_line_starting_elsewhere_jumps_there_first() {
+        let mut state = ObjectState::default();
+        let a = cart(0.0, 1.0, 0.0);
+        let b = cart(-1.0, 0.0, 0.0);
+        let c = cart(1.0, 0.0, 0.0);
+        let objects = [object(300, vec![(0, a)], vec![line(100, 1000, b, c)])];
+        let frames = object_metadata(&objects, 0, 0, 48_000, 4096, &mut state);
+        assert_eq!(frames.len(), 3, "{}", frames.len());
+        assert_eq!(frames[1].sample_pos, 100);
+        let jump = event_of(&frames[1], 0);
+        assert_eq!(jump.ramp_duration, 0);
+        assert!(close(jump.pos, [-1.0, 0.0, 0.0]));
+        assert_eq!(frames[2].sample_pos, 100);
+        let ramp = event_of(&frames[2], 0);
+        assert_eq!(ramp.ramp_duration, 1000);
+        assert!(close(ramp.pos, [1.0, 0.0, 0.0]));
+    }
+
+    /// A subblock followed through the evaluated positions (a curve): its
+    /// start is said once, though the decoder evaluated a position at that
+    /// sample too, and every position after it is heard.
+    #[test]
+    fn a_followed_subblock_is_heard_at_every_evaluated_position() {
+        let mut state = ObjectState::default();
+        let a = cart(0.0, 0.0, 0.0);
+        let b = cart(1.0, 1.0, 0.0);
+        let positions: Vec<(u32, ObjectPosition)> = (0..4)
+            .map(|k| {
+                let t = k as f32 / 4.0;
+                (k * 256, cart(t, t * t, 0.0))
+            })
+            .collect();
+        let objects = [object(
+            300,
+            positions,
+            vec![PositionMove {
+                offset: 0,
+                duration: 1024,
+                animation: PositionAnimationType::Bezier,
+                from: a,
+                to: b,
+            }],
+        )];
+        let frames = object_metadata(&objects, 0, 0, 48_000, 1024, &mut state);
+        // The sighting at 0, then the three positions after the start.
+        let at: Vec<u64> = frames.iter().map(|f| f.sample_pos).collect();
+        assert_eq!(at, [0, 256, 512, 768], "{at:?}");
+        let last = event_of(&frames[3], 0);
+        assert!(close(last.pos, [0.75, 0.5625, 0.0]), "{:?}", last.pos);
+        assert_eq!(last.ramp_duration, POSITION_INTERVAL);
+    }
+
+    /// An object still on its way when another moves is told the rest of
+    /// its ramp: the same end, what is left of its length.
+    #[test]
+    fn a_ramp_still_running_is_restated_with_what_is_left() {
+        let mut state = ObjectState::default();
+        let a = cart(-1.0, 1.0, 0.0);
+        let b = cart(1.0, 1.0, 0.0);
+        let c = cart(0.0, 0.0, 1.0);
+        let objects = [
+            object(300, vec![(0, a)], vec![line(0, 3000, a, b)]),
+            object(
+                301,
+                vec![(0, c)],
+                vec![step(0, 1000, c), step(1000, 3096, a)],
+            ),
+        ];
+        let frames = object_metadata(&objects, 0, 0, 48_000, 4096, &mut state);
+        // The sighting at 0, the ramp at 0, the step at 1000.
+        assert_eq!(frames.len(), 3, "{}", frames.len());
+        assert_eq!(frames[1].sample_pos, 0);
+        assert_eq!(event_of(&frames[1], 0).ramp_duration, 3000);
+        let later = &frames[2];
+        assert_eq!(later.sample_pos, 1000);
+        let rest = event_of(later, 0);
+        assert_eq!(rest.ramp_duration, 2000);
+        assert!(close(rest.pos, [1.0, 1.0, 0.0]));
+        assert_eq!(event_of(later, 1).ramp_duration, 0);
+        // A standstill coded as a step where the object already is says
+        // nothing: the next unit has no frame.
+        let objects = [
+            object(300, vec![(0, b)], vec![step(0, 4096, b)]),
+            object(301, vec![(0, a)], vec![step(0, 4096, a)]),
+        ];
+        let frames = object_metadata(&objects, 0, 4096, 48_000, 4096, &mut state);
+        assert!(frames.is_empty(), "{}", frames.len());
     }
 
     #[test]
