@@ -548,6 +548,55 @@ fn a_sequence_cut_short_ends_where_its_audio_does() {
 }
 
 #[test]
+fn a_sequence_followed_by_another_keeps_every_move_before_the_boundary() {
+    // The first three units of the object vector decoded alone, and
+    // followed by a second sequence without position blocks: the object's
+    // events before the boundary are the same — the arc that ends exactly
+    // on the boundary keeps its exact end, rather than being cut at the
+    // last evaluated position.
+    let stream = vector_or_skip!("test_000800.iamf");
+    let data = std::fs::read(&stream).unwrap();
+    let (descriptors, units) = object_vector_units(&data);
+    let mut alone = descriptors.clone();
+    for unit in &units[..3] {
+        for (_, bytes) in unit {
+            alone.extend_from_slice(bytes);
+        }
+    }
+    let mut followed = alone.clone();
+    followed.extend_from_slice(&descriptors);
+    for unit in &units[3..6] {
+        for &(kind, bytes) in unit {
+            if is_audio(&kind) {
+                followed.extend_from_slice(bytes);
+            }
+        }
+    }
+    let base_alone = out_base("iamf_sequence_alone");
+    let input = sibling(&base_alone, "iamf");
+    std::fs::write(&input, &alone).unwrap();
+    decode(&input, &base_alone, &[]);
+    let base_followed = out_base("iamf_sequence_followed");
+    let input = sibling(&base_followed, "iamf");
+    std::fs::write(&input, &followed).unwrap();
+    decode(&input, &base_followed, &[]);
+
+    let before = |base: &Path| -> Vec<PositionEvent> {
+        events(&sibling(base, "atmos.metadata"))
+            .into_iter()
+            .filter(|e| e.0 == 10 && e.1 < 3072)
+            .collect()
+    };
+    let alone = before(&base_alone);
+    let followed = before(&base_followed);
+    assert_eq!(alone, followed);
+    // The last move of the first sequence ends on the boundary, at the rear.
+    let last = alone.last().unwrap();
+    assert_eq!(last.1 + u64::from(last.3.unwrap_or(0)), 3072, "{last:?}");
+    assert!(close(last.2, [0.0, -1.0, 0.0]), "{last:?}");
+}
+
+#[test]
 fn a_bed_and_static_objects_make_one_event_each() {
     // IAMF v2.0 advanced-1: a 5.1 element and four static polar objects.
     let stream = vector_or_skip!("test_000903.iamf");

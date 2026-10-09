@@ -313,12 +313,16 @@ impl ObjectPath {
         self.close_open(id, out);
     }
 
-    /// The sequence ends at sample `at`, before the object's moves did: a
-    /// ramp still running is cut there, to where it had got, and a followed
-    /// subblock ends where it was last evaluated. The object is then where
-    /// the audio left it, not where the moves were taking it.
+    /// The sequence ends at sample `at`: a move over by then ends where it
+    /// said, one still running is cut there — a ramp to where it had got, a
+    /// followed subblock where it was last evaluated. The object is then
+    /// where the audio left it, not where the moves were taking it.
     fn cut(&mut self, id: u32, at: u64, out: &mut Vec<Move>) {
         if let Some(mut sampled) = self.sampled.take() {
+            if sampled.until <= at {
+                // Over by the boundary: its exact end is known.
+                sampled.follower.point(id, sampled.until, sampled.end, out);
+            }
             sampled.follower.close(id, out);
             self.position = sampled.follower.anchor;
         }
@@ -1134,6 +1138,43 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!((out[1].sample_pos, out[1].ramp), (512, 0));
         assert_eq!(out[1].pos, adm_position(cart(b)));
+    }
+
+    /// A followed subblock over exactly at the boundary a sequence ends on
+    /// keeps its exact end: only one still running is cut at the last
+    /// evaluated position.
+    #[test]
+    fn a_curve_over_at_a_sequence_boundary_keeps_its_end() {
+        let a = [0.0, 0.0, 0.0];
+        let b = [1.0, 1.0, 0.0];
+        let positions: Vec<(u32, ObjectPosition)> = (1..4)
+            .map(|k| {
+                let t = k as f64 / 4.0;
+                (k * 256, cart([t, t * t, 0.0]))
+            })
+            .collect();
+        let object = DecodedObject {
+            audio_element_id: 300,
+            index: 0,
+            samples: Vec::new(),
+            positions,
+            position_kind: PositionKind::Cart16,
+            moves: vec![subblock(
+                0,
+                1024,
+                PositionAnimationType::Bezier,
+                cart(a),
+                cart(b),
+            )],
+        };
+        let mut out = Vec::new();
+        let mut path = ObjectPath::new(adm_position(cart(a)));
+        follow_unit(&mut path, 10, 0, &object, 1024, &mut out);
+        path.cut(10, 1024, &mut out);
+        let last = out.last().unwrap();
+        assert_eq!(last.pos, adm_position(cart(b)), "{out:?}");
+        assert_eq!(last.sample_pos + u64::from(last.ramp), 1024);
+        assert_eq!(path.position, adm_position(cart(b)));
     }
 
     /// A curve is followed through the evaluated positions, and ends
