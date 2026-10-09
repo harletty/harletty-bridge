@@ -152,6 +152,10 @@ mod tests {
             0xF9, 0x09, 0x02, 0xAA, 0xBB, b'i', b'a', b'm', b'f', 0x00, 0x00,
         ];
         assert_eq!(IamfPipeline::sniff(&extended), Some(IamfCodec::Iamf));
+        // A reserved additional profile (libiamf's test_000710): still the
+        // stream's, as the combined bridge takes it.
+        let reserved = [0xF8, 0x06, b'i', b'a', b'm', b'f', 0x02, 0xFF];
+        assert_eq!(IamfPipeline::sniff(&reserved), Some(IamfCodec::Iamf));
         assert_eq!(
             IamfPipeline::sniff(&[0xF8, 0x06, b'x', b'a', b'm', b'f']),
             None

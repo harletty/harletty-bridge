@@ -6,15 +6,21 @@
 //! well-formed LEB128 at least as large as the syntax it covers; when
 //! `obu_extension_flag` is set, the extension's LEB128 size and that many
 //! bytes come before the payload; the payload opens with the `iamf` code and
-//! a primary and an additional profile the decoder knows. Nothing after these
+//! two profile bytes, of which the primary is one the decoder knows. The
+//! additional profile is not judged: it names a second profile the sequence
+//! also complies with, possibly one reserved for the future (6–255), and the
+//! sequence still decodes under its primary profile — libiamf's vectors
+//! test_000710 and test_000711 declare 255 there and expect their
+//! Base-Enhanced mix decoded. A primary profile the decoder does not know is
+//! a sequence it discards (§3.4), so it is not claimed. Nothing after these
 //! fields is required: `obu_size` may extend past them, and reserved OBUs may
 //! follow before the codec config. So a start is decided within 15 bytes
 //! without an extension, and within 23 bytes plus the declared extension
 //! with one.
 //!
 //! IAMF has no CRC and need not repeat its sequence header: the OBU type, a
-//! 32-bit code and two constrained profile bytes at fixed places make a
-//! chance match negligible.
+//! 32-bit code and a constrained profile byte at fixed places make a chance
+//! match negligible.
 //!
 //! One ambiguity is the syntax's own: the header byte of a sequence header
 //! (0xF8–0xFF) reads as a LEB128 continuation byte, so a byte of 0xF8, 0xF9,
@@ -35,7 +41,7 @@ const OBU_SEQUENCE_HEADER: u8 = 31;
 const OBU_TRIMMING_STATUS_FLAG: u8 = 0x02;
 const OBU_EXTENSION_FLAG: u8 = 0x01;
 const IA_CODE: [u8; 4] = *b"iamf";
-/// The highest profile number the decoder knows (simple, base,
+/// The highest primary profile number the decoder knows (simple, base,
 /// base-enhanced, base-advanced, advanced-1, advanced-2).
 const MAX_PROFILE: u8 = 5;
 /// A LEB128 of the OBU syntax is at most 8 bytes long (§2.4).
@@ -89,11 +95,7 @@ fn fields(s: &[u8]) -> Result<usize, Start> {
         return Err(Start::Need(end));
     }
     let primary = s[payload + IA_CODE.len()];
-    let additional = s[payload + IA_CODE.len() + 1];
-    if s[payload..payload + IA_CODE.len()] != IA_CODE
-        || primary > MAX_PROFILE
-        || additional > MAX_PROFILE
-    {
+    if s[payload..payload + IA_CODE.len()] != IA_CODE || primary > MAX_PROFILE {
         return Err(Start::Reject);
     }
     Ok(payload)
@@ -263,7 +265,7 @@ mod tests {
         code[2] = b'x';
         assert_eq!(probe_raw(&code[..8]).verdict, RProbeVerdict::None);
         let mut profile = good.clone();
-        profile[7] = MAX_PROFILE + 1;
+        profile[6] = MAX_PROFILE + 1;
         assert_eq!(probe_raw(&profile[..8]).verdict, RProbeVerdict::None);
         let mut trimmed = good.clone();
         trimmed[0] |= OBU_TRIMMING_STATUS_FLAG;
@@ -277,6 +279,23 @@ mod tests {
         long.extend([0x80; 9]);
         long.extend_from_slice(b"iamf\0\0");
         assert_eq!(probe_raw(&long).verdict, RProbeVerdict::None);
+    }
+
+    /// An additional profile the decoder does not know, one reserved for
+    /// the future, does not hide the stream: it still complies with its
+    /// primary profile. The header of libiamf's test_000710 (Base-Enhanced,
+    /// additional profile 255), whose mix 43 decodes.
+    #[test]
+    fn a_reserved_additional_profile_is_claimed() {
+        let header = [0xF8, 0x06, b'i', b'a', b'm', b'f', 0x02, 0xFF];
+        assert_eq!(probe_raw(&header), RProbe::claim(0));
+        let mut reserved = sequence(6, 1, None);
+        reserved[7] = MAX_PROFILE + 1;
+        assert_claimed_at(&reserved, 0, 8);
+        // Not so a reserved primary profile (test_000709): the decoder
+        // discards that sequence.
+        let primary = [0xF8, 0x06, b'i', b'a', b'm', b'f', 0xFF, 0xFF];
+        assert_eq!(probe_raw(&primary).verdict, RProbeVerdict::None);
     }
 
     #[test]
