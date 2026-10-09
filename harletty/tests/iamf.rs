@@ -278,10 +278,14 @@ fn a_moving_polar_object_is_followed_by_its_events() {
     assert!(close(at, [-h, h, 0.0]), "{at:?}");
     assert!(close(position_at(&events, 10, 2048), [-1.0, 0.0, 0.0]));
     assert!(close(position_at(&events, 10, 3072), [0.0, -1.0, 0.0]));
-    // Moves ramp over the 256 samples the decoder evaluates positions at;
-    // the first event states where the object starts.
+    // A polar line is an arc: followed through the positions the decoder
+    // evaluates every 256 samples, each a ramp over them. The first event
+    // states where the object starts, and the default past the blocks is
+    // where the stream puts the object at once, not a move: a jump.
     assert_eq!(events[0].3, Some(0));
-    assert!(events[1..].iter().all(|e| e.3 == Some(256)));
+    let last = events.last().unwrap();
+    assert_eq!((last.1, last.3), (4096, Some(0)), "{last:?}");
+    assert!(events[1..events.len() - 1].iter().all(|e| e.3 == Some(256)));
     let (channels, _) = read_caf(&sibling(&base, "atmos.audio"));
     assert_eq!(channels, 1);
 }
