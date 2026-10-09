@@ -10,9 +10,10 @@ of the flat stereo/5.1 downmix you normally get. It turns the encoded
 audio in your movie file into sound + the spatial information the
 renderer needs to place each object in space.
 
-It is a **plugin**: you don't run it on its own. You install
-Omniphony or mpv-omniphony, drop this file next to it, and tell the
-config where it is. That's the whole job.
+It comes as **plugins**, one per codec family: you don't run them on
+their own. You install Omniphony or mpv-omniphony, drop the three files
+next to it (or tell the config where they are), and that's the whole
+job.
 
 > **Looking for the command-line converter instead?** This repo also
 > ships **`harletty`** — a fork of
@@ -38,56 +39,76 @@ file for your system from the
 [**releases page**](https://github.com/harletty/harletty-bridge/releases)
 and follow the three steps for your OS below.
 
-> Each release has one bridge file per system. Download the one that
-> matches (the `harletty-cli-*` archives alongside them are the separate
+> Each release has one bridge archive per system,
+> `harletty-bridge-<version>-<system>.zip`. It holds three plugins, one
+> per codec family; install all three side by side (the
+> `harletty-cli-*` archives alongside are the separate
 > [offline tool](docs/harletty-cli.md) — not needed for playback):
 >
-> | Your system | File to download |
+> | Your system | Files in the archive |
 > |---|---|
-> | **Windows** | `harletty_bridge.dll` |
-> | **Linux** | `libharletty_bridge.so` |
-> | **macOS** | `libharletty_bridge.dylib` |
+> | **Windows** | `harletty_dolby_bridge.dll`, `harletty_dts_bridge.dll`, `harletty_iamf_bridge.dll` |
+> | **Linux** | `libharletty_dolby_bridge.so`, `libharletty_dts_bridge.so`, `libharletty_iamf_bridge.so` |
+> | **macOS** | `libharletty_dolby_bridge.dylib`, `libharletty_dts_bridge.dylib`, `libharletty_iamf_bridge.dylib` |
+>
+> `dolby` decodes TrueHD and E-AC-3 / AC-3 (with Atmos objects), `dts`
+> decodes DTS, DTS-HD, DTS:X and Auro-3D, `iamf` decodes IAMF (Eclipsa
+> Audio). The host loads them together and hands each stream to the one
+> that recognises it. On Linux the IAMF plugin uses the system's libopus
+> (`libopus0` on Debian/Ubuntu, `opus` on Arch and Fedora); on Windows
+> and macOS it is built in.
+>
+> **Upgrading from a single `harletty_bridge` file?** Delete it and put
+> the three files in its place. A config whose `bridge_path` still names
+> `libharletty_bridge.so` / `harletty_bridge.dll` /
+> `libharletty_bridge.dylib` keeps working: the host loads the three
+> family plugins from that folder instead, and the next Save writes them.
 
-> **Match the bridge to your Omniphony.** A bridge loads only in an
+> **Match the bridges to your Omniphony.** A bridge loads only in an
 > Omniphony built against the same `bridge_api` minor version, so each
 > release says at the top of its notes which Omniphony it requires
 > ("Requires Omniphony ≥ …"). The current `main` requires **Omniphony
-> with `bridge_api` 0.5**: Omniphony `main` since
-> [mgth/Omniphony#695](https://github.com/mgth/Omniphony/pull/695), and
-> the first Omniphony release after 0.6.0. Omniphony 0.6.0 carries
-> `bridge_api` 0.4 and refuses it. When a host loads the bridge, its log
-> shows what the bridge was built from, e.g.
-> `harletty-bridge 0.8.0 (bridge_api 0.5.0, Omniphony 43006ee2…)`.
+> with `bridge_api` 0.6 that loads several bridges**: Omniphony `main`
+> since [mgth/Omniphony#785](https://github.com/mgth/Omniphony/pull/785),
+> and the first Omniphony release after 0.6.0. Older hosts refuse the
+> plugins. When a host loads a plugin, its log shows what it was built
+> from, e.g.
+> `harletty-dolby-bridge 0.8.0 (bridge_api 0.6.0, Omniphony 25369b9f…)`.
 
 ### 🪟 Windows
 
-Download **`harletty_bridge.dll`** from the releases page, then pick
-**one** of the two options below.
+Download **`harletty-bridge-<version>-windows-x86_64.zip`** from the
+releases page and extract the three `.dll` files, then pick **one** of
+the two options below.
 
-**Option A — drop it next to `orender.exe` (recommended, no config).**
-The host automatically loads any `*_bridge.dll` sitting in its own
+**Option A — drop them next to `orender.exe` (recommended, no config).**
+The host automatically loads every `*_bridge.dll` sitting in its own
 folder, so there's nothing else to set up.
 
 1. Find that folder: right-click your Omniphony / mpv-omniphony
    shortcut → *Open file location*; or search `orender.exe` in the
    Start menu, right-click the result → *Open file location*.
-2. Drop `harletty_bridge.dll` into that folder. Keep the file name as
-   is (auto-detection needs the `_bridge.dll` ending).
+2. Drop the three `harletty_*_bridge.dll` files into that folder. Keep
+   the file names as they are (auto-detection needs the `_bridge.dll`
+   ending).
 
 Done — skip to "Check it worked" below.
 
-**Option B — keep it in a folder of your choice (needs one config line).**
+**Option B — keep them in a folder of your choice (needs a config entry).**
 
-1. Put the file somewhere permanent, e.g. create `C:\Omniphony\` and
-   drop it in → `C:\Omniphony\harletty_bridge.dll`.
-2. Tell Omniphony where it is. Open (or create) the file
+1. Put the files somewhere permanent, e.g. create `C:\Omniphony\` and
+   drop them in → `C:\Omniphony\harletty_dolby_bridge.dll` and so on.
+2. Tell Omniphony where they are. Open (or create) the file
    `%APPDATA%\omniphony\config.yaml` — paste that into the address bar
-   of Explorer to find the folder — and make sure it contains the full
-   path to the file:
+   of Explorer to find the folder — and make sure it lists the full
+   path to each file:
 
    ```yaml
    render:
-     bridge_path: C:\Omniphony\harletty_bridge.dll
+     bridge_paths:
+       - C:\Omniphony\harletty_dolby_bridge.dll
+       - C:\Omniphony\harletty_dts_bridge.dll
+       - C:\Omniphony\harletty_iamf_bridge.dll
    ```
 
 That's it. Start mpv-omniphony or Omniphony Studio and your Atmos
@@ -119,25 +140,31 @@ Play any TrueHD/Atmos file:
   an OSC-enabled host (mpv with `--ad-orender-osc`, or the CLI) is
   playing.
 
-If the bridge isn't found, the host falls back to the normal
+If a bridge isn't found, the host falls back to the normal
 (non-object) audio and the config save log / Studio status will say so
-— double-check the `bridge_path` points at the file you downloaded.
+— double-check that `bridge_paths` points at the files you downloaded.
 
 ### 🐧 Linux
 
-1. Download **`libharletty_bridge.so`** from the releases page.
-2. Put it somewhere permanent, e.g.
-   `~/.local/lib/harletty/libharletty_bridge.so`.
+1. Download **`harletty-bridge-<version>-linux-x86_64.zip`** from the
+   releases page, and install libopus if it isn't already
+   (`sudo apt install libopus0`, `sudo pacman -S opus`,
+   `sudo dnf install opus`): the IAMF plugin uses it.
+2. Extract the three `.so` files somewhere permanent, e.g.
+   `~/.local/lib/harletty/`.
 3. Edit `~/.config/omniphony/config.yaml` (create it if missing) so it
    contains:
 
    ```yaml
    render:
-     bridge_path: /home/you/.local/lib/harletty/libharletty_bridge.so
+     bridge_paths:
+       - /home/you/.local/lib/harletty/libharletty_dolby_bridge.so
+       - /home/you/.local/lib/harletty/libharletty_dts_bridge.so
+       - /home/you/.local/lib/harletty/libharletty_iamf_bridge.so
    ```
 
-   (Or drop the file next to the `orender` binary and skip this step —
-   the host auto-loads any `*_bridge.so` in its own folder.)
+   (Or drop the files next to the `orender` binary and skip this step —
+   the host auto-loads every `*_bridge.so` in its own folder.)
 
 Then verify it with the [Check it worked](#check-it-worked) steps above.
 
@@ -148,32 +175,37 @@ Then verify it with the [Check it worked](#check-it-worked) steps above.
 > paru -S harletty-bridge
 > ```
 >
-> It builds from this repo's release and lands at
-> `/usr/lib/orender/libharletty_bridge.so`. Hosts installed system-wide
-> (`/usr/bin/orender`, the AUR `mpv-omniphony`/`omniphony-studio`) don't
-> scan that directory, so point them at it once in
-> `~/.config/omniphony/config.yaml`:
+> It builds from this repo's release and installs the plugins in
+> `/usr/lib/orender/`, the system plugin folder the host searches last
+> when no bridge is configured. A config that names them explicitly:
 >
 > ```yaml
 > render:
->   bridge_path: /usr/lib/orender/libharletty_bridge.so
+>   bridge_paths:
+>     - /usr/lib/orender/libharletty_dolby_bridge.so
+>     - /usr/lib/orender/libharletty_dts_bridge.so
+>     - /usr/lib/orender/libharletty_iamf_bridge.so
 > ```
 
 ### 🍎 macOS
 
-1. Download **`libharletty_bridge.dylib`** from the releases page.
-2. Put it somewhere permanent, e.g.
-   `~/Library/Application Support/omniphony/libharletty_bridge.dylib`.
+1. Download **`harletty-bridge-<version>-macos-arm64.zip`** from the
+   releases page.
+2. Extract the three `.dylib` files somewhere permanent, e.g.
+   `~/Library/Application Support/omniphony/`.
 3. Edit `~/.config/omniphony/config.yaml` (create it if missing) so it
    contains:
 
    ```yaml
    render:
-     bridge_path: /Users/you/Library/Application Support/omniphony/libharletty_bridge.dylib
+     bridge_paths:
+       - /Users/you/Library/Application Support/omniphony/libharletty_dolby_bridge.dylib
+       - /Users/you/Library/Application Support/omniphony/libharletty_dts_bridge.dylib
+       - /Users/you/Library/Application Support/omniphony/libharletty_iamf_bridge.dylib
    ```
 
-   (Or drop the file next to the `orender` binary and skip this step —
-   the host auto-loads any `*_bridge.dylib` in its own folder.)
+   (Or drop the files next to the `orender` binary and skip this step —
+   the host auto-loads every `*_bridge.dylib` in its own folder.)
 
 Then verify it with the [Check it worked](#check-it-worked) steps above.
 
@@ -203,9 +235,14 @@ Step by step:
 4. The renderer takes care of VBAP, distance / spread modeling and the
    speaker-side output.
 
-Architecturally the bridge is a runtime `dlopen` plugin — the exact
-same loading pattern Omniphony uses for any future format-specific
-bridge (`*_bridge.so` / `.dll` / `.dylib`).
+Architecturally each bridge is a runtime `dlopen` plugin — the exact
+same loading pattern Omniphony uses for any format-specific bridge
+(`*_bridge.so` / `.dll` / `.dylib`). harletty ships one per codec
+family; the host loads them together, asks each one's `probe` where a
+stream of its family starts, and routes each stream to the one that
+claims it
+([docs/multi-bridge.md](https://github.com/mgth/Omniphony/blob/main/docs/multi-bridge.md)
+in Omniphony).
 
 ### Related projects
 
@@ -219,7 +256,7 @@ bridge (`*_bridge.so` / `.dll` / `.dylib`).
 Only needed if you want to hack on the bridge or there's no prebuilt
 artifact for your platform. Requires a Rust toolchain **and a checkout of
 [Omniphony](https://github.com/mgth/Omniphony) next to this repository, as
-`../Omniphony`**: `bridge/Cargo.toml` takes `bridge_api` (and, for the
+`../Omniphony`**: the bridge crates take `bridge_api` (and, for the
 bench, `spdif`) from it by path. [`.omniphony-ref`](.omniphony-ref) names the
 Omniphony commit CI and the releases build against; check that one out to
 build what a release would:
@@ -234,42 +271,50 @@ cd harletty-bridge
 Then:
 
 ```sh
-./build_bridge.sh       # Linux / macOS / MSYS — runs `cargo build --release`
+./build_bridge.sh       # Linux / macOS / MSYS — builds the three plugins
 ```
 
 ```cmd
 build_bridge.bat        :: Windows native
 ```
 
-The build produces `target/release/libharletty_bridge.{so,dylib}` on
-unix and `target\release\harletty_bridge.dll` on Windows. Point
-`bridge_path` at that file exactly as in the install steps above.
+The build produces `target/release/libharletty_{dolby,dts,iamf}_bridge.{so,dylib}`
+on unix and `target\release\harletty_{dolby,dts,iamf}_bridge.dll` on
+Windows. Point `bridge_paths` at those files exactly as in the install
+steps above.
 
-The library records the Omniphony commit it was built against (`git
+The IAMF plugin links libopus. On Linux it takes the system's through
+pkg-config (install `libopus-dev` or your distribution's equivalent). On
+Windows and macOS, `build_bridge` builds libopus from source first and
+links it in statically (`scripts/build-static-opus.sh`, CMake needed), as
+the release does; set `OPUS_LIB_DIR` (and `OPUS_STATIC=1`) to use one of
+your own instead.
+
+Each library records the Omniphony commit it was built against (`git
 rev-parse HEAD` in `../Omniphony`, or `HARLETTY_OMNIPHONY_COMMIT` when set,
 `unknown` when neither is available) and logs it with its own version and
 the `bridge_api` version when a host loads it.
 
-### Choosing the codec families
+### One plugin per codec family
 
-Each codec family is a crate of its own, and a Cargo feature of the bridge
-picks which ones it contains:
+Each codec family is a crate of its own, and each has a plugin crate that
+makes it a bridge library:
 
-| Feature | Decodes | Default |
-|---|---|---|
-| `dolby` | TrueHD (raw and MAT), E-AC-3 / AC-3 with JOC objects | yes |
-| `dts` | DTS, DTS-HD, DTS:X, Auro-3D over DTS-HD MA | yes |
-| `iamf` | IAMF (Eclipsa Audio); its Opus path links the system libopus | no |
+| Plugin (package) | Library | Decodes | IEC 61937 burst types |
+|---|---|---|---|
+| `harletty-dolby-bridge` | `harletty_dolby_bridge` | TrueHD (raw and MAT), E-AC-3 / AC-3 with JOC objects | 0x01, 0x15, 0x16 |
+| `harletty-dts-bridge` | `harletty_dts_bridge` | DTS, DTS-HD, DTS:X, Auro-3D over DTS-HD MA | 0x0B–0x0D, 0x11 |
+| `harletty-iamf-bridge` | `harletty_iamf_bridge` | IAMF (Eclipsa Audio) | none |
 
-A stream of a family left out is refused by name. For instance, a bridge
-that decodes IAMF and nothing else:
-
-```sh
-cargo build --release -p harletty-bridge --no-default-features --features iamf
-```
-
-Such a build holds none of the other families' decoders, which CI checks
+Build any of them on its own, e.g. `cargo build --release -p
+harletty-iamf-bridge`. A plugin's crate graph holds its own family's
+decoders and no other's, which CI checks
 (`scripts/check-crate-isolation.sh`).
+
+`bridge/` is the combined bridge, every family behind one router, kept as
+a library for the fuzz target, `bridge_bench` and the bit-exactness kit;
+it is no longer shipped. Its Cargo features (`dolby`, `dts`, `iamf`) pick
+the families it holds.
 
 ## The offline `harletty` CLI
 
@@ -307,20 +352,23 @@ thing to debug. See
 [docs/truehdd-fork-retirement.md](docs/truehdd-fork-retirement.md) for
 the audit of what was ported, superseded or imported.
 
-It is also a *separate artifact*: the bridge does not link it, does not
+It is also a *separate artifact*: the bridges do not link it, do not
 pay for it, and cannot reach it. That isolation is by crate graph rather
 than feature flags, and `scripts/check-crate-isolation.sh` asserts it in
-CI — if you find yourself wanting `use damf::…` inside `bridge/`, the
-mapping you want belongs on the CLI side instead.
+CI — if you find yourself wanting `use damf::…` inside a bridge crate,
+the mapping you want belongs on the CLI side instead.
 
 ## Layout
 
 The repo is a virtual cargo workspace — no package at the root. It
-builds two artifacts from one decoder lineage.
+builds the bridge plugins and the CLI from one decoder lineage.
 
 ```
-bridge/              # the plugin: entry points, codec detection, routing to a family
-bridge-common/       # what the families share (state, host logging, frame helpers)
+plugin-dolby/        # the Dolby bridge plugin (harletty_dolby_bridge)
+plugin-dts/          # the DTS bridge plugin (harletty_dts_bridge)
+plugin-iamf/         # the IAMF bridge plugin (harletty_iamf_bridge)
+bridge-common/       # what the families share: FamilyPipeline, PluginBridge, probe helpers, root module
+bridge/              # the combined bridge (every family behind one router), for fuzz / bench / kit
 bridge-family-dolby/ # TrueHD (raw / MAT) and E-AC-3 / AC-3 JOC paths
 bridge-family-dts/   # DTS, DTS-HD, DTS:X and Auro-3D paths
 bridge-family-iamf/  # IAMF path (iamf-rs)
@@ -332,6 +380,7 @@ eac3/                # E-AC-3 (JOC) decoder crate
 dca/                 # DTS (core / XXCH / DTS-HD MA / XLL / DTS:X) decoder crate
 auro/                # Auro-Codec side channel: detection and unfold
 docs/                # protocol notes (IEC61937, OAMD shape, …)
+tools/host-baseline/ # bit-exactness through Omniphony's own bridge router
 EAC3_PATCH_NOTES.md  # upstream patches to the E-AC-3 decoder
 OBJECT_SIZE_NOTES.md # notes on OAMD object_size handling
 .omniphony-ref       # the Omniphony commit CI and releases build against
@@ -374,8 +423,8 @@ are not distributable under the same terms, so they are worth separating:
 - **`harletty`, the CLI** — Apache-2.0. It depends only on this workspace, on
   crates.io and on our fork of `truehd` (`truehd` and `truehdd-macros` are
   Apache-2.0 too), so the binary carries no copyleft.
-- **`libharletty_bridge.so` / `.dll`, the decoder bridge** —
-  **GPL-3.0-or-later**. It links `bridge_api` from
+- **`libharletty_{dolby,dts,iamf}_bridge.so` / `.dll`, the decoder
+  bridges** — **GPL-3.0-or-later**. It links `bridge_api` from
   [Omniphony](https://github.com/mgth/Omniphony), which is GPL-3.0-or-later,
   and the resulting library is a combined work. Apache-2.0 code may be
   combined into a GPLv3 work, so there is no licence conflict — but what you

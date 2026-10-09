@@ -2,8 +2,9 @@
 //! a bridge that decodes IAMF and nothing else.
 
 use abi_stable::std_types::RVec;
-use bridge_api::{RChannelPose, RChannelTag, RPushResult, RSourceFamily};
+use bridge_api::{RChannelPose, RChannelTag, RProbe, RPushResult, RSourceFamily};
 use bridge_common::family::{FamilyPipeline, source_family};
+use bridge_common::probe::Start;
 use bridge_common::shared::{AfterPush, SharedState};
 
 use crate::{IamfState, push_iamf};
@@ -30,22 +31,13 @@ impl IamfPipeline {
     }
 }
 
-/// An IA sequence header OBU (type 31) at offset 0 whose payload starts with
-/// the `iamf` code (IAMF §3.4). The size field between the two is a leb128.
-fn opens_with_sequence_header(data: &[u8]) -> bool {
-    if data.first().is_none_or(|&header| header >> 3 != 31) {
-        return false;
-    }
-    let size_len = data
-        .iter()
-        .skip(1)
-        .take(8)
-        .position(|&byte| byte & 0x80 == 0);
-    size_len.is_some_and(|n| data.get(2 + n..6 + n) == Some(b"iamf".as_slice()))
-}
-
 impl FamilyPipeline for IamfPipeline {
     type Codec = IamfCodec;
+    const INPUT_CODECS: &'static [&'static str] = &["iamf"];
+
+    fn probe_raw(data: &[u8]) -> RProbe {
+        crate::probe::probe_raw(data)
+    }
 
     fn new(_shared: &SharedState) -> Self {
         Self::default()
@@ -55,8 +47,9 @@ impl FamilyPipeline for IamfPipeline {
         (name == "iamf").then_some(IamfCodec::Iamf)
     }
 
+    /// The sequence header the probe claims, at the first byte.
     fn sniff(data: &[u8]) -> Option<IamfCodec> {
-        opens_with_sequence_header(data).then_some(IamfCodec::Iamf)
+        (crate::probe::sequence_header(data) == Start::Claim).then_some(IamfCodec::Iamf)
     }
 
     /// An IAMF stream only announces itself in its sequence header, so a
@@ -152,8 +145,13 @@ mod tests {
         let header = [0xF8, 0x06, b'i', b'a', b'm', b'f', 0x00, 0x00];
         assert_eq!(IamfPipeline::sniff(&header), Some(IamfCodec::Iamf));
         // A two-byte obu_size moves the code along.
-        let long = [0xF8, 0x86, 0x00, b'i', b'a', b'm', b'f', 0x00];
+        let long = [0xF8, 0x86, 0x00, b'i', b'a', b'm', b'f', 0x00, 0x00];
         assert_eq!(IamfPipeline::sniff(&long), Some(IamfCodec::Iamf));
+        // An extension before the code.
+        let extended = [
+            0xF9, 0x09, 0x02, 0xAA, 0xBB, b'i', b'a', b'm', b'f', 0x00, 0x00,
+        ];
+        assert_eq!(IamfPipeline::sniff(&extended), Some(IamfCodec::Iamf));
         assert_eq!(
             IamfPipeline::sniff(&[0xF8, 0x06, b'x', b'a', b'm', b'f']),
             None

@@ -699,6 +699,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "harletty-dolby-bridge"
+version = "0.8.0"
+dependencies = [
+ "abi_stable",
+ "bridge-common",
+ "bridge-family-dolby",
+ "bridge_api",
+]
+
+[[package]]
+name = "harletty-dts-bridge"
+version = "0.8.0"
+dependencies = [
+ "abi_stable",
+ "bridge-common",
+ "bridge-family-dts",
+ "bridge_api",
+]
+
+[[package]]
+name = "harletty-iamf-bridge"
+version = "0.8.0"
+dependencies = [
+ "abi_stable",
+ "bridge-common",
+ "bridge-family-iamf",
+ "bridge_api",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

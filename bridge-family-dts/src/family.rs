@@ -2,7 +2,7 @@
 //! bridge that decodes DTS and nothing else.
 
 use abi_stable::std_types::RVec;
-use bridge_api::{RChannelPose, RPushResult, RSourceFamily};
+use bridge_api::{RChannelPose, RProbe, RPushResult, RSourceFamily};
 use bridge_common::family::{FamilyPipeline, source_family};
 
 use crate::dts_pipeline::{DtsPipeline, FAMILY_AURO, FAMILY_DTS};
@@ -21,6 +21,12 @@ const SUBSTREAM_SYNC: [u8; 4] = 0x6458_2025u32.to_be_bytes();
 
 impl FamilyPipeline for DtsPipeline {
     type Codec = DtsCodec;
+    const INPUT_CODECS: &'static [&'static str] =
+        &["dts", "dca", "dtshd", "dts-hd", "dtsx", "dts:x"];
+
+    fn probe_raw(data: &[u8]) -> RProbe {
+        crate::probe::probe_raw(data)
+    }
 
     fn new(_shared: &SharedState) -> Self {
         DtsPipeline::new()

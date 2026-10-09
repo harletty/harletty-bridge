@@ -1,51 +1,31 @@
-//! The bridge a host loads: a router over the codec families, each in its
-//! own crate (`bridge-family-dolby`, `bridge-family-dts`,
+//! The combined bridge: a router over every codec family built in, each in
+//! its own crate (`bridge-family-dolby`, `bridge-family-dts`,
 //! `bridge-family-iamf`), on what they share (`bridge-common`).
+//!
+//! Not a plugin library: harletty ships one plugin per family
+//! (`plugin-dolby`, `plugin-dts`, `plugin-iamf`). This crate stays for what
+//! links the bridge in-process — the fuzz target, `bridge_bench` and the
+//! bit-exactness kit — while those move to the family plugins.
 
 mod bridge;
 
 // The `crate::` paths the router uses for what the families share.
-use bridge_common::{logging, shared};
+#[cfg(any(test, not(all(feature = "dolby", feature = "dts", feature = "iamf"))))]
+use bridge_common::logging;
+use bridge_common::shared;
 #[cfg(feature = "iamf")]
 use bridge_family_iamf as iamf_pipeline;
 
-use abi_stable::std_types::{RSlice, RString, RVec};
-use abi_stable::{
-    export_root_module, prefix_type::PrefixTypeTrait, sabi_trait::prelude::TD_Opaque,
-};
-use bridge::AtmosBridge;
-use bridge_api::{
-    BridgeLib, BridgeLibRef, FormatBridge_TO, FormatBridgeBox, RInputTransport, RProbe,
-    RSourceFamily,
-};
+use bridge::Families;
+use bridge_common::plugin::{self, Plugin};
 
-// Silence unused import warning — FormatBridge is used via the proc-macro generated impl.
-#[allow(unused_imports)]
-use bridge_api::FormatBridge as _FormatBridgeTrait;
+/// The combined bridge as a [`Plugin`], for the root-module helpers.
+struct Combined;
 
-/// Plugin entry point: export the root module so the host can load it.
-#[export_root_module]
-fn get_library() -> BridgeLibRef {
-    BridgeLib {
-        new_bridge: create_bridge,
-        set_host_log_sink,
-        source_families,
-        probe,
-        input_codecs,
-    }
-    .leak_into_prefix()
-}
-
-extern "C" fn create_bridge(strict: bool) -> FormatBridgeBox {
-    log_build_id_once();
-    FormatBridge_TO::from_value(AtmosBridge::new(strict), TD_Opaque)
-}
-
-extern "C" fn set_host_log_sink(sink: usize) {
-    logging::register_host_log_sink(sink);
-    if sink != 0 {
-        log_build_id_once();
-    }
+impl Plugin for Combined {
+    type Family = Families;
+    const NAME: &'static str = env!("CARGO_PKG_NAME");
+    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 }
 
 /// This bridge's version.
@@ -53,44 +33,19 @@ pub const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The mgth/Omniphony commit this library's `bridge_api` was built from
 /// (`.omniphony-ref` in a release build), or `unknown` when the sibling
-/// checkout was not a git one (build.rs).
-pub const OMNIPHONY_COMMIT: &str = env!("HARLETTY_BUILD_OMNIPHONY_COMMIT");
+/// checkout was not a git one (bridge-common's build.rs).
+pub const OMNIPHONY_COMMIT: &str = plugin::OMNIPHONY_COMMIT;
 
-/// What this library was built from, as logged when a host loads it: compare
-/// it with the host's `bridge_api` when a bridge will not load.
+/// What this library was built from, as logged at the first bridge.
 pub fn build_id() -> String {
-    format!(
-        "harletty-bridge {BRIDGE_VERSION} (bridge_api {}, Omniphony {OMNIPHONY_COMMIT})",
-        bridge_api::VERSION
-    )
+    plugin::build_id::<Combined>()
 }
 
-/// Log [`build_id`] once per process: when the host installs its log sink at
-/// load, or at the first bridge if it never does.
-fn log_build_id_once() {
-    static LOGGED: std::sync::Once = std::sync::Once::new();
-    LOGGED.call_once(|| {
-        bridge_common::bridge_log!(log::Level::Info, "{}", build_id());
-    });
-}
-
-extern "C" fn source_families() -> RVec<RSourceFamily> {
-    bridge::source_families()
-}
-
-extern "C" fn probe(data: RSlice<'_, u8>, transport: RInputTransport, data_type: u8) -> RProbe {
-    bridge::probe(data.as_slice(), transport, data_type)
-}
-
-extern "C" fn input_codecs() -> RVec<RString> {
-    bridge::input_codecs()
-}
-
-/// A bridge as the host gets one, for in-process callers linking the rlib —
-/// `examples/bridge_bench.rs` — rather than loading the library.
+/// A bridge as a host gets one, for in-process callers linking this crate
+/// (`examples/bridge_bench.rs`, the fuzz target).
 #[doc(hidden)]
-pub fn new_bridge(strict: bool) -> FormatBridgeBox {
-    create_bridge(strict)
+pub fn new_bridge(strict: bool) -> bridge_api::FormatBridgeBox {
+    plugin::new_bridge::<Combined>(strict)
 }
 
 /// Install a host log sink, for the same in-process callers as
@@ -98,5 +53,5 @@ pub fn new_bridge(strict: bool) -> FormatBridgeBox {
 /// stderr, which no real host does.
 #[doc(hidden)]
 pub fn set_log_sink(sink: bridge_api::BridgeHostLogSink) {
-    set_host_log_sink(sink as usize);
+    plugin::set_log_sink::<Combined>(sink);
 }

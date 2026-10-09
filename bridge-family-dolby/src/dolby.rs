@@ -1279,6 +1279,11 @@ const MAJOR_SYNC_PREFIX: [u8; 3] = [0xF8, 0x72, 0x6F];
 
 impl FamilyPipeline for DolbyPipeline {
     type Codec = DolbyCodec;
+    const INPUT_CODECS: &'static [&'static str] = &["truehd", "mlp", "eac3", "ac3", "ec3", "e-ac3"];
+
+    fn probe_raw(data: &[u8]) -> bridge_api::RProbe {
+        crate::probe::probe_raw(data)
+    }
 
     fn new(shared: &SharedState) -> Self {
         DolbyPipeline::new(shared)
