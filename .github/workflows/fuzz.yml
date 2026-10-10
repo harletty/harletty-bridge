@@ -55,7 +55,6 @@ jobs:
             seeds: seeds/push_packet
             features: --features iamf
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       FUZZ_SECONDS: ${{ inputs.seconds || (github.event_name == 'pull_request' && '60') || '900' }}
     defaults:
       run:
@@ -63,7 +62,7 @@ jobs:
         working-directory: harletty-bridge/${{ matrix.crate }}/fuzz
     steps:
       - name: Checkout harletty-bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: harletty-bridge
 
@@ -73,7 +72,7 @@ jobs:
         run: echo "ref=$(harletty-bridge/scripts/omniphony-ref.sh)" >> "$GITHUB_OUTPUT"
 
       - name: Checkout Omniphony (path dependencies)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: mgth/Omniphony
           ref: ${{ steps.omniphony.outputs.ref }}
@@ -84,7 +83,7 @@ jobs:
 
       - name: Cache cargo-fuzz
         id: cargo-fuzz
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-fuzz
           key: cargo-fuzz-0.13.2-${{ runner.os }}
@@ -99,7 +98,7 @@ jobs:
 
       # The newest corpus any earlier run of this target saved.
       - name: Restore the corpus
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: harletty-bridge/${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -126,14 +125,14 @@ jobs:
 
       - name: Save the corpus
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: harletty-bridge/${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload the crash
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: harletty-bridge/${{ matrix.crate }}/fuzz/artifacts/${{ matrix.target }}
