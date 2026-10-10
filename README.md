@@ -73,7 +73,7 @@ and follow the three steps for your OS below.
 > and the first Omniphony release after 0.6.0. Older hosts refuse the
 > plugins. When a host loads a plugin, its log shows what it was built
 > from, e.g.
-> `harletty-dolby-bridge 0.8.0 (bridge_api 0.6.0, Omniphony 25369b9f…)`.
+> `harletty-dolby-bridge 0.9.0 (bridge_api 0.6.0, Omniphony c821eb34…)`.
 
 ### 🪟 Windows
 
