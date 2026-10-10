@@ -28,14 +28,12 @@ jobs:
   omniphony:
     name: Resolve the Omniphony pin
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     outputs:
       ref: ${{ steps.pin.outputs.ref }}
       commit: ${{ steps.pin.outputs.commit }}
     steps:
       - name: Checkout harletty-bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: harletty-bridge
 
@@ -57,16 +55,15 @@ jobs:
     outputs:
       bridge_api: ${{ steps.bridge_api.outputs.version }}
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       HARLETTY_OMNIPHONY_COMMIT: ${{ needs.omniphony.outputs.commit }}
     steps:
       - name: Checkout harletty-bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: harletty-bridge
 
       - name: Checkout Omniphony (path dependencies)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: mgth/Omniphony
           ref: ${{ needs.omniphony.outputs.commit }}
@@ -110,7 +107,7 @@ jobs:
           zip "harletty-cli-${GITHUB_REF_NAME}-linux-x86_64.zip" harletty
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: harletty-bridge-linux-x86_64
           path: |
@@ -121,16 +118,15 @@ jobs:
     runs-on: windows-latest
     needs: omniphony
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       HARLETTY_OMNIPHONY_COMMIT: ${{ needs.omniphony.outputs.commit }}
     steps:
       - name: Checkout harletty-bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: harletty-bridge
 
       - name: Checkout Omniphony (path dependencies)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: mgth/Omniphony
           ref: ${{ needs.omniphony.outputs.commit }}
@@ -190,7 +186,7 @@ jobs:
           Compress-Archive -Path harletty.exe -DestinationPath "harletty-cli-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: harletty-bridge-windows-x86_64
           path: |
@@ -201,16 +197,15 @@ jobs:
     runs-on: macos-14
     needs: omniphony
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       HARLETTY_OMNIPHONY_COMMIT: ${{ needs.omniphony.outputs.commit }}
     steps:
       - name: Checkout harletty-bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: harletty-bridge
 
       - name: Checkout Omniphony (path dependencies)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: mgth/Omniphony
           ref: ${{ needs.omniphony.outputs.commit }}
@@ -253,7 +248,7 @@ jobs:
           zip "harletty-cli-${GITHUB_REF_NAME}-macos-arm64.zip" harletty
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: harletty-bridge-macos-arm64
           path: |
@@ -269,21 +264,19 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Download Linux artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: harletty-bridge-linux-x86_64
 
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: harletty-bridge-windows-x86_64
 
       - name: Download macOS artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: harletty-bridge-macos-arm64
 
@@ -325,7 +318,7 @@ jobs:
           echo "path=omniphony-requirement.md" >> "$GITHUB_OUTPUT"
 
       - name: Create draft release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           body_path: ${{ steps.notes.outputs.path }}
