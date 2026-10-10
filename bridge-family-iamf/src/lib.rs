@@ -2105,7 +2105,7 @@ mod tests {
     /// The bed holds the channels a layout reaches, read off its rendering
     /// matrix: all of 7.1.4; for 5.1, whose surrounds sit at ±110°, the rear
     /// surrounds and no side or height; the LFE alone for the LFE-only
-    /// expanded layout; and in the 9.1.6 bed, what 9.1.6 names them.
+    /// expanded layout, in either bed; and all of the 9.1.6 bed for 9.1.6.
     #[test]
     fn a_layout_reaches_the_channels_its_matrix_renders_into() {
         let reached = |bed: Bed, layout: u8, expanded: Option<u8>| {
