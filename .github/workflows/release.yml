@@ -27,7 +27,7 @@ on:
 jobs:
   omniphony:
     name: Resolve the Omniphony pin
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       ref: ${{ steps.pin.outputs.ref }}
       commit: ${{ steps.pin.outputs.commit }}
@@ -50,7 +50,11 @@ jobs:
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
 
   build-linux:
-    runs-on: ubuntu-latest
+    # A named image, not ubuntu-latest: the libraries need the glibc of the
+    # image they are built on or newer (2.39 here), so a moving label would
+    # raise that floor without anyone deciding it. Move it deliberately, with
+    # ci.yml and fuzz.yml, and say so in the release notes.
+    runs-on: ubuntu-24.04
     needs: omniphony
     outputs:
       bridge_api: ${{ steps.bridge_api.outputs.version }}
@@ -261,7 +265,7 @@ jobs:
     # dispatched on a tag (`gh workflow run release.yml --ref v…` gives it
     # `refs/tags/v…`), so only the tag push itself publishes.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:

@@ -45,7 +45,7 @@ on:
 
 jobs:
   test-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout harletty-bridge
         uses: actions/checkout@v5
@@ -170,7 +170,7 @@ jobs:
   # workspace run above and fail here. Then the release library itself.
   plugin:
     name: plugin (${{ matrix.family }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -307,7 +307,7 @@ jobs:
   # against the root Cargo.lock, the dependency versions the bridge ships;
   # not `--locked`, since the copy lacks the fuzz crate's own entries.
   fuzz-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout harletty-bridge
         uses: actions/checkout@v5
