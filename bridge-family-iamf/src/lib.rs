@@ -7,7 +7,10 @@
 //! System J (7.1.4), or IAMF's 9.1.6 when the mix carries channels 7.1.4
 //! has no speaker for (the ±60° wides, the top sides) — and goes out as a
 //! labelled channel bed, which the renderer then places on the actual
-//! speakers like any other bed.
+//! speakers like any other bed. The bed goes out as far as the mix reaches
+//! into it: an LFE-only element is a bed of one LFE, a stereo one a bed of
+//! L and R, and a channel no element renders into is not declared at all
+//! rather than sent silent ([`reached_channels`]).
 //!
 //! Framing the OBUs here rather than handing raw chunks to the decoder is what
 //! lets the bridge start mid-stream (everything before the first sequence
@@ -29,9 +32,11 @@ use bridge_api::{
     RObjectChannel, RPushResult,
 };
 use iamf_codecs::DefaultFactory;
-use iamf_dec::layout::SoundSystem;
+use iamf_dec::MatrixLayout;
+use iamf_dec::layout::{SoundSystem, expanded_info, loudspeaker_info};
 use iamf_dec::position::{ObjectPosition, PositionAnimationType};
 use iamf_dec::presentation::Descriptors;
+use iamf_dec::reconstruct::Reconstructed;
 use iamf_dec::stream::{
     DecodedElement, DecodedObject, MixSelection, OutputSampleType, StreamDecoder, StreamSettings,
 };
@@ -328,6 +333,10 @@ pub struct IamfState {
     num_objects: usize,
     /// The bed the selected mix is rendered to.
     bed: Bed,
+    /// The bed's channels the mix's rendered elements reach (indices into
+    /// the bed, ascending): the ones the frames carry. Empty when the mix
+    /// renders nothing into the bed.
+    reached: Vec<usize>,
     /// Absolute sample position of the next frame, for metadata events.
     sample_pos: u64,
     /// The temporal unit being pulled, interleaved: kept from one unit to
@@ -409,7 +418,9 @@ impl IamfState {
         self.decoder.is_some() && self.num_objects > 0
     }
 
-    /// The bed's channel poses, as [`Bed::declared_poses`] states them.
+    /// The bed's channel poses, as [`Bed::declared_poses`] states them: of
+    /// the whole bed, whatever part of it the frames carry, since a
+    /// dialogue element's channels are placed by the same labels.
     pub fn declared_poses(&self) -> RVec<RChannelPose> {
         self.bed.declared_poses()
     }
@@ -420,16 +431,12 @@ impl IamfState {
     }
 
     /// The dialogue channels, when the mix codes its dialogue apart: they
-    /// follow the bed (or open the frame when there is no bed).
+    /// follow the bed's channels (or open the frame when there is no bed).
     pub fn channel_tags(&self) -> RVec<RChannelTag> {
-        let (Some(decoder), Some(dialogue)) = (&self.decoder, &self.dialogue) else {
+        let (Some(_), Some(dialogue)) = (&self.decoder, &self.dialogue) else {
             return RVec::new();
         };
-        let first = if decoder.0.has_rendered_elements() {
-            self.bed.labels().len()
-        } else {
-            0
-        };
+        let first = self.reached.len();
         let mut tags = RVec::with_capacity(1);
         tags.push(RChannelTag {
             kind: RString::from("dialogue"),
@@ -543,12 +550,24 @@ impl IamfState {
         self.num_objects = decoder.num_objects();
         self.dialogue = find_dialogue(&self.descriptors, mix_id)
             .filter(|dialogue| decoder.split_element(dialogue.audio_element_id));
+        // Whether the decoder renders anything at all is its call; what it
+        // reaches is read off the elements it renders.
+        self.reached = if decoder.has_rendered_elements() {
+            reached_channels(
+                &self.descriptors,
+                mix_id,
+                bed,
+                self.dialogue.as_ref().map(|d| d.audio_element_id),
+            )
+        } else {
+            Vec::new()
+        };
         bridge_log!(
             log::Level::Info,
             "atmos-bridge: iamf sequence: {description}, mix {mix_id}: {}{} at {} Hz",
             match (decoder.has_rendered_elements(), self.num_objects) {
-                (true, 0) => format!("rendered to {}", bed.name()),
-                (true, n) => format!("{} bed + {n} object(s)", bed.name()),
+                (true, 0) => format!("rendered to {}", self.bed_name(bed)),
+                (true, n) => format!("{} bed + {n} object(s)", self.bed_name(bed)),
                 (false, n) => format!("{n} object(s)"),
             },
             match &self.dialogue {
@@ -568,6 +587,21 @@ impl IamfState {
         Ok(())
     }
 
+    /// `7.1.4`, or `7.1.4 (1 of 12 channels)` when the mix reaches only
+    /// part of the bed, for the log.
+    fn bed_name(&self, bed: Bed) -> String {
+        let whole = bed.labels().len();
+        if self.reached.len() == whole {
+            bed.name().to_owned()
+        } else {
+            format!(
+                "{} ({} of {whole} channels)",
+                bed.name(),
+                self.reached.len()
+            )
+        }
+    }
+
     /// Flush the units still in the decoder and close the sequence.
     fn end_sequence(&mut self, out: &mut RVec<RDecodedFrame>) -> Result<(), String> {
         if let Some(decoder) = &mut self.decoder {
@@ -576,6 +610,7 @@ impl IamfState {
         }
         self.decoder = None;
         self.dialogue = None;
+        self.reached.clear();
         Ok(())
     }
 
@@ -634,7 +669,10 @@ impl IamfState {
             });
             let mut frame = build_frame(
                 &self.unit,
-                bed.then_some(labels),
+                bed.then_some(RenderedBed {
+                    labels,
+                    reached: &self.reached,
+                }),
                 dialogue,
                 objects,
                 sample_rate,
@@ -685,19 +723,32 @@ fn bed_to_pcm_i32(sample: f32) -> i32 {
     whole + i32::from(rest >= CARRY) - i32::from(rest < BORROW)
 }
 
-/// One temporal unit as a frame: the rendered bed (interleaved, when the
-/// mix has elements rendered into it, with its labels), the dialogue
-/// element's channels when it is handed out, then one channel per object.
+/// The bed a unit was rendered to: the labels of all its channels, in the
+/// decoder's order (the unit is interleaved over them), and the ones the
+/// mix reaches (indices into them, ascending), which the frame carries.
+#[derive(Clone, Copy)]
+struct RenderedBed<'a> {
+    labels: &'a [RChannelLabel],
+    reached: &'a [usize],
+}
+
+/// One temporal unit as a frame: the channels of the rendered bed the mix
+/// reaches (when it has elements rendered into it, with their labels), the
+/// dialogue element's channels when it is handed out, then one channel per
+/// object.
 fn build_frame(
     unit: &[f32],
-    bed_labels: Option<&[RChannelLabel]>,
+    rendered: Option<RenderedBed<'_>>,
     dialogue: Option<(&DecodedElement, &'static [RChannelLabel])>,
     objects: &[DecodedObject],
     sample_rate: u32,
 ) -> RDecodedFrame {
-    let bed_channels = bed_labels.map(<[RChannelLabel]>::len);
-    let bed = bed_channels.unwrap_or(0);
-    let sample_count = match (bed_channels, dialogue) {
+    // The decoder's bed, which the unit is interleaved over, and the part
+    // of it the frame carries.
+    let stride = rendered.map(|bed| bed.labels.len());
+    let reached = rendered.map_or(&[][..], |bed| bed.reached);
+    let bed = reached.len();
+    let sample_count = match (stride, dialogue) {
         (Some(channels), _) => unit.len() / channels,
         (None, Some((element, _))) => element.planes.first().map_or(0, Vec::len),
         (None, None) => objects.first().map_or(0, |o| o.samples.len()),
@@ -706,7 +757,7 @@ fn build_frame(
     let channels = bed + dialogue_channels + objects.len();
     let first_object = bed + dialogue_channels;
     let mut pcm: Vec<i32>;
-    if objects.is_empty() && dialogue.is_none() {
+    if objects.is_empty() && dialogue.is_none() && stride == Some(bed) {
         pcm = Vec::with_capacity(sample_count * channels);
         pcm.extend(
             unit[..sample_count * channels]
@@ -715,10 +766,13 @@ fn build_frame(
         );
     } else {
         pcm = vec![0i32; sample_count * channels];
-        if bed > 0 {
-            for (out, source) in pcm.chunks_exact_mut(channels).zip(unit.chunks_exact(bed)) {
-                for (out, &sample) in out.iter_mut().zip(source) {
-                    *out = bed_to_pcm_i32(sample);
+        if let Some(stride) = stride.filter(|_| bed > 0) {
+            for (out, source) in pcm
+                .chunks_exact_mut(channels)
+                .zip(unit.chunks_exact(stride))
+            {
+                for (out, &channel) in out.iter_mut().zip(reached) {
+                    *out = bed_to_pcm_i32(source[channel]);
                 }
             }
         }
@@ -737,8 +791,8 @@ fn build_frame(
     }
     let pcm: RVec<i32> = pcm.into();
     let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(channels);
-    if let Some(labels) = bed_labels {
-        channel_labels.extend(labels.iter().copied());
+    if let Some(rendered) = rendered {
+        channel_labels.extend(reached.iter().map(|&channel| rendered.labels[channel]));
     }
     if let Some((_, labels)) = dialogue {
         channel_labels.extend(labels.iter().copied());
@@ -1111,6 +1165,109 @@ fn event(id: usize, sample_pos: u64, pos: [f64; 3], ramp: u32) -> REvent {
         size: [0.0; 3],
         ramp_duration: ramp,
     }
+}
+
+/// The channels of `bed` (indices into its labels, ascending) the elements
+/// mix `mix_id` renders into it reach: every element but the objects, which
+/// are handed out, and `split`, the dialogue element when it is.
+///
+/// The decoder renders a channel-based element's highest layer to the bed
+/// (neither bed matches a lower one); the channels it reaches are those its
+/// rendering matrix has a gain for. An expanded layout is the only layer,
+/// rendered whole or, as a subset, through the rows of its reference
+/// layout's matrix. Ambisonics is rendered to every speaker, the LFE
+/// staying silent. What cannot be read off — unreadable descriptors, a
+/// layout without a matrix, which the decoder refuses anyway — keeps the
+/// bed whole, and so does a mix that would leave it empty.
+fn reached_channels(descriptors: &[u8], mix_id: u32, bed: Bed, split: Option<u32>) -> Vec<usize> {
+    let labels = bed.labels();
+    let whole = || (0..labels.len()).collect::<Vec<_>>();
+    let Ok(parsed) = Descriptors::collect(descriptors) else {
+        return whole();
+    };
+    let Some(sub_mix) = parsed
+        .mix_presentations
+        .iter()
+        .find(|mix| mix.mix_presentation_id == mix_id)
+        .and_then(|mix| mix.sub_mixes.first())
+    else {
+        return whole();
+    };
+    let output = bed.layout().matrix_layout();
+    let mut reached = vec![false; labels.len()];
+    for sub in &sub_mix.elements {
+        if split == Some(sub.audio_element_id) {
+            continue;
+        }
+        let Some(element) = parsed
+            .audio_elements
+            .iter()
+            .find(|e| e.audio_element_id == sub.audio_element_id)
+        else {
+            continue;
+        };
+        match &element.config {
+            AudioElementConfig::ChannelBased { layers } => {
+                let Some(top) = layers.last() else { continue };
+                let layout = if top.loudspeaker_layout == 15 {
+                    top.expanded_loudspeaker_layout
+                        .and_then(expanded_info)
+                        .map(|info| (info.matrix, info.rows, info.channels))
+                } else {
+                    loudspeaker_info(top.loudspeaker_layout)
+                        .map(|info| (info.matrix, None, info.channels))
+                };
+                let Some((matrix, rows, channels)) = layout else {
+                    return whole();
+                };
+                if !mark_rendered(matrix, rows, channels, output, &mut reached) {
+                    return whole();
+                }
+            }
+            AudioElementConfig::AmbisonicsMono { .. }
+            | AudioElementConfig::AmbisonicsProjection { .. } => {
+                for (slot, label) in reached.iter_mut().zip(labels) {
+                    *slot |= *label != RChannelLabel::LFE;
+                }
+            }
+            AudioElementConfig::ObjectBased { .. } => {}
+        }
+    }
+    if reached.iter().any(|&slot| slot) {
+        (0..labels.len()).filter(|&i| reached[i]).collect()
+    } else {
+        whole()
+    }
+}
+
+/// Mark the `output` channels a `channels`-channel layout of `matrix`
+/// renders into, one input channel at a time so that no two gains can
+/// cancel. `rows` are the matrix rows of a subset layout's channels.
+/// `false` when the decoder has no matrix from the layout to `output`.
+fn mark_rendered(
+    matrix: MatrixLayout,
+    rows: Option<&'static [usize]>,
+    channels: usize,
+    output: MatrixLayout,
+    reached: &mut [bool],
+) -> bool {
+    for input in 0..channels {
+        let planar = (0..channels)
+            .map(|i| vec![if i == input { 1.0 } else { 0.0 }])
+            .collect();
+        let probe = Reconstructed::Channels {
+            matrix,
+            rows,
+            planar,
+        };
+        let Ok(rendered) = iamf_dec::render::render(&probe, output) else {
+            return false;
+        };
+        for (slot, plane) in reached.iter_mut().zip(&rendered) {
+            *slot |= plane.iter().any(|&s| s != 0.0);
+        }
+    }
+    true
 }
 
 /// The mix's dialogue element, if it codes one apart: a channel-based
@@ -1806,15 +1963,28 @@ mod tests {
         assert!(bridge.has_objects());
         assert_eq!(bridge.source_label().as_str(), "IAMF (PCM) 5.1 + 4 objects");
         let labels = frames[0].channel_labels.as_slice();
-        assert_eq!(labels[..12], BED_714_LABELS);
-        assert_eq!(labels[12..], [RChannelLabel::Object; 4]);
+        // The bed as far as 5.1 reaches into 7.1.4: its surrounds sit at
+        // ±110° and are rendered to the rear pair, and no side or height
+        // channel is declared.
+        assert_eq!(
+            labels[..6],
+            [
+                RChannelLabel::L,
+                RChannelLabel::R,
+                RChannelLabel::C,
+                RChannelLabel::LFE,
+                RChannelLabel::Lb,
+                RChannelLabel::Rb
+            ]
+        );
+        assert_eq!(labels[6..], [RChannelLabel::Object; 4]);
         let declared = &frames[0].metadata[0].object_channels;
         assert_eq!(
             declared
                 .iter()
                 .map(|d| (d.id, d.channel))
                 .collect::<Vec<_>>(),
-            [(0, 12), (1, 13), (2, 14), (3, 15)]
+            [(0, 6), (1, 7), (2, 8), (3, 9)]
         );
         // Static objects: announced at the start, then only on the 2 Hz
         // heartbeat, all four every time.
@@ -1861,14 +2031,16 @@ mod tests {
         let frames = decode_raw(&mut bridge, &stream);
         assert!(!frames.is_empty());
         assert!(!bridge.has_objects());
+        // The other stereo element is all the bed holds: its L and R, then
+        // the dialogue's own.
         let labels = frames[0].channel_labels.as_slice();
-        assert_eq!(labels[..12], BED_714_LABELS);
-        assert_eq!(labels[12..], [RChannelLabel::L, RChannelLabel::R]);
+        assert_eq!(labels[..2], [RChannelLabel::L, RChannelLabel::R]);
+        assert_eq!(labels[2..], [RChannelLabel::L, RChannelLabel::R]);
         let tags = bridge.channel_tags();
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].kind.as_str(), "dialogue");
         assert_eq!(tags[0].label.as_str(), "test_sub_mix_0_audio_element_0");
-        assert_eq!(tags[0].channels.as_slice(), [12, 13]);
+        assert_eq!(tags[0].channels.as_slice(), [2, 3]);
 
         // Rendered to the bed and added back, the dialogue gives the mix.
         let mut settings = StreamSettings::default();
@@ -1888,10 +2060,10 @@ mod tests {
         let mut peak = 0f32;
         for frame in &frames {
             let n = frame.sample_count as usize;
-            let planes: Vec<Vec<f32>> = (12..14)
+            let planes: Vec<Vec<f32>> = (2..4)
                 .map(|c| {
                     (0..n)
-                        .map(|s| frame.pcm[s * 14 + c] as f32 * scale)
+                        .map(|s| frame.pcm[s * 4 + c] as f32 * scale)
                         .collect()
                 })
                 .collect();
@@ -1909,7 +2081,14 @@ mod tests {
                 for c in 0..12 {
                     let dialogue = rendered[c][s];
                     peak = peak.max(dialogue.abs());
-                    ours.push(frame.pcm[s * 14 + c] as f32 * scale + dialogue);
+                    // L and R open System J as they open the frame; the
+                    // bed's other channels are the ones it does not carry.
+                    let bed = if c < 2 {
+                        frame.pcm[s * 4 + c] as f32 * scale
+                    } else {
+                        0.0
+                    };
+                    ours.push(bed + dialogue);
                 }
             }
         }
@@ -1921,6 +2100,76 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         assert!(worst < 4.0 * scale, "bed + dialogue differs by {worst}");
+    }
+
+    /// The bed holds the channels a layout reaches, read off its rendering
+    /// matrix: all of 7.1.4; for 5.1, whose surrounds sit at ±110°, the rear
+    /// surrounds and no side or height; the LFE alone for the LFE-only
+    /// expanded layout; and in the 9.1.6 bed, what 9.1.6 names them.
+    #[test]
+    fn a_layout_reaches_the_channels_its_matrix_renders_into() {
+        let reached = |bed: Bed, layout: u8, expanded: Option<u8>| {
+            let (matrix, rows, channels) = match expanded {
+                Some(expanded) => {
+                    let info = expanded_info(expanded).unwrap();
+                    (info.matrix, info.rows, info.channels)
+                }
+                None => {
+                    let info = loudspeaker_info(layout).unwrap();
+                    (info.matrix, None, info.channels)
+                }
+            };
+            let labels = bed.labels();
+            let mut reached = vec![false; labels.len()];
+            assert!(mark_rendered(
+                matrix,
+                rows,
+                channels,
+                bed.layout().matrix_layout(),
+                &mut reached
+            ));
+            labels
+                .iter()
+                .zip(reached)
+                .filter_map(|(label, reached)| reached.then_some(*label))
+                .collect::<Vec<_>>()
+        };
+        use RChannelLabel::{C, L, LFE, Lb, R, Rb, Tfl, Tfr};
+        assert_eq!(reached(Bed::Bed714, 7, None), BED_714_LABELS);
+        assert_eq!(reached(Bed::Bed714, 2, None), [L, R, C, LFE, Lb, Rb]);
+        assert_eq!(reached(Bed::Bed714, 1, None), [L, R]);
+        assert_eq!(reached(Bed::Bed714, 15, Some(0)), [LFE]);
+        assert_eq!(reached(Bed::Bed714, 15, Some(4)), [Tfl, Tfr]);
+        assert_eq!(reached(Bed::Bed916, 15, Some(0)), [LFE]);
+        assert_eq!(reached(Bed::Bed916, 15, Some(8)), BED_916_LABELS);
+    }
+
+    /// A frame carries the bed's reached channels only, each under its own
+    /// label, then the objects.
+    #[test]
+    fn a_frame_carries_the_reached_channels_of_the_bed() {
+        // Two samples of a 7.1.4 unit, each channel holding its own index.
+        let unit: Vec<f32> = (0..2)
+            .flat_map(|sample| (0..12).map(move |c| (c + 12 * sample) as f32 / 64.0))
+            .collect();
+        let frame = build_frame(
+            &unit,
+            Some(RenderedBed {
+                labels: &BED_714_LABELS,
+                reached: &[3, 8],
+            }),
+            None,
+            &[],
+            48_000,
+        );
+        assert_eq!(frame.channel_count, 2);
+        assert_eq!(frame.sample_count, 2);
+        assert_eq!(
+            frame.channel_labels.as_slice(),
+            [RChannelLabel::LFE, RChannelLabel::Tfl]
+        );
+        let at = |index: usize| bed_to_pcm_i32(index as f32 / 64.0);
+        assert_eq!(frame.pcm.as_slice(), [at(3), at(8), at(15), at(20)]);
     }
 
     #[test]

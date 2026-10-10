@@ -4,7 +4,7 @@
 #![cfg(feature = "iamf")]
 
 use abi_stable::std_types::RSlice;
-use bridge_api::{FormatBridgeBox, RDecodedFrame, RInputTransport};
+use bridge_api::{FormatBridgeBox, RChannelLabel, RDecodedFrame, RInputTransport};
 use bridge_family_iamf::{BED_714_LABELS, frame_obu};
 
 // ── Conformance vectors ─────────────────────────────────────────────
@@ -204,8 +204,9 @@ fn a_reset_resumes_at_the_next_temporal_unit_without_a_sequence_header() {
 /// All metadata events of a decode, in order.
 #[test]
 fn a_mix_of_unmarked_elements_tags_nothing() {
-    // Two-layer 5.1 + stereo, neither annotated nor adjustable: the bed
-    // as before.
+    // Two-layer 5.1 + stereo, neither annotated nor adjustable: both are
+    // rendered into the bed, which holds what 5.1 reaches of it (its
+    // surrounds, at ±110°, go to the rear pair).
     let Some(path) = vector("test_000087.iamf") else {
         eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
         return;
@@ -213,6 +214,16 @@ fn a_mix_of_unmarked_elements_tags_nothing() {
     let stream = std::fs::read(path).unwrap();
     let mut bridge = harletty_bridge::new_bridge(false);
     let frames = decode_raw(&mut bridge, &stream);
-    assert_eq!(frames[0].channel_labels.as_slice(), BED_714_LABELS);
+    assert_eq!(
+        frames[0].channel_labels.as_slice(),
+        [
+            RChannelLabel::L,
+            RChannelLabel::R,
+            RChannelLabel::C,
+            RChannelLabel::LFE,
+            RChannelLabel::Lb,
+            RChannelLabel::Rb
+        ]
+    );
     assert!(bridge.channel_tags().is_empty());
 }
