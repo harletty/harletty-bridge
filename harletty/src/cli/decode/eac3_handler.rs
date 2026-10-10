@@ -608,11 +608,16 @@ impl Eac3DecodeHandler {
             (conf.events.clone(), false)
         };
 
-        if conf.restates_current_state && remove_header {
+        // The next payload is diffed against what was written. An object whose
+        // restatement was dropped keeps its last written state: the restatement
+        // zeroed its ramp without the file saying so, and a zero-ramp move
+        // diffed against it would come out without a ramp.
+        self.prev_events = if conf.restates_current_state && remove_header {
             Event::drop_re_asserted_ramps(&mut events_diff);
-        }
-
-        self.prev_events = conf.events.clone();
+            Event::baseline_after(&self.prev_events, &conf.events, &events_diff)
+        } else {
+            conf.events.clone()
+        };
         conf.events = events_diff;
         let serialized = conf.serialize_events(remove_header);
 

@@ -864,6 +864,25 @@ impl Event {
             }
         }
     }
+
+    /// What the next payload is to be diffed against, once `drop_re_asserted_ramps` has run over
+    /// `written`: `payload` for every object whose event was written, `previous` for every object
+    /// whose event was dropped.
+    ///
+    /// A dropped restatement zeroed the object's ramp without the file saying so. Diffed against
+    /// it, a zero-ramp move that follows would carry no `rampLength`, and a reader carrying the
+    /// ramp forward would give that jump the ramp stated before the restatement. Diffed against
+    /// what was last written, the move states its ramp.
+    pub fn baseline_after(previous: &[Event], payload: &[Event], written: &[Event]) -> Vec<Event> {
+        payload
+            .iter()
+            .enumerate()
+            .map(|(i, now)| match (written.get(i), previous.get(i)) {
+                (Some(diff), Some(before)) if *diff == Event::default() => before.clone(),
+                _ => now.clone(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
@@ -1303,4 +1322,58 @@ fn a_re_asserted_payload_still_reports_a_move() {
     let written = later.serialize_events(true);
     assert!(written.contains("pos: [-0.5, -0.5, 0.5]"), "{written}");
     assert!(written.contains("samplePos: 5120"), "{written}");
+}
+
+/// After a dropped restatement, the next payload is diffed against what was last written. A
+/// zero-ramp move that follows one must state its ramp: the file never said the ramp had gone to
+/// nought, so a reader carrying it forward would otherwise give the jump the ramp stated before.
+#[test]
+fn a_move_after_a_dropped_restatement_states_its_zero_ramp() {
+    let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
+    let mut ramped = oamd.clone();
+    let blocks = &mut ramped
+        .object_element
+        .as_mut()
+        .unwrap()
+        .md_update_info
+        .block_update_info;
+    for block in blocks.iter_mut() {
+        block.ramp_duration = 1536;
+    }
+    let first = Configuration::with_oamd_payload(&ramped, 48000, 0).unwrap();
+
+    // The encoder re-asserts the same values with the timing zeroed: nothing is written, and
+    // the baseline stays the first payload.
+    let mut repeat = oamd.clone();
+    let update = &mut repeat.object_element.as_mut().unwrap().md_update_info;
+    update.sample_offset = 0;
+    for block in update.block_update_info.iter_mut() {
+        block.block_offset_factor_bits = 0;
+        block.ramp_duration = 0;
+    }
+    let mut restated = Configuration::with_oamd_payload(&repeat, 48000, 5120).unwrap();
+    let mut events = Event::compare_event_vectors(&first.events, &restated.events);
+    Event::drop_re_asserted_ramps(&mut events);
+    let baseline = Event::baseline_after(&first.events, &restated.events, &events);
+    restated.events = events;
+    assert_eq!(restated.serialize_events(true), "");
+    assert_eq!(baseline, first.events);
+
+    // Then one object jumps, the timing still zeroed: its event states the zero ramp.
+    let mut moved = repeat.clone();
+    let render = &mut moved.object_element.as_mut().unwrap().object_data[1][0].object_render_info;
+    render.pos3d = [0.25, 0.75, 0.5];
+    let mut jump = Configuration::with_oamd_payload(&moved, 48000, 10240).unwrap();
+    let mut events = Event::compare_event_vectors(&baseline, &jump.events);
+    Event::drop_re_asserted_ramps(&mut events);
+    let baseline = Event::baseline_after(&baseline, &jump.events, &events);
+    jump.events = events;
+    let written = jump.serialize_events(true);
+    assert!(written.contains("samplePos: 10240"), "{written}");
+    assert!(written.contains("pos: [-0.5, -0.5, 0.5]"), "{written}");
+    assert!(written.contains("rampLength: 0"), "{written}");
+    assert_eq!(written.matches("- ID:").count(), 1, "{written}");
+    // The object that jumped is at a zero ramp from here; the others keep the ramp last written.
+    assert_eq!(baseline[1].ramp_length, Some(0));
+    assert_eq!(baseline[0].ramp_length, Some(1536));
 }
