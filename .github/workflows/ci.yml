@@ -45,12 +45,10 @@ on:
 
 jobs:
   test-linux:
-    runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout harletty-bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: harletty-bridge
 
@@ -71,7 +69,7 @@ jobs:
           echo "ref=${ref}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout Omniphony (path dependencies)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: mgth/Omniphony
           ref: ${{ steps.omniphony.outputs.ref }}
@@ -172,17 +170,16 @@ jobs:
   # workspace run above and fail here. Then the release library itself.
   plugin:
     name: plugin (${{ matrix.family }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         family: [dolby, dts, iamf]
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       RUSTFLAGS: -D warnings
     steps:
       - name: Checkout harletty-bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: harletty-bridge
 
@@ -202,7 +199,7 @@ jobs:
           echo "ref=${ref}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout Omniphony (path dependencies)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: mgth/Omniphony
           ref: ${{ steps.omniphony.outputs.ref }}
@@ -247,11 +244,10 @@ jobs:
             python: python3
             rustflags: -D warnings
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - name: Checkout harletty-bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: harletty-bridge
 
@@ -270,7 +266,7 @@ jobs:
           echo "ref=${ref}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout Omniphony (path dependencies)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: mgth/Omniphony
           ref: ${{ steps.omniphony.outputs.ref }}
@@ -311,12 +307,10 @@ jobs:
   # against the root Cargo.lock, the dependency versions the bridge ships;
   # not `--locked`, since the copy lacks the fuzz crate's own entries.
   fuzz-build:
-    runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout harletty-bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: harletty-bridge
 
@@ -336,7 +330,7 @@ jobs:
           echo "ref=${ref}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout Omniphony (path dependencies)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: mgth/Omniphony
           ref: ${{ steps.omniphony.outputs.ref }}
@@ -347,7 +341,7 @@ jobs:
 
       - name: Cache cargo-fuzz
         id: cargo-fuzz
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-fuzz
           key: cargo-fuzz-0.13.2-${{ runner.os }}
