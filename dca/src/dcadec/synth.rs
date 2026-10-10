@@ -1090,6 +1090,8 @@ mod tests {
     impl Isa {
         /// Every build this CPU runs, the fastest last.
         fn available() -> Vec<Isa> {
+            // Only x86_64 has more than the baseline to add.
+            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
             let mut all = vec![Isa::Baseline];
             #[cfg(target_arch = "x86_64")]
             {

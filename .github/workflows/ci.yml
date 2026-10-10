@@ -288,6 +288,14 @@ jobs:
         run: cargo test --locked -p harletty-iamf-bridge -p bridge-family-iamf
         working-directory: harletty-bridge
 
+      # release.yml runs the whole workspace's tests on these platforms with
+      # warnings denied. Compile them here too, so a warning only one
+      # platform sees (an x86-only `mut` on arm64) fails a pull request, not
+      # a release.
+      - name: Compile the workspace tests as the release does
+        run: cargo test --release --locked --no-run
+        working-directory: harletty-bridge
+
       - name: Build the plugin library
         run: cargo build --release --locked -p harletty-iamf-bridge
         working-directory: harletty-bridge
