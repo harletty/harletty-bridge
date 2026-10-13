@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod aht;
 mod allocation;
 mod bitstream;
 mod decoder;
@@ -16,9 +17,12 @@ pub use metadata::{
     OamdObjectBlock, OamdObjectElement, OamdPayload, ParsedEmdfPayloadData, ParsedEmdfPayloadKind,
 };
 pub use pcm::{
-    CorePcmFrame, ObjectPcmDecoder, ObjectPcmFrame, ObjectPcmPushResult, PcmDecoder, PcmPushResult,
+    CorePcmFrame, JOC_LATENCY_SAMPLES, ObjectPcmDecoder, ObjectPcmFrame, ObjectPcmPushResult,
+    PcmDecoder, PcmPushResult, dependent_chanmap_positions, merge_core_with_decoded_dependent,
+    merge_core_with_dependent,
 };
 pub use syncframe::{
     AccessUnitInfo, AudioFrameInfo, AuxParseStatus, BlockDrcInfo, EmdfBlockInfo, EmdfPayloadInfo,
-    EmdfSource, FrameType, ParseError, PayloadInfo, SkipFieldInfo, inspect_access_unit,
+    EmdfSource, FrameType, ParseError, PayloadInfo, SkipFieldInfo, fullband_channel_order,
+    inspect_access_unit,
 };

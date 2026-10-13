@@ -18,7 +18,7 @@
 //!
 //! Streaming: reads ~16384 samples per channel at a time from each file,
 //! computes diffs incrementally, never materialises the full vectors.
-//! Each pairing is a single pass over both files. The full 2h Dune track
+//! Each pairing is a single pass over both files. A full two-hour witness
 //! produces 11.5 GB f32 files, which would OOM a 60 GB box if loaded
 //! whole for all three pairings (34 GB Vec<f32> peak).
 //!

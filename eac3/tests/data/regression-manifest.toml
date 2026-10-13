@@ -14,11 +14,11 @@
 # skips gracefully so CI without NAS access still passes.
 
 [[track]]
-id = "dune-part-two-vff-t1"
+id = "eac3-witness"
 role = "witness"
-source = "/mnt/nas/backup/Videos/EAC3_Atmos/Dune.Part.Two.2024.MULTi.VFF.2160p.UHD.BluRay.REMUX.HEVC.Dolby Vision.HDR.TrueHD Atmos.DDP Atmos-1544.mkv"
+source = "/path/to/eac3-witness.mkv"
 
 [[track]]
-id = "dune-2021-vff"
+id = "eac3-baseline"
 role = "failing"
-source = "/mnt/nas/backup/Videos/EAC3_Atmos/Dune.2021.MULTi.VFF.2160p.UHD.BluRay.REMUX.HEVC.Dolby Vision.HDR.TrueHD Atmos.DDP Atmos-1544.mkv"
+source = "/path/to/eac3-baseline.mkv"

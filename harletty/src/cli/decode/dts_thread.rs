@@ -1,0 +1,282 @@
+//! Demux a raw DTS byte stream and decode each frame.
+//!
+//! DTS elementary streams are a run of `[core]` or `[core][exss]` frames. When
+//! an EXSS substream follows the core and carries an XLL asset, the lossless HD
+//! decoder reconstructs the 5.1/7.1 bed plus any DTS:X extension feeds;
+//! otherwise only the core is decodable (DTS-HD HRA layers lossy detail we do
+//! not decode, so its core is rendered and the extension dropped).
+//!
+//! The demux mirrors `bridge/src/dts_pipeline.rs`, which does the same job for
+//! the realtime path. Kept separate on purpose: that one is a streaming
+//! push-model driven by an audio callback, this one owns a file and can block.
+
+use super::auro_stage::AuroStage;
+use super::dts_handler::DtsFrameMessage;
+use crate::input::InputReader;
+use anyhow::Result;
+use dca::{
+    ExssKind, HdDecoder, HdError, PcmDecoder, XMetadata, XPresentation, exss_kind,
+    exss_substream_size, parse_header,
+};
+use indicatif::ProgressBar;
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
+
+const CORE_SYNC: [u8; 4] = 0x7FFE_8001u32.to_be_bytes();
+const SUBSTREAM_SYNC: [u8; 4] = 0x6458_2025u32.to_be_bytes();
+
+pub struct DtsDecoderThreadConfig {
+    pub input_path: PathBuf,
+    pub strict_mode: bool,
+    pub prefix: Vec<u8>,
+    pub tx: mpsc::Sender<Result<DtsFrameMessage>>,
+    pub pb_clone: Option<ProgressBar>,
+}
+
+struct DtsDecodeState {
+    buffer: Vec<u8>,
+    core: PcmDecoder,
+    hd: HdDecoder,
+    /// Auro-Codec detection and unfolding over the lossless output; owns
+    /// the frames it holds back while deciding.
+    auro: AuroStage,
+    frame_count: u64,
+    strict_mode: bool,
+}
+
+pub fn spawn_dts_decoder_thread(config: DtsDecoderThreadConfig) -> thread::JoinHandle<Result<()>> {
+    thread::spawn(move || -> Result<()> {
+        let DtsDecoderThreadConfig {
+            input_path,
+            strict_mode,
+            prefix,
+            tx,
+            pb_clone,
+        } = config;
+
+        let mut state = DtsDecodeState {
+            buffer: prefix,
+            core: PcmDecoder::new(),
+            hd: HdDecoder::new(),
+            auro: AuroStage::new(),
+            frame_count: 0,
+            strict_mode,
+        };
+
+        let mut input_reader = InputReader::new(&input_path)?;
+        input_reader.process_chunks(64 * 1024, |chunk| {
+            state.buffer.extend_from_slice(chunk);
+            drain_frames(&mut state, &pb_clone, &tx, false)?;
+            Ok(true)
+        })?;
+
+        // The final frame has nothing after it, so it is only decodable once
+        // the demux knows no EXSS can follow.
+        drain_frames(&mut state, &pb_clone, &tx, true)?;
+        state.auro.finish(&tx);
+
+        log::info!("DTS decode complete: {} frames", state.frame_count);
+        Ok(())
+    })
+}
+
+/// Consume every complete frame currently buffered, leaving any partial tail.
+///
+/// `at_eof` says no more input will arrive: a core frame that ends the buffer
+/// (or is followed by fewer bytes than an EXSS syncword) is then complete and
+/// decoded core-only, instead of being held back to look for an EXSS.
+fn drain_frames(
+    state: &mut DtsDecodeState,
+    pb: &Option<ProgressBar>,
+    tx: &mpsc::Sender<Result<DtsFrameMessage>>,
+    at_eof: bool,
+) -> Result<()> {
+    let mut consumed = 0usize;
+    loop {
+        let rest = &state.buffer[consumed..];
+        let Some(sync_offset) = find(rest, &CORE_SYNC) else {
+            // Keep back three bytes in case a syncword straddles the boundary.
+            consumed += rest.len().saturating_sub(CORE_SYNC.len() - 1);
+            break;
+        };
+        consumed += sync_offset;
+        let rest = &state.buffer[consumed..];
+
+        let info = match parse_header(rest) {
+            Ok(info) => info,
+            Err(dca::HeaderParseError::InsufficientData) => break,
+            Err(err) => {
+                if state.strict_mode {
+                    return Err(anyhow::anyhow!("invalid DTS header: {err:?}"));
+                }
+                log::debug!("skipping invalid DTS header: {err:?}");
+                consumed += CORE_SYNC.len(); // resync past this candidate
+                continue;
+            }
+        };
+
+        let core_size = info.frame_size;
+        // Need the core frame plus four bytes to test for a trailing EXSS,
+        // unless the input has ended: then whatever follows the core is too
+        // short to be one, and the core stands alone.
+        let exss_testable = rest.len() >= core_size + SUBSTREAM_SYNC.len();
+        if !exss_testable && !(at_eof && rest.len() >= core_size) {
+            break;
+        }
+
+        let mut frame_size = core_size;
+        let mut exss: Option<&[u8]> = None;
+        if exss_testable && rest[core_size..core_size + SUBSTREAM_SYNC.len()] == SUBSTREAM_SYNC {
+            let buffered = exss_substream_size(&rest[core_size..])
+                .filter(|&exss_size| rest.len() >= core_size + exss_size);
+            match buffered {
+                Some(exss_size) => {
+                    frame_size = core_size + exss_size;
+                    let candidate = &rest[core_size..core_size + exss_size];
+                    // Nothing beyond the core to reconstruct (an XBR-only lossy
+                    // extension) means the core, which every such stream still
+                    // carries; a lossless asset or a lossy carrier's channel
+                    // sets go through the HD decoder.
+                    if exss_kind(candidate) != ExssKind::Core {
+                        exss = Some(candidate);
+                    }
+                }
+                // A file cut inside the EXSS: it will never complete, but the
+                // core before it is whole and still plays.
+                None if at_eof => {}
+                None => break, // EXSS not fully buffered yet
+            }
+        }
+
+        // Borrow the decoders and the buffer as disjoint fields: `rest` still
+        // points into `state.buffer`, so `state` cannot be passed whole here.
+        let DtsDecodeState {
+            core: core_decoder,
+            hd: hd_decoder,
+            auro,
+            frame_count,
+            strict_mode,
+            ..
+        } = state;
+        decode_one(
+            DecodeTargets {
+                core_decoder,
+                hd_decoder,
+                auro,
+                frame_count,
+                strict_mode: *strict_mode,
+            },
+            &rest[..core_size],
+            exss,
+            pb,
+            tx,
+        )?;
+        consumed += frame_size;
+    }
+
+    state.buffer.drain(..consumed);
+    Ok(())
+}
+
+/// The mutable slice of decode state one frame needs, borrowed apart from the
+/// input buffer the frame bytes point into.
+struct DecodeTargets<'a> {
+    core_decoder: &'a mut PcmDecoder,
+    hd_decoder: &'a mut HdDecoder,
+    auro: &'a mut AuroStage,
+    frame_count: &'a mut u64,
+    strict_mode: bool,
+}
+
+fn decode_one(
+    targets: DecodeTargets<'_>,
+    core: &[u8],
+    exss: Option<&[u8]>,
+    pb: &Option<ProgressBar>,
+    tx: &mpsc::Sender<Result<DtsFrameMessage>>,
+) -> Result<()> {
+    let DecodeTargets {
+        core_decoder,
+        hd_decoder,
+        auro,
+        frame_count,
+        strict_mode,
+    } = targets;
+    if let Some(exss) = exss {
+        match hd_decoder.decode(core, exss) {
+            Ok(frame) => {
+                let presentation = XPresentation::detect(&frame);
+                // Unreadable metadata is reported by the handler once; the
+                // frame still plays with its bed as authored.
+                let metadata = presentation
+                    .and_then(|p| XMetadata::parse(&frame.x_payload, p.feed_count()).ok());
+                *frame_count += 1;
+                tick(pb);
+                // The Auro side channel lives in the low bits of the lossless
+                // integers, so it is read off the decoder's integer tap, not
+                // off the float frame. The stage decides whether the frame
+                // goes out as it is or unfolded.
+                let lossless: Vec<(usize, Vec<i32>)> = hd_decoder
+                    .lossless_samples()
+                    .map(|(speaker, samples)| (speaker, samples.to_vec()))
+                    .collect();
+                if lossless.is_empty() {
+                    // A lossy carrier: no side channel to read, the frame
+                    // goes out as it is.
+                    auro.not_a_carrier(tx);
+                    let _ = tx.send(Ok(DtsFrameMessage::Hd {
+                        frame: Box::new(frame),
+                        presentation,
+                        metadata,
+                    }));
+                    return Ok(());
+                }
+                auro.frame(
+                    Box::new(frame),
+                    presentation,
+                    metadata,
+                    lossless.into_iter(),
+                    tx,
+                );
+                return Ok(());
+            }
+            // Peak-bitrate buffering: this packet yields no frame, which is
+            // normal and not an error.
+            Err(HdError::Pending) => return Ok(()),
+            Err(err) => {
+                if strict_mode {
+                    return Err(anyhow::anyhow!("DTS-HD decode error: {err:?}"));
+                }
+                log::warn!("DTS-HD decode error, falling back to the core: {err:?}");
+            }
+        }
+    }
+
+    match core_decoder.push_access_unit(core) {
+        Ok(push) => {
+            *frame_count += 1;
+            tick(pb);
+            // A lossy core frame cannot carry the side channel.
+            auro.not_a_carrier(tx);
+            let _ = tx.send(Ok(DtsFrameMessage::Core(Box::new(push))));
+        }
+        Err(err) => {
+            if strict_mode {
+                return Err(anyhow::anyhow!("DTS core decode error: {err:?}"));
+            }
+            log::warn!("DTS core decode error (dropping frame): {err:?}");
+        }
+    }
+    Ok(())
+}
+
+fn find(data: &[u8], needle: &[u8; 4]) -> Option<usize> {
+    data.windows(needle.len()).position(|w| w == needle)
+}
+
+fn tick(pb: &Option<ProgressBar>) {
+    if let Some(pb) = pb {
+        pb.inc(1);
+    }
+}

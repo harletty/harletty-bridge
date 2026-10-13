@@ -166,7 +166,7 @@ impl TrackSummary {
         }
         // E-AC-3 PCM at full bitstream scale (no dialnorm, no DRC, no
         // limiter) can legitimately peak well above 1.0 — observed 2.23
-        // on Dune Part Two's main track. FFmpeg with `-drc_scale 0` and
+        // on the main witness track. FFmpeg with `-drc_scale 0` and
         // Cavern (raw decoder, pre-Listener normalizer) peak similarly
         // (1.80 and 1.89 respectively). 4.0 is a sanity ceiling for
         // catastrophic over-range / NaN-like garbage, not a content cap.
@@ -246,7 +246,7 @@ fn run_track(
 ) -> Result<TrackSummary, String> {
     // Prefer the bootstrap-cached harletty PCM (corpus_root/harletty-pcm/<id>.f32).
     // Falling back to an on-the-fly decode would write 11.5 GB to /tmp,
-    // which is tmpfs (RAM-backed) on most systems — the full 2 h Dune
+    // which is tmpfs (RAM-backed) on most systems — a full two-hour
     // track immediately OOM-pressures a 60 GB box. The on-the-fly path
     // is kept for users running the test without bootstrap caches.
     let (harletty_pcm_path, decoded, owned_temp) = if cached_harletty_pcm.exists() {
@@ -255,7 +255,7 @@ fn run_track(
         (cached_harletty_pcm.to_path_buf(), stats, None)
     } else {
         let tmp_path = std::env::temp_dir().join(format!(
-            "eac3-mkv-test-{}.f32",
+            "eac3-mkv-corpus-test-{}.f32",
             eac3_path
                 .file_stem()
                 .and_then(|s| s.to_str())

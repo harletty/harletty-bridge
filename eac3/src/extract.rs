@@ -219,4 +219,26 @@ mod tests {
         assert_eq!(extracted.as_bytes(), frame.as_slice());
         assert_eq!(extractor.next_frame().unwrap(), None);
     }
+
+    #[test]
+    fn extracts_44_1_khz_legacy_ac3_frames_with_the_padding_word() {
+        // 44.1 kHz / 384 kbps: frmsizecod 29 frames are 836 words (1672
+        // bytes). Sized without the padding word they came out two bytes
+        // short, leaving their last word to be skipped as garbage before
+        // the next syncword — and the decoder saw a truncated frame.
+        let mut frame = vec![0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1];
+        frame.resize(1672, 0xAA);
+        let mut extractor = Extractor::default();
+        extractor.push_bytes(&frame);
+        extractor.push_bytes(&frame);
+
+        for _ in 0..2 {
+            let extracted = extractor.next_frame().unwrap().unwrap();
+            assert_eq!(extracted.info().sample_rate, 44_100);
+            assert_eq!(extracted.info().frame_size, 1672);
+            assert_eq!(extracted.as_bytes(), frame.as_slice());
+        }
+        assert_eq!(extractor.next_frame().unwrap(), None);
+        assert_eq!(extractor.buffered_len(), 0);
+    }
 }

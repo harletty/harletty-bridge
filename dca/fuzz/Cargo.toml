@@ -1,0 +1,38 @@
+# Fuzz targets for the DCA decoder. Not part of the root workspace (the empty
+# [workspace] table below keeps it standalone). CI builds every target on each
+# push and pull request, and `.github/workflows/fuzz.yml` runs them weekly
+# with a cached corpus. Run locally with a nightly toolchain:
+#
+#   cargo +nightly fuzz run core_frame corpus/core_frame seeds/core_frame
+#   cargo +nightly fuzz run exss_xll corpus/exss_xll seeds/exss_xll
+#
+# The first corpus directory collects what the fuzzer finds; `seeds/` holds
+# the small checked-in starting inputs and is only read.
+[package]
+name = "dca-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dca = { path = ".." }
+
+[[bin]]
+name = "core_frame"
+path = "fuzz_targets/core_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "exss_xll"
+path = "fuzz_targets/exss_xll.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

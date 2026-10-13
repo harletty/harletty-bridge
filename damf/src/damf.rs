@@ -1,0 +1,1379 @@
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt::Display;
+use std::path::Path;
+use truehd::structs::oamd::{ObjectAudioMetadataPayload, SpeakerLabels, Trim};
+
+pub const DAMF_VERSION: &str = "0.5.1";
+
+/// An OAMD payload shape the DAMF projection does not implement yet.
+///
+/// These are real streams, not corrupt ones — the projection simply has no reading for
+/// them, and guessing would write a master set that misplaces objects. They used to
+/// abort the process from inside the writer; reporting them lets the caller finalize
+/// whatever it has already written and say what it could not project.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsupportedPayload {
+    /// More than one object info block per payload.
+    MultipleUpdateBlocks(usize),
+    /// More than one bed instance in the program assignment.
+    MultipleBedInstances(usize),
+    /// Intermediate spatial format objects, which carry no per-object position.
+    IsfObjects(usize),
+}
+
+impl Display for UnsupportedPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match *self {
+            Self::MultipleUpdateBlocks(n) => format!("{n} object info blocks"),
+            Self::MultipleBedInstances(n) => format!("{n} bed instances"),
+            Self::IsfObjects(n) => format!("{n} ISF objects"),
+        };
+
+        write!(f, "{what} are not supported yet, please submit a sample")
+    }
+}
+
+impl std::error::Error for UnsupportedPayload {}
+
+/// Identifies the program that produced a master set, written verbatim into
+/// `creationTool` / `creationToolVersion`.
+///
+/// This used to be read straight off `CARGO_PKG_NAME`/`CARGO_PKG_VERSION`, back
+/// when the writer lived inside the CLI's own binary crate. It cannot stay that
+/// way now that it is a library: the env vars would resolve to *this* crate and
+/// silently relabel every master set as produced by "damf 0.1.0". The caller
+/// declares itself instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreationTool {
+    pub name: &'static str,
+    pub version: &'static str,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct Data {
+    version: String,
+    presentations: Vec<Presentation>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Presentation {
+    #[serde(rename = "type")]
+    presentation_type: PresentationType,
+    simplified: bool,
+    metadata: String,
+    audio: String,
+    offset: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ffoa: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fps: Option<Fps>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sc_number_of_elements: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sc_bed_configuration: Option<VecDisplay<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation_tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation_tool_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_codec: Option<SourceCodec>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "downmixType_5to2"
+    )]
+    downmix_type_5to2: Option<DownmixMode>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "51-to-20_LsRs90degPhaseShift"
+    )]
+    ls_rs_90_deg_phase_shift: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warp_mode: Option<WarpMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trim_mode: Option<TrimMode>,
+    #[serde(default)]
+    bed_instances: Vec<BedInstance>,
+    #[serde(default)]
+    objects: Vec<Object>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PresentationType {
+    Home,
+    Cinema,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCodec {
+    #[serde(rename = "TrueHD")]
+    TrueHD,
+    #[serde(rename = "EAC3-JOC")]
+    Eac3Joc,
+    // DTS:X, one label per spatial presentation.
+    //
+    // These strings are not free choices. Atmos Ranker classifies DTS:X tracks
+    // at scan time by looking for the alternate-profile syncwords in the
+    // elementary stream, and stores the result under exactly these names; its
+    // `canonical_codec` maps them to themselves. Emitting anything else here —
+    // a generic "DTS-X", say — would leave the same physical codec stored under
+    // two different strings depending on whether it was scanned or decoded,
+    // which is precisely what that function exists to prevent.
+    //
+    // The scanner's syncword list is not visible from this repository, so the
+    // agreement is an expectation held here rather than a thing checked here.
+    // A label that decodes but never ranks is the shape that disagreement
+    // takes, and the profile added most recently is where to look for it.
+    /// Standard DTS:X: 7.1 bed plus four height feeds.
+    #[serde(rename = "DTS:X-7.1.4")]
+    DtsX714,
+    /// Five-feed presentation (D0): 7.1 bed, four fixed heights and one
+    /// object, at the position its record declares. (Formerly labelled
+    /// `DTS:X-7.1.5`, when that object was presented as a fixed
+    /// centre-height channel regardless of where it said it was; Atmos
+    /// Ranker maps that label onto this one.)
+    #[serde(rename = "DTS:X-7.1.4+1")]
+    DtsX714Plus1,
+    /// Six-feed presentation (D1): 7.1 bed, four fixed heights and two
+    /// objects. (Formerly labelled `DTS:X-9.1.4` when the two objects were
+    /// taken for wide channels; Atmos Ranker maps that label onto this one.)
+    #[serde(rename = "DTS:X-7.1.4+2")]
+    DtsX714Plus2,
+    /// Eight-feed presentation (D3): 7.1 bed, four fixed heights and four
+    /// objects. (Formerly `DTS:X-7.1+8`, when the height quartet was counted
+    /// among the objects; mapped likewise.)
+    #[serde(rename = "DTS:X-7.1.4+4")]
+    DtsX714Plus4,
+    /// Nine-feed presentation (D4): 7.1 bed, four fixed heights and five
+    /// objects.
+    #[serde(rename = "DTS:X-7.1.4+5")]
+    DtsX714Plus5,
+    /// Seven-feed presentation (the D0 marker over a three-channel first
+    /// set): 7.1 bed, four fixed heights and the single declared object as
+    /// three components at the bed's C, L and R positions.
+    #[serde(rename = "DTS:X-7.1.4+3")]
+    DtsX714Plus3,
+    /// Object-only presentation on a 5.1 bed: one object waveform, no height
+    /// quartet (the D0 marker with a 5.1 reference layout).
+    #[serde(rename = "DTS:X-5.1+1")]
+    DtsX51Plus1,
+    // Auro-3D, by the channel count of the layout the carrier unfolds to:
+    // bed plus heights plus top. Layouts with no common name fall back to
+    // the bare label.
+    #[serde(rename = "Auro-3D-9.1")]
+    Auro3d91,
+    #[serde(rename = "Auro-3D-10.1")]
+    Auro3d101,
+    #[serde(rename = "Auro-3D-11.1")]
+    Auro3d111,
+    #[serde(rename = "Auro-3D-13.1")]
+    Auro3d131,
+    #[serde(rename = "Auro-3D")]
+    Auro3d,
+    /// IAMF (AOMedia Immersive Audio Model and Formats), whatever its
+    /// profile: v2.0 objects, a v1.1 channel bed, or both.
+    #[serde(rename = "IAMF")]
+    Iamf,
+}
+
+impl SourceCodec {
+    /// Every label, for the taxonomy checks.
+    pub const ALL: [SourceCodec; 15] = [
+        SourceCodec::TrueHD,
+        SourceCodec::Eac3Joc,
+        SourceCodec::DtsX714,
+        SourceCodec::DtsX714Plus1,
+        SourceCodec::DtsX714Plus2,
+        SourceCodec::DtsX714Plus4,
+        SourceCodec::DtsX714Plus5,
+        SourceCodec::DtsX714Plus3,
+        SourceCodec::DtsX51Plus1,
+        SourceCodec::Auro3d91,
+        SourceCodec::Auro3d101,
+        SourceCodec::Auro3d111,
+        SourceCodec::Auro3d131,
+        SourceCodec::Auro3d,
+        SourceCodec::Iamf,
+    ];
+
+    /// The string this codec is written as: the `sourceCodec` of the DAMF
+    /// header, and the label `harletty info --json` reports. The same
+    /// strings as the serde names above, kept in step by a test, so a
+    /// caller can hold the label without serialising a header.
+    pub fn label(self) -> &'static str {
+        match self {
+            SourceCodec::TrueHD => "TrueHD",
+            SourceCodec::Eac3Joc => "EAC3-JOC",
+            SourceCodec::DtsX714 => "DTS:X-7.1.4",
+            SourceCodec::DtsX714Plus1 => "DTS:X-7.1.4+1",
+            SourceCodec::DtsX714Plus2 => "DTS:X-7.1.4+2",
+            SourceCodec::DtsX714Plus4 => "DTS:X-7.1.4+4",
+            SourceCodec::DtsX714Plus5 => "DTS:X-7.1.4+5",
+            SourceCodec::DtsX714Plus3 => "DTS:X-7.1.4+3",
+            SourceCodec::DtsX51Plus1 => "DTS:X-5.1+1",
+            SourceCodec::Auro3d91 => "Auro-3D-9.1",
+            SourceCodec::Auro3d101 => "Auro-3D-10.1",
+            SourceCodec::Auro3d111 => "Auro-3D-11.1",
+            SourceCodec::Auro3d131 => "Auro-3D-13.1",
+            SourceCodec::Auro3d => "Auro-3D",
+            SourceCodec::Iamf => "IAMF",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+enum Fps {
+    #[serde(rename = "23.976")]
+    R23_976,
+    #[serde(rename = "24")]
+    R24,
+    #[serde(rename = "25")]
+    R25,
+    #[serde(rename = "29.97")]
+    R29_97,
+    #[serde(rename = "29.97df")]
+    R29_97df,
+    #[serde(rename = "30")]
+    R30,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+enum DownmixMode {
+    #[serde(rename = "LoRo_Stereo")]
+    LoRoStereo,
+    #[serde(rename = "LtRt_ProLogic")]
+    LtRtProLogic,
+    #[serde(rename = "LtRt_PLII")]
+    LtRtPLII,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy)]
+pub enum WarpMode {
+    #[default]
+    #[serde(rename = "normal")]
+    Normal,
+    #[serde(rename = "warping")]
+    Warping,
+    ProLogicIIx,
+    LoRo,
+}
+
+impl WarpMode {
+    fn from_oamd_u8(warp_mode: u8) -> Self {
+        match warp_mode {
+            1 => Self::Warping,
+            2 => Self::ProLogicIIx,
+            3 => Self::LoRo,
+            _ => Self::Normal,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct TrimMode {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    no_surrounds_no_heights: Option<TrimOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    some_surrounds_no_heights: Option<TrimOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    many_surrounds_no_heights: Option<TrimOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    no_surrounds_some_heights: Option<TrimOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    some_surrounds_some_heights: Option<TrimOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    many_surrounds_some_heights: Option<TrimOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    no_surrounds_many_heights: Option<TrimOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    some_surrounds_many_heights: Option<TrimOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    many_surrounds_many_heights: Option<TrimOptions>,
+}
+
+impl TrimMode {
+    pub fn try_from_oamd(oamd: &ObjectAudioMetadataPayload) -> Option<Self> {
+        let Some(trim) = &oamd.trim_element else {
+            return None;
+        };
+
+        Some(Self {
+            no_surrounds_no_heights: TrimOptions::try_from_oamd_trim(&trim.trims[0]),
+            some_surrounds_no_heights: TrimOptions::try_from_oamd_trim(&trim.trims[1]),
+            many_surrounds_no_heights: TrimOptions::try_from_oamd_trim(&trim.trims[2]),
+            no_surrounds_some_heights: TrimOptions::try_from_oamd_trim(&trim.trims[3]),
+            some_surrounds_some_heights: TrimOptions::try_from_oamd_trim(&trim.trims[4]),
+            many_surrounds_some_heights: TrimOptions::try_from_oamd_trim(&trim.trims[5]),
+            no_surrounds_many_heights: TrimOptions::try_from_oamd_trim(&trim.trims[6]),
+            some_surrounds_many_heights: TrimOptions::try_from_oamd_trim(&trim.trims[7]),
+            many_surrounds_many_heights: TrimOptions::try_from_oamd_trim(&trim.trims[8]),
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrimOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    center_trim: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    surround_trim: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    height_trim: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    front_back_balance_overhead_floor: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    front_back_balance_listener: Option<f64>,
+}
+
+impl TrimOptions {
+    pub fn try_from_oamd_trim(trim: &Option<Trim>) -> Option<Self> {
+        let Some(trim) = trim else {
+            return None;
+        };
+
+        let options = Self {
+            center_trim: trim.trim_centre,
+            surround_trim: trim.trim_surround,
+            height_trim: trim.trim_height,
+            front_back_balance_overhead_floor: trim.bal3d_y_tb,
+            front_back_balance_listener: trim.bal3d_y_lis,
+        };
+
+        // A trim the renderer derives itself carries no value for any of these. The
+        // payload distinguishes it from an absent trim, but the master set has no way
+        // to say "derived", and an empty trim entry states nothing at all — so it is
+        // written as the absence it was written as before that distinction existed.
+        if options == Self::default() {
+            return None;
+        }
+
+        Some(options)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Channel {
+    channel: String,
+    #[serde(rename = "ID")]
+    id: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Object {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_name: Option<String>,
+    #[serde(rename = "ID")]
+    id: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BedInstance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_name: Option<String>,
+    channels: Vec<Channel>,
+}
+
+impl BedInstance {
+    pub fn to_index_vec(&self) -> Vec<usize> {
+        self.channels.iter().map(|x| x.id as usize).collect()
+    }
+
+    pub fn with_oamd_payload(oamd: &ObjectAudioMetadataPayload) -> Vec<Self> {
+        oamd.program_assignment
+            .bed_assignment
+            .iter()
+            .map(|bed| BedInstance {
+                description: None,
+                group_name: None,
+                channels: bed
+                    .to_index_vec()
+                    .iter()
+                    .map(|&i| Channel {
+                        channel: format!("{:?}", SpeakerLabels::from_u8(i as u8).unwrap()),
+                        id: match i {
+                            0..8 => i,
+                            8..10 => i + 122,
+                            10..12 => i - 2,
+                            _ => i + 120,
+                        } as u32,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+impl Data {
+    pub fn serialize_damf(&self) -> String {
+        format_yaml_string(serde_yaml_ng::to_string(self).unwrap())
+    }
+
+    pub fn presentations_mut(&mut self) -> &mut Vec<Presentation> {
+        &mut self.presentations
+    }
+
+    pub fn with_oamd_payload_bed_conform(
+        oamd: &ObjectAudioMetadataPayload,
+        base_path: &Path,
+        source_codec: SourceCodec,
+        creation_tool: CreationTool,
+    ) -> Self {
+        let mut data = Self::with_oamd_payload(oamd, base_path, source_codec, creation_tool);
+
+        if let Some(presentation) = data.presentations.first_mut() {
+            presentation.bed_instances = vec![BedInstance {
+                description: None,
+                group_name: None,
+                channels: (0..10)
+                    .map(|i| Channel {
+                        channel: format!(
+                            "{:?}",
+                            SpeakerLabels::from_u8(match i {
+                                0..8 => i,
+                                8..10 => i + 2,
+                                _ => unreachable!(),
+                            })
+                            .unwrap()
+                        ),
+                        id: i as u32,
+                    })
+                    .collect(),
+            }];
+        }
+
+        data
+    }
+
+    pub fn with_oamd_payload(
+        oamd: &ObjectAudioMetadataPayload,
+        base_path: &Path,
+        source_codec: SourceCodec,
+        creation_tool: CreationTool,
+    ) -> Self {
+        let presentation_type = PresentationType::Home;
+
+        let base_name = base_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+
+        // TODO: move elsewhere?
+        let bed_instances = BedInstance::with_oamd_payload(oamd);
+
+        let objects = (0..oamd.program_assignment.num_dynamic_objects)
+            .map(|i| Object {
+                description: None,
+                group_name: None,
+                id: i as u32 + 10,
+            })
+            .collect();
+
+        let warp_mode = oamd
+            .trim_element
+            .as_ref()
+            .map(|trim| WarpMode::from_oamd_u8(trim.warp_mode));
+        let trim_mode = TrimMode::try_from_oamd(oamd);
+
+        let sc_bed_configuration = oamd
+            .program_assignment
+            .bed_assignment
+            .first()
+            .map(|bed| VecDisplay(bed.to_index_vec().iter().map(|i| *i as u32).collect()));
+
+        Self {
+            version: DAMF_VERSION.to_string(),
+            presentations: vec![Presentation {
+                presentation_type,
+                simplified: false,
+                metadata: format!("{base_name}.atmos.metadata"),
+                audio: format!("{base_name}.atmos.audio"),
+                offset: 0.0,
+                ffoa: None,
+                fps: Some(Fps::R24), // TODO: derive
+                sc_number_of_elements: None,
+                sc_bed_configuration,
+                creation_tool: Some(creation_tool.name.to_string()),
+                creation_tool_version: Some(creation_tool.version.to_string()),
+                source_codec: Some(source_codec),
+                downmix_type_5to2: None,
+                ls_rs_90_deg_phase_shift: None,
+                warp_mode,
+                trim_mode,
+                bed_instances,
+                objects,
+            }],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Configuration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    pub events: Vec<Event>,
+    /// The payload carried no update timing, so it restates what is already in force.
+    #[serde(skip)]
+    pub restates_current_state: bool,
+}
+
+impl Configuration {
+    pub fn serialize_events(&mut self, remove_header: bool) -> String {
+        if remove_header {
+            self.events.retain(|e| e != &Event::default());
+            if self.events.is_empty() {
+                return String::new();
+            }
+            self.sample_rate = None;
+        }
+
+        let mut yaml_str = serde_yaml_ng::to_string(&self).unwrap();
+        let result = if remove_header {
+            yaml_str.split_off(8) // remove 'events:\n'
+        } else {
+            yaml_str
+        };
+
+        format_yaml_string(result)
+    }
+
+    pub fn with_oamd_payload(
+        oamd: &ObjectAudioMetadataPayload,
+        sample_rate: u32,
+        sample_pos: u64,
+    ) -> Result<Self, UnsupportedPayload> {
+        let object_count = oamd.object_count;
+        let Some(object_element) = &oamd.object_element else {
+            return Ok(Self {
+                sample_rate: Some(sample_rate),
+                events: vec![],
+                restates_current_state: false,
+            });
+        };
+
+        let pos_vec = oamd.get_damf_pos();
+
+        let trim_bypass_vec = if let Some(trim) = &oamd.trim_element {
+            if trim.b_disable_trim_per_obj {
+                trim.b_disable_trim.clone()
+            } else if trim.global_trim_mode == 1 {
+                vec![true; object_count]
+            } else {
+                vec![false; object_count]
+            }
+        } else {
+            vec![false; object_count]
+        };
+
+        // TODO: implement
+        let num_obj_info_blocks = object_element.md_update_info.num_obj_info_blocks;
+        if num_obj_info_blocks != 1 {
+            return Err(UnsupportedPayload::MultipleUpdateBlocks(
+                num_obj_info_blocks,
+            ));
+        }
+
+        let bed_instances = oamd.program_assignment.bed_assignment.len();
+        if bed_instances != 1 {
+            return Err(UnsupportedPayload::MultipleBedInstances(bed_instances));
+        }
+
+        let num_isf_objects = oamd.program_assignment.num_isf_objects;
+        if num_isf_objects != 0 {
+            return Err(UnsupportedPayload::IsfObjects(num_isf_objects));
+        }
+
+        let sample_offset = object_element.md_update_info.sample_offset as u64;
+        let restates_current_state = sample_offset == 0
+            && object_element
+                .md_update_info
+                .block_update_info
+                .iter()
+                .all(|block| block.block_offset_factor_bits == 0 && block.ramp_duration == 0);
+
+        let ramp_duration =
+            object_element.md_update_info.block_update_info[0].ramp_duration as usize;
+
+        let sample_pos = sample_pos + sample_offset + oamd.evo_sample_offset;
+
+        let mut events = Vec::with_capacity(object_count);
+
+        let bed_index_vec = if let Some(bed) = oamd.program_assignment.bed_assignment.first() {
+            bed.to_index_vec()
+        } else {
+            Vec::new()
+        };
+
+        // Dynamic objects take the IDs 10, 11, … in the order they appear,
+        // matching the `objects:` list of the header. Counting them as they
+        // come, rather than subtracting the bed size from the index, keeps
+        // the IDs right whether or not the bed objects precede them in
+        // `object_data`: a TrueHD payload lists the bed first, a payload
+        // synthesised for a DTS:X or Auro-3D track lists no bed at all.
+        let mut dynamic_rank = 0usize;
+        for i in 0..object_count {
+            let object_data = &object_element.object_data[i][0];
+            let id = if object_data.b_object_in_bed_or_isf {
+                let index = bed_index_vec[i];
+
+                // assign unusual bed objects to the end (skip 128 & 129)
+                match index {
+                    0..8 => index,
+                    8..10 => index + 122,
+                    10..12 => index - 2,
+                    _ => index + 120,
+                }
+            } else {
+                dynamic_rank += 1;
+                dynamic_rank + 9
+            };
+
+            let mut event: Event = Event::with_id(id as u32);
+            event.active = Some(!object_data.b_object_not_active);
+            event.sample_pos = Some(sample_pos);
+
+            let basic = &object_data.object_basic_info;
+
+            event.importance = Some(basic.object_priority);
+            event.gain = Some(basic.gain_string());
+            event.ramp_length = Some(ramp_duration as u32);
+
+            if !object_data.b_object_in_bed_or_isf {
+                let render = &object_data.object_render_info;
+
+                event.elevation = Some(render.b_enable_elevation);
+                event.snap = Some(render.b_object_snap);
+                event.pos = Some(VecDisplay(pos_vec[i][0].to_vec()));
+                event.zones = Some(Zones::from_u8(render.zone_constraints_idx));
+
+                // size3D does not exist in Atmos
+                event.size = Some(render.object_size[0]);
+
+                event.distance = render.distance_factor;
+                event.screen_factor = Some(render.screen_factor);
+                event.depth_factor = Some(render.depth_factor);
+
+                // Unimplemented, seems in ObjectDescriptionElement
+                event.dialog = Some(-1);
+                event.music = Some(-1);
+
+                event.binaural_render_mode = Some("undefined".to_string());
+            } else {
+                event.binaural_render_mode = Some("off".to_string());
+            }
+
+            event.trim_bypass = Some(trim_bypass_vec[i]);
+
+            // Unimplemented
+            event.head_track_mode = Some("undefined".to_string());
+
+            events.push(event);
+        }
+
+        Ok(Self {
+            sample_rate: Some(sample_rate),
+            events,
+            restates_current_state,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[repr(u8)]
+pub enum Zones {
+    #[default]
+    #[serde(rename = "all")]
+    All,
+    #[serde(rename = "no back")]
+    NoBack,
+    #[serde(rename = "no sides")]
+    NoSides,
+    #[serde(rename = "center back")]
+    CenterBack,
+    #[serde(rename = "screen only")]
+    ScreenOnly,
+    #[serde(rename = "surround only")]
+    SurroundOnly,
+}
+
+impl Zones {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Zones::All,
+            1 => Zones::NoBack,
+            2 => Zones::NoSides,
+            3 => Zones::CenterBack,
+            4 => Zones::ScreenOnly,
+            5 => Zones::SurroundOnly,
+            _ => Zones::All, // Default case
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Event {
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ID")]
+    id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sample_pos: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pos: Option<VecDisplay<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snap: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    elevation: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    zones: Option<Zones>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    size: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "size3D")]
+    size_3d: Option<VecDisplay<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decorr: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    importance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ramp_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trim_bypass: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dialog: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    music: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    distance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    screen_factor: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    depth_factor: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head_track_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binaural_render_mode: Option<String>,
+}
+
+impl Event {
+    pub fn with_id(id: u32) -> Self {
+        Self {
+            id: Some(id),
+            ..Default::default()
+        }
+    }
+
+    /// An object moving to `pos`, reached `ramp_length` samples after
+    /// `sample_pos`, and nothing else restated: for a source that states
+    /// positions as a trajectory rather than as payloads repeating every
+    /// field, so there is nothing to diff (IAMF).
+    pub fn position_update(id: u32, sample_pos: u64, pos: [f64; 3], ramp_length: u32) -> Self {
+        Self {
+            id: Some(id),
+            sample_pos: Some(sample_pos),
+            pos: Some(VecDisplay(pos.to_vec())),
+            ramp_length: Some(ramp_length),
+            ..Default::default()
+        }
+    }
+
+    /// Restate where the object is, for a caller that holds the position
+    /// more exactly than the OAMD payload the event was projected from: its
+    /// encoding halves and offsets each coordinate, which rounds.
+    pub fn set_pos(&mut self, pos: [f64; 3]) {
+        self.pos = Some(VecDisplay(pos.to_vec()));
+    }
+
+    fn diff(&self, b: &Self) -> Self {
+        let mut out = Self::default();
+
+        macro_rules! diff {
+            ($($f:ident),* $(,)?) => {
+                $(
+                    if self.$f != b.$f {
+                        out.$f = b.$f.clone();
+                    } else {
+                        out.$f = None;
+                    }
+                )*
+            };
+        }
+
+        diff!(
+            active,
+            pos,
+            snap,
+            elevation,
+            zones,
+            size,
+            size_3d,
+            decorr,
+            importance,
+            gain,
+            ramp_length,
+            trim_bypass,
+            dialog,
+            music,
+            distance,
+            screen_factor,
+            depth_factor,
+            head_track_mode,
+            binaural_render_mode
+        );
+
+        if out != Self::default() {
+            out.id = b.id;
+            out.sample_pos = b.sample_pos;
+        }
+
+        out
+    }
+
+    pub fn compare_event_vectors(events1: &[Event], events2: &[Event]) -> Vec<Event> {
+        events1
+            .iter()
+            .zip(events2)
+            .map(|(event1, event2)| event1.diff(event2))
+            .collect()
+    }
+
+    /// A payload that restates values already in force zeroes its timing, which leaves the ramp as
+    /// the only field that moved. A ramp to values that did not change is not an event.
+    pub fn drop_re_asserted_ramps(events: &mut [Event]) {
+        for event in events.iter_mut() {
+            let mut rest = event.clone();
+            rest.id = None;
+            rest.sample_pos = None;
+            rest.ramp_length = None;
+
+            if event.ramp_length == Some(0) && rest == Event::default() {
+                *event = Event::default();
+            }
+        }
+    }
+
+    /// What the next payload is to be diffed against, once `drop_re_asserted_ramps` has run over
+    /// `written`: `payload` for every object whose event was written, `previous` for every object
+    /// whose event was dropped.
+    ///
+    /// A dropped restatement zeroed the object's ramp without the file saying so. Diffed against
+    /// it, a zero-ramp move that follows would carry no `rampLength`, and a reader carrying the
+    /// ramp forward would give that jump the ramp stated before the restatement. Diffed against
+    /// what was last written, the move states its ramp.
+    pub fn baseline_after(previous: &[Event], payload: &[Event], written: &[Event]) -> Vec<Event> {
+        payload
+            .iter()
+            .enumerate()
+            .map(|(i, now)| match (written.get(i), previous.get(i)) {
+                (Some(diff), Some(before)) if *diff == Event::default() => before.clone(),
+                _ => now.clone(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Default, Debug, Clone, PartialEq)]
+struct VecDisplay<T>(Vec<T>);
+
+impl<T> Serialize for VecDisplay<T>
+where
+    T: Display,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use std::fmt::Write;
+
+        let mut result = String::with_capacity(self.0.len() * 8 + 2); // Pre-allocate
+        result.push('[');
+
+        for (i, item) in self.0.iter().enumerate() {
+            if i > 0 {
+                result.push_str(", ");
+            }
+            write!(result, "{item}").unwrap();
+        }
+        result.push(']');
+
+        serializer.collect_str(&result)
+    }
+}
+
+impl<'de, T> Deserialize<'de> for VecDisplay<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<T> = Vec::deserialize(deserializer)?;
+        Ok(VecDisplay(vec))
+    }
+}
+
+/// Reformat `serde_yaml_ng` output into the layout Dolby's tools emit for DAMF:
+/// four-space indent steps, sequence dashes one step under their key, and
+/// scalars written plain (DAMF quotes nothing, so `'24'` is written `24`).
+///
+/// Only structural text is rewritten. Scalar *content* is left alone apart from
+/// undoing YAML quoting, so a path containing `'`, `  ` or `- ` survives
+/// intact. This used to be a whole-document search and replace, which rewrote
+/// those sequences inside values too and produced `.atmos` files whose
+/// `metadata:`/`audio:` entries did not name the files actually written.
+fn format_yaml_string(yaml_str: String) -> String {
+    let mut out = String::with_capacity(yaml_str.len() * 2);
+
+    for raw_line in yaml_str.split_inclusive('\n') {
+        let (line, newline) = match raw_line.strip_suffix('\n') {
+            Some(line) => (line, "\n"),
+            None => (raw_line, ""),
+        };
+
+        // serde indents two spaces per level, DAMF four.
+        let content = line.trim_start_matches(' ');
+        for _ in 0..(line.len() - content.len()) * 2 {
+            out.push(' ');
+        }
+
+        // A sequence entry sits one further step in than its key in DAMF.
+        let mut content = content;
+        while let Some(rest) = content.strip_prefix("- ") {
+            out.push_str("  - ");
+            content = rest;
+        }
+
+        match split_key_value(content) {
+            Some((key, value)) => {
+                out.push_str(&unquote(key));
+                out.push(':');
+                if !value.is_empty() {
+                    out.push(' ');
+                    out.push_str(&unquote(value));
+                }
+            }
+            None => out.push_str(&unquote(content)),
+        }
+
+        out.push_str(newline);
+    }
+
+    out
+}
+
+/// Split `key: value` (or a bare `key:`) into its two halves, honouring a
+/// single-quoted key. Returns `None` when the line is a lone scalar.
+fn split_key_value(content: &str) -> Option<(&str, &str)> {
+    let key_end = if content.starts_with('\'') {
+        closing_quote(content)? + 1
+    } else {
+        content.find(':')?
+    };
+
+    let value = content.get(key_end..)?.strip_prefix(':')?;
+
+    match value.strip_prefix(' ') {
+        Some(value) => Some((&content[..key_end], value)),
+        None if value.is_empty() => Some((&content[..key_end], "")),
+        // A colon that is not followed by a space is part of the scalar.
+        None => None,
+    }
+}
+
+/// Byte offset of the `'` closing the single-quoted scalar starting at byte 0,
+/// skipping the `''` escape.
+fn closing_quote(content: &str) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut i = 1;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return Some(i);
+        }
+        i += 1;
+    }
+
+    None
+}
+
+/// Drop the single quotes `serde_yaml_ng` wraps a scalar in and undo the `''`
+/// escape. An apostrophe *inside* a scalar is content and is kept.
+fn unquote(scalar: &str) -> String {
+    match closing_quote(scalar) {
+        Some(end) if scalar.starts_with('\'') && end == scalar.len() - 1 => {
+            scalar[1..end].replace("''", "'")
+        }
+        _ => scalar.to_string(),
+    }
+}
+
+/// Stands in for the CLI binary's own identity. The CLI passes
+/// `CreationTool { name: env!("CARGO_PKG_NAME"), version: env!("CARGO_PKG_VERSION") }`,
+/// so pinning a fixture here checks that whatever the caller declares reaches
+/// `creationTool` verbatim.
+#[test]
+fn source_codec_labels_are_the_serde_names() {
+    for codec in SourceCodec::ALL {
+        let written = serde_yaml_ng::to_string(&codec).unwrap();
+        assert_eq!(written.trim(), codec.label(), "{codec:?}");
+    }
+    let distinct: std::collections::BTreeSet<&str> =
+        SourceCodec::ALL.iter().map(|codec| codec.label()).collect();
+    assert_eq!(
+        distinct.len(),
+        SourceCodec::ALL.len(),
+        "labels are distinct"
+    );
+}
+
+/// An object audio metadata payload with trim and bed assignments, as `truehd`
+/// carried it for its own tests before the `oamd` crate took them over.
+#[cfg(test)]
+const TEST_DATA_TRIM: &[u8] = &[
+    0x1F, 0x88, 0x4B, 0x80, 0x00, 0xA2, 0x70, 0x00, 0x80, 0x40, 0xE4, 0x0B, 0x40, 0x81, 0xDF, 0x02,
+    0x01, 0x03, 0x80, 0xFC, 0x02, 0x07, 0xD4, 0x5A, 0x04, 0x0F, 0xF0, 0x10, 0x08, 0x1C, 0x0F, 0xA0,
+    0x10, 0x38, 0x00, 0x7C, 0x20, 0x7F, 0x9F, 0x80, 0x40, 0xFF, 0x7D, 0x00, 0x81, 0xFE, 0x03, 0xE1,
+    0x03, 0x81, 0xF7, 0xC2, 0x07, 0xFB, 0xEF, 0x84, 0x0E, 0x00, 0x10, 0x08, 0x1C, 0x00, 0x20, 0x10,
+    0x02, 0xB2, 0x20, 0xCC, 0xE6, 0xAB, 0xEF, 0x0C, 0xED, 0x0D, 0x29, 0x86, 0x85, 0x80,
+];
+
+#[cfg(test)]
+const TEST_TOOL: CreationTool = CreationTool {
+    name: "harletty",
+    version: "9.9.9",
+};
+
+#[test]
+fn roundtrip() {
+    let yaml_data = format!(
+        r#"version: {DAMF_VERSION}
+presentations:
+  - type: home
+    simplified: false
+    metadata: NaturesFury.atmos.metadata
+    audio: NaturesFury.atmos.audio
+    offset: 3598.0
+    ffoa: 3600.0
+    fps: 24
+    scNumberOfElements: 14
+    scBedConfiguration: [3]
+    creationTool: Dolby Atmos Conversion Tool
+    creationToolVersion: 2.1.0
+    downmixType_5to2: LoRo_Stereo
+    51-to-20_LsRs90degPhaseShift: false
+    warpMode: LoRo
+    trimMode:
+        NoSurroundsNoHeights:
+            surroundTrim: -0.75
+        SomeSurroundsNoHeights:
+            surroundTrim: -1.5
+        ManySurroundsNoHeights:
+            surroundTrim: -3.0
+        NoSurroundsSomeHeights:
+            surroundTrim: -4.5
+        SomeSurroundsSomeHeights:
+            surroundTrim: -6.0
+        ManySurroundsSomeHeights:
+            surroundTrim: -7.5
+        NoSurroundsManyHeights:
+            surroundTrim: -9.0
+        SomeSurroundsManyHeights:
+            surroundTrim: -10.5
+        ManySurroundsManyHeights:
+            surroundTrim: -12.0
+    bedInstances:
+      - description: Composite Bed
+        groupName: Comp Bed
+        channels:
+          - channel: L
+            ID: 0
+          - channel: R
+            ID: 1
+          - channel: C
+            ID: 2
+          - channel: LFE
+            ID: 3
+          - channel: Lss
+            ID: 4
+          - channel: Rss
+            ID: 5
+          - channel: Lrs
+            ID: 6
+          - channel: Rrs
+            ID: 7
+          - channel: Lts
+            ID: 8
+          - channel: Rts
+            ID: 9
+    objects:
+      - groupName: Dialog
+        ID: 10
+      - description: Dialog Object 2
+        groupName: Dialog
+        ID: 11
+      - description: Dialog Object 3
+        groupName: Dialog
+        ID: 12
+"#
+    );
+
+    let data: Data = serde_yaml_ng::from_str(&yaml_data).unwrap();
+    let string = format_yaml_string(serde_yaml_ng::to_string(&data).unwrap());
+
+    assert_eq!(yaml_data, string);
+}
+
+#[test]
+fn damf() {
+    let test_str = format!(
+        r#"version: {DAMF_VERSION}
+presentations:
+  - type: home
+    simplified: false
+    metadata: test.atmos.metadata
+    audio: test.atmos.audio
+    offset: 0.0
+    fps: 24
+    scBedConfiguration: [3]
+    creationTool: {}
+    creationToolVersion: {}
+    sourceCodec: TrueHD
+    warpMode: ProLogicIIx
+    trimMode:
+        NoSurroundsNoHeights:
+            surroundTrim: -3.0
+            heightTrim: -4.5
+        SomeSurroundsNoHeights:
+            surroundTrim: -9.0
+            frontBackBalanceOverheadFloor: 1.0
+            frontBackBalanceListener: -1.0
+        ManySurroundsNoHeights:
+            surroundTrim: -4.5
+            heightTrim: -3.0
+        SomeSurroundsSomeHeights:
+            surroundTrim: -7.5
+            heightTrim: -0.75
+        SomeSurroundsManyHeights:
+            surroundTrim: -6.0
+            heightTrim: -1.5
+    bedInstances:
+      - channels:
+          - channel: LFE
+            ID: 3
+    objects:
+      - ID: 10
+      - ID: 11
+      - ID: 12
+      - ID: 13
+      - ID: 14
+      - ID: 15
+      - ID: 16
+      - ID: 17
+      - ID: 18
+      - ID: 19
+      - ID: 20
+      - ID: 21
+      - ID: 22
+      - ID: 23
+      - ID: 24
+"#,
+        TEST_TOOL.name, TEST_TOOL.version
+    );
+
+    let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
+    let data = Data::with_oamd_payload(&oamd, Path::new("test"), SourceCodec::TrueHD, TEST_TOOL);
+    let yaml_str = serde_yaml_ng::to_string(&data).unwrap();
+
+    assert_eq!(test_str, format_yaml_string(yaml_str));
+}
+
+/// The `metadata:`/`audio:` entries must name the files actually written, even
+/// when the output path holds characters the YAML layout pass used to rewrite:
+/// a single quote, two spaces in a row, or a hyphen followed by a space.
+/// Anything else and the DAMF will not open in a DAW.
+#[test]
+fn base_name_survives_yaml_formatting() {
+    let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
+
+    for base_name in [
+        "audio  -  output",
+        "Ocean's Eleven",
+        "Movie - 2017",
+        "A Long Name That Comfortably Exceeds The Emitter's Default Line Width Of Eighty Columns",
+    ] {
+        let data =
+            Data::with_oamd_payload(&oamd, Path::new(base_name), SourceCodec::TrueHD, TEST_TOOL);
+        let yaml = data.serialize_damf();
+
+        assert!(
+            yaml.contains(&format!("metadata: {base_name}.atmos.metadata\n")),
+            "metadata entry mangled for {base_name:?}:\n{yaml}"
+        );
+        assert!(
+            yaml.contains(&format!("audio: {base_name}.atmos.audio\n")),
+            "audio entry mangled for {base_name:?}:\n{yaml}"
+        );
+    }
+}
+
+/// A payload shape the projection has no reading for must be reported, not asserted.
+/// These are legal streams — an assert took the whole process down and left the caller
+/// with no way to finalize what it had already written. This affected every version.
+#[test]
+fn unsupported_payload_shapes_are_reported_rather_than_asserted() {
+    use truehd::structs::oamd::BedAssignment;
+
+    let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
+    assert!(
+        Configuration::with_oamd_payload(&oamd, 48000, 0).is_ok(),
+        "the shape the projection does read must still read"
+    );
+
+    let mut isf = oamd.clone();
+    isf.program_assignment.num_isf_objects = 4;
+    assert!(matches!(
+        Configuration::with_oamd_payload(&isf, 48000, 0),
+        Err(UnsupportedPayload::IsfObjects(4))
+    ));
+
+    let mut beds = oamd.clone();
+    beds.program_assignment
+        .bed_assignment
+        .push(BedAssignment::with_lfe_only());
+    assert!(matches!(
+        Configuration::with_oamd_payload(&beds, 48000, 0),
+        Err(UnsupportedPayload::MultipleBedInstances(2))
+    ));
+}
+
+/// An encoder that has no fresh metadata for a while re-asserts the last payload it sent, with
+/// the timing zeroed. The values are unchanged, so it says nothing new, and it must not turn
+/// into an event: the source never had one there.
+#[test]
+fn a_re_asserted_payload_writes_no_event() {
+    let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
+    let first = Configuration::with_oamd_payload(&oamd, 48000, 0).unwrap();
+
+    let mut repeat = oamd.clone();
+    let update = &mut repeat.object_element.as_mut().unwrap().md_update_info;
+    update.sample_offset = 0;
+    for block in update.block_update_info.iter_mut() {
+        block.block_offset_factor_bits = 0;
+        block.ramp_duration = 0;
+    }
+
+    let mut later = Configuration::with_oamd_payload(&repeat, 48000, 5120).unwrap();
+    assert!(later.restates_current_state);
+
+    let mut events = Event::compare_event_vectors(&first.events, &later.events);
+    Event::drop_re_asserted_ramps(&mut events);
+    later.events = events;
+
+    assert_eq!(
+        later.serialize_events(true),
+        "",
+        "a re-assert of the same values is not an event"
+    );
+}
+
+/// The re-assert rule keys on the values being unchanged, so a payload that zeroes its timing
+/// and moves an object is still an event.
+#[test]
+fn a_re_asserted_payload_still_reports_a_move() {
+    let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
+    let first = Configuration::with_oamd_payload(&oamd, 48000, 0).unwrap();
+
+    let mut repeat = oamd.clone();
+    let object_element = repeat.object_element.as_mut().unwrap();
+
+    let update = &mut object_element.md_update_info;
+    update.sample_offset = 0;
+    for block in update.block_update_info.iter_mut() {
+        block.block_offset_factor_bits = 0;
+        block.ramp_duration = 0;
+    }
+
+    let render = &mut object_element.object_data[1][0].object_render_info;
+    render.pos3d = [0.25, 0.75, 0.5];
+
+    let mut later = Configuration::with_oamd_payload(&repeat, 48000, 5120).unwrap();
+    let mut events = Event::compare_event_vectors(&first.events, &later.events);
+    Event::drop_re_asserted_ramps(&mut events);
+    later.events = events;
+
+    let written = later.serialize_events(true);
+    assert!(written.contains("pos: [-0.5, -0.5, 0.5]"), "{written}");
+    assert!(written.contains("samplePos: 5120"), "{written}");
+}
+
+/// After a dropped restatement, the next payload is diffed against what was last written. A
+/// zero-ramp move that follows one must state its ramp: the file never said the ramp had gone to
+/// nought, so a reader carrying it forward would otherwise give the jump the ramp stated before.
+#[test]
+fn a_move_after_a_dropped_restatement_states_its_zero_ramp() {
+    let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
+    let mut ramped = oamd.clone();
+    let blocks = &mut ramped
+        .object_element
+        .as_mut()
+        .unwrap()
+        .md_update_info
+        .block_update_info;
+    for block in blocks.iter_mut() {
+        block.ramp_duration = 1536;
+    }
+    let first = Configuration::with_oamd_payload(&ramped, 48000, 0).unwrap();
+
+    // The encoder re-asserts the same values with the timing zeroed: nothing is written, and
+    // the baseline stays the first payload.
+    let mut repeat = oamd.clone();
+    let update = &mut repeat.object_element.as_mut().unwrap().md_update_info;
+    update.sample_offset = 0;
+    for block in update.block_update_info.iter_mut() {
+        block.block_offset_factor_bits = 0;
+        block.ramp_duration = 0;
+    }
+    let mut restated = Configuration::with_oamd_payload(&repeat, 48000, 5120).unwrap();
+    let mut events = Event::compare_event_vectors(&first.events, &restated.events);
+    Event::drop_re_asserted_ramps(&mut events);
+    let baseline = Event::baseline_after(&first.events, &restated.events, &events);
+    restated.events = events;
+    assert_eq!(restated.serialize_events(true), "");
+    assert_eq!(baseline, first.events);
+
+    // Then one object jumps, the timing still zeroed: its event states the zero ramp.
+    let mut moved = repeat.clone();
+    let render = &mut moved.object_element.as_mut().unwrap().object_data[1][0].object_render_info;
+    render.pos3d = [0.25, 0.75, 0.5];
+    let mut jump = Configuration::with_oamd_payload(&moved, 48000, 10240).unwrap();
+    let mut events = Event::compare_event_vectors(&baseline, &jump.events);
+    Event::drop_re_asserted_ramps(&mut events);
+    let baseline = Event::baseline_after(&baseline, &jump.events, &events);
+    jump.events = events;
+    let written = jump.serialize_events(true);
+    assert!(written.contains("samplePos: 10240"), "{written}");
+    assert!(written.contains("pos: [-0.5, -0.5, 0.5]"), "{written}");
+    assert!(written.contains("rampLength: 0"), "{written}");
+    assert_eq!(written.matches("- ID:").count(), 1, "{written}");
+    // The object that jumped is at a zero ramp from here; the others keep the ramp last written.
+    assert_eq!(baseline[1].ramp_length, Some(0));
+    assert_eq!(baseline[0].ramp_length, Some(1536));
+}

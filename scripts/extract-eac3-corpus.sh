@@ -4,7 +4,7 @@
 # Usage:
 #   extract-eac3-corpus.sh <mkv_path> <track_id> [audio_track_index]
 #
-# - <mkv_path>            Source MKV (typically on /mnt/nas/...).
+# - <mkv_path>            Source MKV.
 # - <track_id>            Short id used as directory name under dumps/eac3-regression/.
 # - [audio_track_index]   Optional 0-based audio stream index. Default: first
 #                         E-AC3 stream reported by mkvmerge -J.

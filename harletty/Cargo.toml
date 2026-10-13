@@ -1,0 +1,64 @@
+[package]
+name = "harletty"
+# Every crate in the workspace shares one version line: they all come from a
+# single commit and are tagged together, so a release number means the same
+# thing everywhere. Bump them together or not at all.
+version = "0.9.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Offline decoder for TrueHD, E-AC-3 JOC, DTS and IAMF bitstreams, writing Dolby Atmos master files"
+repository = "https://github.com/harletty/harletty-bridge"
+build = "build.rs"
+authors = ["Rainbaby"]
+rust-version = "1.87.0"
+
+[[bin]]
+name = "harletty"
+path = "src/main.rs"
+
+[features]
+default = []
+# IAMF (AOMedia Immersive Audio Model and Formats) through iamf-rs, the same
+# pinned fork the bridge decodes with. Off by default for the same reason as
+# there: its Opus decoding links libopus (pkg-config, or OPUS_LIB_DIR), which
+# the Windows and macOS release builds do not provide yet.
+iamf = ["dep:iamf-obu", "dep:iamf-dec", "dep:iamf-codecs"]
+
+# Decoder crates + the offline writers. Nothing here may depend on the
+# Omniphony bridge ABI: this stays a pure offline tool. CI asserts the mirror
+# invariant (no damf/clap/indicatif reachable from harletty-bridge).
+[dependencies]
+truehdd-macros = "0.1.1"
+# `evo-protection`: the keyed digest an Evolution frame's protection word
+# holds. It brings in `hmac` and `sha2`; the key itself is local to the
+# machine and is never part of this repository.
+truehd = { version = "0.7.2", features = ["evo-protection"] }
+eac3 = { version = "0.9.0", path = "../eac3" }
+dca = { version = "0.9.0", path = "../dca" }
+auro = { version = "0.9.0", path = "../auro" }
+damf = { version = "0.9.0", path = "../damf" }
+
+anyhow = "1.0.99"
+clap = { version = "4.5.45", features = ["derive"] }
+env_logger = "0.11.8"
+indicatif = "0.18.0"
+indicatif-log-bridge = "0.2.3"
+log = "0.4.27"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_yaml_ng = "0.10.0"
+serde_json = "1.0.142"
+# Keep the rev in step with bridge/Cargo.toml: both hosts decode IAMF with the
+# same reviewed commit of harletty's fork (object passthrough, f32 output,
+# expanded loudspeaker layouts, split elements).
+iamf-obu = { git = "https://github.com/harletty/iamf-rs", rev = "7515932385ff114dabae4eaf832748a70327e794", optional = true }
+iamf-dec = { git = "https://github.com/harletty/iamf-rs", rev = "7515932385ff114dabae4eaf832748a70327e794", default-features = false, optional = true }
+iamf-codecs = { git = "https://github.com/harletty/iamf-rs", rev = "7515932385ff114dabae4eaf832748a70327e794", default-features = false, features = ["pcm", "flac", "aac", "opus-ffi"], optional = true }
+
+[dev-dependencies]
+sha2 = "0.10"
+
+[build-dependencies]
+anyhow = "1.0.99"
+vergen-gitcl = { version = "1.0.8", default-features = false, features = ["build"] }
+chrono = "0.4.41"
+serde_json = "1.0.142"

@@ -16,7 +16,7 @@ use super::allocation::{
 use super::bitstream::BitReader;
 use super::imdct::ImdctState;
 use super::metadata::{
-    MetadataParseState, ParsedEmdfPayloadData, parse_emdf_payload_body_with_state,
+    JocPayload, MetadataParseState, ParsedEmdfPayloadData, parse_emdf_payload_body_with_state,
 };
 use super::pcm::CorePcmFrame;
 use crate::BedChannel;
@@ -26,27 +26,6 @@ use thiserror::Error;
 const EAC3_BLOCKS: [u8; 4] = [1, 2, 3, 6];
 const AC3_SAMPLE_RATES: [u32; 3] = [48_000, 44_100, 32_000];
 const AC3_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
-const AC3_FRAME_SIZE_WORDS: [[usize; 3]; 19] = [
-    [64, 69, 96],
-    [80, 87, 120],
-    [96, 104, 144],
-    [112, 121, 168],
-    [128, 139, 192],
-    [160, 174, 240],
-    [192, 208, 288],
-    [224, 243, 336],
-    [256, 278, 384],
-    [320, 348, 480],
-    [384, 417, 576],
-    [448, 487, 672],
-    [512, 557, 768],
-    [640, 696, 960],
-    [768, 835, 1152],
-    [896, 975, 1344],
-    [1024, 1114, 1536],
-    [1152, 1253, 1728],
-    [1280, 1393, 1920],
-];
 const DEF_CPL_BNDSTRC: [bool; 18] = [
     false, false, false, false, false, false, false, false, true, false, true, true, false, true,
     true, true, true, true,
@@ -58,6 +37,14 @@ const REMATRIX_BAND_TAB: [usize; 5] = [13, 25, 37, 61, 253];
 const ECPL_SUBBAND_TAB: [usize; 23] = [
     13, 19, 25, 31, 37, 49, 61, 73, 85, 97, 109, 121, 133, 145, 157, 169, 181, 193, 205, 217, 229,
     241, 253,
+];
+const SPX_MAX_SUBBANDS: usize = 17;
+/// Table E2.15 default spectral extension banding structure (FFmpeg
+/// `ff_eac3_default_spx_band_struct`). Applied at block 0 when the band
+/// structure is not transmitted; persists across the frame otherwise.
+const DEF_SPX_BNDSTRC: [bool; SPX_MAX_SUBBANDS] = [
+    false, false, false, false, false, false, false, false, true, false, true, false, true, false,
+    true, false, true,
 ];
 const FRM_EXP_STRATEGIES: [[u8; 6]; 32] = [
     [1, 0, 0, 0, 0, 0],
@@ -306,6 +293,13 @@ pub struct TransientProcessorInfo {
 pub struct AudioFrameInfo {
     pub exponent_strategies_embedded: bool,
     pub adaptive_hybrid_transform_enabled: bool,
+    /// Whether the coupling channel carries its mantissas as an AHT payload in
+    /// block 0 (`chahtinu` for the coupling channel).
+    pub coupling_uses_aht: bool,
+    /// Per fullband channel `chahtinu` flag.
+    pub channel_uses_aht: Vec<bool>,
+    /// `chahtinu` flag for the LFE channel.
+    pub lfe_uses_aht: bool,
     pub snr_offset_strategy: u8,
     pub transient_processing_enabled: bool,
     pub block_switching_enabled: bool,
@@ -329,6 +323,78 @@ pub struct AudioFrameInfo {
     pub block_start_info_present: bool,
     pub block_start_info_bit_len: usize,
     pub block_payload_start_bit_offset: usize,
+}
+
+impl AudioFrameInfo {
+    /// Make `self` a copy of `source`, reusing `self`'s vectors: the decoder
+    /// copies each frame's fields into the one it updates block by block.
+    /// `source` is destructured, so a field added to the struct and not here
+    /// does not compile.
+    fn copy_from(&mut self, source: &Self) {
+        let Self {
+            exponent_strategies_embedded,
+            adaptive_hybrid_transform_enabled,
+            coupling_uses_aht,
+            channel_uses_aht,
+            lfe_uses_aht,
+            snr_offset_strategy,
+            transient_processing_enabled,
+            block_switching_enabled,
+            dithering_enabled,
+            bit_allocation_mode_enabled,
+            frame_gain_syntax_enabled,
+            delta_bit_allocation_enabled,
+            skip_field_syntax_enabled,
+            spectral_extension_attenuation_enabled,
+            coupling_strategy_updates,
+            coupling_in_use,
+            coupling_exponent_strategy,
+            channel_exponent_strategy,
+            lfe_exponent_strategy,
+            converter_exponent_strategy_present,
+            converter_exponent_strategy,
+            frame_csnr_offset,
+            frame_fsnr_offset,
+            transient_processors,
+            spectral_extension_attenuation,
+            block_start_info_present,
+            block_start_info_bit_len,
+            block_payload_start_bit_offset,
+        } = source;
+        self.exponent_strategies_embedded = *exponent_strategies_embedded;
+        self.adaptive_hybrid_transform_enabled = *adaptive_hybrid_transform_enabled;
+        self.coupling_uses_aht = *coupling_uses_aht;
+        self.channel_uses_aht.clone_from(channel_uses_aht);
+        self.lfe_uses_aht = *lfe_uses_aht;
+        self.snr_offset_strategy = *snr_offset_strategy;
+        self.transient_processing_enabled = *transient_processing_enabled;
+        self.block_switching_enabled = *block_switching_enabled;
+        self.dithering_enabled = *dithering_enabled;
+        self.bit_allocation_mode_enabled = *bit_allocation_mode_enabled;
+        self.frame_gain_syntax_enabled = *frame_gain_syntax_enabled;
+        self.delta_bit_allocation_enabled = *delta_bit_allocation_enabled;
+        self.skip_field_syntax_enabled = *skip_field_syntax_enabled;
+        self.spectral_extension_attenuation_enabled = *spectral_extension_attenuation_enabled;
+        self.coupling_strategy_updates
+            .clone_from(coupling_strategy_updates);
+        self.coupling_in_use.clone_from(coupling_in_use);
+        self.coupling_exponent_strategy
+            .clone_from(coupling_exponent_strategy);
+        self.channel_exponent_strategy
+            .clone_from(channel_exponent_strategy);
+        self.lfe_exponent_strategy.clone_from(lfe_exponent_strategy);
+        self.converter_exponent_strategy_present = *converter_exponent_strategy_present;
+        self.converter_exponent_strategy
+            .clone_from(converter_exponent_strategy);
+        self.frame_csnr_offset = *frame_csnr_offset;
+        self.frame_fsnr_offset = *frame_fsnr_offset;
+        self.transient_processors.clone_from(transient_processors);
+        self.spectral_extension_attenuation
+            .clone_from(spectral_extension_attenuation);
+        self.block_start_info_present = *block_start_info_present;
+        self.block_start_info_bit_len = *block_start_info_bit_len;
+        self.block_payload_start_bit_offset = *block_payload_start_bit_offset;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -400,6 +466,18 @@ impl AccessUnitInfo {
         self.payloads()
             .filter(|payload| payload.info.payload_id == 14)
             .count()
+    }
+
+    /// First JOC payload parsed out of this access unit, if any.
+    ///
+    /// The payload is decoded during inspection, so callers that only need the
+    /// header it declares — the downmix configuration, the object count — can
+    /// read it here instead of parsing the access unit again.
+    pub fn first_joc_payload(&self) -> Option<&JocPayload> {
+        self.payloads().find_map(|payload| match &payload.parsed {
+            ParsedEmdfPayloadData::Joc(joc) => Some(joc),
+            _ => None,
+        })
     }
 
     /// Number of OAMD payloads present in this access unit.
@@ -507,9 +585,30 @@ struct ParsedAudioFrame {
     block_start_bit_offsets: Option<Vec<usize>>,
 }
 
+/// Each fullband channel's end mantissa for one block. `acmod` allows at
+/// most five fullband channels, so this lives on the stack.
 struct BlockAllocationInfo {
-    channel_end_mantissas: Vec<usize>,
+    end_mantissas: [usize; MAX_FULLBAND_CHANNELS],
+    channels: usize,
 }
+
+impl BlockAllocationInfo {
+    fn new(end_mantissas: &[usize]) -> Self {
+        let mut stored = [0; MAX_FULLBAND_CHANNELS];
+        stored[..end_mantissas.len()].copy_from_slice(end_mantissas);
+        Self {
+            end_mantissas: stored,
+            channels: end_mantissas.len(),
+        }
+    }
+
+    fn channel_end_mantissas(&self) -> &[usize] {
+        &self.end_mantissas[..self.channels]
+    }
+}
+
+/// The most fullband channels an `acmod` describes (3/2).
+const MAX_FULLBAND_CHANNELS: usize = 5;
 
 #[derive(Debug, Default)]
 struct TrailingAuxDataInfo {
@@ -519,7 +618,22 @@ struct TrailingAuxDataInfo {
 
 #[derive(Debug, Clone)]
 struct BlockSyntaxState {
+    /// AHT pre-mantissas decoded from block 0, indexed `[channel][bin][block]`
+    /// for fullband channels plus dedicated buffers for the coupling and LFE
+    /// channels. Empty until the stream actually uses AHT; sized once and
+    /// reused afterwards.
+    aht_channel_pre_mantissas: Vec<Vec<[i32; 6]>>,
+    aht_coupling_pre_mantissas: Vec<[i32; 6]>,
+    aht_lfe_pre_mantissas: Vec<[i32; 6]>,
+    /// The transform coefficients of the block being decoded, kept between
+    /// blocks so no block starts by zeroing them (every decoder writes its
+    /// whole target). Taken out for the length of a block; a clone of the
+    /// state starts without it.
+    coefficients: CoefficientScratch,
     bit_allocation_params: BitAllocationParams,
+    /// Per-channel end mantissa, refreshed only when a channel transmits new
+    /// exponents and reused across `Reuse` blocks (FFmpeg `end_freq`).
+    channel_end_mantissas: Vec<usize>,
     coupling_allocation: AllocationState,
     coupling_coordinates: Vec<[f32; DEF_CPL_BNDSTRC.len()]>,
     coupling_delta_bit_allocation: DeltaBitAllocationState,
@@ -559,15 +673,67 @@ struct BlockSyntaxState {
     spx_end_subbnd: usize,
     spx_in_use: bool,
     nspxbnds: usize,
-    spx_master: Vec<u8>,
-    spx_gains: Vec<Vec<f32>>,
-    spx_noise_blend: Vec<bool>,
+    /// Persistent SPX banding structure, indexed by absolute subband
+    /// (FFmpeg `spx_band_struct`).
+    spx_band_struct: [bool; SPX_MAX_SUBBANDS],
+    /// Bin count of each SPX band, derived from the banding structure.
+    spx_band_sizes: Vec<usize>,
+    /// First bin of the copy region the extension is synthesized from.
+    spx_dst_start_freq: usize,
+    /// One past the last extension bin (used for the noise-blend ratio).
+    spx_dst_end_freq: usize,
+    /// Per-channel, per-band signal scale: SPX coordinate times the signal
+    /// blending factor. The matching noise term is deliberately not modeled
+    /// (this decoder never injects dither noise).
+    spx_signal_blend: Vec<Vec<f32>>,
+}
+
+/// One block's transform coefficients: a fullband channel's (two in 2/0
+/// mode, where rematrixing needs both before either is transformed; the LFE
+/// takes the first once the fullband channels are done) and the coupling
+/// channel's.
+#[derive(Debug, Default)]
+struct CoefficientScratch(Option<Box<BlockCoefficients>>);
+
+#[derive(Debug)]
+struct BlockCoefficients {
+    channel: [[f32; 256]; 2],
+    coupling: [f32; 256],
+}
+
+impl CoefficientScratch {
+    /// The buffers, allocated the first time they are asked for. Their
+    /// content is whatever the last block left: a decoder writes all of its
+    /// target before anything reads it.
+    fn take(&mut self) -> Box<BlockCoefficients> {
+        self.0.take().unwrap_or_else(|| {
+            Box::new(BlockCoefficients {
+                channel: [[0.0; 256]; 2],
+                coupling: [0.0; 256],
+            })
+        })
+    }
+
+    fn put_back(&mut self, coefficients: Box<BlockCoefficients>) {
+        self.0 = Some(coefficients);
+    }
+}
+
+impl Clone for CoefficientScratch {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
 }
 
 impl BlockSyntaxState {
     fn new(fullband_channels: usize, lfe_on: bool, sample_rate_index: usize) -> Self {
         Self {
+            aht_channel_pre_mantissas: vec![Vec::new(); fullband_channels],
+            aht_coupling_pre_mantissas: Vec::new(),
+            aht_lfe_pre_mantissas: Vec::new(),
+            coefficients: CoefficientScratch::default(),
             bit_allocation_params: BitAllocationParams::default(),
+            channel_end_mantissas: vec![0; fullband_channels],
             coupling_allocation: AllocationState::new(),
             coupling_coordinates: vec![[0.0; DEF_CPL_BNDSTRC.len()]; fullband_channels],
             coupling_delta_bit_allocation: DeltaBitAllocationState::default(),
@@ -608,9 +774,11 @@ impl BlockSyntaxState {
             spx_end_subbnd: 0,
             spx_in_use: false,
             nspxbnds: 0,
-            spx_master: Vec::new(),
-            spx_gains: Vec::new(),
-            spx_noise_blend: Vec::new(),
+            spx_band_struct: DEF_SPX_BNDSTRC,
+            spx_band_sizes: Vec::new(),
+            spx_dst_start_freq: 0,
+            spx_dst_end_freq: 0,
+            spx_signal_blend: Vec::new(),
         }
     }
 
@@ -620,9 +788,10 @@ impl BlockSyntaxState {
         self.spx_begin_subbnd = 0;
         self.spx_end_subbnd = 0;
         self.spxbegf = 0;
-        self.spx_master.clear();
-        self.spx_gains.clear();
-        self.spx_noise_blend.clear();
+        self.spx_band_sizes.clear();
+        self.spx_dst_start_freq = 0;
+        self.spx_dst_end_freq = 0;
+        self.spx_signal_blend.clear();
         for in_use in &mut self.chinspx {
             *in_use = false;
         }
@@ -708,6 +877,9 @@ pub(crate) struct CoreDecodeState {
     block_syntax: Option<BlockSyntaxState>,
     imdct: Vec<ImdctState>,
     lfe_imdct: Option<ImdctState>,
+    /// The frame's audio frame fields, which the block loop updates as it
+    /// goes; kept between frames only so its vectors are reused.
+    audio_frame: Option<AudioFrameInfo>,
 }
 
 impl CoreDecodeState {
@@ -862,11 +1034,19 @@ pub fn inspect_legacy_ac3_access_unit(data: &[u8]) -> Result<AccessUnitInfo, Par
     })
 }
 
-pub(crate) fn inspect_access_unit_with_metadata_state(
-    data: &[u8],
-    metadata_state: &mut MetadataParseState,
-    mut aux_state: Option<&mut AuxDataDecodeState>,
-) -> Result<AccessUnitInfo, ParseError> {
+/// Everything in an E-AC-3 access unit up to its audio blocks: the
+/// syncinfo, bit stream information and audio frame fields, and the trailing
+/// aux data located from the end of the frame. Reading it costs a few hundred
+/// bits; the blocks behind it are what a walk or a decode then goes through.
+struct AccessUnitPrefix<'a> {
+    frame: &'a [u8],
+    info: AccessUnitInfo,
+    sample_rate_index: usize,
+    block_start_bit_offsets: Option<Vec<usize>>,
+    trailing_aux_data: TrailingAuxDataInfo,
+}
+
+fn parse_access_unit_prefix(data: &[u8]) -> Result<AccessUnitPrefix<'_>, ParseError> {
     if data.len() < 7 {
         return Err(ParseError::ShortPacket);
     }
@@ -1015,11 +1195,75 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
     )?;
 
     let trailing_aux_data = extract_trailing_aux_data(frame);
+
+    Ok(AccessUnitPrefix {
+        frame,
+        info: AccessUnitInfo {
+            frame_size,
+            bitstream_id,
+            frame_type,
+            substreamid,
+            sample_rate,
+            num_blocks,
+            channel_mode,
+            channels,
+            fullband_channels,
+            lfe_on,
+            dependent_channel_map,
+            dialogue_normalization,
+            heavy_compression_exists,
+            heavy_compression_word,
+            addbsi_present,
+            extension_type_a,
+            complexity_index_type_a,
+            mixing_metadata_present,
+            informational_metadata_present,
+            addbsi_bytes,
+            body_start_bit_offset,
+            audio_frame: audio_frame.info,
+            block_drc: Vec::new(),
+            skip_fields: Vec::new(),
+            trailing_aux_data: Vec::new(),
+            aux_data: Vec::new(),
+            aux_parse_status: AuxParseStatus::Disabled,
+            emdf_source: EmdfSource::None,
+            emdf_blocks: Vec::new(),
+            emdf_block_count: 0,
+            first_emdf_sync_offset: None,
+        },
+        sample_rate_index,
+        block_start_bit_offsets: audio_frame.block_start_bit_offsets,
+        trailing_aux_data,
+    })
+}
+
+pub(crate) fn inspect_access_unit_with_metadata_state(
+    data: &[u8],
+    metadata_state: &mut MetadataParseState,
+    mut aux_state: Option<&mut AuxDataDecodeState>,
+) -> Result<AccessUnitInfo, ParseError> {
+    let AccessUnitPrefix {
+        frame,
+        mut info,
+        sample_rate_index,
+        block_start_bit_offsets,
+        trailing_aux_data,
+    } = parse_access_unit_prefix(data)?;
+    let AccessUnitInfo {
+        frame_type,
+        num_blocks,
+        channel_mode,
+        fullband_channels,
+        lfe_on,
+        ..
+    } = info;
+    let audio_frame = &info.audio_frame;
+
     let mut block_drc = Vec::with_capacity(num_blocks as usize);
     let mut skip_fields = Vec::new();
     let mut aux_parse_status = AuxParseStatus::Disabled;
-    if audio_frame.info.skip_field_syntax_enabled {
-        if num_blocks == 1 || audio_frame.block_start_bit_offsets.is_some() {
+    if audio_frame.skip_field_syntax_enabled {
+        if num_blocks == 1 || block_start_bit_offsets.is_some() {
             match collect_skip_fields(
                 frame,
                 frame_type,
@@ -1027,8 +1271,8 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                 channel_mode,
                 fullband_channels as usize,
                 lfe_on,
-                &audio_frame.info,
-                audio_frame.block_start_bit_offsets.as_deref(),
+                audio_frame,
+                block_start_bit_offsets.as_deref(),
                 trailing_aux_data.start_bit_offset,
                 sample_rate_index,
                 &mut block_drc,
@@ -1079,7 +1323,7 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                 channel_mode,
                 fullband_channels as usize,
                 lfe_on,
-                &audio_frame.info,
+                audio_frame,
                 trailing_aux_data.start_bit_offset,
                 &mut walk_state,
                 &mut block_drc,
@@ -1107,7 +1351,9 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                 Err(
                     err @ (ParseError::ShortPacket
                     | ParseError::InvalidHeader("block-end")
-                    | ParseError::InvalidHeader("mantissa-range")),
+                    | ParseError::InvalidHeader("mantissa-range")
+                    | ParseError::InvalidHeader("spx-range")
+                    | ParseError::InvalidHeader("spx-copy-start")),
                 ) => {
                     emit_aux_debug(format_args!(
                         "no-blkstart frame sequential parse error: {err}"
@@ -1130,8 +1376,8 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
             channel_mode,
             fullband_channels as usize,
             lfe_on,
-            &audio_frame.info,
-            audio_frame.block_start_bit_offsets.as_deref(),
+            audio_frame,
+            block_start_bit_offsets.as_deref(),
             trailing_aux_data.start_bit_offset,
             sample_rate_index,
             &mut block_drc,
@@ -1143,8 +1389,24 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
         }
     }
 
+    info.block_drc = block_drc;
+    info.skip_fields = skip_fields;
+    info.aux_parse_status = aux_parse_status;
+    finish_access_unit_info(&mut info, frame, trailing_aux_data, metadata_state);
+    Ok(info)
+}
+
+/// Gather the aux data the skip fields and the frame's tail carry and parse
+/// the EMDF in it, completing `info` once its blocks have been read.
+fn finish_access_unit_info(
+    info: &mut AccessUnitInfo,
+    frame: &[u8],
+    trailing_aux_data: TrailingAuxDataInfo,
+    metadata_state: &mut MetadataParseState,
+) {
+    let skip_fields = &info.skip_fields;
     let mut aux_data = Vec::new();
-    for field in &skip_fields {
+    for field in skip_fields {
         aux_data.extend_from_slice(&field.bytes);
     }
     aux_data.extend_from_slice(&trailing_aux_data.bytes);
@@ -1161,47 +1423,19 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
     };
     let first_emdf_sync_offset = emdf_blocks.first().map(|block| block.sync_offset);
 
-    Ok(AccessUnitInfo {
-        frame_size,
-        bitstream_id,
-        frame_type,
-        substreamid,
-        sample_rate,
-        num_blocks,
-        channel_mode,
-        channels,
-        fullband_channels,
-        lfe_on,
-        dependent_channel_map,
-        dialogue_normalization,
-        heavy_compression_exists,
-        heavy_compression_word,
-        addbsi_present,
-        extension_type_a,
-        complexity_index_type_a,
-        mixing_metadata_present,
-        informational_metadata_present,
-        addbsi_bytes,
-        body_start_bit_offset,
-        audio_frame: audio_frame.info,
-        block_drc,
-        skip_fields,
-        trailing_aux_data: trailing_aux_data.bytes,
-        aux_data,
-        aux_parse_status,
-        emdf_source,
-        emdf_block_count: emdf_blocks.len(),
-        first_emdf_sync_offset,
-        emdf_blocks,
-    })
+    info.trailing_aux_data = trailing_aux_data.bytes;
+    info.aux_data = aux_data;
+    info.emdf_source = emdf_source;
+    info.emdf_block_count = emdf_blocks.len();
+    info.first_emdf_sync_offset = first_emdf_sync_offset;
+    info.emdf_blocks = emdf_blocks;
 }
 
+/// Frame size of a legacy AC-3 syncframe; one table for the whole crate (the
+/// raw extractor frames with it too), see [`crate::parser::legacy_ac3_frame_size`].
 fn legacy_ac3_frame_size(fscod: u8, frmsizecod: u8) -> Result<usize, ParseError> {
-    let bitrate_index = usize::from(frmsizecod >> 1);
-    if fscod > 2 || bitrate_index >= AC3_FRAME_SIZE_WORDS.len() {
-        return Err(ParseError::InvalidHeader("frame-size"));
-    }
-    Ok(AC3_FRAME_SIZE_WORDS[bitrate_index][usize::from(fscod)] * 2)
+    crate::parser::legacy_ac3_frame_size(fscod, frmsizecod)
+        .ok_or(ParseError::InvalidHeader("frame-size"))
 }
 
 fn legacy_ac3_volume_control(
@@ -1273,6 +1507,9 @@ fn legacy_ac3_audio_frame_info(
     AudioFrameInfo {
         exponent_strategies_embedded: true,
         adaptive_hybrid_transform_enabled: false,
+        coupling_uses_aht: false,
+        channel_uses_aht: vec![false; fullband_channels],
+        lfe_uses_aht: false,
         snr_offset_strategy: 2,
         transient_processing_enabled: false,
         block_switching_enabled: true,
@@ -1423,9 +1660,6 @@ fn parse_audio_frame(
     } else {
         false
     };
-    if adaptive_hybrid_transform_enabled {
-        return Err(ParseError::UnsupportedFeature("aht"));
-    }
 
     let snr_offset_strategy = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as u8;
     let transient_processing_enabled = reader.read_bit().ok_or(ParseError::ShortPacket)?;
@@ -1518,6 +1752,40 @@ fn parse_audio_frame(
         }
     }
 
+    // Determine which channels use AHT (`chahtinu`). The flag is only present
+    // for channels whose exponent strategy reuses block 0's exponents in every
+    // later block; the coupling channel additionally requires coupling in use
+    // in all six blocks with no mid-frame strategy update. Mirrors FFmpeg
+    // ff_eac3_parse_header's parse_aht_info section. `adaptive_hybrid_
+    // transform_enabled` implies num_blocks == 6.
+    let mut coupling_uses_aht = false;
+    let mut channel_uses_aht = vec![false; fullband_channels];
+    let mut lfe_uses_aht = false;
+    if adaptive_hybrid_transform_enabled {
+        if coupling_in_use.iter().all(|in_use| *in_use) {
+            let eligible = (1..num_blocks).all(|blk| {
+                !coupling_strategy_updates[blk]
+                    && coupling_exponent_strategy[blk] == Some(ExpStrategy::Reuse)
+            });
+            if eligible {
+                coupling_uses_aht = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+            }
+        }
+        for channel in 0..fullband_channels {
+            let eligible = (1..num_blocks)
+                .all(|blk| channel_exponent_strategy[blk][channel] == ExpStrategy::Reuse);
+            if eligible {
+                channel_uses_aht[channel] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+            }
+        }
+        if lfe_on {
+            let eligible = (1..num_blocks).all(|blk| !lfe_exponent_strategy[blk]);
+            if eligible {
+                lfe_uses_aht = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+            }
+        }
+    }
+
     let (frame_csnr_offset, frame_fsnr_offset) = if snr_offset_strategy == 0 {
         (
             Some(reader.read_bits(6).ok_or(ParseError::ShortPacket)? as u8),
@@ -1576,6 +1844,9 @@ fn parse_audio_frame(
         info: AudioFrameInfo {
             exponent_strategies_embedded,
             adaptive_hybrid_transform_enabled,
+            coupling_uses_aht,
+            channel_uses_aht,
+            lfe_uses_aht,
             snr_offset_strategy,
             transient_processing_enabled,
             block_switching_enabled,
@@ -1948,6 +2219,7 @@ fn parse_block(
             audio_frame,
             state,
         )?;
+        read_rematrixing(reader, block, channel_mode, false, audio_frame, state)?;
         read_legacy_ac3_exponent_strategies(reader, block, fullband_channels, lfe_on, audio_frame)?;
     } else {
         read_spx(reader, block, channel_mode, fullband_channels, state)?;
@@ -1967,6 +2239,10 @@ fn parse_block(
             audio_frame,
             state,
         )?;
+        // Stereo rematrixing sits between the coupling coordinates and the
+        // exponents; the walker used to skip it, desyncing every 2/0 block
+        // that transmits a rematrixing strategy (up to 4 bits per block).
+        read_rematrixing(reader, block, channel_mode, true, audio_frame, state)?;
     }
     let allocation = read_exponents(reader, block, fullband_channels, lfe_on, audio_frame, state)?;
 
@@ -2054,13 +2330,6 @@ fn read_legacy_ac3_coupling_strategy(
     audio_frame: &mut AudioFrameInfo,
     state: &mut BlockSyntaxState,
 ) -> Result<(), ParseError> {
-    if channel_mode <= 1 {
-        audio_frame.coupling_strategy_updates[block] = false;
-        audio_frame.coupling_in_use[block] = false;
-        state.clear_coupling();
-        return Ok(());
-    }
-
     let update = reader.read_bit().ok_or(ParseError::ShortPacket)?;
     if block == 0 && !update {
         return Err(ParseError::InvalidHeader("cplstrat"));
@@ -2068,6 +2337,13 @@ fn read_legacy_ac3_coupling_strategy(
     audio_frame.coupling_strategy_updates[block] = update;
     if update {
         let in_use = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+        // Legacy AC-3 transmits cplstre/cplinu in every audblk regardless of
+        // acmod — mono and dual-mono included (skipping them desyncs the whole
+        // block). Coupling itself needs two full-bandwidth channels, so
+        // cplinu=1 there is invalid data (FFmpeg errors identically).
+        if in_use && channel_mode <= 1 {
+            return Err(ParseError::InvalidHeader("cpl-mono"));
+        }
         audio_frame.coupling_in_use[block] = in_use;
         state.ecplinu = false;
         if in_use {
@@ -2086,10 +2362,14 @@ fn read_legacy_ac3_coupling_strategy(
             };
             state.cplbegf = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as usize;
             state.cplendf = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as usize;
-            if state.cplendf < state.cplbegf {
-                state.clear_coupling();
-                audio_frame.coupling_in_use[block] = false;
-                return Ok(());
+            // The coupled subband range is [cplbegf, cplendf + 3), so
+            // `cplendf < cplbegf` alone is legal (high-band coupling with up to
+            // 2 subbands). Only an empty range is invalid, and it must be a
+            // hard error: bailing out mid-syntax would desync every field
+            // after cplbndstrc (FFmpeg ac3dec.c rejects
+            // `cpl_start_subband >= cpl_end_subband` the same way).
+            if state.cplbegf >= state.cplendf + 3 {
+                return Err(ParseError::InvalidHeader("cpl-band-range"));
             }
             state.ncplsubnd = 3 + state.cplendf - state.cplbegf;
             state.ncplbnd = state.ncplsubnd;
@@ -2225,7 +2505,7 @@ fn coupling_end_mantissa(state: &BlockSyntaxState) -> Result<usize, ParseError> 
     }
 }
 
-fn allocate_coupling_channel(state: &mut BlockSyntaxState) -> Result<(), ParseError> {
+fn allocate_coupling_channel(state: &mut BlockSyntaxState, aht: bool) -> Result<(), ParseError> {
     let cplendmant = coupling_end_mantissa(state)?;
     let coupling_snr_offset = (((state.csnr_offset - 15) << 4) + state.cpl_fsnr_offset) << 2;
     if state.csnr_offset == 0 && state.cpl_fsnr_offset == 0 {
@@ -2243,6 +2523,7 @@ fn allocate_coupling_channel(state: &mut BlockSyntaxState) -> Result<(), ParseEr
         &state.coupling_delta_bit_allocation,
         state.cpl_fast_leak,
         state.cpl_slow_leak,
+        aht,
     )
 }
 
@@ -2301,28 +2582,58 @@ fn read_spx(
                     state.chinspx[channel] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
                 }
             }
-            reader.skip_bits(2).ok_or(ParseError::ShortPacket)?;
+            let dst_start_code = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as usize;
             state.spxbegf = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as usize;
             let spxendf = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as usize;
-            state.spx_begin_subbnd = if state.spxbegf < 6 {
-                state.spxbegf + 2
-            } else {
-                state.spxbegf * 2 - 3
-            };
-            state.spx_end_subbnd = if spxendf < 3 {
-                spxendf + 5
-            } else {
-                spxendf * 2 + 3
-            };
+            let mut begin_subbnd = state.spxbegf + 2;
+            if begin_subbnd > 7 {
+                begin_subbnd += begin_subbnd - 7;
+            }
+            let mut end_subbnd = spxendf + 5;
+            if end_subbnd > 7 {
+                end_subbnd += end_subbnd - 7;
+            }
+            // Both are hard errors: bailing out mid-syntax would desync every
+            // field after the band structure (FFmpeg rejects them the same
+            // way).
+            if begin_subbnd >= end_subbnd {
+                return Err(ParseError::InvalidHeader("spx-range"));
+            }
+            state.spx_begin_subbnd = begin_subbnd;
+            state.spx_end_subbnd = end_subbnd;
+            state.spx_dst_start_freq = dst_start_code * 12 + 25;
+            state.spx_dst_end_freq = end_subbnd * 12 + 25;
+            if state.spx_dst_start_freq >= begin_subbnd * 12 + 25 {
+                return Err(ParseError::InvalidHeader("spx-copy-start"));
+            }
 
-            let mut band_struct = vec![false; state.spx_end_subbnd];
+            // Banding structure (FFmpeg decode_band_structure): reset to the
+            // default table on block 0, optionally overridden from the
+            // bitstream, and persistent across the remaining blocks.
+            if block == 0 {
+                state.spx_band_struct = DEF_SPX_BNDSTRC;
+            }
             if reader.read_bit().ok_or(ParseError::ShortPacket)? {
-                for band in (state.spx_begin_subbnd + 1)..state.spx_end_subbnd {
-                    band_struct[band] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+                for subbnd in (begin_subbnd + 1)..end_subbnd {
+                    let merged = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+                    let Some(slot) = state.spx_band_struct.get_mut(subbnd) else {
+                        return Err(ParseError::InvalidHeader("spxbndstrc"));
+                    };
+                    *slot = merged;
                 }
             }
-            state.nspxbnds =
-                count_spx_bands(&band_struct, state.spx_begin_subbnd, state.spx_end_subbnd);
+            state.spx_band_sizes.clear();
+            state.spx_band_sizes.push(12);
+            for subbnd in (begin_subbnd + 1)..end_subbnd {
+                if state.spx_band_struct.get(subbnd).copied().unwrap_or(false) {
+                    if let Some(last) = state.spx_band_sizes.last_mut() {
+                        *last += 12;
+                    }
+                } else {
+                    state.spx_band_sizes.push(12);
+                }
+            }
+            state.nspxbnds = state.spx_band_sizes.len();
         } else {
             state.clear_spx();
         }
@@ -2338,33 +2649,44 @@ fn read_spx(
                     reader.read_bit().ok_or(ParseError::ShortPacket)?
                 };
                 if coordinates_present {
-                    let master = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as u8;
-                    let noise_blend = reader.read_bit().ok_or(ParseError::ShortPacket)?;
-                    if noise_blend {
-                        reader.skip_bits(4).ok_or(ParseError::ShortPacket)?;
+                    // Field order per A/52 Annex E / FFmpeg spx_coordinates:
+                    // spxblnd (5), mstrspxco (2), then per band spxcoexp (4) +
+                    // spxcomant (2).
+                    let spx_blend =
+                        reader.read_bits(5).ok_or(ParseError::ShortPacket)? as f32 / 32.0;
+                    let master = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as usize * 3;
+                    while state.spx_signal_blend.len() <= channel {
+                        state.spx_signal_blend.push(Vec::new());
                     }
-                    let mut gains = Vec::with_capacity(state.nspxbnds);
-                    for _ in 0..state.nspxbnds {
-                        let exponent = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
-                        let mantissa = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as i32;
-                        gains.push(decode_coupling_coordinate(
-                            exponent,
-                            mantissa,
-                            master as i32 * 3,
-                        ));
+                    let mut blends = std::mem::take(&mut state.spx_signal_blend[channel]);
+                    blends.clear();
+                    blends.reserve(state.nspxbnds);
+                    let mut bin = state.spx_begin_subbnd * 12 + 25;
+                    for band in 0..state.nspxbnds {
+                        let band_size = state.spx_band_sizes.get(band).copied().unwrap_or_default();
+                        // Signal blending factor: sqrt(1 - nratio), the
+                        // counterpart noise term sqrt(3 * nratio) is not
+                        // modeled (no dither noise in this decoder).
+                        let nratio = ((bin + (band_size >> 1)) as f32
+                            / state.spx_dst_end_freq.max(1) as f32
+                            - spx_blend)
+                            .clamp(0.0, 1.0);
+                        let sblend = (1.0 - nratio).sqrt();
+                        bin += band_size;
+
+                        let exponent = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as usize;
+                        let mut mantissa =
+                            reader.read_bits(2).ok_or(ParseError::ShortPacket)? as i32;
+                        if exponent == 15 {
+                            mantissa <<= 1;
+                        } else {
+                            mantissa += 4;
+                        }
+                        mantissa <<= 25 - exponent - master;
+                        let spx_coord = mantissa as f32 / (1 << 23) as f32;
+                        blends.push(sblend * spx_coord);
                     }
-                    while state.spx_master.len() <= channel {
-                        state.spx_master.push(0);
-                    }
-                    while state.spx_gains.len() <= channel {
-                        state.spx_gains.push(Vec::new());
-                    }
-                    while state.spx_noise_blend.len() <= channel {
-                        state.spx_noise_blend.push(false);
-                    }
-                    state.spx_master[channel] = master;
-                    state.spx_gains[channel] = gains;
-                    state.spx_noise_blend[channel] = noise_blend;
+                    state.spx_signal_blend[channel] = blends;
                 }
             } else {
                 state.first_spx_coords[channel] = true;
@@ -2373,16 +2695,6 @@ fn read_spx(
     }
 
     Ok(())
-}
-
-fn count_spx_bands(band_struct: &[bool], begin_subbnd: usize, end_subbnd: usize) -> usize {
-    let mut bands = 1usize;
-    for band in (begin_subbnd + 1)..end_subbnd {
-        if !band_struct.get(band).copied().unwrap_or(false) {
-            bands += 1;
-        }
-    }
-    bands
 }
 
 fn read_coupling_strategy(
@@ -2431,15 +2743,15 @@ fn read_coupling_strategy(
                 state.spxbegf * 2 - 7
             };
 
-            if state.cplendf < state.cplbegf {
-                state.clear_coupling();
-                return Ok(());
+            // Same range rule as legacy AC-3: coupled subbands span
+            // [cplbegf, cplendf + 3), so only an empty range is invalid, and
+            // continuing after clearing coupling would desync the remaining
+            // block syntax.
+            if state.cplbegf >= state.cplendf + 3 {
+                return Err(ParseError::InvalidHeader("cpl-band-range"));
             }
 
             state.ncplsubnd = 3 + state.cplendf - state.cplbegf;
-            if state.ncplsubnd == 0 {
-                return Err(ParseError::InvalidHeader("ncplsubnd"));
-            }
             state.ncplbnd = state.ncplsubnd;
 
             if reader.read_bit().ok_or(ParseError::ShortPacket)? {
@@ -2637,9 +2949,9 @@ fn read_exponents(
         if state.ecplinu {
             // TODO: Derive exponent group sizes for enhanced coupling instead of falling back.
             state.clear_coupling();
-            return Ok(BlockAllocationInfo {
-                channel_end_mantissas: vec![0; fullband_channels],
-            });
+            return Ok(BlockAllocationInfo::new(
+                &[0; MAX_FULLBAND_CHANNELS][..fullband_channels],
+            ));
         }
         if let Some(strategy) = audio_frame.coupling_exponent_strategy[block] {
             // Reuse means no exponent payload at all — neither the absolute
@@ -2672,15 +2984,26 @@ fn read_exponents(
         }
     }
 
-    let mut channel_end_mantissas = vec![0usize; fullband_channels];
     for channel in 0..fullband_channels {
+        // Per FFmpeg ac3dec.c "channel bandwidth": the end mantissa is chosen
+        // from this channel's own coupling / SPX flags, and is only refreshed
+        // when the channel transmits new exponents — a `Reuse` block keeps the
+        // previous block's value. Deriving it from the frame-wide `spx_in_use`
+        // instead of the per-channel `chinspx` made every non-SPX channel in an
+        // SPX frame read its exponent groups against the wrong end mantissa
+        // (the 6-bit chbwcod was parsed and then discarded), desyncing the
+        // block.
+        if audio_frame.channel_exponent_strategy[block][channel] == ExpStrategy::Reuse {
+            continue;
+        }
+
         let endmant = if state.ecplinu {
             // TODO: Derive `endmant` for enhanced coupling instead of falling back.
             state.spx_begin_subbnd * 12 + 25
-        } else if state.spx_in_use && !audio_frame.coupling_in_use[block] {
-            state.spx_begin_subbnd * 12 + 25
         } else if state.chincpl[channel] {
             cplstrtmant
+        } else if state.chinspx[channel] {
+            state.spx_begin_subbnd * 12 + 25
         } else {
             if state.chbwcod[channel] > 60 {
                 return Err(ParseError::InvalidHeader("chbwcod"));
@@ -2688,20 +3011,19 @@ fn read_exponents(
             (state.chbwcod[channel] as usize + 12) * 3 + 37
         };
 
-        channel_end_mantissas[channel] = endmant;
+        state.channel_end_mantissas[channel] = endmant;
         let group_count = grouped_exponent_count(
             endmant,
             audio_frame.channel_exponent_strategy[block][channel],
         )?;
-        if audio_frame.channel_exponent_strategy[block][channel] != ExpStrategy::Reuse {
-            state.channel_allocations[channel].read_channel_exponents(
-                reader,
-                audio_frame.channel_exponent_strategy[block][channel],
-                group_count,
-                endmant,
-            )?;
-        }
+        state.channel_allocations[channel].read_channel_exponents(
+            reader,
+            audio_frame.channel_exponent_strategy[block][channel],
+            group_count,
+            endmant,
+        )?;
     }
+    let allocation = BlockAllocationInfo::new(&state.channel_end_mantissas);
 
     if lfe_on
         && audio_frame
@@ -2715,9 +3037,7 @@ fn read_exponents(
         }
     }
 
-    Ok(BlockAllocationInfo {
-        channel_end_mantissas,
-    })
+    Ok(allocation)
 }
 
 fn read_bit_allocation_params(
@@ -2795,12 +3115,13 @@ fn read_snr_offsets(
         return Ok(());
     }
 
-    let snr_offsets_present = if block == 0 {
-        true
-    } else {
-        reader.read_bit().ok_or(ParseError::ShortPacket)?
-    };
-    if !snr_offsets_present {
+    // E-AC-3 transmits per-block SNR offsets only in block 0, behind a
+    // presence flag; later blocks carry nothing and keep block 0's values
+    // (FFmpeg ac3dec.c: `if (!s->eac3 || !blk)`).
+    if block != 0 {
+        return Ok(());
+    }
+    if !reader.read_bit().ok_or(ParseError::ShortPacket)? {
         return Ok(());
     }
 
@@ -2930,22 +3251,33 @@ fn consume_block_mantissas(
     let mut mantissa_groups = MantissaGroupState::new_block();
     let mut total_mantissa_bits = 0usize;
     let first_coupled_channel = if audio_frame.coupling_in_use[block] {
-        allocate_coupling_channel(state)?;
+        if !audio_frame.coupling_uses_aht {
+            allocate_coupling_channel(state, false)?;
+        } else if block == 0 {
+            allocate_coupling_channel(state, true)?;
+        }
         state.chincpl.iter().position(|in_use| *in_use)
     } else {
         None
     };
-    for channel in 0..allocation.channel_end_mantissas.len() {
-        let end_mantissa = allocation.channel_end_mantissas[channel];
+    for (channel, &end_mantissa) in allocation.channel_end_mantissas().iter().enumerate() {
         if end_mantissa > 256 {
             return Err(ParseError::InvalidHeader("mantissa-range"));
         }
 
+        let uses_aht = audio_frame
+            .channel_uses_aht
+            .get(channel)
+            .copied()
+            .unwrap_or(false);
         let channel_snr_offset =
             (((state.csnr_offset - 15) << 4) + state.channel_fsnr_offsets[channel]) << 2;
-        if state.csnr_offset == 0 && state.channel_fsnr_offsets[channel] == 0 {
+        if (!uses_aht || block == 0)
+            && state.csnr_offset == 0
+            && state.channel_fsnr_offsets[channel] == 0
+        {
             state.channel_allocations[channel].clear_bap();
-        } else {
+        } else if !uses_aht || block == 0 {
             state.channel_allocations[channel].allocate(
                 0,
                 end_mantissa,
@@ -2956,52 +3288,88 @@ fn consume_block_mantissas(
                 &state.channel_delta_bit_allocation[channel],
                 0,
                 0,
+                uses_aht,
             )?;
         }
 
-        let mantissa_bits = state.channel_allocations[channel].count_mantissa_bits(
-            0,
-            end_mantissa,
-            &mut mantissa_groups,
-        );
-        total_mantissa_bits += mantissa_bits;
-        emit_aux_debug(format_args!(
-            "block={block} ch={channel} endmant={end_mantissa} csnr={} fsnr={} fgain={} mantissa_bits={mantissa_bits}",
-            state.csnr_offset,
-            state.channel_fsnr_offsets[channel],
-            state.channel_fgain_codes[channel],
-        ));
-        reader
-            .skip_bits(mantissa_bits)
-            .ok_or(ParseError::ShortPacket)?;
-
-        if first_coupled_channel == Some(channel) {
-            let coupling_bits = state.coupling_allocation.count_mantissa_bits(
-                coupling_start_mantissa(state),
-                coupling_end_mantissa(state)?,
+        if uses_aht {
+            // AHT payloads have data-dependent length (GAQ escape codes), so
+            // the walker decodes them for real instead of counting bits.
+            let start_pos = reader.position();
+            if block == 0 {
+                state.channel_allocations[channel].decode_aht_mantissas(
+                    reader,
+                    0,
+                    end_mantissa,
+                    &mut state.aht_channel_pre_mantissas[channel],
+                )?;
+            }
+            let mantissa_bits = reader.position() - start_pos;
+            total_mantissa_bits += mantissa_bits;
+            emit_aux_debug(format_args!(
+                "block={block} ch={channel} endmant={end_mantissa} aht=1 mantissa_bits={mantissa_bits}",
+            ));
+        } else {
+            let mantissa_bits = state.channel_allocations[channel].count_mantissa_bits(
+                0,
+                end_mantissa,
                 &mut mantissa_groups,
             );
-            total_mantissa_bits += coupling_bits;
+            total_mantissa_bits += mantissa_bits;
             emit_aux_debug(format_args!(
-                "block={block} cpl startmant={} endmant={} csnr={} fsnr={} fgain={} mantissa_bits={coupling_bits}",
-                coupling_start_mantissa(state),
-                coupling_end_mantissa(state)?,
+                "block={block} ch={channel} endmant={end_mantissa} csnr={} fsnr={} fgain={} mantissa_bits={mantissa_bits}",
                 state.csnr_offset,
-                state.cpl_fsnr_offset,
-                state.cpl_fgain_code,
+                state.channel_fsnr_offsets[channel],
+                state.channel_fgain_codes[channel],
             ));
             reader
-                .skip_bits(coupling_bits)
+                .skip_bits(mantissa_bits)
                 .ok_or(ParseError::ShortPacket)?;
+        }
+
+        if first_coupled_channel == Some(channel) {
+            let cpl_start = coupling_start_mantissa(state);
+            let cpl_end = coupling_end_mantissa(state)?;
+            if audio_frame.coupling_uses_aht {
+                let start_pos = reader.position();
+                if block == 0 {
+                    state.coupling_allocation.decode_aht_mantissas(
+                        reader,
+                        cpl_start,
+                        cpl_end,
+                        &mut state.aht_coupling_pre_mantissas,
+                    )?;
+                }
+                let coupling_bits = reader.position() - start_pos;
+                total_mantissa_bits += coupling_bits;
+                emit_aux_debug(format_args!(
+                    "block={block} cpl startmant={cpl_start} endmant={cpl_end} aht=1 mantissa_bits={coupling_bits}",
+                ));
+            } else {
+                let coupling_bits = state.coupling_allocation.count_mantissa_bits(
+                    cpl_start,
+                    cpl_end,
+                    &mut mantissa_groups,
+                );
+                total_mantissa_bits += coupling_bits;
+                emit_aux_debug(format_args!(
+                    "block={block} cpl startmant={cpl_start} endmant={cpl_end} csnr={} fsnr={} fgain={} mantissa_bits={coupling_bits}",
+                    state.csnr_offset, state.cpl_fsnr_offset, state.cpl_fgain_code,
+                ));
+                reader
+                    .skip_bits(coupling_bits)
+                    .ok_or(ParseError::ShortPacket)?;
+            }
         }
     }
 
     if lfe_on {
         if let Some(lfe_allocation) = state.lfe_allocation.as_mut() {
+            let uses_aht = audio_frame.lfe_uses_aht;
             let lfe_snr_offset = (((state.csnr_offset - 15) << 4) + state.lfe_fsnr_offset) << 2;
-            if state.csnr_offset == 0 && state.lfe_fsnr_offset == 0 {
+            if (!uses_aht || block == 0) && state.csnr_offset == 0 && state.lfe_fsnr_offset == 0 {
                 lfe_allocation.clear_bap();
-            } else {
+            } else if !uses_aht || block == 0 {
                 lfe_allocation.allocate(
                     0,
                     LFE_END_MANTISSA,
@@ -3012,18 +3380,40 @@ fn consume_block_mantissas(
                     &DeltaBitAllocationState::default(),
                     0,
                     0,
+                    uses_aht,
                 )?;
             }
-            let mantissa_bits =
-                lfe_allocation.count_mantissa_bits(0, LFE_END_MANTISSA, &mut mantissa_groups);
-            total_mantissa_bits += mantissa_bits;
-            emit_aux_debug(format_args!(
-                "block={block} lfe endmant={} csnr={} fsnr={} fgain={} mantissa_bits={mantissa_bits}",
-                LFE_END_MANTISSA, state.csnr_offset, state.lfe_fsnr_offset, state.lfe_fgain_code,
-            ));
-            reader
-                .skip_bits(mantissa_bits)
-                .ok_or(ParseError::ShortPacket)?;
+            if uses_aht {
+                let start_pos = reader.position();
+                if block == 0 {
+                    lfe_allocation.decode_aht_mantissas(
+                        reader,
+                        0,
+                        LFE_END_MANTISSA,
+                        &mut state.aht_lfe_pre_mantissas,
+                    )?;
+                }
+                let mantissa_bits = reader.position() - start_pos;
+                total_mantissa_bits += mantissa_bits;
+                emit_aux_debug(format_args!(
+                    "block={block} lfe endmant={} aht=1 mantissa_bits={mantissa_bits}",
+                    LFE_END_MANTISSA,
+                ));
+            } else {
+                let mantissa_bits =
+                    lfe_allocation.count_mantissa_bits(0, LFE_END_MANTISSA, &mut mantissa_groups);
+                total_mantissa_bits += mantissa_bits;
+                emit_aux_debug(format_args!(
+                    "block={block} lfe endmant={} csnr={} fsnr={} fgain={} mantissa_bits={mantissa_bits}",
+                    LFE_END_MANTISSA,
+                    state.csnr_offset,
+                    state.lfe_fsnr_offset,
+                    state.lfe_fgain_code,
+                ));
+                reader
+                    .skip_bits(mantissa_bits)
+                    .ok_or(ParseError::ShortPacket)?;
+            }
         }
     }
 
@@ -3039,21 +3429,100 @@ pub(crate) fn decode_core_pcm_frame_with_state(
     info: &AccessUnitInfo,
     state: &mut CoreDecodeState,
 ) -> Result<CorePcmFrame, ParseError> {
-    let mut pcm = CorePcmFrame {
-        sample_rate: 0,
-        fullband_channel_order: Vec::new(),
-        fullband_channels: Vec::new(),
-        lfe_channel: None,
-    };
-    decode_core_pcm_frame_with_state_into(frame, info, state, &mut pcm)?;
+    let mut pcm = CorePcmFrame::empty();
+    decode_core_pcm_frame_with_state_into(frame, info, state, &mut pcm, None)?;
     Ok(pcm)
 }
 
-pub(crate) fn decode_core_pcm_frame_with_state_into(
+/// What the inspection walk reads out of the audio blocks, recorded by a
+/// decode that goes through the same syntax anyway.
+#[derive(Debug, Default)]
+struct BlockSideInfo {
+    block_drc: Vec<BlockDrcInfo>,
+    skip_fields: Vec<SkipFieldInfo>,
+}
+
+/// Decode one E-AC-3 access unit and describe it, reading its audio blocks
+/// once.
+///
+/// [`inspect_access_unit_with_metadata_state`] walks every block - exponents,
+/// bit allocation, mantissa bit counts - to find the skip fields that carry
+/// the EMDF (and the per-block DRC words), and a decode then reads the same
+/// blocks again. Here the decode records both on its way through, so the
+/// result is the inspection's `AccessUnitInfo` plus the PCM for one pass over
+/// the blocks instead of two.
+///
+/// Frames the decode does not walk the way the inspection does - a single
+/// block or block start offsets (the inspection reads each block from its
+/// declared start), or a buffer that is not exactly one frame (the inspection
+/// reports its errors first) - take the two-pass path, which is what this
+/// replaces and so gives the same result by construction.
+pub(crate) fn decode_access_unit_with_metadata_state(
+    data: &[u8],
+    metadata_state: &mut MetadataParseState,
+    aux_state: &mut AuxDataDecodeState,
+    core_state: &mut CoreDecodeState,
+    pcm: &mut CorePcmFrame,
+) -> Result<AccessUnitInfo, ParseError> {
+    let prefix = parse_access_unit_prefix(data)?;
+    if data.len() != prefix.info.frame_size
+        || prefix.info.num_blocks == 1
+        || prefix.block_start_bit_offsets.is_some()
+    {
+        let info = inspect_access_unit_with_metadata_state(data, metadata_state, Some(aux_state))?;
+        check_access_unit_size(data, &info)?;
+        decode_core_pcm_frame_with_state_into(data, &info, core_state, pcm, None)?;
+        return Ok(info);
+    }
+
+    let AccessUnitPrefix {
+        frame,
+        mut info,
+        trailing_aux_data,
+        ..
+    } = prefix;
+    let mut side = BlockSideInfo {
+        block_drc: Vec::with_capacity(info.num_blocks as usize),
+        skip_fields: Vec::new(),
+    };
+    decode_core_pcm_frame_with_state_into(frame, &info, core_state, pcm, Some(&mut side))?;
+    info.aux_parse_status = if info.audio_frame.skip_field_syntax_enabled {
+        AuxParseStatus::Extracted
+    } else {
+        AuxParseStatus::Disabled
+    };
+    info.block_drc = side.block_drc;
+    info.skip_fields = side.skip_fields;
+    finish_access_unit_info(&mut info, frame, trailing_aux_data, metadata_state);
+    Ok(info)
+}
+
+/// The decoders take exactly one syncframe per access unit.
+pub(crate) fn check_access_unit_size(
+    access_unit: &[u8],
+    info: &AccessUnitInfo,
+) -> Result<(), ParseError> {
+    if access_unit.len() < info.frame_size {
+        return Err(ParseError::TruncatedFrame {
+            expected: info.frame_size,
+            available: access_unit.len(),
+        });
+    }
+    if access_unit.len() != info.frame_size {
+        return Err(ParseError::TrailingData {
+            expected: info.frame_size,
+            provided: access_unit.len(),
+        });
+    }
+    Ok(())
+}
+
+fn decode_core_pcm_frame_with_state_into(
     frame: &[u8],
     info: &AccessUnitInfo,
     state: &mut CoreDecodeState,
     pcm: &mut CorePcmFrame,
+    mut side: Option<&mut BlockSideInfo>,
 ) -> Result<(), ParseError> {
     // Dependent substreams are decoded here too (4 coded channels for a 7.1
     // extension); the caller remaps them to their real speaker positions via the
@@ -3088,6 +3557,7 @@ pub(crate) fn decode_core_pcm_frame_with_state_into(
         block_syntax,
         imdct,
         lfe_imdct,
+        audio_frame,
         ..
     } = state;
     let block_syntax = block_syntax
@@ -3111,18 +3581,25 @@ pub(crate) fn decode_core_pcm_frame_with_state_into(
         *first = true;
     }
 
-    let mut audio_frame = info.audio_frame.clone();
+    let audio_frame = match audio_frame {
+        Some(audio_frame) => {
+            audio_frame.copy_from(&info.audio_frame);
+            audio_frame
+        }
+        None => audio_frame.insert(info.audio_frame.clone()),
+    };
     for block in 0..info.num_blocks as usize {
         decode_block_core_pcm(
             &mut reader,
             block,
             info,
-            &mut audio_frame,
+            audio_frame,
             block_syntax,
             imdct,
             lfe_imdct.as_mut(),
             &mut pcm.fullband_channels,
             pcm.lfe_channel.as_mut(),
+            side.as_deref_mut(),
         )?;
     }
 
@@ -3152,7 +3629,11 @@ fn prepare_lfe_channel_storage(channel: &mut Option<Vec<f32>>, enabled: bool, sa
     }
 }
 
-fn fullband_channel_order(channel_mode: u8) -> Result<&'static [BedChannel], ParseError> {
+/// Bitstream order of the fullband channels for an AC-3 / E-AC-3 `acmod`
+/// (ATSC A/52 Table 5.8). This is the order `CorePcmFrame::fullband_channel_order`
+/// reports, so a host that has to fabricate a frame for one it could not decode
+/// (silence substitution) can label it exactly like the decoded neighbours.
+pub fn fullband_channel_order(channel_mode: u8) -> Result<&'static [BedChannel], ParseError> {
     match channel_mode {
         0 => Ok(&[BedChannel::Center, BedChannel::Center]),
         1 => Ok(&[BedChannel::Center]),
@@ -3220,14 +3701,16 @@ fn decode_block_core_pcm(
     lfe_imdct: Option<&mut ImdctState>,
     fullband_channels: &mut [Vec<f32>],
     lfe_channel: Option<&mut Vec<f32>>,
+    mut side: Option<&mut BlockSideInfo>,
 ) -> Result<(), ParseError> {
     let fullband_count = info.fullband_channels as usize;
-    let mut block_switch = vec![false; fullband_count];
+    let mut block_switch_flags = [false; MAX_FULLBAND_CHANNELS];
+    let block_switch = &mut block_switch_flags[..fullband_count];
 
     bittrace("audblk_start", block, reader.position());
 
     if audio_frame.block_switching_enabled {
-        for flag in &mut block_switch {
+        for flag in block_switch.iter_mut() {
             *flag = reader.read_bit().ok_or(ParseError::ShortPacket)?;
         }
     }
@@ -3238,9 +3721,17 @@ fn decode_block_core_pcm(
         }
     }
 
-    skip_conditional_bits(reader, 8)?;
-    if info.channel_mode == 0 {
-        skip_conditional_bits(reader, 8)?;
+    let mut drc_info = BlockDrcInfo::default();
+    for program in 0..if info.channel_mode == 0 { 2 } else { 1 } {
+        drc_info.dynamic_range_exists[program] =
+            reader.read_bit().ok_or(ParseError::ShortPacket)?;
+        if drc_info.dynamic_range_exists[program] {
+            drc_info.dynamic_range_word[program] =
+                reader.read_bits(8).ok_or(ParseError::ShortPacket)? as u8;
+        }
+    }
+    if let Some(side) = side.as_deref_mut() {
+        side.block_drc.push(drc_info);
     }
     bittrace("after_dynrng", block, reader.position());
 
@@ -3349,9 +3840,21 @@ fn decode_block_core_pcm(
 
     if audio_frame.skip_field_syntax_enabled && reader.read_bit().ok_or(ParseError::ShortPacket)? {
         let skip_length = reader.read_bits(9).ok_or(ParseError::ShortPacket)? as usize;
-        reader
-            .skip_bits(skip_length * 8)
-            .ok_or(ParseError::ShortPacket)?;
+        if let Some(side) = side {
+            let bit_offset = reader.position();
+            let bytes = reader
+                .read_bytes(skip_length)
+                .ok_or(ParseError::ShortPacket)?;
+            side.skip_fields.push(SkipFieldInfo {
+                block_index: Some(block),
+                bit_offset,
+                bytes,
+            });
+        } else {
+            reader
+                .skip_bits(skip_length * 8)
+                .ok_or(ParseError::ShortPacket)?;
+        }
     }
     bittrace("after_skip", block, reader.position());
 
@@ -3361,9 +3864,10 @@ fn decode_block_core_pcm(
         block,
         block_offset,
         info.lfe_on,
+        audio_frame,
         state,
         &allocation,
-        &block_switch,
+        block_switch,
         imdct,
         lfe_imdct,
         fullband_channels,
@@ -3379,6 +3883,7 @@ fn decode_block_pcm_mantissas(
     block: usize,
     block_offset: usize,
     lfe_on: bool,
+    audio_frame: &AudioFrameInfo,
     state: &mut BlockSyntaxState,
     allocation: &BlockAllocationInfo,
     block_switch: &[bool],
@@ -3387,10 +3892,57 @@ fn decode_block_pcm_mantissas(
     fullband_channels: &mut [Vec<f32>],
     lfe_channel: Option<&mut Vec<f32>>,
 ) -> Result<(), ParseError> {
+    // The coefficient buffers leave the state for the block, so a channel's
+    // decoder (a borrow of the state) can write them; back on every exit.
+    let mut coefficients = state.coefficients.take();
+    let decoded = decode_block_pcm_mantissas_into(
+        reader,
+        block,
+        block_offset,
+        lfe_on,
+        audio_frame,
+        state,
+        allocation,
+        block_switch,
+        imdct,
+        lfe_imdct,
+        fullband_channels,
+        lfe_channel,
+        &mut coefficients,
+    );
+    state.coefficients.put_back(coefficients);
+    decoded
+}
+
+fn decode_block_pcm_mantissas_into(
+    reader: &mut BitReader<'_>,
+    block: usize,
+    block_offset: usize,
+    lfe_on: bool,
+    audio_frame: &AudioFrameInfo,
+    state: &mut BlockSyntaxState,
+    allocation: &BlockAllocationInfo,
+    block_switch: &[bool],
+    imdct: &mut [ImdctState],
+    lfe_imdct: Option<&mut ImdctState>,
+    fullband_channels: &mut [Vec<f32>],
+    lfe_channel: Option<&mut Vec<f32>>,
+    coefficients: &mut BlockCoefficients,
+) -> Result<(), ParseError> {
     let mut mantissa_state = MantissaDecodeState::new_block();
-    let mut coupling_coeffs = [0.0f32; 256];
+    let BlockCoefficients {
+        channel: channel_coeffs,
+        coupling: coupling_coeffs,
+    } = coefficients;
     let first_coupled_channel = if state.chincpl.iter().any(|in_use| *in_use) {
-        allocate_coupling_channel(state)?;
+        // AHT channels transmit their whole frame in block 0, so their bit
+        // allocation is computed once there (with the high-efficiency bap
+        // table) and left untouched afterwards.
+        if !audio_frame.coupling_uses_aht {
+            allocate_coupling_channel(state, false)?;
+        } else if block == 0 {
+            allocate_coupling_channel(state, true)?;
+        }
         state.chincpl.iter().position(|in_use| *in_use)
     } else {
         None
@@ -3398,22 +3950,29 @@ fn decode_block_pcm_mantissas(
 
     // Stereo rematrixing mixes the two channels' coefficients before the IMDCT,
     // so in 2/0 mode (exactly two fullband channels) the per-channel transforms
-    // are deferred: decode both channels' coeffs into `stereo_coeffs`, rematrix,
-    // then IMDCT. Other modes IMDCT each channel immediately (no extra buffer).
-    let stereo = allocation.channel_end_mantissas.len() == 2;
-    let mut stereo_coeffs = [[0.0f32; 256]; 2];
+    // are deferred: decode both channels' coeffs into their own buffer,
+    // rematrix, then IMDCT. Other modes IMDCT each channel immediately, all
+    // from the first buffer.
+    let stereo = allocation.channel_end_mantissas().len() == 2;
 
-    for channel in 0..allocation.channel_end_mantissas.len() {
-        let end_mantissa = allocation.channel_end_mantissas[channel];
+    for (channel, &end_mantissa) in allocation.channel_end_mantissas().iter().enumerate() {
         if end_mantissa > 256 {
             return Err(ParseError::InvalidHeader("mantissa-range"));
         }
 
+        let uses_aht = audio_frame
+            .channel_uses_aht
+            .get(channel)
+            .copied()
+            .unwrap_or(false);
         let channel_snr_offset =
             (((state.csnr_offset - 15) << 4) + state.channel_fsnr_offsets[channel]) << 2;
-        if state.csnr_offset == 0 && state.channel_fsnr_offsets[channel] == 0 {
+        if (!uses_aht || block == 0)
+            && state.csnr_offset == 0
+            && state.channel_fsnr_offsets[channel] == 0
+        {
             state.channel_allocations[channel].clear_bap();
-        } else {
+        } else if !uses_aht || block == 0 {
             state.channel_allocations[channel].allocate(
                 0,
                 end_mantissa,
@@ -3424,6 +3983,7 @@ fn decode_block_pcm_mantissas(
                 &state.channel_delta_bit_allocation[channel],
                 0,
                 0,
+                uses_aht,
             )?;
         }
 
@@ -3433,35 +3993,78 @@ fn decode_block_pcm_mantissas(
             channel as i32,
             reader.position(),
         );
-        let mut coeffs = [0.0f32; 256];
-        state.channel_allocations[channel].decode_transform_coeffs(
-            reader,
-            &mut coeffs,
-            0,
-            end_mantissa,
-            &mut mantissa_state,
-        )?;
-        if first_coupled_channel == Some(channel) {
-            bittrace_ch("mantissas_cpl_start", block, -1, reader.position());
-            state.coupling_allocation.decode_transform_coeffs(
+        let coeffs = &mut channel_coeffs[if stereo { channel } else { 0 }];
+        if uses_aht {
+            if block == 0 {
+                state.channel_allocations[channel].decode_aht_mantissas(
+                    reader,
+                    0,
+                    end_mantissa,
+                    &mut state.aht_channel_pre_mantissas[channel],
+                )?;
+            }
+            state.channel_allocations[channel].extract_aht_coeffs(
+                &state.aht_channel_pre_mantissas[channel],
+                block,
+                coeffs,
+                0,
+                end_mantissa,
+            );
+        } else {
+            state.channel_allocations[channel].decode_transform_coeffs(
                 reader,
-                &mut coupling_coeffs,
-                coupling_start_mantissa(state),
-                coupling_end_mantissa(state)?,
+                coeffs,
+                0,
+                end_mantissa,
                 &mut mantissa_state,
             )?;
         }
+        if first_coupled_channel == Some(channel) {
+            bittrace_ch("mantissas_cpl_start", block, -1, reader.position());
+            let cpl_start = coupling_start_mantissa(state);
+            let cpl_end = coupling_end_mantissa(state)?;
+            if audio_frame.coupling_uses_aht {
+                if block == 0 {
+                    state.coupling_allocation.decode_aht_mantissas(
+                        reader,
+                        cpl_start,
+                        cpl_end,
+                        &mut state.aht_coupling_pre_mantissas,
+                    )?;
+                }
+                state.coupling_allocation.extract_aht_coeffs(
+                    &state.aht_coupling_pre_mantissas,
+                    block,
+                    coupling_coeffs,
+                    cpl_start,
+                    cpl_end,
+                );
+            } else {
+                state.coupling_allocation.decode_transform_coeffs(
+                    reader,
+                    coupling_coeffs,
+                    cpl_start,
+                    cpl_end,
+                    &mut mantissa_state,
+                )?;
+            }
+        }
         if state.chincpl[channel] {
-            apply_standard_coupling(state, channel, &mut coeffs, &coupling_coeffs);
+            apply_standard_coupling(state, channel, coeffs, coupling_coeffs);
         }
-        if state.spx_in_use && state.chinspx[channel] {
-            apply_spx_extension(&mut coeffs, end_mantissa, state, channel);
-        }
-        if stereo {
-            stereo_coeffs[channel] = coeffs;
-        } else {
+        if !stereo {
+            // FFmpeg applies spectral extension after rematrixing; outside 2/0
+            // there is no rematrixing, so SPX runs right away.
+            if state.spx_in_use && state.chinspx[channel] {
+                apply_spx_extension(
+                    coeffs,
+                    state,
+                    channel,
+                    spx_attenuation_code(audio_frame, channel),
+                );
+            }
             imdct[channel].apply(
-                &coeffs,
+                coeffs,
                 block_switch.get(channel).copied().unwrap_or(false),
                 &mut fullband_channels[channel][block_offset..block_offset + 256],
             );
@@ -3469,10 +4072,20 @@ fn decode_block_pcm_mantissas(
     }
 
     if stereo {
-        apply_rematrixing(&mut stereo_coeffs, allocation, state);
-        for channel in 0..2 {
+        apply_rematrixing(channel_coeffs, allocation, state);
+        for (channel, coeffs) in channel_coeffs.iter_mut().enumerate() {
+            // SPX copies from the sub-extension region, which rematrixing may
+            // have just rewritten — keep FFmpeg's rematrix-then-SPX order.
+            if state.spx_in_use && state.chinspx[channel] {
+                apply_spx_extension(
+                    coeffs,
+                    state,
+                    channel,
+                    spx_attenuation_code(audio_frame, channel),
+                );
+            }
             imdct[channel].apply(
-                &stereo_coeffs[channel],
+                coeffs,
                 block_switch.get(channel).copied().unwrap_or(false),
                 &mut fullband_channels[channel][block_offset..block_offset + 256],
             );
@@ -3483,10 +4096,11 @@ fn decode_block_pcm_mantissas(
         if let (Some(lfe_allocation), Some(lfe_imdct), Some(lfe_channel)) =
             (state.lfe_allocation.as_mut(), lfe_imdct, lfe_channel)
         {
+            let uses_aht = audio_frame.lfe_uses_aht;
             let lfe_snr_offset = (((state.csnr_offset - 15) << 4) + state.lfe_fsnr_offset) << 2;
-            if state.csnr_offset == 0 && state.lfe_fsnr_offset == 0 {
+            if (!uses_aht || block == 0) && state.csnr_offset == 0 && state.lfe_fsnr_offset == 0 {
                 lfe_allocation.clear_bap();
-            } else {
+            } else if !uses_aht || block == 0 {
                 lfe_allocation.allocate(
                     0,
                     LFE_END_MANTISSA,
@@ -3497,20 +4111,39 @@ fn decode_block_pcm_mantissas(
                     &DeltaBitAllocationState::default(),
                     0,
                     0,
+                    uses_aht,
                 )?;
             }
 
             bittrace_ch("mantissas_lfe_start", block, -2, reader.position());
-            let mut coeffs = [0.0f32; 256];
-            lfe_allocation.decode_transform_coeffs(
-                reader,
-                &mut coeffs,
-                0,
-                LFE_END_MANTISSA,
-                &mut mantissa_state,
-            )?;
+            let coeffs = &mut channel_coeffs[0];
+            if uses_aht {
+                if block == 0 {
+                    lfe_allocation.decode_aht_mantissas(
+                        reader,
+                        0,
+                        LFE_END_MANTISSA,
+                        &mut state.aht_lfe_pre_mantissas,
+                    )?;
+                }
+                lfe_allocation.extract_aht_coeffs(
+                    &state.aht_lfe_pre_mantissas,
+                    block,
+                    coeffs,
+                    0,
+                    LFE_END_MANTISSA,
+                );
+            } else {
+                lfe_allocation.decode_transform_coeffs(
+                    reader,
+                    coeffs,
+                    0,
+                    LFE_END_MANTISSA,
+                    &mut mantissa_state,
+                )?;
+            }
             lfe_imdct.apply(
-                &coeffs,
+                coeffs,
                 false,
                 &mut lfe_channel[block_offset..block_offset + 256],
             );
@@ -3531,7 +4164,8 @@ fn apply_rematrixing(
     allocation: &BlockAllocationInfo,
     state: &BlockSyntaxState,
 ) {
-    let end = allocation.channel_end_mantissas[0].min(allocation.channel_end_mantissas[1]);
+    let end_mantissas = allocation.channel_end_mantissas();
+    let end = end_mantissas[0].min(end_mantissas[1]);
     for band in 0..state.num_rematrixing_bands {
         if !state.rematrixing_flags[band] {
             continue;
@@ -3547,48 +4181,147 @@ fn apply_rematrixing(
 
 /// Apply spectral extension to fill the high-frequency bins of `coeffs`.
 ///
-/// After mantissa decode, SPX channels only have transform coefficients in the
-/// baseband region (bins 0..end_mantissa). This function fills the extension
-/// region by copying the baseband's spectral envelope, scaled by per-band SPX
-/// gains. The result is a full 256-point spectrum ready for the IMDCT.
+/// After mantissa decode, SPX channels only carry transform coefficients up to
+/// the extension start. The extension region is synthesized by repeatedly
+/// copying the low-frequency copy region `[spx_dst_start_freq,
+/// spx_src_start_freq)`, wrapping at band boundaries that do not fit, applying
+/// an optional notch attenuation at each wrap point, and scaling every band by
+/// its signal-blend coordinate. Mirrors FFmpeg
+/// `ff_eac3_apply_spectral_extension`, minus the injected dither noise (this
+/// decoder never models dither).
 fn apply_spx_extension(
     coeffs: &mut [f32; 256],
-    baseband_end: usize,
     state: &BlockSyntaxState,
     channel: usize,
+    attenuation_code: Option<u8>,
 ) {
-    let Some(gains) = state.spx_gains.get(channel) else {
+    let Some(blends) = state.spx_signal_blend.get(channel) else {
         emit_aux_debug(format_args!(
-            "spx_ext: no gains for channel {channel} (spx_in_use={} gains_len={})",
+            "spx_ext: no coordinates for channel {channel} (spx_in_use={} blend_len={})",
             state.spx_in_use,
-            state.spx_gains.len(),
+            state.spx_signal_blend.len(),
         ));
         return;
     };
-    let nbands = gains.len();
-    if nbands == 0 {
+    let src_start = state.spx_begin_subbnd * 12 + 25;
+    let dst_start = state.spx_dst_start_freq;
+    if dst_start >= src_start || state.nspxbnds == 0 || blends.len() < state.nspxbnds {
         return;
     }
 
-    let extension_start = state.spx_begin_subbnd * 12 + 25;
-    let extension_end = (state.spx_end_subbnd * 12 + 37).min(256);
-    if extension_start >= extension_end || extension_start >= 256 {
-        return;
-    }
-
-    let extension_len = extension_end - extension_start;
-
-    for band in 0..nbands {
-        let band_start = extension_start + (band * extension_len) / nbands;
-        let band_end = extension_start + ((band + 1) * extension_len) / nbands;
-        let src_start = (band * baseband_end) / nbands;
-
-        for bin in band_start..band_end {
-            let src_bin = src_start + (bin - band_start) % (baseband_end - src_start).max(1);
-            coeffs[bin] = coeffs[src_bin] * gains[band];
+    // Fill the extension by cycling through the copy region. The source
+    // restarts at `dst_start` when a whole band no longer fits (a wrap,
+    // notched below) or when it reaches the extension start; writes stay at
+    // or above `src_start`, so the source bins are never clobbered — this is
+    // position-identical to FFmpeg's copy-section memcpy loop.
+    let mut wrap_flags = [false; SPX_MAX_SUBBANDS];
+    wrap_flags[0] = true;
+    let mut src = dst_start;
+    let mut dst = src_start;
+    for band in 0..state.nspxbnds {
+        let band_size = state.spx_band_sizes.get(band).copied().unwrap_or_default();
+        if src + band_size > src_start {
+            src = dst_start;
+            if let Some(flag) = wrap_flags.get_mut(band) {
+                *flag = true;
+            }
+        }
+        for _ in 0..band_size {
+            if src == src_start {
+                src = dst_start;
+            }
+            if dst >= 256 {
+                break;
+            }
+            coeffs[dst] = coeffs[src];
+            dst += 1;
+            src += 1;
         }
     }
+
+    // Notch filter around the extension start and every wrap point.
+    if let Some(code) = attenuation_code {
+        let atten = spx_attenuation_factors(code);
+        let mut bin = src_start - 2;
+        for band in 0..state.nspxbnds {
+            if wrap_flags.get(band).copied().unwrap_or(false) && bin + 5 <= 256 {
+                coeffs[bin] *= atten[0];
+                coeffs[bin + 1] *= atten[1];
+                coeffs[bin + 2] *= atten[2];
+                coeffs[bin + 3] *= atten[1];
+                coeffs[bin + 4] *= atten[0];
+            }
+            bin += state.spx_band_sizes.get(band).copied().unwrap_or_default();
+        }
+    }
+
+    // Scale each band by its signal-blend coordinate. The reference decoder
+    // additionally adds RMS-scaled noise here; deliberately omitted.
+    let mut bin = src_start;
+    for band in 0..state.nspxbnds {
+        let band_size = state.spx_band_sizes.get(band).copied().unwrap_or_default();
+        let scale = blends[band];
+        let end = (bin + band_size).min(256);
+        for coeff in &mut coeffs[bin.min(256)..end] {
+            *coeff *= scale;
+        }
+        bin = end;
+    }
 }
+
+/// SPX attenuation code for one channel, when transmitted in this frame's
+/// header (FFmpeg `spx_atten_code`, -1 when absent).
+fn spx_attenuation_code(audio_frame: &AudioFrameInfo, channel: usize) -> Option<u8> {
+    audio_frame
+        .spectral_extension_attenuation
+        .get(channel)
+        .copied()
+        .flatten()
+}
+
+/// Notch attenuation factors for one 5-bit SPX attenuation code
+/// (`ff_eac3_spx_atten_tab[code][bin] = 2^((bin+1)*(code+1)/-15)`).
+fn spx_attenuation_factors(code: u8) -> [f32; 3] {
+    SPX_ATTENUATION_FACTORS[usize::from(code & 0x1f)]
+}
+
+/// [`spx_attenuation_factors`] for every code: `2^(k * (code + 1) / -15)`
+/// for k = 1, 2, 3, computed in f64 and rounded to f32 (the test below holds
+/// the table to that).
+const SPX_ATTENUATION_FACTORS: [[f32; 3]; 32] = [
+    [0.9548416, 0.9117225, 0.8705506],
+    [0.9117225, 0.8312379, 0.7578583],
+    [0.8705506, 0.7578583, 0.659754],
+    [0.8312379, 0.6909564, 0.57434916],
+    [0.7937005, 0.62996054, 0.5],
+    [0.7578583, 0.57434916, 0.4352753],
+    [0.7236346, 0.52364707, 0.37892914],
+    [0.6909564, 0.4774208, 0.329877],
+    [0.659754, 0.4352753, 0.28717458],
+    [0.62996054, 0.39685026, 0.25],
+    [0.6015125, 0.3618173, 0.21763764],
+    [0.57434916, 0.329877, 0.18946457],
+    [0.5484125, 0.30075625, 0.1649385],
+    [0.52364707, 0.27420625, 0.14358729],
+    [0.5, 0.25, 0.125],
+    [0.4774208, 0.22793062, 0.10881882],
+    [0.45586124, 0.20780948, 0.094732285],
+    [0.4352753, 0.18946457, 0.08246925],
+    [0.41561896, 0.1727391, 0.071793646],
+    [0.39685026, 0.15749013, 0.0625],
+    [0.37892914, 0.14358729, 0.05440941],
+    [0.3618173, 0.13091177, 0.047366142],
+    [0.3454782, 0.1193552, 0.041234624],
+    [0.329877, 0.10881882, 0.035896823],
+    [0.31498027, 0.099212565, 0.03125],
+    [0.30075625, 0.090454325, 0.027204705],
+    [0.28717458, 0.08246925, 0.023683071],
+    [0.27420625, 0.07518906, 0.020617312],
+    [0.26182353, 0.06855156, 0.017948411],
+    [0.25, 0.0625, 0.015625],
+    [0.2387104, 0.056982655, 0.013602353],
+    [0.22793062, 0.05195237, 0.011841536],
+];
 
 fn scan_frame_for_emdf(
     frame: &[u8],
@@ -3764,8 +4497,56 @@ mod tests {
     use super::{
         AccessUnitInfo, AudioFrameInfo, BlockSyntaxState, CoreDecodeState, EmdfSource, ExpStrategy,
         FrameType, ParseError, apply_spx_extension, decode_block_core_pcm, inspect_access_unit,
+        inspect_legacy_ac3_access_unit,
     };
     use crate::BedChannel;
+
+    #[test]
+    fn spx_attenuation_table_is_the_formula() {
+        for code in 0..32u8 {
+            let x = f64::from(code) + 1.0;
+            let computed = [
+                2f64.powf(x / -15.0) as f32,
+                2f64.powf(2.0 * x / -15.0) as f32,
+                2f64.powf(3.0 * x / -15.0) as f32,
+            ];
+            assert_eq!(
+                super::spx_attenuation_factors(code).map(f32::to_bits),
+                computed.map(f32::to_bits),
+                "code {code}"
+            );
+        }
+        // The code is five bits: higher bits are ignored.
+        assert_eq!(
+            super::spx_attenuation_factors(0x3f),
+            super::spx_attenuation_factors(0x1f)
+        );
+    }
+
+    #[test]
+    fn legacy_ac3_inspect_sizes_44_1_khz_odd_frmsizecod_frames() {
+        // 44.1 kHz, 384 kbps, frmsizecod=29: 836 words = 1672 bytes, not the
+        // 1670 of the even neighbour. bsid=8, acmod=7 (3/2) with LFE.
+        let mut frame = vec![0u8; 1672];
+        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1]);
+
+        let info = inspect_legacy_ac3_access_unit(&frame).expect("legacy AC-3 header");
+        assert_eq!(info.frame_type, FrameType::LegacyAc3);
+        assert_eq!(info.sample_rate, 44_100);
+        assert_eq!(info.frame_size, 1672);
+        assert_eq!(info.channels, 6);
+        assert!(info.lfe_on);
+
+        // The two-bytes-short slice the old sizing produced is now rejected up
+        // front instead of being decoded with its tail missing.
+        assert!(matches!(
+            inspect_legacy_ac3_access_unit(&frame[..1670]),
+            Err(ParseError::TruncatedFrame {
+                expected: 1672,
+                available: 1670,
+            })
+        ));
+    }
 
     fn push_bits(bits: &mut Vec<bool>, value: u32, width: usize) {
         for bit in (0..width).rev() {
@@ -3927,6 +4708,9 @@ mod tests {
         AudioFrameInfo {
             exponent_strategies_embedded: true,
             adaptive_hybrid_transform_enabled: false,
+            coupling_uses_aht: false,
+            channel_uses_aht: Vec::new(),
+            lfe_uses_aht: false,
             snr_offset_strategy: 0,
             transient_processing_enabled: false,
             block_switching_enabled: false,
@@ -3988,6 +4772,9 @@ mod tests {
         let audio_frame = super::AudioFrameInfo {
             exponent_strategies_embedded: true,
             adaptive_hybrid_transform_enabled: false,
+            coupling_uses_aht: false,
+            channel_uses_aht: Vec::new(),
+            lfe_uses_aht: false,
             snr_offset_strategy: 0,
             transient_processing_enabled: false,
             block_switching_enabled: false,
@@ -4170,6 +4957,7 @@ mod tests {
             None,
             &mut channels,
             None,
+            None,
         )
         .expect("coupling PCM block should decode");
 
@@ -4252,61 +5040,154 @@ mod tests {
     }
 
     #[test]
-    fn spx_extension_copies_baseband_with_gains() {
+    fn spx_extension_copies_low_band_and_applies_signal_blend() {
+        // Extension bins are filled by walking the copy region
+        // [spx_dst_start_freq, spx_src_start_freq) once per band, then scaled
+        // by that band's signal-blend coordinate (FFmpeg
+        // ff_eac3_apply_spectral_extension).
+        const BLENDS: [f32; 6] = [0.5, 2.0, 1.0, 0.25, 4.0, 0.125];
         let mut state = BlockSyntaxState::new(1, false, 0);
         state.spx_in_use = true;
         state.spx_begin_subbnd = 8;
         state.spx_end_subbnd = 14;
-        state.spx_gains = vec![vec![0.5, 2.0, 1.0]];
+        state.spx_dst_start_freq = 25;
+        state.spx_dst_end_freq = 14 * 12 + 25;
+        state.spx_band_sizes = vec![12; 6];
+        state.nspxbnds = 6;
+        state.spx_signal_blend = vec![BLENDS.to_vec()];
         state.chinspx = vec![true];
 
-        // Fill baseband with a known ramp (bins 0..baseband_end).
-        // baseband_end = spx_begin_subbnd * 12 + 25 = 8*12+25 = 121
-        let baseband_end = 121;
+        // src_start = 8 * 12 + 25; the copy region [25, 121) holds 96 bins,
+        // enough for all 6 bands of 12 without wrapping.
+        let src_start = 8 * 12 + 25;
         let mut coeffs = [0.0f32; 256];
-        for bin in 0..baseband_end {
+        for bin in 0..src_start {
             coeffs[bin] = bin as f32;
         }
 
-        apply_spx_extension(&mut coeffs, baseband_end, &state, 0);
+        apply_spx_extension(&mut coeffs, &state, 0, None);
 
-        // extension_start = 8*12+25 = 121, extension_end = min(14*12+37, 256) = 205
-        // extension_len = 205-121 = 84, 3 bands.
-        // Band 0: bins [121..149), src_start=0 -> copies coeffs[0..28] * 0.5
-        // Band 1: bins [149..177), src_start=40 -> copies coeffs[40..68] * 2.0
-        // Band 2: bins [177..205), src_start=80 -> copies coeffs[80..108] * 1.0
-        for bin in 121..149 {
-            let expected = (bin - 121) as f32 * 0.5;
-            assert!(
-                (coeffs[bin] - expected).abs() < 1e-6,
-                "band 0 bin {bin}: expected {expected}, got {}",
-                coeffs[bin]
-            );
-        }
-        for bin in 149..177 {
-            let expected = (40 + (bin - 149)) as f32 * 2.0;
-            assert!(
-                (coeffs[bin] - expected).abs() < 1e-6,
-                "band 1 bin {bin}: expected {expected}, got {}",
-                coeffs[bin]
-            );
-        }
-        for bin in 177..205 {
-            let expected = (80 + (bin - 177)) as f32 * 1.0;
-            assert!(
-                (coeffs[bin] - expected).abs() < 1e-6,
-                "band 2 bin {bin}: expected {expected}, got {}",
-                coeffs[bin]
-            );
+        for (band, scale) in BLENDS.iter().enumerate() {
+            for offset in 0..12 {
+                let dst = src_start + band * 12 + offset;
+                let src = state.spx_dst_start_freq + band * 12 + offset;
+                let expected = src as f32 * scale;
+                assert!(
+                    (coeffs[dst] - expected).abs() < 1e-3,
+                    "band {band} bin {dst}: expected {expected}, got {}",
+                    coeffs[dst]
+                );
+            }
         }
 
-        // Baseband should be unchanged.
-        for bin in 0..baseband_end {
+        // The source region below the extension is left untouched.
+        for bin in 0..src_start {
             assert!((coeffs[bin] - bin as f32).abs() < 1e-6);
         }
-        // Bins above extension_end should remain zero.
-        for bin in 205..256 {
-            assert!(coeffs[bin].abs() < 1e-6);
+        // Nothing is written past the extension end (14 * 12 + 25).
+        for bin in (14 * 12 + 25)..256 {
+            assert!(coeffs[bin].abs() < 1e-6, "bin {bin} should stay zero");
         }
+    }
+
+    /// The coupled subband range is [cplbegf, cplendf + 3), so `cplendf <
+    /// cplbegf` alone is a legal high-band coupling configuration (BD-style
+    /// DD+ 7.1 cores encode e.g. cplbegf=13/cplendf=12 on nearly every
+    /// frame). Rejecting it desyncs the whole remaining block syntax.
+    #[test]
+    fn legacy_coupling_accepts_high_band_range() {
+        let fullband_channels = 5usize;
+        let mut bits = Vec::new();
+        push_bits(&mut bits, 1, 1); // cplstre
+        push_bits(&mut bits, 1, 1); // cplinu
+        push_bits(&mut bits, 0b11111, 5); // chincpl, all coupled
+        push_bits(&mut bits, 13, 4); // cplbegf
+        push_bits(&mut bits, 12, 4); // cplendf -> ncplsubnd = 2
+        push_bits(&mut bits, 1, 1); // cplbndstrc for band 1
+        let bytes = bits_to_bytes(&bits, 4);
+
+        let mut reader = super::BitReader::new(&bytes);
+        let mut audio_frame = super::legacy_ac3_audio_frame_info(0, fullband_channels, true);
+        let mut state = BlockSyntaxState::new(fullband_channels, true, 0);
+        super::read_legacy_ac3_coupling_strategy(
+            &mut reader,
+            0,
+            7,
+            fullband_channels,
+            &mut audio_frame,
+            &mut state,
+        )
+        .expect("high-band coupling range must parse");
+        assert!(audio_frame.coupling_in_use[0]);
+        assert_eq!(state.ncplsubnd, 2);
+        assert_eq!(state.ncplbnd, 1); // band 1 folded into band 0
+        assert_eq!(reader.position(), 16); // every strategy bit consumed
+    }
+
+    /// Legacy AC-3 transmits cplstre/cplinu in every audblk regardless of
+    /// acmod — mono included. Skipping the bits desyncs the whole block
+    /// (real-world mono BD tracks then fail every frame).
+    #[test]
+    fn legacy_coupling_reads_strategy_bits_in_mono() {
+        let mut bits = Vec::new();
+        push_bits(&mut bits, 1, 1); // cplstre
+        push_bits(&mut bits, 0, 1); // cplinu = 0 (mandatory in mono)
+        let bytes = bits_to_bytes(&bits, 1);
+
+        let mut reader = super::BitReader::new(&bytes);
+        let mut audio_frame = super::legacy_ac3_audio_frame_info(0, 1, false);
+        let mut state = BlockSyntaxState::new(1, false, 0);
+        super::read_legacy_ac3_coupling_strategy(&mut reader, 0, 1, 1, &mut audio_frame, &mut state)
+            .expect("mono coupling strategy bits must parse");
+        assert!(!audio_frame.coupling_in_use[0]);
+        assert_eq!(reader.position(), 2); // cplstre + cplinu consumed
+
+        // cplinu=1 with fewer than two full-bandwidth channels is invalid data.
+        let mut bits = Vec::new();
+        push_bits(&mut bits, 1, 1); // cplstre
+        push_bits(&mut bits, 1, 1); // cplinu = 1
+        let bytes = bits_to_bytes(&bits, 1);
+        let mut reader = super::BitReader::new(&bytes);
+        let mut audio_frame = super::legacy_ac3_audio_frame_info(0, 1, false);
+        let mut state = BlockSyntaxState::new(1, false, 0);
+        let err = super::read_legacy_ac3_coupling_strategy(
+            &mut reader,
+            0,
+            1,
+            1,
+            &mut audio_frame,
+            &mut state,
+        )
+        .expect_err("coupling in mono must be rejected");
+        assert!(matches!(err, ParseError::InvalidHeader("cpl-mono")));
+    }
+
+    /// An empty coupling range is a hard parse error: silently clearing
+    /// coupling and returning Ok would leave the reader misaligned for every
+    /// field after cplbndstrc.
+    #[test]
+    fn legacy_coupling_rejects_empty_range() {
+        let fullband_channels = 5usize;
+        let mut bits = Vec::new();
+        push_bits(&mut bits, 1, 1); // cplstre
+        push_bits(&mut bits, 1, 1); // cplinu
+        push_bits(&mut bits, 0b11111, 5); // chincpl
+        push_bits(&mut bits, 15, 4); // cplbegf
+        push_bits(&mut bits, 0, 4); // cplendf -> ncplsubnd would be -12
+        let bytes = bits_to_bytes(&bits, 4);
+
+        let mut reader = super::BitReader::new(&bytes);
+        let mut audio_frame = super::legacy_ac3_audio_frame_info(0, fullband_channels, true);
+        let mut state = BlockSyntaxState::new(fullband_channels, true, 0);
+        let err = super::read_legacy_ac3_coupling_strategy(
+            &mut reader,
+            0,
+            7,
+            fullband_channels,
+            &mut audio_frame,
+            &mut state,
+        )
+        .expect_err("empty coupling range must be rejected");
+        assert!(matches!(err, ParseError::InvalidHeader("cpl-band-range")));
     }
 }
