@@ -1,5 +1,5 @@
 [package]
-name = "harletty-bridge"
+name = "bridge-router"
 version = "0.9.0"
 edition = "2024"
 # The sources in this crate are Apache-2.0 like the rest of the workspace, but
@@ -11,10 +11,11 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 
 # An rlib only: the plugin libraries are the family crates' (plugin-dolby,
-# plugin-dts, plugin-iamf). This one links the families in-process for the
+# plugin-dts, plugin-iamf, which ship as harletty-bridge, alicia-bridge and
+# eclipsa-bridge). This one links the families in-process for the
 # fuzz target, bridge_bench and the bit-exactness kit.
 [lib]
-name = "harletty_bridge"
+name = "bridge_router"
 crate-type = ["rlib"]
 
 # The codec families this bridge decodes, one crate each; a stream of a family

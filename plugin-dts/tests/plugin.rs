@@ -1,6 +1,6 @@
 //! The plugin as a host loads it: its root module and the bridges it makes.
 
-use harletty_dts_bridge as PLUGIN;
+use alicia_bridge as PLUGIN;
 
 const PRIMARY_CODECS: &[&str] = &["dts"];
 const FOREIGN_CODECS: &[&str] = &["truehd", "eac3", "ac3", "iamf"];

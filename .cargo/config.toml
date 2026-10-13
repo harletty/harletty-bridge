@@ -1,4 +1,4 @@
-# Windows (MSVC): link the C runtime statically, so harletty_bridge.dll and
+# Windows (MSVC): link the C runtime statically, so the bridge DLLs and
 # harletty.exe start on a Windows without the Visual C++ Redistributable.
 # Hosts load the bridge into their own process; their builds do the same.
 # Linux and macOS builds are not affected.

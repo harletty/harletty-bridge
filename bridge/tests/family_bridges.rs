@@ -128,7 +128,7 @@ fn assert_same<F: bridge_common::family::FamilyPipeline>(
     name: &str,
     packets: &[(&[u8], RInputTransport, u8)],
 ) {
-    let mut combined = harletty_bridge::new_bridge(false);
+    let mut combined = bridge_router::new_bridge(false);
     let mut family = PluginBridge::<F>::new(false);
     let expected = run(&mut combined, packets);
     let actual = run(&mut family, packets);
@@ -221,7 +221,7 @@ fn the_iamf_family_alone_decodes_as_the_combined_bridge() {
     for path in vectors {
         let stream = std::fs::read(&path).unwrap();
         let packets = raw(&stream, 997);
-        let mut combined = harletty_bridge::new_bridge(false);
+        let mut combined = bridge_router::new_bridge(false);
         let expected = run(&mut combined, &packets);
         // A vector the combined bridge does not take as IAMF (no sequence
         // header at its first byte) is not a comparison of the IAMF path.

@@ -84,7 +84,7 @@ struct Hashes {
 }
 
 fn pass(input: &Input, mut hashes: Option<&mut Hashes>) -> Tally {
-    let mut bridge = harletty_bridge::new_bridge(false);
+    let mut bridge = bridge_router::new_bridge(false);
     let mut t = Tally::default();
     let mut push = |bridge: &mut FormatBridgeBox, data: &[u8], transport, data_type| {
         let result = bridge.push_packet(RSlice::from_slice(data), transport, data_type);
@@ -241,7 +241,7 @@ extern "C" fn log_sink(level: RLogLevel, _target: RStr<'_>, message: RStr<'_>) {
 }
 
 fn main() -> ExitCode {
-    harletty_bridge::set_log_sink(log_sink);
+    bridge_router::set_log_sink(log_sink);
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let iec61937 = args.first().is_some_and(|arg| arg == "--iec61937");
     if iec61937 {

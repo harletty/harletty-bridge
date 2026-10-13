@@ -145,7 +145,7 @@ bridge_bench=""
 if printf '%s\n' "$@" | grep -qi '\.iamf$'; then
     echo "building the bridge's bridge_bench with IAMF (release, $layout layout)…" >&2
     RUSTFLAGS="$rustflags" cargo build --quiet --release --manifest-path "$root/Cargo.toml" \
-        --target-dir "$bench_target" -p harletty-bridge --example bridge_bench --features iamf
+        --target-dir "$bench_target" -p bridge-router --example bridge_bench --features iamf
     bridge_bench=$bench_target/release/examples/bridge_bench
 fi
 

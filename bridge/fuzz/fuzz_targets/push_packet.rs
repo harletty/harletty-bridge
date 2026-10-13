@@ -45,7 +45,7 @@ static INIT: Once = Once::new();
 fuzz_target!(|data: &[u8]| {
     // Formatted as a host would get them, then dropped: stderr would slow
     // the fuzzer down to nothing.
-    INIT.call_once(|| harletty_bridge::set_log_sink(discard_log));
+    INIT.call_once(|| bridge_router::set_log_sink(discard_log));
 
     let [mode, size_lo, size_hi, stream @ ..] = data else {
         return;
@@ -65,7 +65,7 @@ fuzz_target!(|data: &[u8]| {
         n => n,
     };
 
-    let mut bridge = harletty_bridge::new_bridge(false);
+    let mut bridge = bridge_router::new_bridge(false);
     if transport == RInputTransport::Raw {
         bridge.configure(RStr::from("input_codec"), RStr::from(CODECS[selector]));
     }

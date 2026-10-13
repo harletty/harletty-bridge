@@ -1,6 +1,6 @@
 //! The Dolby family as an Omniphony bridge plugin of its own
-//! (`libharletty_dolby_bridge.so`, `harletty_dolby_bridge.dll`,
-//! `libharletty_dolby_bridge.dylib`): TrueHD (raw, and MAT over IEC 61937,
+//! (`libharletty_bridge.so`, `harletty_bridge.dll`,
+//! `libharletty_bridge.dylib`): TrueHD (raw, and MAT over IEC 61937,
 //! burst type 0x16) and E-AC-3 / AC-3 with their JOC objects (raw, and IEC
 //! 61937 burst types 0x15 and 0x01).
 //!

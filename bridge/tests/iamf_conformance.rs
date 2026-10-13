@@ -108,7 +108,7 @@ fn lossless_714_decodes_bit_exact_through_the_raw_transport() {
         eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
         return;
     };
-    let mut bridge = harletty_bridge::new_bridge(false);
+    let mut bridge = bridge_router::new_bridge(false);
     let frames = decode_raw(&mut bridge, &std::fs::read(stream).unwrap());
 
     assert!(bridge.is_ready());
@@ -138,7 +138,7 @@ fn an_expanded_7154_stream_renders_to_the_714_bed() {
         eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
         return;
     };
-    let mut bridge = harletty_bridge::new_bridge(false);
+    let mut bridge = bridge_router::new_bridge(false);
     let frames = decode_raw(&mut bridge, &std::fs::read(stream).unwrap());
     assert_eq!(
         bridge.source_label().as_str(),
@@ -170,7 +170,7 @@ fn opus_714_decodes_within_the_lossy_tolerance() {
         eprintln!("skipping: set HARLETTY_IAMF_VECTORS to the libiamf test vectors");
         return;
     };
-    let mut bridge = harletty_bridge::new_bridge(false);
+    let mut bridge = bridge_router::new_bridge(false);
     let frames = decode_raw(&mut bridge, &std::fs::read(stream).unwrap());
     assert_eq!(bridge.source_label().as_str(), "IAMF (Opus) 7.1.4");
     let ours = interleaved(&frames);
@@ -202,10 +202,10 @@ fn a_reset_resumes_at_the_next_temporal_unit_without_a_sequence_header() {
     assert_eq!(pos, stream.len(), "the vector frames end to end");
     let seek_to = unit_starts[unit_starts.len() / 2];
 
-    let mut whole = harletty_bridge::new_bridge(false);
+    let mut whole = bridge_router::new_bridge(false);
     let all = interleaved(&decode_raw(&mut whole, &stream));
 
-    let mut bridge = harletty_bridge::new_bridge(false);
+    let mut bridge = bridge_router::new_bridge(false);
     decode_raw(&mut bridge, &stream[..seek_to / 2]);
     bridge.reset();
     let resumed = interleaved(&decode_raw(&mut bridge, &stream[seek_to..]));
@@ -293,7 +293,7 @@ fn a_raw_stream_decodes_the_same_however_it_is_cut_into_packets() {
             ("997-byte packets", stream.chunks(997).collect()),
         ];
         for (cut, pieces) in cuts {
-            let mut bridge = harletty_bridge::new_bridge(false);
+            let mut bridge = bridge_router::new_bridge(false);
             let frames = decode_raw_pieces(&mut bridge, pieces.into_iter());
             assert_eq!(frames.len(), UNITS, "{delimiters}, {cut}");
             for frame in &frames {
@@ -343,7 +343,7 @@ fn a_mix_of_unmarked_elements_tags_nothing() {
         return;
     };
     let stream = std::fs::read(path).unwrap();
-    let mut bridge = harletty_bridge::new_bridge(false);
+    let mut bridge = bridge_router::new_bridge(false);
     let frames = decode_raw(&mut bridge, &stream);
     assert_eq!(
         frames[0].channel_labels.as_slice(),

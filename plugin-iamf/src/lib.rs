@@ -1,6 +1,6 @@
 //! IAMF (AOMedia Immersive Audio Model and Formats) as an Omniphony bridge
-//! plugin of its own (`libharletty_iamf_bridge.so`,
-//! `harletty_iamf_bridge.dll`, `libharletty_iamf_bridge.dylib`): an OBU
+//! plugin of its own (`libeclipsa_bridge.so`,
+//! `eclipsa_bridge.dll`, `libeclipsa_bridge.dylib`): an OBU
 //! stream over the raw transport. IAMF has no IEC 61937 burst type. Its Opus
 //! decoding links libopus.
 //!

@@ -60,6 +60,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "alicia-bridge"
+version = "0.9.0"
+dependencies = [
+ "abi_stable",
+ "bridge-common",
+ "bridge-family-dts",
+ "bridge_api",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -228,6 +238,22 @@ dependencies = [
  "iamf-dec",
  "iamf-obu",
  "log",
+]
+
+[[package]]
+name = "bridge-router"
+version = "0.9.0"
+dependencies = [
+ "abi_stable",
+ "bridge-common",
+ "bridge-family-dolby",
+ "bridge-family-dts",
+ "bridge-family-iamf",
+ "bridge_api",
+ "log",
+ "serde_json",
+ "spdif",
+ "truehd",
 ]
 
 [[package]]
@@ -552,6 +578,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eclipsa-bridge"
+version = "0.9.0"
+dependencies = [
+ "abi_stable",
+ "bridge-common",
+ "bridge-family-iamf",
+ "bridge_api",
+]
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -689,42 +725,6 @@ dependencies = [
  "abi_stable",
  "bridge-common",
  "bridge-family-dolby",
- "bridge-family-dts",
- "bridge-family-iamf",
- "bridge_api",
- "log",
- "serde_json",
- "spdif",
- "truehd",
-]
-
-[[package]]
-name = "harletty-dolby-bridge"
-version = "0.9.0"
-dependencies = [
- "abi_stable",
- "bridge-common",
- "bridge-family-dolby",
- "bridge_api",
-]
-
-[[package]]
-name = "harletty-dts-bridge"
-version = "0.9.0"
-dependencies = [
- "abi_stable",
- "bridge-common",
- "bridge-family-dts",
- "bridge_api",
-]
-
-[[package]]
-name = "harletty-iamf-bridge"
-version = "0.9.0"
-dependencies = [
- "abi_stable",
- "bridge-common",
- "bridge-family-iamf",
  "bridge_api",
 ]
 

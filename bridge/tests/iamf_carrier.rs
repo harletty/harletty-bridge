@@ -68,7 +68,7 @@ fn heard(frames: &[RDecodedFrame]) -> Vec<String> {
 /// The same OBUs on the raw transport, a push for the descriptors and for
 /// each unit: `None` when the bridge refuses the sequence.
 fn decode_raw(sequence: &IamfSequence) -> Option<Vec<RDecodedFrame>> {
-    let mut bridge = harletty_bridge::new_bridge(false);
+    let mut bridge = bridge_router::new_bridge(false);
     let mut frames = Vec::new();
     let pushes = std::iter::once(&sequence.descriptors).chain(&sequence.units);
     for push in pushes {
@@ -84,7 +84,7 @@ fn decode_raw(sequence: &IamfSequence) -> Option<Vec<RDecodedFrame>> {
 /// Decode a carrier's bytes as a host does: its parser, then the bridge,
 /// burst by burst.
 fn decode_carried(name: &str, carried: &[u8]) -> Vec<RDecodedFrame> {
-    let mut bridge = harletty_bridge::new_bridge(false);
+    let mut bridge = bridge_router::new_bridge(false);
     let mut parser = SpdifParser::new();
     let mut frames = Vec::new();
     // Odd-sized reads: bursts straddle them.
@@ -210,7 +210,7 @@ fn a_damaged_burst_costs_its_unit_only() {
         last
     };
     let decode = |damaged: Option<usize>, whole_obu: bool| -> Vec<Vec<i32>> {
-        let mut bridge = harletty_bridge::new_bridge(false);
+        let mut bridge = bridge_router::new_bridge(false);
         let mut units = Vec::new();
         for (index, unit) in sequence.units.iter().enumerate() {
             let mut payload = if index == 0 {
@@ -301,7 +301,7 @@ fn burst_samples(bridge: &mut bridge_api::FormatBridgeBox, bursts: &[Vec<u8>]) -
 fn intact_units(sequence: &IamfSequence) -> Vec<Vec<i32>> {
     let mut bursts = sequence.units.clone();
     bursts[0] = [sequence.descriptors.as_slice(), &sequence.units[0]].concat();
-    burst_samples(&mut harletty_bridge::new_bridge(false), &bursts)
+    burst_samples(&mut bridge_router::new_bridge(false), &bursts)
 }
 
 /// The burst that opens a sequence is damaged: its unit is lost, its
@@ -324,7 +324,7 @@ fn a_damaged_opening_burst_still_opens_the_sequence() {
         };
         let mut bursts = sequence.units.clone();
         bursts[0] = [sequence.descriptors.as_slice(), cut].concat();
-        let hurt = burst_samples(&mut harletty_bridge::new_bridge(false), &bursts);
+        let hurt = burst_samples(&mut bridge_router::new_bridge(false), &bursts);
         assert!(hurt[0].is_empty(), "the damaged unit is not heard");
         assert_eq!(hurt[1..], intact[1..], "whole OBU lost: {whole_obu}");
     }
@@ -342,14 +342,14 @@ fn the_first_unit_after_descriptors_alone_is_checked() {
     let mut bursts = vec![sequence.descriptors.clone()];
     bursts.push(without_last_obu(&sequence.units[0]).to_vec());
     bursts.extend_from_slice(&sequence.units[1..]);
-    let hurt = burst_samples(&mut harletty_bridge::new_bridge(false), &bursts);
+    let hurt = burst_samples(&mut bridge_router::new_bridge(false), &bursts);
     assert!(hurt[0].is_empty() && hurt[1].is_empty());
     assert_eq!(hurt[2..], intact[1..]);
 
     // Intact, the same shape decodes as the stream.
     let mut bursts = vec![sequence.descriptors.clone()];
     bursts.extend_from_slice(&sequence.units);
-    let whole = burst_samples(&mut harletty_bridge::new_bridge(false), &bursts);
+    let whole = burst_samples(&mut bridge_router::new_bridge(false), &bursts);
     assert_eq!(whole[1..], intact[..]);
 }
 
@@ -377,7 +377,7 @@ fn a_new_sequence_led_by_a_copy_of_the_old_is_the_new_one() {
         .concat(),
     );
     bursts.extend_from_slice(&new.units[1..]);
-    let heard = burst_samples(&mut harletty_bridge::new_bridge(false), &bursts);
+    let heard = burst_samples(&mut bridge_router::new_bridge(false), &bursts);
     assert!(heard[..6].iter().all(|unit| !unit.is_empty()));
     assert_eq!(heard[6..], intact_new[..]);
 }

@@ -129,7 +129,7 @@ float output uses; the two differ by 10–15 % in level on these titles.
 
 ```
 cargo run -p dca --release --example lossy_x_probe -- <track.dts> [ffmpeg-7.1.f32]
-HARLETTY_LOSSY_X_CORPUS=<track.dts> HARLETTY_LOSSY_X_REFERENCE=<7.1.f32> cargo test -p dca -p harletty-bridge lossy
+HARLETTY_LOSSY_X_CORPUS=<track.dts> HARLETTY_LOSSY_X_REFERENCE=<7.1.f32> cargo test -p dca -p bridge-router lossy
 ```
 
 The reference is `ffmpeg -i <track.dts> -f f32le <7.1.f32>`; a track is

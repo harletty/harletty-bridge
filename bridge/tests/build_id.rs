@@ -14,13 +14,13 @@ extern "C" fn sink(_level: RLogLevel, _target: RStr<'_>, message: RStr<'_>) {
 
 #[test]
 fn the_build_id_is_logged_once_through_the_host_sink() {
-    harletty_bridge::set_log_sink(sink);
-    let _first = harletty_bridge::new_bridge(false);
+    bridge_router::set_log_sink(sink);
+    let _first = bridge_router::new_bridge(false);
     // A host installs its sink again for every bridge it opens.
-    harletty_bridge::set_log_sink(sink);
-    let _second = harletty_bridge::new_bridge(false);
+    bridge_router::set_log_sink(sink);
+    let _second = bridge_router::new_bridge(false);
 
-    let id = harletty_bridge::build_id();
+    let id = bridge_router::build_id();
     let received = RECEIVED.lock().unwrap();
     let logged: Vec<_> = received.iter().filter(|m| **m == id).collect();
     assert_eq!(logged.len(), 1, "build id {id:?} in {received:?}");
@@ -30,12 +30,12 @@ fn the_build_id_is_logged_once_through_the_host_sink() {
         id.contains(&format!("bridge_api {}", bridge_api::VERSION)),
         "{id}"
     );
-    assert!(id.contains(harletty_bridge::OMNIPHONY_COMMIT), "{id}");
+    assert!(id.contains(bridge_router::OMNIPHONY_COMMIT), "{id}");
 }
 
 #[test]
 fn the_omniphony_commit_is_a_sha_or_unknown() {
-    let commit = harletty_bridge::OMNIPHONY_COMMIT;
+    let commit = bridge_router::OMNIPHONY_COMMIT;
     // The release workflow sets the variable for the build and the tests
     // alike: the library must carry exactly the commit it pinned.
     if let Some(expected) = std::env::var("HARLETTY_OMNIPHONY_COMMIT")

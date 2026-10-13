@@ -1,6 +1,6 @@
 //! The plugin as a host loads it: its root module and the bridges it makes.
 
-use harletty_dolby_bridge as PLUGIN;
+use harletty_bridge as PLUGIN;
 
 const PRIMARY_CODECS: &[&str] = &["truehd", "mlp", "eac3", "ac3"];
 const FOREIGN_CODECS: &[&str] = &["dts", "iamf"];

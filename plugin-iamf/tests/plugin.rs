@@ -1,6 +1,6 @@
 //! The plugin as a host loads it: its root module and the bridges it makes.
 
-use harletty_iamf_bridge as PLUGIN;
+use eclipsa_bridge as PLUGIN;
 
 const PRIMARY_CODECS: &[&str] = &["iamf"];
 const FOREIGN_CODECS: &[&str] = &["truehd", "eac3", "dts"];

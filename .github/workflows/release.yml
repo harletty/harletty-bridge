@@ -8,12 +8,13 @@ name: Release
 # (`HARLETTY_OMNIPHONY_COMMIT`, read by bridge-common/build.rs) and logs it
 # when a host loads it.
 #
-# Each platform archive holds the three bridge plugins, one per codec family
-# (harletty_dolby_bridge, harletty_dts_bridge, harletty_iamf_bridge); a host
-# loads them together (Omniphony docs/multi-bridge.md). The IAMF plugin links
-# libopus: the system's on Linux (libopus0 at run time), built from source
-# and linked in statically on Windows and macOS (scripts/build-static-opus.sh),
-# so that each plugin is one file there.
+# Each bridge plugin, one per codec family, has an archive of its own per
+# platform: harletty-bridge (Dolby), alicia-bridge (DTS) and eclipsa-bridge
+# (IAMF); a host loads the ones installed together (Omniphony
+# docs/multi-bridge.md). eclipsa_bridge links libopus: the system's on Linux
+# (libopus0 at run time), built from source and linked in statically on
+# Windows and macOS (scripts/build-static-opus.sh), so that it is one file
+# there.
 #
 # A manual run builds and tests the three platforms and publishes nothing: a
 # dry run before tagging.
@@ -88,7 +89,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libopus-dev
 
       - name: Build (release)
-        run: cargo build --release --locked -p harletty-dolby-bridge -p harletty-dts-bridge -p harletty-iamf-bridge -p harletty
+        run: cargo build --release --locked -p harletty-bridge -p alicia-bridge -p eclipsa-bridge -p harletty
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -98,7 +99,7 @@ jobs:
       - name: Test (release)
         run: |
           cargo test --release --locked
-          cargo test --release --locked -p bridge-family-iamf -p harletty-iamf-bridge
+          cargo test --release --locked -p bridge-family-iamf -p eclipsa-bridge
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -106,8 +107,9 @@ jobs:
       - name: Package (zip)
         run: |
           cd harletty-bridge/target/release
-          zip "harletty-bridge-${GITHUB_REF_NAME}-linux-x86_64.zip" \
-            libharletty_dolby_bridge.so libharletty_dts_bridge.so libharletty_iamf_bridge.so
+          for bridge in harletty alicia eclipsa; do
+            zip "${bridge}-bridge-${GITHUB_REF_NAME}-linux-x86_64.zip" "lib${bridge}_bridge.so"
+          done
           zip "harletty-cli-${GITHUB_REF_NAME}-linux-x86_64.zip" harletty
 
       - name: Upload artifact
@@ -115,7 +117,7 @@ jobs:
         with:
           name: harletty-bridge-linux-x86_64
           path: |
-            harletty-bridge/target/release/harletty-bridge-*-linux-x86_64.zip
+            harletty-bridge/target/release/*-bridge-*-linux-x86_64.zip
             harletty-bridge/target/release/harletty-cli-*-linux-x86_64.zip
 
   build-windows:
@@ -148,7 +150,7 @@ jobs:
 
       # +crt-static: see .cargo/config.toml, which this RUSTFLAGS replaces.
       - name: Build (release)
-        run: cargo build --release --locked -p harletty-dolby-bridge -p harletty-dts-bridge -p harletty-iamf-bridge -p harletty
+        run: cargo build --release --locked -p harletty-bridge -p alicia-bridge -p eclipsa-bridge -p harletty
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings -C target-feature=+crt-static
@@ -158,7 +160,7 @@ jobs:
       - name: Test (release)
         run: |
           cargo test --release --locked
-          cargo test --release --locked -p bridge-family-iamf -p harletty-iamf-bridge
+          cargo test --release --locked -p bridge-family-iamf -p eclipsa-bridge
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings -C target-feature=+crt-static
@@ -170,9 +172,9 @@ jobs:
         run: |
           if [ -f Omniphony/scripts/check_windows_crt_imports.py ]; then
             python Omniphony/scripts/check_windows_crt_imports.py \
-              harletty-bridge/target/release/harletty_dolby_bridge.dll \
-              harletty-bridge/target/release/harletty_dts_bridge.dll \
-              harletty-bridge/target/release/harletty_iamf_bridge.dll \
+              harletty-bridge/target/release/harletty_bridge.dll \
+              harletty-bridge/target/release/alicia_bridge.dll \
+              harletty-bridge/target/release/eclipsa_bridge.dll \
               harletty-bridge/target/release/harletty.exe
           else
             echo "check_windows_crt_imports.py not in this Omniphony commit: check skipped"
@@ -180,13 +182,15 @@ jobs:
 
       - name: Check libopus is linked in
         shell: bash
-        run: python scripts/check-static-opus.py target/release/harletty_iamf_bridge.dll
+        run: python scripts/check-static-opus.py target/release/eclipsa_bridge.dll
         working-directory: harletty-bridge
 
       - name: Package (zip)
         run: |
           cd harletty-bridge/target/release
-          Compress-Archive -Path harletty_dolby_bridge.dll,harletty_dts_bridge.dll,harletty_iamf_bridge.dll -DestinationPath "harletty-bridge-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
+          foreach ($bridge in 'harletty', 'alicia', 'eclipsa') {
+            Compress-Archive -Path "${bridge}_bridge.dll" -DestinationPath "${bridge}-bridge-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
+          }
           Compress-Archive -Path harletty.exe -DestinationPath "harletty-cli-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
 
       - name: Upload artifact
@@ -194,7 +198,7 @@ jobs:
         with:
           name: harletty-bridge-windows-x86_64
           path: |
-            harletty-bridge/target/release/harletty-bridge-*-windows-x86_64.zip
+            harletty-bridge/target/release/*-bridge-*-windows-x86_64.zip
             harletty-bridge/target/release/harletty-cli-*-windows-x86_64.zip
 
   build-macos:
@@ -225,7 +229,7 @@ jobs:
         working-directory: harletty-bridge
 
       - name: Build (release)
-        run: cargo build --release --locked -p harletty-dolby-bridge -p harletty-dts-bridge -p harletty-iamf-bridge -p harletty
+        run: cargo build --release --locked -p harletty-bridge -p alicia-bridge -p eclipsa-bridge -p harletty
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -235,20 +239,21 @@ jobs:
       - name: Test (release)
         run: |
           cargo test --release --locked
-          cargo test --release --locked -p bridge-family-iamf -p harletty-iamf-bridge
+          cargo test --release --locked -p bridge-family-iamf -p eclipsa-bridge
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
 
       - name: Check libopus is linked in
-        run: python3 scripts/check-static-opus.py target/release/libharletty_iamf_bridge.dylib
+        run: python3 scripts/check-static-opus.py target/release/libeclipsa_bridge.dylib
         working-directory: harletty-bridge
 
       - name: Package (zip)
         run: |
           cd harletty-bridge/target/release
-          zip "harletty-bridge-${GITHUB_REF_NAME}-macos-arm64.zip" \
-            libharletty_dolby_bridge.dylib libharletty_dts_bridge.dylib libharletty_iamf_bridge.dylib
+          for bridge in harletty alicia eclipsa; do
+            zip "${bridge}-bridge-${GITHUB_REF_NAME}-macos-arm64.zip" "lib${bridge}_bridge.dylib"
+          done
           zip "harletty-cli-${GITHUB_REF_NAME}-macos-arm64.zip" harletty
 
       - name: Upload artifact
@@ -256,7 +261,7 @@ jobs:
         with:
           name: harletty-bridge-macos-arm64
           path: |
-            harletty-bridge/target/release/harletty-bridge-*-macos-arm64.zip
+            harletty-bridge/target/release/*-bridge-*-macos-arm64.zip
             harletty-bridge/target/release/harletty-cli-*-macos-arm64.zip
 
   release:
@@ -313,11 +318,11 @@ jobs:
           {
             echo "## ${heading}"
             echo
-            echo "Each platform archive holds three bridge plugins, one per codec family, to install together: \`harletty_dolby_bridge\` (TrueHD, E-AC-3, AC-3), \`harletty_dts_bridge\` (DTS, DTS-HD, DTS:X, Auro-3D) and \`harletty_iamf_bridge\` (IAMF; on Linux it needs the system libopus). They replace the single \`harletty_bridge\` library of earlier releases, which should be removed."
+            echo "Three bridge plugins, one per codec family, each in an archive of its own per platform: \`harletty-bridge\` (TrueHD, E-AC-3, AC-3), \`alicia-bridge\` (DTS, DTS-HD, DTS:X, Auro-3D) and \`eclipsa-bridge\` (IAMF; on Linux it needs the system libopus). Install the ones for the formats you play, side by side. \`harletty_bridge\` decoded every format in earlier releases and now decodes the first family only: replace the old file with the new one, and add the other two for DTS and IAMF."
             echo
             echo "The bridges are built against \`bridge_api\` ${BRIDGE_API}, from ${link} (\`.omniphony-ref\`: \`${REF}\`). A host loads them only when built against the same \`bridge_api\` minor, ${minor}.x: ${since}, up to the release that moves \`bridge_api\` past ${minor}. Other hosts refuse them. The CLI has no such dependency."
             echo
-            echo "When a host loads one, it logs what it was built from: \`harletty-dolby-bridge <version> (bridge_api ${BRIDGE_API}, Omniphony ${COMMIT})\`, and likewise for the other two."
+            echo "When a host loads one, it logs what it was built from: \`harletty-bridge <version> (bridge_api ${BRIDGE_API}, Omniphony ${COMMIT})\`, and likewise for the other two."
           } > omniphony-requirement.md
           echo "path=omniphony-requirement.md" >> "$GITHUB_OUTPUT"
 
@@ -330,6 +335,12 @@ jobs:
             harletty-bridge-*-linux-x86_64.zip
             harletty-bridge-*-windows-x86_64.zip
             harletty-bridge-*-macos-arm64.zip
+            alicia-bridge-*-linux-x86_64.zip
+            alicia-bridge-*-windows-x86_64.zip
+            alicia-bridge-*-macos-arm64.zip
+            eclipsa-bridge-*-linux-x86_64.zip
+            eclipsa-bridge-*-windows-x86_64.zip
+            eclipsa-bridge-*-macos-arm64.zip
             harletty-cli-*-linux-x86_64.zip
             harletty-cli-*-windows-x86_64.zip
             harletty-cli-*-macos-arm64.zip

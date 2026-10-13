@@ -10,10 +10,14 @@ of the flat stereo/5.1 downmix you normally get. It turns the encoded
 audio in your movie file into sound + the spatial information the
 renderer needs to place each object in space.
 
-It comes as **plugins**, one per codec family: you don't run them on
-their own. You install Omniphony or mpv-omniphony, drop the three files
-next to it (or tell the config where they are), and that's the whole
-job.
+It is a **plugin**: you don't run it on its own. You install Omniphony
+or mpv-omniphony, drop the file next to it (or tell the config where it
+is), and that's the whole job.
+
+This repository builds two more plugins of the same kind, each released
+under its own name: **alicia-bridge** for DTS, DTS-HD, DTS:X and
+Auro-3D, and **eclipsa-bridge** for IAMF (Eclipsa Audio). Install the
+ones for the formats you play; the host loads them together.
 
 > **Looking for the command-line converter instead?** This repo also
 > ships **`harletty`** — a fork of
@@ -39,30 +43,30 @@ file for your system from the
 [**releases page**](https://github.com/harletty/harletty-bridge/releases)
 and follow the three steps for your OS below.
 
-> Each release has one bridge archive per system,
-> `harletty-bridge-<version>-<system>.zip`. It holds three plugins, one
-> per codec family; install all three side by side (the
+> Each release has one archive per bridge and per system,
+> `<bridge>-<version>-<system>.zip`, holding one file (the
 > `harletty-cli-*` archives alongside are the separate
 > [offline tool](docs/harletty-cli.md) — not needed for playback):
 >
-> | Your system | Files in the archive |
-> |---|---|
-> | **Windows** | `harletty_dolby_bridge.dll`, `harletty_dts_bridge.dll`, `harletty_iamf_bridge.dll` |
-> | **Linux** | `libharletty_dolby_bridge.so`, `libharletty_dts_bridge.so`, `libharletty_iamf_bridge.so` |
-> | **macOS** | `libharletty_dolby_bridge.dylib`, `libharletty_dts_bridge.dylib`, `libharletty_iamf_bridge.dylib` |
+> | Bridge | Decodes | File on Windows / Linux / macOS |
+> |---|---|---|
+> | **harletty-bridge** | TrueHD and E-AC-3 / AC-3 (with Atmos objects) | `harletty_bridge.dll` / `libharletty_bridge.so` / `libharletty_bridge.dylib` |
+> | **alicia-bridge** | DTS, DTS-HD, DTS:X and Auro-3D | `alicia_bridge.dll` / `libalicia_bridge.so` / `libalicia_bridge.dylib` |
+> | **eclipsa-bridge** | IAMF (Eclipsa Audio) | `eclipsa_bridge.dll` / `libeclipsa_bridge.so` / `libeclipsa_bridge.dylib` |
 >
-> `dolby` decodes TrueHD and E-AC-3 / AC-3 (with Atmos objects), `dts`
-> decodes DTS, DTS-HD, DTS:X and Auro-3D, `iamf` decodes IAMF (Eclipsa
-> Audio). The host loads them together and hands each stream to the one
-> that recognises it. On Linux the IAMF plugin uses the system's libopus
-> (`libopus0` on Debian/Ubuntu, `opus` on Arch and Fedora); on Windows
-> and macOS it is built in.
+> Put the ones you install side by side: the host loads them together and
+> hands each stream to the one that recognises it. On Linux
+> eclipsa-bridge uses the system's libopus (`libopus0` on Debian/Ubuntu,
+> `opus` on Arch and Fedora); on Windows and macOS it is built in.
 >
-> **Upgrading from a single `harletty_bridge` file?** Delete it and put
-> the three files in its place. A config whose `bridge_path` still names
-> `libharletty_bridge.so` / `harletty_bridge.dll` /
-> `libharletty_bridge.dylib` keeps working: the host loads the three
-> family plugins from that folder instead, and the next Save writes them.
+> **Upgrading from harletty-bridge 0.8 or older?** Its single
+> `harletty_bridge` file decoded every format. The file of that name now
+> decodes the Dolby formats only: put the new one in its place, and
+> `alicia_bridge` and `eclipsa_bridge` next to it for the others. A
+> config or an `mpv.conf` that names `libharletty_bridge.so` /
+> `harletty_bridge.dll` / `libharletty_bridge.dylib` alone keeps working:
+> the host loads the other two from that folder too, and the next Save
+> writes the three.
 
 > **Match the bridges to your Omniphony.** A bridge loads only in an
 > Omniphony built against the same `bridge_api` minor version, so each
@@ -73,12 +77,13 @@ and follow the three steps for your OS below.
 > and the first Omniphony release after 0.6.0. Older hosts refuse the
 > plugins. When a host loads a plugin, its log shows what it was built
 > from, e.g.
-> `harletty-dolby-bridge 0.9.0 (bridge_api 0.6.0, Omniphony c821eb34…)`.
+> `harletty-bridge 0.9.0 (bridge_api 0.6.0, Omniphony c821eb34…)`.
 
 ### 🪟 Windows
 
 Download **`harletty-bridge-<version>-windows-x86_64.zip`** from the
-releases page and extract the three `.dll` files, then pick **one** of
+releases page (and the `alicia-bridge-…` and `eclipsa-bridge-…` archives
+for the other formats), extract the `.dll` files, then pick **one** of
 the two options below.
 
 **Option A — drop them next to `orender.exe` (recommended, no config).**
@@ -88,7 +93,7 @@ folder, so there's nothing else to set up.
 1. Find that folder: right-click your Omniphony / mpv-omniphony
    shortcut → *Open file location*; or search `orender.exe` in the
    Start menu, right-click the result → *Open file location*.
-2. Drop the three `harletty_*_bridge.dll` files into that folder. Keep
+2. Drop the `*_bridge.dll` files into that folder. Keep
    the file names as they are (auto-detection needs the `_bridge.dll`
    ending).
 
@@ -97,7 +102,7 @@ Done — skip to "Check it worked" below.
 **Option B — keep them in a folder of your choice (needs a config entry).**
 
 1. Put the files somewhere permanent, e.g. create `C:\Omniphony\` and
-   drop them in → `C:\Omniphony\harletty_dolby_bridge.dll` and so on.
+   drop them in → `C:\Omniphony\harletty_bridge.dll` and so on.
 2. Tell Omniphony where they are. Open (or create) the file
    `%APPDATA%\omniphony\config.yaml` — paste that into the address bar
    of Explorer to find the folder — and make sure it lists the full
@@ -106,9 +111,9 @@ Done — skip to "Check it worked" below.
    ```yaml
    render:
      bridge_paths:
-       - C:\Omniphony\harletty_dolby_bridge.dll
-       - C:\Omniphony\harletty_dts_bridge.dll
-       - C:\Omniphony\harletty_iamf_bridge.dll
+       - C:\Omniphony\harletty_bridge.dll
+       - C:\Omniphony\alicia_bridge.dll
+       - C:\Omniphony\eclipsa_bridge.dll
    ```
 
 That's it. Start mpv-omniphony or Omniphony Studio and your Atmos
@@ -147,10 +152,11 @@ If a bridge isn't found, the host falls back to the normal
 ### 🐧 Linux
 
 1. Download **`harletty-bridge-<version>-linux-x86_64.zip`** from the
-   releases page, and install libopus if it isn't already
-   (`sudo apt install libopus0`, `sudo pacman -S opus`,
-   `sudo dnf install opus`): the IAMF plugin uses it.
-2. Extract the three `.so` files somewhere permanent, e.g.
+   releases page, and the `alicia-bridge-…` and `eclipsa-bridge-…`
+   archives for the other formats. For eclipsa-bridge, install libopus
+   if it isn't already (`sudo apt install libopus0`,
+   `sudo pacman -S opus`, `sudo dnf install opus`).
+2. Extract the `.so` files somewhere permanent, e.g.
    `~/.local/lib/harletty/`.
 3. Edit `~/.config/omniphony/config.yaml` (create it if missing) so it
    contains:
@@ -158,9 +164,9 @@ If a bridge isn't found, the host falls back to the normal
    ```yaml
    render:
      bridge_paths:
-       - /home/you/.local/lib/harletty/libharletty_dolby_bridge.so
-       - /home/you/.local/lib/harletty/libharletty_dts_bridge.so
-       - /home/you/.local/lib/harletty/libharletty_iamf_bridge.so
+       - /home/you/.local/lib/harletty/libharletty_bridge.so
+       - /home/you/.local/lib/harletty/libalicia_bridge.so
+       - /home/you/.local/lib/harletty/libeclipsa_bridge.so
    ```
 
    (Or drop the files next to the `orender` binary and skip this step —
@@ -168,30 +174,33 @@ If a bridge isn't found, the host falls back to the normal
 
 Then verify it with the [Check it worked](#check-it-worked) steps above.
 
-> **Arch users:** there's nothing to download by hand — the bridge is on
-> the AUR as [`harletty-bridge`](https://aur.archlinux.org/packages/harletty-bridge):
+> **Arch users:** there's nothing to download by hand — the bridges are
+> on the AUR, one package each
+> ([`harletty-bridge`](https://aur.archlinux.org/packages/harletty-bridge),
+> `alicia-bridge`, `eclipsa-bridge`):
 >
 > ```sh
-> paru -S harletty-bridge
+> paru -S harletty-bridge alicia-bridge eclipsa-bridge
 > ```
 >
-> It builds from this repo's release and installs the plugins in
+> They build from this repo's release and install the plugins in
 > `/usr/lib/orender/`, the system plugin folder the host searches last
 > when no bridge is configured. A config that names them explicitly:
 >
 > ```yaml
 > render:
 >   bridge_paths:
->     - /usr/lib/orender/libharletty_dolby_bridge.so
->     - /usr/lib/orender/libharletty_dts_bridge.so
->     - /usr/lib/orender/libharletty_iamf_bridge.so
+>     - /usr/lib/orender/libharletty_bridge.so
+>     - /usr/lib/orender/libalicia_bridge.so
+>     - /usr/lib/orender/libeclipsa_bridge.so
 > ```
 
 ### 🍎 macOS
 
 1. Download **`harletty-bridge-<version>-macos-arm64.zip`** from the
-   releases page.
-2. Extract the three `.dylib` files somewhere permanent, e.g.
+   releases page, and the `alicia-bridge-…` and `eclipsa-bridge-…`
+   archives for the other formats.
+2. Extract the `.dylib` files somewhere permanent, e.g.
    `~/Library/Application Support/omniphony/`.
 3. Edit `~/.config/omniphony/config.yaml` (create it if missing) so it
    contains:
@@ -199,9 +208,9 @@ Then verify it with the [Check it worked](#check-it-worked) steps above.
    ```yaml
    render:
      bridge_paths:
-       - /Users/you/Library/Application Support/omniphony/libharletty_dolby_bridge.dylib
-       - /Users/you/Library/Application Support/omniphony/libharletty_dts_bridge.dylib
-       - /Users/you/Library/Application Support/omniphony/libharletty_iamf_bridge.dylib
+       - /Users/you/Library/Application Support/omniphony/libharletty_bridge.dylib
+       - /Users/you/Library/Application Support/omniphony/libalicia_bridge.dylib
+       - /Users/you/Library/Application Support/omniphony/libeclipsa_bridge.dylib
    ```
 
    (Or drop the files next to the `orender` binary and skip this step —
@@ -237,7 +246,7 @@ Step by step:
 
 Architecturally each bridge is a runtime `dlopen` plugin — the exact
 same loading pattern Omniphony uses for any format-specific bridge
-(`*_bridge.so` / `.dll` / `.dylib`). harletty ships one per codec
+(`*_bridge.so` / `.dll` / `.dylib`). This repository builds one per codec
 family; the host loads them together, asks each one's `probe` where a
 stream of its family starts, and routes each stream to the one that
 claims it
@@ -278,12 +287,12 @@ Then:
 build_bridge.bat        :: Windows native
 ```
 
-The build produces `target/release/libharletty_{dolby,dts,iamf}_bridge.{so,dylib}`
-on unix and `target\release\harletty_{dolby,dts,iamf}_bridge.dll` on
+The build produces `target/release/lib{harletty,alicia,eclipsa}_bridge.{so,dylib}`
+on unix and `target\release\{harletty,alicia,eclipsa}_bridge.dll` on
 Windows. Point `bridge_paths` at those files exactly as in the install
 steps above.
 
-The IAMF plugin links libopus. On Linux it takes the system's through
+eclipsa-bridge links libopus. On Linux it takes the system's through
 pkg-config (install `libopus-dev` or your distribution's equivalent). On
 Windows and macOS, `build_bridge` builds libopus from source first and
 links it in statically (`scripts/build-static-opus.sh`, CMake needed), as
@@ -300,11 +309,11 @@ the `bridge_api` version when a host loads it.
 Each codec family is a crate of its own, and each has a plugin crate that
 makes it a bridge library:
 
-| Plugin (package) | Library | Decodes | IEC 61937 burst types |
-|---|---|---|---|
-| `harletty-dolby-bridge` | `harletty_dolby_bridge` | TrueHD (raw and MAT), E-AC-3 / AC-3 with JOC objects | 0x01, 0x15, 0x16 |
-| `harletty-dts-bridge` | `harletty_dts_bridge` | DTS, DTS-HD, DTS:X, Auro-3D over DTS-HD MA | 0x0B–0x0D, 0x11 |
-| `harletty-iamf-bridge` | `harletty_iamf_bridge` | IAMF (Eclipsa Audio) | 0x1D (private, see below) |
+| Plugin (package) | Crate | Library | Decodes | IEC 61937 burst types |
+|---|---|---|---|---|
+| `harletty-bridge` | `plugin-dolby/` | `harletty_bridge` | TrueHD (raw and MAT), E-AC-3 / AC-3 with JOC objects | 0x01, 0x15, 0x16 |
+| `alicia-bridge` | `plugin-dts/` | `alicia_bridge` | DTS, DTS-HD, DTS:X, Auro-3D over DTS-HD MA | 0x0B–0x0D, 0x11 |
+| `eclipsa-bridge` | `plugin-iamf/` | `eclipsa_bridge` | IAMF (Eclipsa Audio) | 0x1D (private, see below) |
 
 IAMF has no IEC 61937 data type of its own. `0x1D` is a private one, for a
 sender and a receiver that are both Omniphony's: a burst carries the OBUs of
@@ -312,13 +321,13 @@ one temporal unit, with a redundant copy of the descriptors now and then
 (Omniphony `docs/iamf-transport-plan.md`). No other equipment decodes it.
 
 Build any of them on its own, e.g. `cargo build --release -p
-harletty-iamf-bridge`. A plugin's crate graph holds its own family's
+eclipsa-bridge`. A plugin's crate graph holds its own family's
 decoders and no other's, which CI checks
 (`scripts/check-crate-isolation.sh`).
 
-`bridge/` is the combined bridge, every family behind one router, kept as
-a library for the fuzz target, `bridge_bench` and the bit-exactness kit;
-it is no longer shipped. Its Cargo features (`dolby`, `dts`, `iamf`) pick
+`bridge/` (package `bridge-router`) is the combined bridge, every family
+behind one router, kept as a library for the fuzz target, `bridge_bench`
+and the bit-exactness kit; it is no longer shipped. Its Cargo features (`dolby`, `dts`, `iamf`) pick
 the families it holds.
 
 ## The offline `harletty` CLI
@@ -369,9 +378,9 @@ The repo is a virtual cargo workspace — no package at the root. It
 builds the bridge plugins and the CLI from one decoder lineage.
 
 ```
-plugin-dolby/        # the Dolby bridge plugin (harletty_dolby_bridge)
-plugin-dts/          # the DTS bridge plugin (harletty_dts_bridge)
-plugin-iamf/         # the IAMF bridge plugin (harletty_iamf_bridge)
+plugin-dolby/        # the Dolby bridge plugin (harletty_bridge)
+plugin-dts/          # the DTS bridge plugin (alicia_bridge)
+plugin-iamf/         # the IAMF bridge plugin (eclipsa_bridge)
 bridge-common/       # what the families share: FamilyPipeline, PluginBridge, probe helpers, root module
 bridge/              # the combined bridge (every family behind one router), for fuzz / bench / kit
 bridge-family-dolby/ # TrueHD (raw / MAT) and E-AC-3 / AC-3 JOC paths

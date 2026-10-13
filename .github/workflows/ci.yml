@@ -109,7 +109,7 @@ jobs:
       # The bridge-perf timing path is compiled by nothing else — it rotted
       # unnoticed once already (#31) — so keep it building.
       - name: Check bridge-perf feature
-        run: cargo check --locked -p harletty-bridge -p harletty-dolby-bridge --features harletty-bridge/bridge-perf,harletty-dolby-bridge/bridge-perf --all-targets
+        run: cargo check --locked -p bridge-router -p harletty-bridge --features bridge-router/bridge-perf,harletty-bridge/bridge-perf --all-targets
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -124,7 +124,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libopus-dev
 
       - name: Test iamf feature
-        run: cargo test --locked -p harletty-bridge -p bridge-family-iamf -p harletty-iamf-bridge --features harletty-bridge/iamf
+        run: cargo test --locked -p bridge-router -p bridge-family-iamf -p eclipsa-bridge --features bridge-router/iamf
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -133,7 +133,7 @@ jobs:
       # it builds at all without the Dolby and DTS crates. The crate-isolation
       # step below checks that its graph holds none of their decoders.
       - name: Test IAMF-only bridge
-        run: cargo test --locked -p harletty-bridge --no-default-features --features iamf
+        run: cargo test --locked -p bridge-router --no-default-features --features iamf
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -141,8 +141,8 @@ jobs:
       # Every family can be left out: keep the one-family builds compiling.
       - name: Check single-family bridges
         run: |
-          cargo check --locked -p harletty-bridge --no-default-features --features dolby --all-targets
-          cargo check --locked -p harletty-bridge --no-default-features --features dts --all-targets
+          cargo check --locked -p bridge-router --no-default-features --features dolby --all-targets
+          cargo check --locked -p bridge-router --no-default-features --features dts --all-targets
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -235,12 +235,12 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            library: harletty_iamf_bridge.dll
+            library: eclipsa_bridge.dll
             python: python
             # +crt-static: see .cargo/config.toml, which RUSTFLAGS replaces.
             rustflags: -D warnings -C target-feature=+crt-static
           - os: macos-14
-            library: libharletty_iamf_bridge.dylib
+            library: libeclipsa_bridge.dylib
             python: python3
             rustflags: -D warnings
     env:
@@ -281,7 +281,7 @@ jobs:
         working-directory: harletty-bridge
 
       - name: Test the IAMF plugin and its family
-        run: cargo test --locked -p harletty-iamf-bridge -p bridge-family-iamf
+        run: cargo test --locked -p eclipsa-bridge -p bridge-family-iamf
         working-directory: harletty-bridge
 
       # release.yml runs the whole workspace's tests on these platforms with
@@ -293,7 +293,7 @@ jobs:
         working-directory: harletty-bridge
 
       - name: Build the plugin library
-        run: cargo build --release --locked -p harletty-iamf-bridge
+        run: cargo build --release --locked -p eclipsa-bridge
         working-directory: harletty-bridge
 
       - name: Check libopus is linked in

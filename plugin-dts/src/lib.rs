@@ -1,6 +1,6 @@
 //! The DTS family as an Omniphony bridge plugin of its own
-//! (`libharletty_dts_bridge.so`, `harletty_dts_bridge.dll`,
-//! `libharletty_dts_bridge.dylib`): DTS core, DTS-HD (HRA, MA), the DTS:X
+//! (`libalicia_bridge.so`, `alicia_bridge.dll`,
+//! `libalicia_bridge.dylib`): DTS core, DTS-HD (HRA, MA), the DTS:X
 //! extensions and Auro-3D carried in DTS-HD MA, raw and over IEC 61937
 //! (burst types 0x0B, 0x0C, 0x0D and 0x11).
 //!

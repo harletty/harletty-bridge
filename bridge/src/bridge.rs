@@ -16,7 +16,7 @@ use bridge_family_dolby::{DolbyPipeline, FAMILY_DOLBY};
 use bridge_family_dts::{DtsPipeline, FAMILY_AURO, FAMILY_DTS};
 
 #[cfg(not(any(feature = "dolby", feature = "dts", feature = "iamf")))]
-compile_error!("harletty-bridge needs a codec family: enable `dolby`, `dts` or `iamf`");
+compile_error!("bridge-router needs a codec family: enable `dolby`, `dts` or `iamf`");
 
 /// The source family IAMF streams report. The renderer knows no family by
 /// name: the catalogue below is what it, and Studio, offer.

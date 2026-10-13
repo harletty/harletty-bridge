@@ -3,8 +3,8 @@
 //! sink. A process of its own, so no other test has logged it first.
 
 use abi_stable::std_types::RStr;
+use alicia_bridge as plugin;
 use bridge_api::RLogLevel;
-use harletty_dts_bridge as plugin;
 use std::sync::Mutex;
 
 static RECEIVED: Mutex<Vec<String>> = Mutex::new(Vec::new());

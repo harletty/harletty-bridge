@@ -4,7 +4,7 @@
 
 use abi_stable::std_types::RStr;
 use bridge_api::RLogLevel;
-use harletty_dolby_bridge as plugin;
+use harletty_bridge as plugin;
 use std::sync::Mutex;
 
 static RECEIVED: Mutex<Vec<String>> = Mutex::new(Vec::new());
