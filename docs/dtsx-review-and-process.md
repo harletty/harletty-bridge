@@ -105,8 +105,13 @@ resolved it, so this doubles as a checklist of what "done right" looks like.
   When the height quartet was absent or invalid for a frame, the emitted
   channel count flipped 12↔8 with no crossfade, forcing the renderer to
   renegotiate. → *Re-landing:* once a valid quartet locks, dropout frames
-  keep the 12-channel shape (composite bed + silent heights); the renderer's
-  constant-rate gain slew handles the transitions.
+  keep the 12-channel shape (composite bed + silent heights), so the
+  renderer no longer renegotiates. **The click is not shown to be gone**: a
+  dropout switches the PCM itself, from the cleaned bed with its heights to
+  the composite bed with silent heights, while the labels and the gains stay
+  as they were, so the renderer's gain slew has no change to smooth. Whether
+  that step is audible is unverified until a transition test or an A/B
+  listen says so.
 
 ### 3b. Contract violations — the root design mistake
 
@@ -233,10 +238,15 @@ format is presented. In one line:
   absent**, so **CI cannot run them** — they only prove anything on a machine with the corpus. A green CI
   run does **not** mean the DTS:X path was exercised. Run the gated tests
   locally, and say so in the PR.
-- When you change the presentation, verify the lossless bed is still
-  **bit-exact vs ffmpeg** (the existing `xll_*_matches_ffmpeg_lossless`
-  tests), and do an **A/B listen** before merging — decode correctness is
-  not audibility.
+- When you change the presentation, run the existing
+  `xll_*_matches_ffmpeg_lossless` tests, and know what they prove: they match
+  each ffmpeg channel to the closest decoded speaker and pass when the worst
+  RMS error is under `1e-5`. They are a regression with a tolerance, not a
+  bit-exact gate: samples that differ can pass. A claim that the lossless bed
+  is **bit-exact vs ffmpeg** needs a strict sample-for-sample comparison on
+  top, reported as such in the PR.
+- Do an **A/B listen** before merging — decode correctness is not
+  audibility.
 
 ### Pre-PR checklist for DTS:X work
 
@@ -244,7 +254,9 @@ format is presented. In one line:
 - [ ] `cargo build --all-targets` clean with `-D warnings`.
 - [ ] Full test suite green **with the corpus present**; gated tests
       actually ran (not skipped).
-- [ ] Lossless bed still bit-exact vs ffmpeg.
+- [ ] `xll_*_matches_ffmpeg_lossless` pass (a tolerance of `1e-5` RMS, not
+      a bit-exact check); if the PR claims the lossless bed is bit-exact vs
+      ffmpeg, a strict sample comparison is reported with it.
 - [ ] No fabricated metadata / bed-ids; fixed channels are labeled, objects
       declared (contract).
 - [ ] No panic path, no per-frame/per-sample allocation, no research state
