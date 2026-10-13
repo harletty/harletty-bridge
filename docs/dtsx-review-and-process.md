@@ -238,13 +238,17 @@ format is presented. In one line:
   absent**, so **CI cannot run them** — they only prove anything on a machine with the corpus. A green CI
   run does **not** mean the DTS:X path was exercised. Run the gated tests
   locally, and say so in the PR.
-- When you change the presentation, run the existing
-  `xll_*_matches_ffmpeg_lossless` tests, and know what they prove: they match
-  each ffmpeg channel to the closest decoded speaker and pass when the worst
-  RMS error is under `1e-5`. They are a regression with a tolerance, not a
-  bit-exact gate: samples that differ can pass. A claim that the lossless bed
-  is **bit-exact vs ffmpeg** needs a strict sample-for-sample comparison on
-  top, reported as such in the PR.
+- When you change the presentation, the lossless bed must stay **bit-exact
+  vs ffmpeg**, and two checks are both required:
+  - the existing `xll_*_matches_ffmpeg_lossless` tests. Know what they prove:
+    they match each ffmpeg channel to the closest decoded speaker and pass
+    when the worst RMS error is under `1e-5`. They are a regression with a
+    tolerance, not a bit-exact gate: samples that differ can pass;
+  - a strict sample-for-sample comparison of the decoder's lossless bed with
+    ffmpeg's, with not one differing sample, its result reported in the PR.
+    `scripts/compare-dtsx-bed.py` on an `xll_pcm_range` dump prints the
+    largest absolute difference of each bed channel: bit-exact is
+    `maxabs=0` on all of them.
 - Do an **A/B listen** before merging — decode correctness is not
   audibility.
 
@@ -254,9 +258,10 @@ format is presented. In one line:
 - [ ] `cargo build --all-targets` clean with `-D warnings`.
 - [ ] Full test suite green **with the corpus present**; gated tests
       actually ran (not skipped).
-- [ ] `xll_*_matches_ffmpeg_lossless` pass (a tolerance of `1e-5` RMS, not
-      a bit-exact check); if the PR claims the lossless bed is bit-exact vs
-      ffmpeg, a strict sample comparison is reported with it.
+- [ ] Lossless bed still bit-exact vs ffmpeg: a strict sample-for-sample
+      comparison shows no differing sample, and its result is in the PR.
+- [ ] `xll_*_matches_ffmpeg_lossless` pass as well (a tolerance of `1e-5`
+      RMS: a regression, not the bit-exact check).
 - [ ] No fabricated metadata / bed-ids; fixed channels are labeled, objects
       declared (contract).
 - [ ] No panic path, no per-frame/per-sample allocation, no research state
