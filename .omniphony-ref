@@ -20,5 +20,8 @@
 # scripts/check_windows_crt_imports.py the Windows static-libopus check
 # imports. bridge_api itself is the 0.6 of #782, unchanged since. Moved to the
 # merge of #831 for spdif 0.1.1: the IAMF burst writer the carrier test
-# (bridge/tests/iamf_carrier.rs) cuts its vectors with.
-55af2c57d6092f72478c4a8f36350bb71703185e
+# (bridge/tests/iamf_carrier.rs) cuts its vectors with. Then to #841, the
+# first host that loads a path named `harletty_bridge` as the bridge it is:
+# the hosts before it take that name for the library that decoded every
+# format and load the `harletty_*` libraries beside it in its place.
+refactor/bridge-names
