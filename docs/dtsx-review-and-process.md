@@ -27,8 +27,9 @@ to `main`, in nine commits, with no pull request and no CI** (see §2).
 
 Resolution: the bridge `main` was rolled back (force-push to the
 pre-campaign commit — `main` was unprotected and no release tag pointed
-into the range), the work preserved on `research/spatial-object-layer`, and
-the two Omniphony commits reverted (Omniphony `main` is protected, so
+into the range), the work preserved on a `research/spatial-object-layer`
+branch (deleted on 2026-10-13, long after the re-landing; its last commit was
+`b1b5da4`), and the two Omniphony commits reverted (Omniphony `main` is protected, so
 reverts rather than a force-push). The feature was then re-landed cleanly,
 in phases, through the channel/object contract.
 
@@ -54,10 +55,8 @@ made them dangerous, because nothing caught them before they were on `main`.
 
 3. **Corpus-gated tests silently self-skipped.** The tests that would have
    exercised the real stream pointed at a dump path that did not exist on
-   this machine (`/mnt/local/SSD_B-CT4000/…` instead of
-   `/mnt/local/SSD_A-CT4000/DTS:X-Dumps/…`). Because they skip when the file
-   is absent, they had **never run** — the coverage looked green while
-   testing nothing.
+   the machine they ran on. Because they skip when the file is absent, they
+   had **never run** — the coverage looked green while testing nothing.
 
 4. **The campaign doc was out of sync** — it announced a branch the work no
    longer lived on.
@@ -188,9 +187,11 @@ feat/* ──(open PR, CI green, review)──▶ main ──(when ready)──�
 
 - The bridge now runs a real `ci.yml` on every push/PR to `main` (build
   `--all-targets` with warnings denied, plus the full test suite). Green CI
-  is a merge precondition. The bridge CI checks out Omniphony `main` for its
-  path dependencies, so when a change spans both repos, **merge the
-  Omniphony side first**.
+  is a merge precondition. The bridge CI builds against the Omniphony commit
+  that `.omniphony-ref` pins (see that file), so when a change spans both
+  repos, **merge the Omniphony side first**, then move the pin to its merge
+  commit. A pull request may name its unmerged Omniphony branch there; CI
+  then fails its last step until the pin is a release pin again.
 - Do not merge red. Do not merge un-run.
 
 ### The channel/object contract (the design lesson)
@@ -221,16 +222,15 @@ format is presented. In one line:
 - **Keep research state out of the shipped path.** Feature-gate diagnostics
   or put them in a separate struct; don't grow the ABI frame with them.
 - **Named constants, not magic numbers.** English-only comments and messages.
-- **Do not touch `truehd-bridge/truehd/`** — vendored upstream, kept
-  byte-for-byte aligned.
 
 ### Corpus tests
 
-- The real DTS:X corpus lives at `/mnt/local/SSD_A-CT4000/DTS:X-Dumps/`
-  (e.g. `Ex.Machina.2014.dtsx.eng.dts`). Corpus-gated tests must point
-  there.
-- These tests **self-skip when the dump is absent**, so **CI cannot run
-  them** — they only prove anything on a machine with the corpus. A green CI
+- The real DTS:X corpus is not in the repository. Corpus-gated tests take
+  its location from environment variables (`HARLETTY_DTSX_STANDARD_CORPUS`
+  and its siblings, named in each test) and never from a path written in the
+  source.
+- These tests **self-skip when the variable is unset or the dump is
+  absent**, so **CI cannot run them** — they only prove anything on a machine with the corpus. A green CI
   run does **not** mean the DTS:X path was exercised. Run the gated tests
   locally, and say so in the PR.
 - When you change the presentation, verify the lossless bed is still
@@ -261,7 +261,8 @@ format is presented. In one line:
 
 - **Bridge `main`:** force-pushed back to the last pre-campaign commit. Safe
   only because `main` was unprotected and no release tag pointed into the
-  range; the work was preserved on `research/spatial-object-layer`.
+  range; the work was preserved on a `research/spatial-object-layer` branch
+  until the re-landing made it redundant.
 - **Omniphony `main`:** protected, so the two commits were **reverted**
   (not force-pushed), leaving a clean history and a trace of the decision.
 
