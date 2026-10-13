@@ -305,8 +305,44 @@ opposite front 0.1305, `Lss` 0.3430 (25th–75th percentile 0.3427–0.3432 over
 892 dominant blocks), `Lb` 0.1039, `C` about 0.09–0.13 in the few blocks
 that expose it, nothing in LFE; the squares sum to 1.00. This is a panning
 law computed by the encoder, not coded rows. Removing a mode-0 object from
-the bed therefore means reproducing that law, and one position in one input
-is not enough to recover it.
+the bed therefore means reproducing that law.
+
+### The mode-0 law: the encoder's object renderer
+
+The law was identified in the object renderer of the author's v0.2.7
+decoder (static analysis of the published binary, never executed), and
+holds against the measurement above: re-rendering the object at its
+transmitted position over the bed gives `L` 0.9152, `C` and the opposite
+front 0.1305, `Lss` 0.3430, `Lsr` 0.1037, to four digits. The ETSI TS 103 584
+predefined virtual speakers give `L` 0.9997 and `Lss` 0.0251 instead. The
+renderer, re-implemented in `dca/src/dcadec/xrender.rs`:
+
+- the full-range bed speakers sit on the horizontal ring (the side pair at
+  +-90 degrees whatever the bed names it); with no speaker above 25 degrees
+  a virtual speaker is added at +45 degrees over each real one, and one at
+  -45 degrees under it with none below -25;
+- VBAP over every facet of the convex hull of those points, both
+  triangulations of a coplanar quad included; a direction inside several
+  facets takes their mean, one on an edge counts each facet half;
+- the object's gains are the square roots of its VBAP gains;
+- each virtual speaker folds into the real ones through a row made of the
+  plain VBAP gains at its azimuth -45, 0 and +45 degrees on the ring,
+  weighted 0.707, 1, 0.707, summed in power and normalised to unit power;
+- the folds add in power and the result is normalised to unit power.
+
+Two bits of the record select variants. The position options' 0x04 bit (the
+0x24 form) folds each virtual speaker whole into the speaker under it; the
+two-bit field read here as the position mode must be 0 or 1 for the record
+to be rendered at all, and is 0 in every stream. A bed with nothing behind
+its side pair (5.1) leaves the rear virtual folds undefined; the reference
+decoder rejects such a layout, and so does the renderer here, leaving the
+waveform to the estimator.
+
+On the moving mode-0 object of the D4 input the law leaves -8.9 dB of the bed
+on the frames the object dominates, against -11.4 dB for a per-frame least
+squares fit (which also absorbs bed content correlated with the object) and
+-7.6 dB for the cos(theta/2)^1.5 fit noted earlier. The decoder applies the
+render, then estimates from the audio only what is still unknown.
 
 ### Gain-code calibration
 
@@ -468,9 +504,9 @@ heights as labeled channels, objects with transmitted positions, every
 stated fold removed from the bed, an unstated fold left in the bed with the
 feed muted). What remains:
 
-1. Recover the mode-0 panning law, which needs more mode-0 inputs than the
-   single one at hand; until then a mode-0 object stays in the bed and its
-   object channel is silent.
+1. Confirm the mode-0 law on more mode-0 inputs: one static position is
+   matched exactly and one moving object closely, which is all the corpus
+   holds.
 2. Confirm the gain-code table relation on codes other than the four
    verified points; the reader applies it to every code in 1..=61.
 3. Explain the type-3 control word and the general association navigation,
@@ -484,7 +520,9 @@ feed muted). What remains:
 The investigation was prompted by the author's first-hand
 [legacy DTS:X article](https://touch-max.ru/zvuk/dts-iznutri-gde-v-dts-hd-ma-spryatany-vysotnye-kanaly-i-obekty).
 The author's v0.2.5 diagnostic was inspected and run locally against anonymous
-excerpts in an isolated environment without network access. Its reported
+excerpts in an isolated environment without network access. Its v0.2.7
+decoder was only analysed statically, for the mode-0 law; that law is
+re-implemented from its description and checked against the corpus audio. Its reported
 fields and parser behavior supplied hypotheses; original field readers,
 synthetic fixtures, corpus CRCs and existing Harletty/FFmpeg comparisons were
 used here. No external binary, decoder implementation or corpus audio is

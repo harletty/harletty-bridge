@@ -15,56 +15,61 @@ name: CI
 # (truehdd/tests/golden.rs).
 #
 # The bridge builds against a checkout of Omniphony (path dependencies on
-# `../Omniphony`), normally its `main`. A pull request whose Omniphony side
-# is not merged yet can name the ref to build against in a file
-# `.omniphony-ref` at the repository root — one line, a branch, tag or SHA
-# of mgth/Omniphony — and its CI runs against that instead. The file is for
-# pull requests only: remove it before merging, once the Omniphony side is
-# on `main`. A push to `main` that still carries one fails on purpose,
-# because `main` would then be tested against something `main` is not
-# built with.
+# `../Omniphony`) at the ref `.omniphony-ref` names (see that file): the same
+# one the release workflow builds with, read by `scripts/omniphony-ref.sh`.
+# A pull request whose Omniphony side is not merged yet can point the file at
+# that branch or commit; CI builds and tests against it, then fails its last
+# step until the file holds a release pin again (a tag, or a commit of
+# Omniphony's `main`), so `main` never pins something a release could not
+# rebuild.
+#
+# The scheduled run builds against Omniphony's `main` instead: it says when
+# the engine has moved on and the pin needs to follow (a `bridge_api` minor
+# bump, a lockfile change). A manual run takes the ref as an input.
+#
+# Every cargo command is `--locked`, as the release build is: a lockfile
+# that does not match the manifests fails here, not when a tag is pushed.
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      omniphony-ref:
+        description: mgth/Omniphony branch, tag or SHA to build against (the pin when empty)
+        required: false
 
 jobs:
   test-linux:
-    runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout harletty-bridge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: harletty-bridge
 
-      # `main` unless the branch names another ref in `.omniphony-ref` (see
-      # the header). Blank lines and `#` comments in the file are ignored;
-      # the first remaining line is the ref.
+      # The pin, or Omniphony's `main` for the scheduled run (see the header).
       - name: Resolve the Omniphony ref
         id: omniphony
         shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.omniphony-ref }}
         run: |
-          ref=main
-          if [ -f harletty-bridge/.omniphony-ref ]; then
-            ref=$(grep -v -E '^\s*(#|$)' harletty-bridge/.omniphony-ref | head -n 1 | tr -d '[:space:]')
-            if [ -z "$ref" ]; then
-              echo "::error file=.omniphony-ref::.omniphony-ref is present but names no ref"
-              exit 1
-            fi
-            if [ "${{ github.event_name }}" = "push" ]; then
-              echo "::error file=.omniphony-ref::.omniphony-ref (${ref}) is only for pull requests; remove it before merging"
-              exit 1
-            fi
-            echo "::notice file=.omniphony-ref::building against mgth/Omniphony@${ref} (remove the file before merging)"
-          fi
+          case "$EVENT" in
+            schedule) ref=main ;;
+            workflow_dispatch) ref=${INPUT_REF:-$(harletty-bridge/scripts/omniphony-ref.sh)} ;;
+            *) ref=$(harletty-bridge/scripts/omniphony-ref.sh) ;;
+          esac
+          echo "::notice::building against mgth/Omniphony@${ref}"
           echo "ref=${ref}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout Omniphony (path dependencies)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: mgth/Omniphony
           ref: ${{ steps.omniphony.outputs.ref }}
@@ -74,21 +79,70 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --locked --all-targets
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
 
+      # dca picks its vector code from the CPU it runs on, so the run above
+      # tests whatever the runner has (AVX2, or AVX-512 on some hosts). Test
+      # the portable and the AVX2 code on every run as well (`dca/src/cpu.rs`);
+      # `tests/fixture_decode.rs` checks they decode to the same samples.
+      - name: Test dca on its portable code
+        run: cargo test --locked -p dca
+        working-directory: harletty-bridge
+        env:
+          RUSTFLAGS: -D warnings --cfg dca_force_scalar
+
+      - name: Test dca on its AVX2 code
+        run: cargo test --locked -p dca
+        working-directory: harletty-bridge
+        env:
+          RUSTFLAGS: -D warnings --cfg dca_force_avx2
+
       # The bridge-perf timing path is compiled by nothing else — it rotted
       # unnoticed once already (#31) — so keep it building.
       - name: Check bridge-perf feature
-        run: cargo check -p harletty-bridge --features bridge-perf --all-targets
+        run: cargo check --locked -p harletty-bridge -p harletty-dolby-bridge --features harletty-bridge/bridge-perf,harletty-dolby-bridge/bridge-perf --all-targets
+        working-directory: harletty-bridge
+        env:
+          RUSTFLAGS: -D warnings
+
+      # IAMF links libopus (the system's here; Windows and macOS build it
+      # from source, see the iamf-static-opus job), so the default build
+      # above never compiles it: bridge-family-iamf and the IAMF plugin are
+      # left out of the workspace's default members. The decode tests
+      # against the libiamf conformance vectors skip here: they need
+      # HARLETTY_IAMF_VECTORS.
+      - name: Install libopus
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev
+
+      - name: Test iamf feature
+        run: cargo test --locked -p harletty-bridge -p bridge-family-iamf -p harletty-iamf-bridge --features harletty-bridge/iamf
+        working-directory: harletty-bridge
+        env:
+          RUSTFLAGS: -D warnings
+
+      # The bridge built from the IAMF family alone: what it refuses, and that
+      # it builds at all without the Dolby and DTS crates. The crate-isolation
+      # step below checks that its graph holds none of their decoders.
+      - name: Test IAMF-only bridge
+        run: cargo test --locked -p harletty-bridge --no-default-features --features iamf
+        working-directory: harletty-bridge
+        env:
+          RUSTFLAGS: -D warnings
+
+      # Every family can be left out: keep the one-family builds compiling.
+      - name: Check single-family bridges
+        run: |
+          cargo check --locked -p harletty-bridge --no-default-features --features dolby --all-targets
+          cargo check --locked -p harletty-bridge --no-default-features --features dts --all-targets
         working-directory: harletty-bridge
         env:
           RUSTFLAGS: -D warnings
@@ -100,3 +154,213 @@ jobs:
       - name: Check crate-graph isolation
         run: ./scripts/check-crate-isolation.sh
         working-directory: harletty-bridge
+
+      # Last, so a pull request pinned to an unmerged Omniphony branch still
+      # gets its build and test results: the pin on `main` must be one a
+      # release can rebuild (see the header).
+      - name: Check the Omniphony pin
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        run: ./scripts/omniphony-ref.sh --check
+        working-directory: harletty-bridge
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # Each plugin on its own, against its own crates only: a test of one
+  # family that needed another family's code built in would pass in the
+  # workspace run above and fail here. Then the release library itself.
+  plugin:
+    name: plugin (${{ matrix.family }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        family: [dolby, dts, iamf]
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Checkout harletty-bridge
+        uses: actions/checkout@v5
+        with:
+          path: harletty-bridge
+
+      # As in test-linux: the pin, or Omniphony's `main` for the scheduled run.
+      - name: Resolve the Omniphony ref
+        id: omniphony
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.omniphony-ref }}
+        run: |
+          case "$EVENT" in
+            schedule) ref=main ;;
+            workflow_dispatch) ref=${INPUT_REF:-$(harletty-bridge/scripts/omniphony-ref.sh)} ;;
+            *) ref=$(harletty-bridge/scripts/omniphony-ref.sh) ;;
+          esac
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Omniphony (path dependencies)
+        uses: actions/checkout@v5
+        with:
+          repository: mgth/Omniphony
+          ref: ${{ steps.omniphony.outputs.ref }}
+          path: Omniphony
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libopus
+        if: matrix.family == 'iamf'
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev
+
+      - name: Test the plugin and its family
+        run: cargo test --locked -p harletty-${{ matrix.family }}-bridge -p bridge-family-${{ matrix.family }}
+        working-directory: harletty-bridge
+
+      - name: Build the plugin library
+        run: |
+          cargo build --release --locked -p harletty-${{ matrix.family }}-bridge
+          test -f target/release/libharletty_${{ matrix.family }}_bridge.so
+        working-directory: harletty-bridge
+
+  # The IAMF plugin on the platforms with no system libopus: libopus built
+  # from source and linked in statically, as release.yml does, checked on
+  # every change rather than first at a release. The test binaries link the
+  # same static library, and no libopus is installed: a plugin that needed a
+  # shared one would not run its tests.
+  iamf-static-opus:
+    name: iamf plugin, static libopus (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            library: harletty_iamf_bridge.dll
+            python: python
+            # +crt-static: see .cargo/config.toml, which RUSTFLAGS replaces.
+            rustflags: -D warnings -C target-feature=+crt-static
+          - os: macos-14
+            library: libharletty_iamf_bridge.dylib
+            python: python3
+            rustflags: -D warnings
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - name: Checkout harletty-bridge
+        uses: actions/checkout@v5
+        with:
+          path: harletty-bridge
+
+      - name: Resolve the Omniphony ref
+        id: omniphony
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.omniphony-ref }}
+        run: |
+          case "$EVENT" in
+            schedule) ref=main ;;
+            workflow_dispatch) ref=${INPUT_REF:-$(harletty-bridge/scripts/omniphony-ref.sh)} ;;
+            *) ref=$(harletty-bridge/scripts/omniphony-ref.sh) ;;
+          esac
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Omniphony (path dependencies)
+        uses: actions/checkout@v5
+        with:
+          repository: mgth/Omniphony
+          ref: ${{ steps.omniphony.outputs.ref }}
+          path: Omniphony
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build libopus (static)
+        shell: bash
+        run: scripts/build-static-opus.sh
+        working-directory: harletty-bridge
+
+      - name: Test the IAMF plugin and its family
+        run: cargo test --locked -p harletty-iamf-bridge -p bridge-family-iamf
+        working-directory: harletty-bridge
+
+      # release.yml runs the whole workspace's tests on these platforms with
+      # warnings denied. Compile them here too, so a warning only one
+      # platform sees (an x86-only `mut` on arm64) fails a pull request, not
+      # a release.
+      - name: Compile the workspace tests as the release does
+        run: cargo test --release --locked --no-run
+        working-directory: harletty-bridge
+
+      - name: Build the plugin library
+        run: cargo build --release --locked -p harletty-iamf-bridge
+        working-directory: harletty-bridge
+
+      - name: Check libopus is linked in
+        shell: bash
+        run: ${{ matrix.python }} scripts/check-static-opus.py target/release/${{ matrix.library }}
+        working-directory: harletty-bridge
+
+  # The fuzz crates (eac3/fuzz, dca/fuzz, bridge/fuzz) are workspaces of
+  # their own, so nothing above compiles them: build every target here so
+  # they cannot rot. `fuzz.yml` runs them, weekly. Each crate is built
+  # against the root Cargo.lock, the dependency versions the bridge ships;
+  # not `--locked`, since the copy lacks the fuzz crate's own entries.
+  fuzz-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout harletty-bridge
+        uses: actions/checkout@v5
+        with:
+          path: harletty-bridge
+
+      # As in test-linux: the pin, or Omniphony's `main` for the scheduled run.
+      - name: Resolve the Omniphony ref
+        id: omniphony
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.omniphony-ref }}
+        run: |
+          case "$EVENT" in
+            schedule) ref=main ;;
+            workflow_dispatch) ref=${INPUT_REF:-$(harletty-bridge/scripts/omniphony-ref.sh)} ;;
+            *) ref=$(harletty-bridge/scripts/omniphony-ref.sh) ;;
+          esac
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Omniphony (path dependencies)
+        uses: actions/checkout@v5
+        with:
+          repository: mgth/Omniphony
+          ref: ${{ steps.omniphony.outputs.ref }}
+          path: Omniphony
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo-fuzz
+        id: cargo-fuzz
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-0.13.2-${{ runner.os }}
+
+      - name: Install cargo-fuzz
+        if: steps.cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      # The IAMF family's Opus path links libopus.
+      - name: Install libopus
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev
+
+      - name: Build fuzz targets
+        shell: bash
+        working-directory: harletty-bridge
+        run: |
+          for crate in eac3 dca bridge; do
+            cp Cargo.lock "$crate/fuzz/Cargo.lock"
+          done
+          (cd eac3/fuzz && cargo fuzz build)
+          (cd dca/fuzz && cargo fuzz build)
+          (cd bridge/fuzz && cargo fuzz build --features iamf)

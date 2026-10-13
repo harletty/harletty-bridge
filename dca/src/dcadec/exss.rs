@@ -8,6 +8,10 @@
 // Consumed by the XLL decoder (Phase 3); allow dead_code until that lands.
 #![allow(dead_code)]
 
+use super::xll::{
+    DCA_SYNCWORD_XLL_X, DCA_SYNCWORD_XLL_X_ALT_D0, DCA_SYNCWORD_XLL_X_ALT_D1,
+    DCA_SYNCWORD_XLL_X_ALT_D3, DCA_SYNCWORD_XLL_X_ALT_D4,
+};
 use crate::bitstream::BitReader;
 
 /// Extension masks (`enum DCAExtensionMask`, EXSS half).
@@ -124,6 +128,12 @@ pub(crate) struct ExssAsset {
 
     pub(crate) core_offset: usize,
     pub(crate) core_size: usize,
+    pub(crate) xbr_offset: usize,
+    pub(crate) xbr_size: usize,
+    pub(crate) xxch_offset: usize,
+    pub(crate) xxch_size: usize,
+    pub(crate) x96_offset: usize,
+    pub(crate) x96_size: usize,
     pub(crate) xll_offset: usize,
     pub(crate) xll_size: usize,
     pub(crate) xll_sync_present: bool,
@@ -132,7 +142,9 @@ pub(crate) struct ExssAsset {
     pub(crate) hd_stream_id: u32,
     /// Unspecified tail of the audio asset descriptor. Newer profiles can put
     /// metadata here while legacy decoders skip to `nuAssetDescriptFsize`.
-    pub(crate) descriptor_tail: Vec<u8>,
+    /// Bit position of the descriptor tail in the EXSS substream, read back
+    /// with [`ExssAsset::copy_descriptor_tail`].
+    pub(crate) descriptor_tail_pos: usize,
     pub(crate) descriptor_tail_bits: usize,
     pub(crate) decode_in_secondary: bool,
     pub(crate) drc_rev2_present: bool,
@@ -168,10 +180,39 @@ impl ExssParser {
     pub(crate) fn has_xll(&self) -> bool {
         self.asset.extension_mask & DCA_EXSS_XLL != 0
     }
+
+    /// True when the asset carries an XXCH component: channels beyond the
+    /// core's, coded lossily (DTS-HD High Resolution Audio 7.1).
+    pub(crate) fn has_xxch(&self) -> bool {
+        self.asset.extension_mask & DCA_EXSS_XXCH != 0
+    }
+
+    /// Start, within `exss`, of the DTS:X extension a lossy carrier places
+    /// after its audio asset — found by its marker within a few bytes of
+    /// the asset's end (six bytes of unread data separate them in the
+    /// corpus). `None` when the substream ends with the asset.
+    pub(crate) fn extension_after_asset(&self, exss: &[u8]) -> Option<usize> {
+        const SCAN: usize = 32;
+        let from = self.asset.asset_offset + self.asset.asset_size;
+        let to = self.exss_size.min(exss.len()).min(from + SCAN);
+        let window = exss.get(from..to)?;
+        window
+            .windows(4)
+            .position(|w| {
+                matches!(
+                    u32::from_be_bytes([w[0], w[1], w[2], w[3]]),
+                    DCA_SYNCWORD_XLL_X
+                        | DCA_SYNCWORD_XLL_X_ALT_D0
+                        | DCA_SYNCWORD_XLL_X_ALT_D1
+                        | DCA_SYNCWORD_XLL_X_ALT_D3
+                        | DCA_SYNCWORD_XLL_X_ALT_D4
+                )
+            })
+            .map(|p| from + p)
+    }
 }
 
 impl ExssParser {
-
     /// Parse an EXSS substream (must start at the 0x64582025 syncword).
     pub(crate) fn parse(data: &[u8]) -> R<Self> {
         let mut s = ExssParser::default();
@@ -352,13 +393,13 @@ impl ExssParser {
                     }
                 }
                 if a.extension_mask & DCA_EXSS_XBR != 0 {
-                    rb(gb, 14)?; // xbr_size-1 (unused)
+                    a.xbr_size = rb(gb, 14)? as usize + 1;
                 }
                 if a.extension_mask & DCA_EXSS_XXCH != 0 {
-                    rb(gb, 14)?;
+                    a.xxch_size = rb(gb, 14)? as usize + 1;
                 }
                 if a.extension_mask & DCA_EXSS_X96 != 0 {
-                    rb(gb, 12)?;
+                    a.x96_size = rb(gb, 12)? as usize + 1;
                 }
                 if a.extension_mask & DCA_EXSS_LBR != 0 {
                     parse_lbr_parameters(gb)?;
@@ -426,21 +467,17 @@ impl ExssParser {
             seek(gb, tail_fields_start)?;
         }
 
-        // Capture the remaining descriptor tail (reserved/profile-specific
+        // Locate the remaining descriptor tail (reserved/profile-specific
         // metadata) for XLL assets only — it is where the XLL-X navigation
-        // word lives. Byte-at-a-time: this runs per frame.
+        // word lives. Read into a stack buffer: this runs per frame, and the
+        // whole descriptor is at most 512 bytes.
         if a.extension_mask & DCA_EXSS_XLL != 0 {
+            a.descriptor_tail_pos = gb.position();
             a.descriptor_tail_bits = descr_end - gb.position();
-            a.descriptor_tail = vec![0; a.descriptor_tail_bits.div_ceil(8)];
-            let full_bytes = a.descriptor_tail_bits / 8;
-            for byte in a.descriptor_tail.iter_mut().take(full_bytes) {
-                *byte = rb(gb, 8)? as u8;
-            }
-            let rest_bits = a.descriptor_tail_bits % 8;
-            if rest_bits > 0 {
-                a.descriptor_tail[full_bytes] = (rb(gb, rest_bits)? as u8) << (8 - rest_bits);
-            }
-            if let Some((offset, size)) = parse_xll_x_navigation(&a.descriptor_tail) {
+            let mut tail = [0u8; DESCRIPTOR_MAX_BYTES];
+            let tail = &mut tail[..a.descriptor_tail_bits.div_ceil(8)];
+            read_tail(gb, a.descriptor_tail_bits, tail)?;
+            if let Some((offset, size)) = parse_xll_x_navigation(tail) {
                 a.xll_x_offset = Some(offset);
                 a.xll_x_size = Some(size);
             }
@@ -453,12 +490,11 @@ impl ExssParser {
         let mut offs = a.asset_offset;
         let mut size = a.asset_size as isize;
 
-        // We only retain CORE and XLL component sizes. When XLL is present, an
-        // intervening XBR/XXCH/X96/LBR component would sit before it and shift the
-        // XLL offset; reject rather than miscompute. When there is NO XLL (e.g.
-        // DTS-HD HRA, which carries CORE + a lossy XBR extension), nothing reads
-        // the XLL offset, so let the EXSS parse succeed — the caller falls back to
-        // the DTS core for these.
+        // The lossless decoder has only been validated with XLL as the sole
+        // component after the core: an intervening XBR/XXCH/X96/LBR component
+        // is rejected rather than decoded around. Without XLL (DTS-HD HRA:
+        // CORE + XBR and/or XXCH), the lossy components are located in
+        // their stated order, as `set_exss_offsets` does.
         if a.extension_mask & DCA_EXSS_XLL != 0
             && a.extension_mask & (DCA_EXSS_XBR | DCA_EXSS_XXCH | DCA_EXSS_X96 | DCA_EXSS_LBR) != 0
         {
@@ -467,14 +503,46 @@ impl ExssParser {
             ));
         }
 
-        if a.extension_mask & DCA_EXSS_CORE != 0 {
-            a.core_offset = offs;
-            if a.core_size as isize > size {
-                return Err(ExssError::Invalid("core size out of bounds"));
+        let mut component = |flag: u32, offset: &mut usize, len: usize, what: &'static str| {
+            if a.extension_mask & flag == 0 {
+                return Ok(());
             }
-            offs += a.core_size;
-            size -= a.core_size as isize;
-        }
+            *offset = offs;
+            if len as isize > size {
+                return Err(ExssError::Invalid(what));
+            }
+            offs += len;
+            size -= len as isize;
+            Ok(())
+        };
+        let core_size = a.core_size;
+        let xbr_size = a.xbr_size;
+        let xxch_size = a.xxch_size;
+        let x96_size = a.x96_size;
+        component(
+            DCA_EXSS_CORE,
+            &mut a.core_offset,
+            core_size,
+            "core size out of bounds",
+        )?;
+        component(
+            DCA_EXSS_XBR,
+            &mut a.xbr_offset,
+            xbr_size,
+            "xbr size out of bounds",
+        )?;
+        component(
+            DCA_EXSS_XXCH,
+            &mut a.xxch_offset,
+            xxch_size,
+            "xxch size out of bounds",
+        )?;
+        component(
+            DCA_EXSS_X96,
+            &mut a.x96_offset,
+            x96_size,
+            "x96 size out of bounds",
+        )?;
         if a.extension_mask & DCA_EXSS_XLL != 0 {
             a.xll_offset = offs;
             if a.xll_size as isize > size {
@@ -491,6 +559,35 @@ impl ExssParser {
 /// Observed syntax across the corpus:
 ///   8-bit marker, 11-bit `offset / 4`, 13 zero bits,
 ///   16-bit marker, 10-bit `(size - 24) / 4`, 6 zero bits.
+/// The largest asset descriptor (a 9-bit size field, in bytes, plus one).
+const DESCRIPTOR_MAX_BYTES: usize = 512;
+
+/// `bits` bits from `gb` into `out` (`bits.div_ceil(8)` bytes), MSB-first,
+/// a final partial byte left-aligned.
+fn read_tail(gb: &mut BitReader, bits: usize, out: &mut [u8]) -> R<()> {
+    let full_bytes = bits / 8;
+    for byte in out.iter_mut().take(full_bytes) {
+        *byte = rb(gb, 8)? as u8;
+    }
+    let rest_bits = bits % 8;
+    if rest_bits > 0 {
+        out[full_bytes] = (rb(gb, rest_bits)? as u8) << (8 - rest_bits);
+    }
+    Ok(())
+}
+
+impl ExssAsset {
+    /// The descriptor tail, read back from `exss` (the substream this asset
+    /// was parsed from) into `out`, replacing its contents.
+    pub(crate) fn copy_descriptor_tail(&self, exss: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        out.resize(self.descriptor_tail_bits.div_ceil(8), 0);
+        let mut gb = BitReader::with_offset(exss, self.descriptor_tail_pos);
+        // The parse read these same bits, so they are there.
+        let _ = read_tail(&mut gb, self.descriptor_tail_bits, out);
+    }
+}
+
 fn parse_xll_x_navigation(tail: &[u8]) -> Option<(usize, usize)> {
     let bytes: [u8; 8] = tail.get(..8)?.try_into().ok()?;
     let word = u64::from_be_bytes(bytes);

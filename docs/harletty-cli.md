@@ -1,6 +1,7 @@
 # The `harletty` CLI
 
-Offline decoder for TrueHD, E-AC-3 JOC and DTS bitstreams. It writes
+Offline decoder for TrueHD, E-AC-3 JOC, DTS and IAMF bitstreams (IAMF in
+builds with the `iamf` feature, see [IAMF](#iamf)). It writes
 Dolby Atmos master files — a `.atmos` presentation, its
 `.atmos.metadata` object automation, and the `.atmos.audio` bed/object
 interleave — or plain PCM when you ask for a downmix presentation.
@@ -32,7 +33,9 @@ What was added on this side is the routing for the two formats upstream
 does not cover — E-AC-3 JOC and DTS/DTS:X, about 2250 lines
 (`eac3_to_oamd.rs`, `dts_to_oamd.rs`, `codec_probe.rs` and their handler
 and thread pairs) — plus decoder robustness work and the damaged-stream
-handling described [below](#damaged-streams).
+handling described [below](#damaged-streams). IAMF input came later
+(`iamf.rs`, `iamf_to_oamd.rs` and the IAMF handler), decoded through
+iamf-rs as the bridge does.
 
 The rename is not a claim of authorship. It exists because the binary
 now accepts a superset of inputs and writes labels upstream does not, so
@@ -66,6 +69,16 @@ cargo build --release -p harletty
 ./target/release/harletty --version
 ```
 
+IAMF input is an opt-in feature, off by default like the bridge's: its Opus
+decoding links the system libopus (found through `pkg-config`, or
+`OPUS_LIB_DIR`), which the Windows and macOS release builds do not provide
+yet. A build without it detects an IAMF stream and says so instead of
+decoding it.
+
+```sh
+cargo build --release -p harletty --features iamf
+```
+
 ## Commands
 
 ```
@@ -83,7 +96,7 @@ Accepted before or after the subcommand.
 
 | Option | Values | Default | What it does |
 |---|---|---|---|
-| `--codec` | `auto`, `truehd`, `eac3`, `dts` | `auto` | Input format. `auto` detects by sync word; override it when the probe guesses wrong on a headerless pipe. |
+| `--codec` | `auto`, `truehd`, `eac3`, `dts`, `iamf` | `auto` | Input format. `auto` detects by sync word, or by the IA sequence header an IAMF stream opens with; override it when the probe guesses wrong on a headerless pipe. |
 | `--loglevel` | `off`, `error`, `warn`, `info`, `debug`, `trace` | `info` | `warn` is the useful floor: it still surfaces the timeline warning described under [Damaged streams](#damaged-streams). |
 | `--log-format` | `plain`, `json` | `plain` | `json` emits one structured record per line, for scripted callers. |
 | `--strict` | flag | off | Treat warnings as fatal and stop at the first one. Use it to *audit* a stream, not to convert it — a normal Blu-ray rip trips warnings that do not affect the output. |
@@ -102,10 +115,11 @@ harletty decode [OPTIONS] <INPUT>
 | `--output-path <PATH>` | path prefix | *(none)* | Base name for the outputs — extensions are appended, so `--output-path out` writes `out.atmos`, `out.atmos.audio`, … With no `--output-path`, the stream is decoded and validated but nothing is written. |
 | `--format` | `caf`, `pcm`, `w64` | `caf` | Audio container. **Ignored for Atmos output**, which is always CAF; see [Output files](#output-files). `pcm` is raw 24-bit little-endian, `w64` is Wave64 with a `.wav` extension. |
 | `--no-audio` | flag | off | Skip the audio file; still write `.atmos` and `.atmos.metadata`. Much faster when you only want the object automation. |
-| `--presentation <0-3>` | index | `3` | Which TrueHD presentation to decode. `3` is the 16-channel Atmos presentation; `0`–`2` are the stereo/5.1/7.1 downmixes carried in the same stream. **TrueHD only** — silently ignored for E-AC-3 and DTS, which have no equivalent. |
-| `--bed-conform` | flag | off | Keep the bed to what an Atmos bed can hold. TrueHD: declare a 7.1.2 bed. DTS:X and Auro-3D: the corner heights (and wides) leave the bed for static objects at their speaker positions, so the master set can feed an Atmos encoder. |
+| `--presentation <0-3>` | index | `3` | Which TrueHD presentation to decode. `3` is the 16-channel Atmos presentation; `0`–`2` are the stereo/5.1/7.1 downmixes carried in the same stream. **TrueHD only** — silently ignored for E-AC-3, DTS and IAMF, which have no equivalent. |
+| `--bed-conform` | flag | off | Keep the bed to what an Atmos bed can hold. TrueHD: declare a 7.1.2 bed. DTS:X, Auro-3D and IAMF: the corner heights (and wides) leave the bed for static objects at their speaker positions, so the master set can feed an Atmos encoder. |
 | `--mono-prefix PREFIX` | path | — | Write the audio as one mono 24-bit RIFF WAV per channel, `PREFIX_<n>.wav` with n from 0 in the order of the interleaved file (a master set's bed, then its objects), instead of one interleaved file; `.atmos` and `.atmos.metadata` are written as usual, and the header still names the interleaved file, which is not written. For a front end that would otherwise de-interleave the CAF itself. Not combinable with `--bed-conform` on TrueHD. |
-| `--no-fold-estimate` | flag | off | DTS:X only. A waveform whose bed fold the stream does not state is normally given a fold estimated from the bed's audio, so it plays at its position and leaves the bed. With this flag it stays in the bed and its own channel is muted. |
+| `--no-fold-render` | flag | off | DTS:X only. An object record without reference rows says the encoder rendered the object into the bed from its position; that fold is normally recomputed and subtracted, so the object plays at its position and leaves the bed. With this flag the object falls to the fold estimate (or stays in the bed, muted, with `--no-fold-estimate`). |
+| `--no-fold-estimate` | flag | off | DTS:X only. A waveform whose bed fold is still unknown (not stated, and not recomputed from its position) is normally given a fold estimated from the bed's audio, so it plays at its position and leaves the bed. With this flag it stays in the bed and its own channel is muted. |
 | `--warp-mode` | `normal`, `warping`, `prologiciix`, `loro` | *(from stream)* | Downmix warp mode to declare when the metadata does not carry one. |
 | `--no-estimate-progress` | flag | off | Skip the pre-pass that counts frames for the progress bar. Automatic for stdin, which cannot be pre-scanned. |
 
@@ -167,6 +181,20 @@ Frames seen  : 33 (0.4 s)
 (`DTS:X-7.1.4`, `DTS:X-7.1.4+2`, `Auro-3D-13.1 (7.1_5H_1T carried in
 7.1)`, …), or `none` for a track that carries neither.
 
+IAMF, from the sequence header, the descriptors and the first temporal
+unit that decodes:
+
+```
+Codec        : IAMF (FLAC)
+Profile      : advanced-2 (additional: advanced-2)
+Mix          : 2
+Elements     : 21
+Objects      : 20
+Bed          : LFE
+Sample rate  : 48000 Hz
+Units seen   : 1
+```
+
 #### Machine-readable info
 
 ```sh
@@ -180,7 +208,8 @@ form a catalogue asks for, so that the decoders and the label set live
 here alone. `--max-seconds` stops the read after about that much audio,
 whatever the codec: the DTS report stops on its own within twenty seconds
 (give it at least two, the time a plain track takes to be called plain);
-TrueHD and E-AC-3 otherwise read the whole input. `taxonomy` prints the
+IAMF stops at its first decoded temporal unit; TrueHD and E-AC-3
+otherwise read the whole input. `taxonomy` prints the
 version fields alone, so a caller knows which label set a binary speaks
 before probing anything.
 
@@ -189,12 +218,14 @@ before probing anything.
 | `schema` | Shape of the object. Bumped only when a field is removed or changes meaning; a field added keeps it. |
 | `harletty`, `build` | Crate version, and the build line (`git describe`, library version, timestamp). |
 | `taxonomy` | The set of strings `spatial.label` can carry. Bumped whenever a label is added or renamed. |
-| `codec` | `TrueHD`, `EAC3`, `DTS` (core only) or `DTS-HD MA`; `null` when no frame was found, with `error` saying why. |
-| `channels`, `sample_rate` | The compatible bed. TrueHD: the highest channel-based presentation. |
-| `spatial` | `null` for a plain track. Otherwise `label` (the `sourceCodec` `decode` writes), `kind` (`atmos`, `joc`, `dtsx`, `auro`), `objects` and `fixed` (waveform counts when the presentation states them), `experimental`, and for DTS:X the decoder's `presentation` name. |
+| `codec` | `TrueHD`, `EAC3`, `DTS` (core only), `DTS-HD HRA` (core + XXCH, with its DTS:X extension when it carries one), `DTS-HD MA` or `IAMF`; `null` when no frame was found, with `error` saying why. An IAMF stream read by a build without the `iamf` feature reports `IAMF`, its profiles, and an `error` saying the build cannot decode it. |
+| `channels`, `sample_rate` | The compatible bed. TrueHD: the highest channel-based presentation. IAMF: the bed of the master set `decode` writes (1 for an LFE-only element, 12 for 7.1.4, 0 for objects alone). |
+| `spatial` | `null` for a plain track. Otherwise `label` (the `sourceCodec` `decode` writes), `kind` (`atmos`, `joc`, `dtsx`, `auro`, `iamf`), `objects` and `fixed` (waveform counts when the presentation states them), `experimental`, and for DTS:X the decoder's `presentation` name. An IAMF track is spatial when it carries objects or a bed with heights. |
 | `truehd` | `max_presentation`, `atmos`, `substreams`. |
 | `eac3` | `oamd`, `joc`, `spx` (Spectral Extension seen in use within the bound; measured only here, it takes a decode), `bitstream_id`. |
 | `auro` | `carrier` and `original` layouts. |
+| `iamf` | `profile` and `additional_profile` (`simple`, `base`, `base-enhanced`, `base-advanced`, `advanced-1`, `advanced-2`), `codec` (`FLAC`, `Opus`, `AAC`, `PCM`), `mix` (the mix presentation decoded), `elements` and `objects` in it; all but the profiles `null` in a build without the `iamf` feature. |
+| `signature` | TrueHD only, and only when this machine has a key: see "Checking a stream's signature". `state` is `verified`, `mismatch`, `unsigned`, `absent` or `unchecked`; `units`, `frames`, `checked`, `verified`, `mismatched`, `sync_checked` and `sync_verified` are the counts behind it. |
 | `frames_seen`, `seconds_seen` | How much was read before the report settled or the bound was reached. |
 
 ```json
@@ -205,12 +236,63 @@ before probing anything.
  "frames_seen":1,"seconds_seen":0.0106}
 ```
 
+#### Checking a stream's signature
+
+```sh
+harletty [--config PATH] info [--no-signature] <INPUT>
+```
+
+A TrueHD stream's object metadata travels in Evolution frames, and each
+frame closes with a protection word: the leading byte of a keyed digest
+over the access unit that carries it. Given the key, `info` recomputes
+every one of them and says whether they check out — in the report's
+`Signature` line and in `--json`'s `signature` object:
+
+| `state` | What it means |
+|---|---|
+| `verified` | No word failed in a unit without a major sync, and at least one word is the digest the key produces: the stream came out of an encoder holding that key and has not been re-encoded since. |
+| `mismatch` | A word in a unit without a major sync is not the key's digest: something was rewritten after signing, or another key signed it. |
+| `unsigned` | Evolution frames were read and none carried a word. Whatever wrote the stream did not sign it; a remux does not strip one. |
+| `absent` | No Evolution frame was read: a stream without object metadata, or a read too short to reach the first one — they come about one access unit in forty. Nothing could have been signed. |
+| `unchecked` | No key on this machine, or `--no-signature`. Not a verdict on the stream. |
+
+The key is not part of this repository, which neither distributes one nor
+helps anyone obtain one. It is read from a local settings file — the
+path given by `--config`, else `$HARLETTY_CONFIG`, else
+`$XDG_CONFIG_HOME/harletty/config.yaml` or `~/.config/harletty/config.yaml`,
+and failing all of those the same two paths under `harlettizer/`, since the
+encoder there reads the same key from the same field:
+
+```yaml
+# ~/.config/harletty/config.yaml — local to this machine, mode 600.
+evolution_key: "0001…"   # hexadecimal
+```
+
+Words carried in an access unit that also carries a major sync are counted
+apart (`sync_checked`, `sync_verified`) and a failure among them does not
+decide the verdict. Measured across a library of commercial discs: every
+word in a unit without a major sync verified, in every title, while the
+words in major-sync units verified in some titles and failed in others — all
+of them in one, a few in another. Whether a tool rewrote those headers after
+encoding or the digest covers them differently is not established; either
+way, such a failure next to thousands of units that verify is no evidence of
+a re-encode. A match in a major-sync unit still counts, since no digest can
+be produced without the key.
+
+Two bounds on what a verdict is worth. Each digest covers only the access
+unit carrying the frame, and about one access unit in forty carries one, so
+`verified` speaks for the metadata and the encoder that wrote it, not for
+every sample. And the counts are over what was read: with `--max-seconds`
+the verdict is about the head of the stream. Checking also means parsing
+every access unit rather than the first few — about seven times what a
+whole-file report costs otherwise — which `--no-signature` turns off.
+
 ## Output files
 
 What lands on disk depends on whether the result is object audio.
 
-**Atmos** (presentation 3 with objects present, or E-AC-3 JOC, or DTS:X)
-— a DAMF master set, which is what Resolve, Pro Tools and the Dolby
+**Atmos** (presentation 3 with objects present, or E-AC-3 JOC, or DTS:X,
+or IAMF whatever it carries) — a DAMF master set, which is what Resolve, Pro Tools and the Dolby
 Reference Player consume:
 
 | File | Contents |
@@ -287,10 +369,71 @@ Read that as: the output is no longer bit-exact to the source across
 those 14 ms, but it is still in sync. If you would rather the run failed
 loudly than substituted anything, use `--strict`.
 
+An E-AC-3 output keeps **one channel layout** through the damage, the one
+of the first frame that decoded. In a JOC stream an access unit that
+fails to decode is silence in every channel of the `.atmos.audio`, and
+one that decodes without its objects is written as its bed, in the bed's
+place, with the object channels silent. A channel the file has no place
+for (the back pair of a 7.1 frame in a 5.1 file) is dropped, with a
+warning. The one case where the file changes is a stream that starts as
+a plain bed and carries objects later: the bed already written is
+rewritten as the head of the `.atmos.audio`, objects silent, so the
+master set covers the stream from its first sample.
+
+A DTS output keeps one layout the same way. A frame whose extension
+substream is missing or fails to decode comes out of the core as 5.1, and
+is written into the 7.1.4 (+ objects) master set with each channel under
+the speaker it is named for, the heights and objects silent for it; a
+frame with another presentation has its objects placed by rank, and no
+event is written for an object the master set does not name. A plain
+bed head followed by DTS:X is rewritten as the head of the
+`.atmos.audio`, as for E-AC-3. (A frame the core decoder rejects as well
+is dropped, with a warning, rather than replaced with silence: the DTS
+path does not substitute.)
+
+An IAMF temporal unit that fails to decode is dropped with the units the
+decoder held, and decoding resumes at the next one: the output is that
+much shorter, and a run that had to do this says how many errors it met
+at `warn`. Use `--strict` to fail instead.
+
 Errors at the *extractor* level — where framing itself is lost and the
 decoder resynchronises — are not compensated this way, because the number
 of access units that went by is unknowable. They remain a possible source
 of drift.
+
+## IAMF
+
+An IAMF input is a standalone OBU stream: an IA sequence header, its
+descriptors, then temporal units, with or without temporal delimiters (a
+stream read back from Matroska carries none). `auto` recognises it by the
+sequence header it opens with; stdin works as for the other codecs. It is
+decoded with the same iamf-rs build, the same settings and the same
+coordinate conventions as the bridge, into a master set labelled
+`sourceCodec: IAMF`:
+
+- **Objects** (IAMF v2.0) are the master set's objects, IDs from 10 in mix
+  order, with their PCM as the decoder hands it out. Their gain is unity: an
+  encoder such as harlettizer bakes each object's gain into its PCM, and the
+  decoder applies the mix gains.
+- **The other elements** — an LFE-only element (expanded layout 0), a v1.1
+  channel bed, ambisonics — are rendered to BS.2051 System J (7.1.4) and
+  become the bed, as far as they reach into it: an LFE element is a bed of
+  one LFE, a 7.1.4 element a 7.1.4 bed (its heights as `Lfh`/`Rfh`/`Lrh`/`Rrh`,
+  or static objects with `--bed-conform`), a 5.1 element L, R, C, LFE and the
+  rear surrounds, where its ±110° surrounds render. A stream without
+  objects is a bed-only master set.
+- **Positions** are evaluated by the decoder every 256 samples and written
+  as moves: a run at constant speed is one event ramping to where it ends
+  (at most 2048 samples long), a turn or a stop ends it, and a static object
+  is stated once. Read back, the events give the positions the decoder
+  evaluated. Cartesian positions are taken as they are; polar ones are
+  converted on the sphere (azimuth positive to the left), as the bridge does.
+- **Length** is what the decoder hands out, with the stream's trims applied;
+  the sample rate is the codec config's.
+
+ffmpeg does not demux `A_IAMF` from Matroska today, so `-f iamf` out of an
+`.mka` does not work; read the track's CodecPrivate and blocks back into a
+standalone stream instead (Omniphony's `scripts/iamf2mka.py --extract`).
 
 ## Known limitations
 
@@ -299,9 +442,11 @@ of drift.
   the fixed heights become bed channels. The private metadata is read
   from corpus evidence rather than a specification, so the alternate
   profiles (D0, D1, D3, D4, 5.1+1, 7.1.4+3) are reported as experimental. A
-  waveform whose bed fold the stream does not state has that fold
-  estimated from the bed's audio (see `--no-fold-estimate`), so it plays
-  on its own track and leaves the bed.
+  object whose bed fold the stream does not state was rendered into the
+  bed by the encoder from its position; that render is recomputed and
+  removed (see `--no-fold-render`). Whatever is still unknown has its fold
+  estimated from the bed's audio (see `--no-fold-estimate`), so it plays on
+  its own track and leaves the bed.
 - **Auro-3D is unfolded, not decoded bit-exactly.** A DTS-HD MA track
   that carries an Auro-Codec side channel in its low bits is recognised
   and unfolded into the layout it was encoded from: a `7.1_5H_1T` carrier
@@ -318,3 +463,8 @@ of drift.
   that ffmpeg rejects the same way.
 - **`--presentation` is TrueHD-only** and is accepted-then-ignored for
   the other codecs rather than rejected.
+- **IAMF needs a build with the `iamf` feature**, which the release
+  archives do not have yet (libopus). Binaural and expanded loudspeaker
+  layouts other than the LFE are refused by the decoder, and an IAMF
+  object's position is only known every 256 samples (5.3 ms at 48 kHz): a
+  jump between two evaluations is written as a 256-sample ramp.

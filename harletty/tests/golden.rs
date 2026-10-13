@@ -105,7 +105,7 @@ fn joc_master_set_matches_golden() {
     // hash pins one target rather than the algorithm. Decoding this same
     // fixture with the same source:
     //
-    //     x86_64-unknown-linux-gnu     c301c8ba…   (the committed hash)
+    //     x86_64-unknown-linux-gnu     f75d7dec…   (the committed hash)
     //     aarch64-unknown-linux-musl   —           (NEON QMF path, differs)
     //
     // Both are correct decodes. Asserting the hash off x86_64 would report a
@@ -114,7 +114,7 @@ fn joc_master_set_matches_golden() {
     // The aarch64 value moved with the last rebase below and was not
     // recomputed; nothing asserts it, so it is left unstated rather than stale.
     //
-    // Rebased six times: once when `float_to_i24` stopped scaling by
+    // Rebased eight times: once when `float_to_i24` stopped scaling by
     // 2^23 - 1 and truncating (1.6% of samples moved one count away from zero,
     // no sign flips, max delta 1), once when the QMF scalar fallbacks stopped
     // accumulating into a single sum, once when the JOC parameter bands started
@@ -150,10 +150,20 @@ fn joc_master_set_matches_golden() {
     // samples, 31,7 %, in 142 runs between 1,017 s and 1,504 s, by at most
     // 3 853 counts of 2^23 (0,00046 full scale, -67 dBFS) and with no sign
     // flips; the peak sits on that channel and moves with it, 0,470330 to
-    // 0,470770. These figures were measured on the decoded CAF, 24-bit
+    // 0,470770. And once when the QMF banks stopped multiplying by a dense
+    // modulation matrix built from f32 phases and became a 128-point FFT
+    // between two twiddles, 35 dB closer to the exact transform (139,7 dB SNR
+    // against an f64 evaluation, from 104,6). Channel 6 alone moves again:
+    // 11 175 of its 72 192 samples, 15,5 %, by at most 13 counts of 2^23
+    // (-116 dBFS), no sign flips, the peak 0,470770 to 0,470771; the
+    // metadata does not change. And once when that FFT halved to 64 points
+    // (an even/odd packing of the real input, and its transpose for the
+    // synthesis), as accurate against f64 and rounded differently: channel 6
+    // moves 1 492 samples, 2,1 %, by at most 2 counts of 2^23, no sign flips,
+    // the peak unchanged. These figures were measured on the decoded CAF, 24-bit
     // big-endian signed, after each merge; the ones this note carried before
     // for the last two rebases - near-full-scale channels, thousands of sign
-    // flips, a peak of 0,99997 - did not describe this file. The last four
+    // flips, a peak of 0,99997 - did not describe this file. The last six
     // change the audio on purpose; that is what they are for.
     #[cfg(target_arch = "x86_64")]
     {

@@ -1,12 +1,53 @@
-# Virtual workspace: the repo produces two independent artifacts from one
-# decoder lineage — `bridge` (the realtime cdylib plugin) and, from phase 2 on,
-# `truehdd` (the offline ADM/DAMF CLI). Isolation between them is by crate
-# graph, not feature flags: `bridge` must never pull in CLI-side crates and the
-# CLI must never pull in the Omniphony bridge ABI. See
-# docs/plan-truehdd-resurrection-in-harletty.md.
+# Virtual workspace: the repo produces two kinds of artifacts from one
+# decoder lineage — the realtime bridge plugins, one per codec family
+# (`plugin-dolby`, `plugin-dts`, `plugin-iamf`, each a cdylib over its
+# `bridge-family-*` crate), and the offline `harletty` CLI. Isolation between
+# them is by crate graph, not feature flags: a plugin must never pull in
+# CLI-side crates nor another family's decoders, and the CLI must never pull
+# in the Omniphony bridge ABI (scripts/check-crate-isolation.sh). `bridge` is
+# the combined router over every family, an rlib kept for the fuzz target,
+# the bench and the bit-exactness kit.
 [workspace]
-members = ["bridge", "harletty", "eac3", "dca", "damf", "auro"]
+members = [
+    "bridge",
+    "bridge-common",
+    "bridge-family-dolby",
+    "bridge-family-dts",
+    "bridge-family-iamf",
+    "plugin-dolby",
+    "plugin-dts",
+    "plugin-iamf",
+    "harletty",
+    "eac3",
+    "dca",
+    "damf",
+    "auro",
+]
+# What a plain `cargo build` / `cargo test` at the root covers: everything but
+# the IAMF family and its plugin, whose Opus path links libopus. Build or test
+# them with `-p bridge-family-iamf -p harletty-iamf-bridge`, or through the
+# bridge's `iamf` feature.
+default-members = [
+    "bridge",
+    "bridge-common",
+    "bridge-family-dolby",
+    "bridge-family-dts",
+    "plugin-dolby",
+    "plugin-dts",
+    "harletty",
+    "eac3",
+    "dca",
+    "damf",
+    "auro",
+]
 resolver = "2"
+
+# What release.yml and build_bridge.sh ship. Thin LTO is the one setting that
+# measured no slower on any decoder, and the E-AC-3 object path gains a few
+# percent. Fat LTO or a single codegen unit sped TrueHD up but slowed DTS and
+# the JOC path by up to 13%, so check every codec before changing this.
+[profile.release]
+lto = "thin"
 
 # Kept from the pre-workspace root package: the CLI ships under this profile.
 [profile.release-deploy]
@@ -14,3 +55,21 @@ inherits = "release"
 lto = "thin"
 strip = "symbols"
 
+# The TrueHD decoder is built from our fork of the `truehd` crate, pinned to a
+# commit: upstream's unreleased main plus the decode-speed series, which
+# decodes in a quarter of the time of 0.7.2 with the same output, and a fix
+# that takes compiling it from over 13 GB of memory to under 1 GB. The crates
+# keep asking for the crates.io version, so dropping this section goes back
+# to it. Move the pin only to a commit that stays reachable on the fork.
+# bridge/fuzz/Cargo.toml, a workspace of its own, repeats this section: move
+# both together.
+[patch.crates-io]
+truehd = { git = "https://github.com/harletty/truehdd", rev = "5c8b880405946e7ff1aee884cf9988415fe2c3a9" }
+
+# The IAMF family in one codegen unit: split in several, how its code (and
+# the FLAC and Opus decoding monomorphised into it) is partitioned moves with
+# any item added to the crate, and the FLAC path measured up to 9% slower
+# from one partition to the next. One unit decodes at the speed of the best
+# partition seen, and keeps doing so.
+[profile.release.package.bridge-family-iamf]
+codegen-units = 1

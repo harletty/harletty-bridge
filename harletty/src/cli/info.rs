@@ -3,9 +3,11 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::Level;
 
 use super::command::{Cli, InfoArgs};
-use super::info_report::{Eac3Facts, InfoReport, Spatial, TrueHdFacts};
+use super::info_report::{Eac3Facts, InfoReport, Signature, Spatial, TrueHdFacts};
 use crate::codec_probe::{Codec, probe_codec};
 use crate::input::InputReader;
+use crate::settings::Settings;
+use crate::signature::{Outcome, State, Tally, Verifier};
 use crate::timestamp::time_str;
 use truehd::process::{
     PresentationMap, PresentationType,
@@ -23,28 +25,63 @@ pub fn cmd_info(args: &InfoArgs, cli: &Cli, multi: Option<&MultiProgress>) -> Re
         // Keeps reading the same handle: the input may be a pipe.
         return super::dts_info::cmd_info_dts(&mut probe_reader, prefix, args);
     }
-    drop(probe_reader);
 
-    if codec == Codec::Eac3 {
-        return cmd_info_eac3(args);
+    if codec == Codec::Iamf {
+        // From the first byte: the sequence header opens the stream.
+        let reader = if probe_reader.is_pipe() {
+            probe_reader.replaying(prefix)
+        } else {
+            drop(probe_reader);
+            InputReader::new(&args.input)?
+        };
+        return super::iamf_info::cmd_info_iamf(reader, args);
     }
 
     if args.matrices || args.params || args.filters || args.stats {
+        drop(probe_reader);
         return super::inspect::run(args, cli);
+    }
+
+    // The report reads the input from its first byte. The probe already
+    // took up to eight kilobytes of it: a file is simply opened again, but a
+    // pipe cannot be, and a short head piped in — a catalogue probe sends a
+    // few hundred bytes of TrueHD — would otherwise be gone entirely.
+    let reader = if probe_reader.is_pipe() {
+        probe_reader.replaying(prefix)
+    } else {
+        drop(probe_reader);
+        InputReader::new(&args.input)?
+    };
+
+    if codec == Codec::Eac3 {
+        return cmd_info_eac3(args, reader);
     }
 
     log::info!("Analyzing TrueHD stream: {}", args.input.display());
 
-    let analysis_result = analyze_stream(&args.input, cli, multi, args.json, args.max_seconds)?;
+    // No key on this machine: the stream is read as it always was, and the
+    // report says the signature was not checked rather than claiming
+    // anything about it.
+    let verifier = if args.no_signature {
+        None
+    } else {
+        let settings = Settings::load(cli.config.as_deref())?;
+        settings
+            .evolution_key
+            .map(|key| Verifier::new(key, settings.from.as_deref()))
+    };
+
+    let analysis_result =
+        analyze_stream(reader, cli, multi, args.json, args.max_seconds, verifier)?;
 
     if args.json {
         return truehd_report(analysis_result.as_ref()).print();
     }
 
     match analysis_result {
-        Some((stream_info, _timestamp, frame_count, total_bytes)) => {
+        Some((stream_info, _timestamp, frame_count, total_bytes, signature)) => {
             // Final update with total frames and duration
-            update_final_stats(&stream_info, frame_count, total_bytes);
+            update_final_stats(&stream_info, frame_count, total_bytes, &signature);
         }
         None => {
             println!("No TrueHD major sync found in the file.");
@@ -55,10 +92,9 @@ pub fn cmd_info(args: &InfoArgs, cli: &Cli, multi: Option<&MultiProgress>) -> Re
     Ok(())
 }
 
-fn cmd_info_eac3(args: &InfoArgs) -> Result<()> {
+fn cmd_info_eac3(args: &InfoArgs, mut reader: InputReader) -> Result<()> {
     log::info!("Analyzing EAC3 stream: {}", args.input.display());
 
-    let mut reader = InputReader::new(&args.input)?;
     let mut extractor = eac3::Extractor::default();
     // Spectral Extension shows only in a decoded frame; the text report
     // never paid for that decode and still does not.
@@ -169,6 +205,7 @@ type AnalysisResultTuple = (
     Option<truehd::structs::timestamp::Timestamp>,
     usize,
     usize,
+    Outcome,
 );
 
 /// The TrueHD facts of `analysis`, for `--json`: the bed's channel count is
@@ -176,7 +213,7 @@ type AnalysisResultTuple = (
 /// (presentation 2 when there are three or more substreams), the spatial
 /// block is present when the major sync flags Atmos.
 fn truehd_report(analysis: Option<&AnalysisResultTuple>) -> InfoReport {
-    let Some((analysis, _, frame_count, _)) = analysis else {
+    let Some((analysis, _, frame_count, _, signature)) = analysis else {
         return InfoReport::not_found("no TrueHD major sync found in the input");
     };
     let major_sync = analysis
@@ -222,6 +259,16 @@ fn truehd_report(analysis: Option<&AnalysisResultTuple>) -> InfoReport {
         atmos: analysis.stream_info.is_atmos,
         substreams: major_sync.substreams as u32,
     });
+    report.signature = Some(Signature {
+        state: signature.state().as_str(),
+        units: signature.tally.units,
+        frames: signature.tally.frames,
+        checked: signature.tally.checked,
+        verified: signature.tally.verified,
+        mismatched: signature.tally.mismatched,
+        sync_checked: signature.tally.sync_checked,
+        sync_verified: signature.tally.sync_verified,
+    });
     report.frames_seen = *frame_count as u64;
     report.seconds_seen = seconds;
     report
@@ -231,13 +278,13 @@ fn truehd_report(analysis: Option<&AnalysisResultTuple>) -> InfoReport {
 /// about that much audio past the major sync. `quiet` keeps the running
 /// report off stdout, for a caller that wants the JSON alone.
 fn analyze_stream(
-    input_path: &std::path::Path,
+    mut input_reader: InputReader,
     cli: &Cli,
     multi: Option<&MultiProgress>,
     quiet: bool,
     max_seconds: Option<f64>,
+    verifier: Option<Verifier>,
 ) -> Result<Option<AnalysisResultTuple>> {
-    let mut input_reader = InputReader::new(input_path)?;
     let mut extractor = Extractor::default();
     let mut parser = Parser::default();
 
@@ -252,6 +299,7 @@ fn analyze_stream(
     let mut context = AnalysisContext {
         quiet,
         max_seconds,
+        verifier,
         ..AnalysisContext::default()
     };
 
@@ -301,6 +349,11 @@ struct AnalysisContext {
     max_seconds: Option<f64>,
     /// Set once the bound is reached.
     stop: bool,
+    /// The signature check, when this machine has a key. Its presence is
+    /// what makes every access unit parsed rather than only the first few:
+    /// the digest is over one unit each, so there is nothing to check in a
+    /// unit that was not parsed.
+    verifier: Option<Verifier>,
 }
 
 struct AnalysisResult {
@@ -311,9 +364,14 @@ struct AnalysisResult {
 
 impl AnalysisContext {
     fn process_frame(&mut self, frame: &Frame, parser: &mut Parser, cli: &Cli) -> Result<()> {
-        if self.analysis_result.is_none() || !self.hires_timing_displayed {
+        if self.analysis_result.is_none() || !self.hires_timing_displayed || self.verifier.is_some()
+        {
             match parser.parse(frame) {
                 Ok(access_unit) => {
+                    if let Some(verifier) = self.verifier.as_mut() {
+                        verifier.check(&access_unit, frame.as_ref(), frame.index);
+                    }
+
                     if let Some(ts) = &frame.timestamp {
                         if self.timestamp.is_none() {
                             self.timestamp = Some(ts.clone());
@@ -450,12 +508,26 @@ impl AnalysisContext {
             pb.finish_and_clear();
         }
 
-        self.analysis_result
-            .map(|result| (result, self.timestamp, self.frame_count, self.total_bytes))
+        let signature = self.verifier.map(Verifier::finish).unwrap_or_default();
+
+        self.analysis_result.map(|result| {
+            (
+                result,
+                self.timestamp,
+                self.frame_count,
+                self.total_bytes,
+                signature,
+            )
+        })
     }
 }
 
-fn update_final_stats(analysis: &AnalysisResult, frame_count: usize, total_bytes: usize) {
+fn update_final_stats(
+    analysis: &AnalysisResult,
+    frame_count: usize,
+    total_bytes: usize,
+    signature: &Outcome,
+) {
     println!("Analysis Summary");
     println!("  Frames processed          {frame_count}");
 
@@ -484,7 +556,54 @@ fn update_final_stats(analysis: &AnalysisResult, frame_count: usize, total_bytes
         }
     }
 
+    print!("  Signature                 ");
+    println!("{}", describe(signature));
+
     println!();
+}
+
+/// What the words in major-sync units said, when there were any: counted
+/// apart, since on some discs they fail beside units that all verify.
+fn sync_note(tally: &Tally) -> String {
+    match tally.sync_checked {
+        0 => String::new(),
+        n if tally.sync_verified == n => format!(", and {n} in major-sync units"),
+        n => format!(
+            "; {} of {n} in major-sync units are not, which does not decide the verdict",
+            n - tally.sync_verified
+        ),
+    }
+}
+
+/// The signature line of the summary: what was asked, and of how much.
+fn describe(signature: &Outcome) -> String {
+    let tally = &signature.tally;
+    let from = signature
+        .from
+        .as_ref()
+        .map(|path| format!(" (key from {})", path.display()))
+        .unwrap_or_default();
+    match signature.state() {
+        State::Unchecked => "not checked: no key configured, see `--config`".to_string(),
+        State::Absent => format!(
+            "absent: no Evolution frame in {} access unit(s), so there is nothing to sign",
+            tally.units
+        ),
+        State::Unsigned => format!(
+            "none: {} Evolution frame(s) carry no protection word{from}",
+            tally.frames
+        ),
+        State::Verified => format!(
+            "verified: {} of {} protection word(s) are the key's digest{}{from}",
+            tally.verified,
+            tally.checked,
+            sync_note(tally)
+        ),
+        State::Mismatch => format!(
+            "MISMATCH: {} of {} protection word(s) are not the key's digest{from}",
+            tally.mismatched, tally.checked
+        ),
+    }
 }
 
 struct StreamInfo {

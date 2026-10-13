@@ -1,0 +1,2000 @@
+use abi_stable::std_types::RVec;
+use bridge_api::{RChannelLabel, RDecodedFrame, RMetadataFrame};
+use eac3::{
+    AccessUnitInfo, AccessUnitParseError, BedChannel, CorePcmFrame, FrameType, OamdPayload,
+    ObjectPcmPushResult, ParsedEmdfPayloadData, inspect_access_unit,
+};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(feature = "bridge-perf")]
+use std::time::Instant;
+
+use crate::dolby::DolbyPipeline;
+use crate::frame_builders::float_to_pcm_i32;
+use crate::labels::bed_channel_to_r;
+use crate::logging::bridge_log;
+use crate::metadata::build_eac3_metadata_frame;
+use crate::shared::SharedState;
+
+const LEGACY_AC3_SAMPLE_COUNT: u32 = 1536;
+const LEGACY_AC3_CHANNEL_COUNT: u32 = 6;
+const AC3_CHANNELS: [u8; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
+const EAC3_BLOCKS: [u32; 4] = [1, 2, 3, 6];
+const EAC3_SAMPLE_RATES: [u32; 3] = [48_000, 44_100, 32_000];
+
+/// An access unit's stateless inspection, taken once when it arrives.
+///
+/// Every routing question below - is it a dependent, can it carry
+/// dependents, does it carry JOC and does its own core satisfy it - and the
+/// per-frame diagnostics read the same `AccessUnitInfo`, and an inspection
+/// is not a header read: reaching the skip fields that carry a DD+ Atmos
+/// stream's EMDF means walking every audio block, exponents and bit
+/// allocation included. Asked separately, each question paid for that walk
+/// again, four times for an independent frame before its decoder walked it
+/// once more.
+pub(crate) type Eac3Inspection = Result<AccessUnitInfo, AccessUnitParseError>;
+
+pub(crate) fn inspect_eac3_frame(frame: &[u8]) -> Eac3Inspection {
+    inspect_access_unit(frame)
+}
+
+/// A dependent access unit held in a pending presentation, with what admitted
+/// it: its decode, or the inspection that stood in for one.
+pub(crate) struct PendingEac3Dependent {
+    pub(crate) access_unit: Vec<u8>,
+    pub(crate) info: AccessUnitInfo,
+    pub(crate) decoded: DecodedDependent,
+}
+
+/// The channels of a held dependent, which the presentation merges onto its
+/// core when it resolves.
+///
+/// A dependent is decoded as it arrives when a presentation can take it:
+/// that one walk over its audio blocks gives both its channels and the
+/// `AccessUnitInfo` that says whether it carries JOC, where an inspection on
+/// arrival and a decode at the merge walked them twice.
+pub(crate) enum DecodedDependent {
+    /// Decoded on arrival.
+    Channels(CorePcmFrame),
+    /// The decode on arrival rejected it. The inspection admitted it all the
+    /// same, as it always could: the merge then has nothing to overlay, and
+    /// must not push the frame through the decoder a second time.
+    Failed,
+}
+
+/// What an independent (or converted AC-3) access unit decoded into.
+pub(crate) enum Eac3IndependentOutcome {
+    /// A frame to emit now (or the error it came to).
+    Emit(Result<RDecodedFrame, String>),
+    /// A plain core to hold until the next access unit says whether a
+    /// dependent belongs to it.
+    Hold(eac3::PcmPushResult),
+}
+
+/// Decode a non-dependent E-AC-3 access unit and say what to do with it.
+///
+/// The routing rule is the one the bridge always applied: an independent
+/// frame whose JOC payload its own channels satisfy is a complete object
+/// presentation and is emitted at once; any other independent frame is a
+/// core that may still be extended, so it is held; a frame that cannot carry
+/// dependents (a converted AC-3 frame) goes through the object decoder and
+/// is emitted. What changed is how it is learned. The rule needs the frame's
+/// EMDF, which sits in a block's skip field, so it used to cost a stateless
+/// inspection walking every audio block before the decoder walked them again.
+/// Now the frame goes straight to the decoder the previous independent frame
+/// of the stream called for - streams do not switch between the two shapes
+/// from one frame to the next - and that decode's own `AccessUnitInfo`
+/// confirms the choice. When it does not (the first frame of a stream, or a
+/// switch), the frame is decoded again by the other decoder, so what comes
+/// out of the frame is what the rule says.
+pub(crate) fn decode_eac3_independent(
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+    frame: &[u8],
+    can_carry_dependents: bool,
+) -> Eac3IndependentOutcome {
+    if can_carry_dependents && !bridge.eac3_expect_self_contained_joc {
+        match bridge.eac3_pcm_decoder.push_access_unit(frame) {
+            Ok(push) if !carries_self_contained_joc(&push.info) => {
+                emit_eac3_frame_info_diagnostic(bridge, &push.info);
+                update_eac3_dialogue_level(bridge, &push.info);
+                return Eac3IndependentOutcome::Hold(push);
+            }
+            Ok(push) => {
+                bridge.eac3_expect_self_contained_joc = true;
+                emit_eac3_frame_info_diagnostic(bridge, &push.info);
+                return Eac3IndependentOutcome::Emit(decode_eac3_objects(
+                    bridge,
+                    shared,
+                    frame,
+                    Some(push),
+                ));
+            }
+            Err(err) => {
+                // Replay the rule on a stateless inspection, as it used to run.
+                let inspection = inspect_eac3_frame(frame);
+                if eac3_frame_can_carry_dependents(&inspection)
+                    && !eac3_frame_carries_self_contained_joc(&inspection)
+                {
+                    return Eac3IndependentOutcome::Emit(Err(format!(
+                        "E-AC3 core decode error: {err}"
+                    )));
+                }
+                emit_eac3_frame_diagnostic(bridge, frame, &inspection);
+                return Eac3IndependentOutcome::Emit(decode_eac3_objects(
+                    bridge, shared, frame, None,
+                ));
+            }
+        }
+    }
+
+    match bridge.eac3_object_decoder.push_access_unit(frame) {
+        Ok(Some(result)) if !can_carry_dependents || carries_self_contained_joc(&result.info) => {
+            bridge.eac3_expect_self_contained_joc = true;
+            emit_eac3_frame_info_diagnostic(bridge, &result.info);
+            Eac3IndependentOutcome::Emit(Ok(build_object_frame(bridge, shared, frame, result)))
+        }
+        // An independent whose JOC declares a wider downmix than it carries:
+        // held for its dependents like any other core.
+        Ok(Some(_)) => {
+            bridge.eac3_expect_self_contained_joc = false;
+            hold_or_emit_core(bridge, shared, frame, can_carry_dependents)
+        }
+        Ok(None) | Err(_) => {
+            bridge.eac3_expect_self_contained_joc = false;
+            hold_or_emit_core(bridge, shared, frame, can_carry_dependents)
+        }
+    }
+}
+
+/// Route a non-dependent access unit that was inspected anyway (its header
+/// said dependent, its inspection said otherwise) the way every frame used to
+/// be routed: on the inspection.
+pub(crate) fn decode_eac3_inspected(
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+    frame: &[u8],
+    inspection: &Eac3Inspection,
+) -> Eac3IndependentOutcome {
+    if eac3_frame_can_carry_dependents(inspection)
+        && !eac3_frame_carries_self_contained_joc(inspection)
+    {
+        return match bridge.eac3_pcm_decoder.push_access_unit(frame) {
+            Ok(push) => {
+                emit_eac3_frame_diagnostic(bridge, frame, inspection);
+                note_eac3_dialogue_level(bridge, &push.info);
+                Eac3IndependentOutcome::Hold(push)
+            }
+            Err(err) => {
+                Eac3IndependentOutcome::Emit(Err(format!("E-AC3 core decode error: {err}")))
+            }
+        };
+    }
+    emit_eac3_frame_diagnostic(bridge, frame, inspection);
+    Eac3IndependentOutcome::Emit(decode_eac3_objects(bridge, shared, frame, None))
+}
+
+/// The objects of a frame already known to carry them, falling back to its
+/// core when the object decoder finds none; `decoded` is the core already
+/// decoded for it, if any, so it is not decoded twice.
+fn decode_eac3_objects(
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+    frame: &[u8],
+    decoded: Option<eac3::PcmPushResult>,
+) -> Result<RDecodedFrame, String> {
+    if let Ok(Some(result)) = bridge.eac3_object_decoder.push_access_unit(frame) {
+        return Ok(build_object_frame(bridge, shared, frame, result));
+    }
+    let push = match decoded {
+        Some(push) => Ok(push),
+        None => bridge.eac3_pcm_decoder.push_access_unit(frame),
+    };
+    emit_core_frame(bridge, shared, frame, push)
+}
+
+/// The core of a frame that turned out to carry no self-contained objects:
+/// held when it can still be extended, emitted otherwise.
+fn hold_or_emit_core(
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+    frame: &[u8],
+    can_carry_dependents: bool,
+) -> Eac3IndependentOutcome {
+    match bridge.eac3_pcm_decoder.push_access_unit(frame) {
+        Ok(push) => {
+            emit_eac3_frame_info_diagnostic(bridge, &push.info);
+            if can_carry_dependents && !carries_self_contained_joc(&push.info) {
+                update_eac3_dialogue_level(bridge, &push.info);
+                Eac3IndependentOutcome::Hold(push)
+            } else {
+                Eac3IndependentOutcome::Emit(emit_core_frame(bridge, shared, frame, Ok(push)))
+            }
+        }
+        Err(err) => {
+            let inspection = inspect_eac3_frame(frame);
+            if eac3_frame_can_carry_dependents(&inspection)
+                && !eac3_frame_carries_self_contained_joc(&inspection)
+            {
+                return Eac3IndependentOutcome::Emit(Err(format!(
+                    "E-AC3 core decode error: {err}"
+                )));
+            }
+            emit_eac3_frame_diagnostic(bridge, frame, &inspection);
+            Eac3IndependentOutcome::Emit(emit_core_frame(bridge, shared, frame, Err(err)))
+        }
+    }
+}
+
+fn build_object_frame(
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+    frame: &[u8],
+    result: ObjectPcmPushResult,
+) -> RDecodedFrame {
+    update_eac3_dialogue_level(bridge, &result.info);
+    let sample_count = result.pcm.samples_per_channel();
+    let base_sample_pos = bridge.eac3_total_samples;
+    bridge.eac3_total_samples += sample_count as u64;
+    let rf = build_eac3_frame_from_object(result, base_sample_pos, bridge, shared);
+    bridge.perf.maybe_report(bridge.eac3_frame_count);
+    maybe_dump_ok_frame(frame, "obj");
+    rf
+}
+
+/// Process a raw E-AC3 access unit (one complete syncframe).
+///
+/// Attempts object-level decode first (JOC + OAMD), then falls back to
+/// core PCM decode.  Converts the result into one [`RDecodedFrame`].
+#[cfg(test)]
+pub(crate) fn process_eac3_frame(
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+    frame: &[u8],
+    inspection: &Eac3Inspection,
+) -> Result<RDecodedFrame, String> {
+    emit_eac3_frame_diagnostic(bridge, frame, inspection);
+    decode_eac3_objects(bridge, shared, frame, None)
+}
+
+/// Emit a decoded core as a frame, or stand in silence for the decode errors
+/// that are known to recover.
+fn emit_core_frame(
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+    frame: &[u8],
+    push: Result<eac3::PcmPushResult, AccessUnitParseError>,
+) -> Result<RDecodedFrame, String> {
+    match push {
+        Ok(result) => {
+            let info = result.info;
+            update_eac3_dialogue_level(bridge, &info);
+            let pcm = result.pcm;
+            let decoded_samples = pcm.samples_per_channel();
+            let sample_count = decoded_samples as u32;
+            let base_sample_pos = bridge.eac3_total_samples;
+            bridge.eac3_total_samples += sample_count as u64;
+            let rf = build_eac3_frame_from_core(&pcm, &info, base_sample_pos, bridge, shared);
+            bridge.perf.maybe_report(bridge.eac3_frame_count);
+            maybe_dump_ok_frame(frame, "pcm");
+            Ok(rf)
+        }
+        Err(e) => {
+            let diag = eac3_frame_reject_diag(frame);
+            let err_str = format!("{e}");
+            if err_str == "not-eac3" {
+                if let Some(silence) = build_legacy_ac3_core_failure_silence(bridge, frame) {
+                    return Ok(silence);
+                }
+            }
+            if err_str == "unsupported-feature:non-independent-core-pcm" {
+                if let (Some((sample_rate, sample_count)), Some(labels)) =
+                    (eac3_frame_timing(frame), eac3_header_bed_labels(frame))
+                {
+                    maybe_dump_reject_frame(frame, "unsupported");
+                    return Ok(build_silence_frame(
+                        sample_rate,
+                        sample_count,
+                        labels,
+                        bridge,
+                    ));
+                }
+            }
+            if err_str == "short-packet" {
+                maybe_dump_short_packet_frame(frame);
+                if let (Some((sample_rate, sample_count)), Some(labels)) =
+                    (eac3_frame_timing(frame), eac3_header_bed_labels(frame))
+                {
+                    maybe_dump_reject_frame(frame, "shortpkt");
+                    bridge.eac3_diag_stats.short_packet_silence_frames += 1;
+                    return Ok(build_silence_frame(
+                        sample_rate,
+                        sample_count,
+                        labels,
+                        bridge,
+                    ));
+                }
+            }
+            maybe_dump_reject_frame(frame, "parseerr");
+            Err(format!("E-AC3 decode error: {e} {diag}"))
+        }
+    }
+}
+
+/// Merge a decoded core (5.1) with its dependent E-AC3 substream — the discrete
+/// surround/back channels of a 7.1 extension — into one bed, via the shared
+/// [`eac3::merge_core_with_decoded_dependent`] helper (also used by the
+/// harletty CLI). Returns `None` (caller falls back to the core alone) when
+/// the dependent could not be decoded or doesn't line up.
+fn merge_eac3_core_with_dependent(
+    core: &CorePcmFrame,
+    dependent: &PendingEac3Dependent,
+) -> Option<CorePcmFrame> {
+    match &dependent.decoded {
+        DecodedDependent::Channels(channels) => {
+            eac3::merge_core_with_decoded_dependent(core, channels, &dependent.info)
+        }
+        DecodedDependent::Failed => None,
+    }
+}
+
+/// Whether ETSI allows this access unit to be followed by dependents.
+///
+/// Only a true independent substream may carry them; a converted-AC-3 frame
+/// (type 2) may not, so holding one back would add latency waiting for a
+/// partner that cannot arrive.
+pub(crate) fn eac3_frame_can_carry_dependents(inspection: &Eac3Inspection) -> bool {
+    inspection
+        .as_ref()
+        .is_ok_and(|info| info.frame_type == FrameType::Independent)
+}
+
+/// Record the dialogue level of an access unit the bridge is holding rather
+/// than emitting immediately, so the frame it eventually produces carries the
+/// level its own bitstream declared.
+pub(crate) fn note_eac3_dialogue_level(bridge: &mut DolbyPipeline, info: &AccessUnitInfo) {
+    update_eac3_dialogue_level(bridge, info);
+}
+
+/// Emit a buffered independent core that ended up standing alone.
+pub(crate) fn build_buffered_core_frame(
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+    push: &eac3::PcmPushResult,
+) -> RDecodedFrame {
+    let base_sample_pos = bridge.eac3_total_samples;
+    bridge.eac3_total_samples += push.pcm.samples_per_channel() as u64;
+    build_eac3_frame_from_core(&push.pcm, &push.info, base_sample_pos, bridge, shared)
+}
+
+/// Turn a complete presentation - a core plus the dependents that followed it -
+/// into the one frame it represents.
+///
+/// The dependents are merged onto the core in bitstream order first, because
+/// for the seven-channel JOC downmix configurations two of the
+/// reconstruction's inputs are channels a dependent carries. The last dependent
+/// then decides the outcome: a JOC payload there means objects, its absence
+/// means the merged bed.
+pub(crate) fn resolve_eac3_presentation(
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+    core: CorePcmFrame,
+    dependents: &[PendingEac3Dependent],
+) -> Result<RDecodedFrame, String> {
+    let mut bed = core;
+    let mut merged_any = false;
+    for dependent in dependents {
+        emit_eac3_frame_info_diagnostic(bridge, &dependent.info);
+        match merge_eac3_core_with_dependent(&bed, dependent) {
+            Some(merged) => {
+                bed = merged;
+                merged_any = true;
+            }
+            None => {
+                // The channels stay as the core had them rather than failing the
+                // presentation, but silently is how this used to hide a
+                // dependent whose layout the mapper does not cover.
+                bridge.eac3_diag_stats.dependent_merge_failures += 1;
+                if let Some(failures) = bridge.eac3_warnings.dependent_merge_failures.note() {
+                    bridge_log!(
+                        log::Level::Warn,
+                        "eac3_dependent_merge_failed dependent channels not overlaid onto the core ({failures} so far)"
+                    );
+                }
+            }
+        }
+    }
+
+    let Some(last) = dependents.last() else {
+        return Err("presentation resolved with no dependents".to_owned());
+    };
+    let dep_info = last.info.clone();
+    let last = last.access_unit.as_slice();
+    update_eac3_dialogue_level(bridge, &dep_info);
+
+    if dep_info.joc_payload_count() == 0 {
+        let sample_count = bed.samples_per_channel();
+        bridge.eac3_total_samples += sample_count as u64;
+        bridge.eac3_diag_stats.dependent_pair_channel_beds += 1;
+        bridge.perf.maybe_report(bridge.eac3_frame_count);
+        return Ok(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge));
+    }
+
+    // The reconstruction is only valid against the downmix the encoder wrote
+    // its matrices for, and Table 47 ties that to `joc_dmx_config_idx`:
+    // configurations 0 and 3 declare a 5-channel downmix, which is the
+    // independent substream on its own. A bed with a dependent overlaid is a
+    // different signal — the 7.1 extension replaces the folded Ls/Rs with the
+    // discrete ones — so feeding it to a 5-channel configuration would place
+    // and level every surround-derived object against channels the encoder
+    // never saw. Every JOC stream measured that carries a dependent declares a
+    // 7-channel configuration, so this guards an assumption rather than a live
+    // code path; if it ever fires, saying so beats reconstructing silently.
+    if let Some(joc) = dep_info.first_joc_payload()
+        && merged_any
+        && joc.channel_count == 5
+    {
+        let message = format!(
+            "E-AC3 JOC declares a {}-channel downmix (joc_dmx_config_idx {}) but the bed carries an overlaid dependent",
+            joc.channel_count, joc.downmix_config
+        );
+        if shared.strict {
+            return Err(message);
+        }
+        if let Some(frames) = bridge.eac3_warnings.joc_downmix_mismatches.note() {
+            bridge_log!(log::Level::Warn, "{message} ({frames} frame(s) so far)");
+        }
+        bridge.eac3_diag_stats.joc_downmix_config_mismatch += 1;
+        bridge.eac3_diag_stats.last_dependent_pair_error = Some(message);
+        bridge.eac3_object_decoder.note_non_joc_presentation();
+        let sample_count = bed.samples_per_channel();
+        bridge.eac3_total_samples += sample_count as u64;
+        return Ok(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge));
+    }
+
+    match bridge
+        .eac3_object_decoder
+        .push_access_unit_with_core(last, bed.clone())
+    {
+        Ok(Some(result)) => {
+            update_eac3_dialogue_level(bridge, &result.info);
+            let sample_count = result.pcm.samples_per_channel();
+            let base_sample_pos = bridge.eac3_total_samples;
+            bridge.eac3_total_samples += sample_count as u64;
+            bridge.eac3_diag_stats.paired_object_frames += 1;
+            bridge.perf.maybe_report(bridge.eac3_frame_count);
+            maybe_dump_ok_frame(last, "depobj");
+            Ok(build_eac3_frame_from_object(
+                result,
+                base_sample_pos,
+                bridge,
+                shared,
+            ))
+        }
+        // The dependent announced a JOC payload the decoder then found nothing
+        // in. The merged bed is real audio either way, and dropping the whole
+        // interval to report that is worse than emitting it.
+        Ok(None) => {
+            bridge.eac3_diag_stats.dependent_pair_no_object += 1;
+            bridge.eac3_diag_stats.last_dependent_pair_error =
+                Some("no_object_payload".to_string());
+            bridge.eac3_object_decoder.note_non_joc_presentation();
+            let sample_count = bed.samples_per_channel();
+            bridge.eac3_total_samples += sample_count as u64;
+            Ok(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge))
+        }
+        Err(err) => {
+            let diag = eac3_frame_reject_diag(last);
+            maybe_dump_reject_frame(last, "depobj");
+            let message = format!("E-AC3 dependent object decode error: {err} {diag}");
+            if shared.strict {
+                return Err(message);
+            }
+            // Non-strict playback keeps going on the bed rather than losing a
+            // whole interval, and the reconstruction starts clean next time.
+            if let Some(frames) = bridge.eac3_warnings.dependent_object_decode_errors.note() {
+                bridge_log!(log::Level::Warn, "{message} ({frames} frame(s) so far)");
+            }
+            bridge.eac3_diag_stats.last_dependent_pair_error = Some(message);
+            bridge.eac3_object_decoder.reset();
+            let sample_count = bed.samples_per_channel();
+            bridge.eac3_total_samples += sample_count as u64;
+            Ok(build_eac3_channel_bed_frame(&bed, Some(&dep_info), bridge))
+        }
+    }
+}
+
+pub(crate) fn is_legacy_ac3_frame(frame: &[u8]) -> bool {
+    legacy_ac3_info(frame).is_some()
+}
+
+/// Whether this access unit carries a JOC payload at all.
+///
+/// The payload rides in the last access unit of a presentation, so one that
+/// carries it ends the group.
+pub(crate) fn eac3_frame_carries_joc(info: &AccessUnitInfo) -> bool {
+    info.joc_payload_count() > 0
+}
+
+/// Whether this access unit carries a JOC payload its own channels satisfy.
+///
+/// An independent frame that does is already a complete presentation - the
+/// reconstruction wants only the core it arrived with - so it need not be held
+/// back to see whether a dependent follows. That is the five-channel downmix
+/// configurations, `joc_dmx_config_idx` 0 and 3, which a 5.1 independent
+/// supplies on its own.
+///
+/// The seven-channel configurations are a different matter. An independent
+/// substream carries 5.1 at most, so configuration 1's back pair and
+/// configurations 2 and 4's top front pair can only arrive in a dependent.
+/// Emitting such a frame on arrival hands the reconstruction a bed two
+/// channels short of what the payload's own header declares, which is how a
+/// height downmix came to be reconstructed from the surrounds; it waits for
+/// its dependents instead.
+///
+/// That second case is malformed input and this deliberately settles for a
+/// correct bed rather than objects. TS 103 420 clause 8.2 requires the EMDF
+/// container carrying OAMD and JOC to ride in the *last dependent* wherever a
+/// stream has dependents at all, so a payload in the independent means there
+/// are none - and then five channels is all it can declare. A wide declaration
+/// here is a stream that contradicts itself. Holding the frame lets its
+/// dependents reach the bed, and [`resolve_eac3_presentation`] then finds no
+/// JOC in the last of them and emits that bed: the extension channels are
+/// heard, the objects are not. Emitting on arrival instead would strand those
+/// dependents with no core to attach to and lose the channels as well, which
+/// is the worse of the two, and reconstructing from the independent's own
+/// payload is machinery for a stream shape the specification forbids.
+pub(crate) fn eac3_frame_carries_self_contained_joc(inspection: &Eac3Inspection) -> bool {
+    inspection.as_ref().is_ok_and(carries_self_contained_joc)
+}
+
+fn carries_self_contained_joc(info: &AccessUnitInfo) -> bool {
+    info.payloads().any(|payload| match &payload.parsed {
+        ParsedEmdfPayloadData::Joc(joc) => usize::from(info.fullband_channels) >= joc.channel_count,
+        _ => false,
+    })
+}
+
+pub(crate) fn diagnose_eac3_frame(
+    bridge: &mut DolbyPipeline,
+    frame: &[u8],
+    inspection: &Eac3Inspection,
+) {
+    emit_eac3_frame_diagnostic(bridge, frame, inspection);
+}
+
+fn emit_eac3_frame_diagnostic(
+    bridge: &mut DolbyPipeline,
+    frame: &[u8],
+    inspection: &Eac3Inspection,
+) {
+    match inspection {
+        Ok(info) => emit_eac3_frame_info_diagnostic(bridge, info),
+        Err(err) => {
+            bridge.eac3_diag_stats.total_frames += 1;
+            if format!("{err}") == "not-eac3" && legacy_ac3_info(frame).is_some() {
+                bridge.eac3_diag_stats.legacy_ac3_frames += 1;
+            }
+        }
+    }
+}
+
+fn emit_eac3_frame_info_diagnostic(bridge: &mut DolbyPipeline, info: &AccessUnitInfo) {
+    bridge.eac3_diag_stats.total_frames += 1;
+    match info.frame_type {
+        FrameType::LegacyAc3 => bridge.eac3_diag_stats.legacy_ac3_frames += 1,
+        FrameType::Independent => bridge.eac3_diag_stats.independent_frames += 1,
+        FrameType::Dependent => bridge.eac3_diag_stats.dependent_frames += 1,
+        FrameType::Ac3Convert => bridge.eac3_diag_stats.ac3_convert_frames += 1,
+    }
+    if info.joc_payload_count() > 0 {
+        bridge.eac3_diag_stats.joc_frames += 1;
+    }
+    if info.oamd_payload_count() > 0 {
+        bridge.eac3_diag_stats.oamd_frames += 1;
+    }
+}
+
+pub(crate) fn is_temporary_eac3_silence_frame(frame: &RDecodedFrame) -> bool {
+    frame.sampling_frequency != 0
+        && frame.sample_count == LEGACY_AC3_SAMPLE_COUNT
+        && frame.channel_count == LEGACY_AC3_CHANNEL_COUNT
+        && frame.metadata.is_empty()
+        && frame.pcm.iter().all(|sample| *sample == 0)
+}
+
+static SHORT_PACKET_DUMPED: AtomicBool = AtomicBool::new(false);
+
+fn maybe_dump_short_packet_frame(frame: &[u8]) {
+    if std::env::var_os("HARLETTY_DUMP_EAC3_SHORT_PACKET").is_none() {
+        return;
+    }
+    if SHORT_PACKET_DUMPED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let path = "/tmp/eac3_short_packet.bin";
+    if let Err(err) = std::fs::write(path, frame) {
+        bridge_log!(
+            log::Level::Warn,
+            "failed to dump short-packet frame to {path}: {err}"
+        );
+    } else {
+        bridge_log!(
+            log::Level::Warn,
+            "dumped first short-packet E-AC3 frame ({} bytes) to {path}",
+            frame.len()
+        );
+    }
+}
+
+static REJECT_DUMP_CAP: OnceLock<usize> = OnceLock::new();
+static REJECT_DUMP_INDEX: AtomicUsize = AtomicUsize::new(0);
+static OK_DUMP_CAP: OnceLock<usize> = OnceLock::new();
+static OK_DUMP_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+fn read_dump_cap_env(name: &str) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn maybe_dump_reject_frame(frame: &[u8], reason: &str) {
+    let cap = *REJECT_DUMP_CAP.get_or_init(|| read_dump_cap_env("HARLETTY_DUMP_EAC3_REJECTS"));
+    if cap == 0 {
+        return;
+    }
+    let idx = REJECT_DUMP_INDEX.fetch_add(1, Ordering::SeqCst);
+    if idx >= cap {
+        return;
+    }
+    let path = format!("/tmp/eac3_reject_{idx:04}_{reason}.bin");
+    if let Err(err) = std::fs::write(&path, frame) {
+        bridge_log!(
+            log::Level::Warn,
+            "failed to dump rejected E-AC3 frame to {path}: {err}"
+        );
+    } else {
+        bridge_log!(
+            log::Level::Warn,
+            "dumped rejected E-AC3 frame [{reason}] ({} bytes) to {path}",
+            frame.len()
+        );
+    }
+}
+
+fn maybe_dump_ok_frame(frame: &[u8], path_kind: &str) {
+    let cap = *OK_DUMP_CAP.get_or_init(|| read_dump_cap_env("HARLETTY_DUMP_EAC3_OK"));
+    if cap == 0 {
+        return;
+    }
+    let idx = OK_DUMP_INDEX.fetch_add(1, Ordering::SeqCst);
+    if idx >= cap {
+        return;
+    }
+    let path = format!("/tmp/eac3_ok_{idx:04}_{path_kind}.bin");
+    if let Err(err) = std::fs::write(&path, frame) {
+        bridge_log!(
+            log::Level::Warn,
+            "failed to dump accepted E-AC3 frame to {path}: {err}"
+        );
+    } else {
+        bridge_log!(
+            log::Level::Warn,
+            "dumped accepted E-AC3 frame [{path_kind}] ({} bytes) to {path}",
+            frame.len()
+        );
+    }
+}
+
+fn eac3_frame_reject_diag(frame: &[u8]) -> String {
+    let sync = frame
+        .get(0..2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
+    let bsid = frame_bsid(frame);
+    let first8 = frame
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "sync={:?} bsid={:?} frame_bytes={} first8=[{}]",
+        sync,
+        bsid,
+        frame.len(),
+        first8
+    )
+}
+
+fn frame_bsid(frame: &[u8]) -> Option<u8> {
+    if frame.len() < 6 {
+        return None;
+    }
+    let bit_offset = 40usize;
+    let byte_index = bit_offset / 8;
+    let bit_shift = 8 - (bit_offset % 8) - 5;
+    frame.get(byte_index).map(|byte| (byte >> bit_shift) & 0x1F)
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct LegacyAc3Info {
+    bsid: u8,
+    sample_rate: u32,
+    frame_size: usize,
+    channel_mode: u8,
+    channels: u8,
+    lfe_on: bool,
+}
+
+fn legacy_ac3_info(frame: &[u8]) -> Option<LegacyAc3Info> {
+    let bsid = frame_bsid(frame)?;
+    if bsid > 10 || frame.len() < 7 {
+        return None;
+    }
+
+    let fscod = frame[4] >> 6;
+    let frmsizecod = frame[4] & 0x3F;
+    let sample_rate = match fscod {
+        0 => 48_000,
+        1 => 44_100,
+        2 => 32_000,
+        _ => return None,
+    };
+    let frame_size = ac3_frame_size_from_fscod_frmsizecod(fscod, frmsizecod)?;
+    let channel_mode = read_bits(frame, 48, 3)? as u8;
+    let mut bit_offset = 51usize;
+    if (channel_mode & 0x01) != 0 && channel_mode != 1 {
+        bit_offset += 2;
+    }
+    if (channel_mode & 0x04) != 0 {
+        bit_offset += 2;
+    }
+    if channel_mode == 2 {
+        bit_offset += 2;
+    }
+    let lfe_on = read_bits(frame, bit_offset, 1)? != 0;
+    let channels = AC3_CHANNELS[usize::from(channel_mode)] + u8::from(lfe_on);
+
+    Some(LegacyAc3Info {
+        bsid,
+        sample_rate,
+        frame_size,
+        channel_mode,
+        channels,
+        lfe_on,
+    })
+}
+
+fn ac3_frame_size_from_fscod_frmsizecod(fscod: u8, frmsizecod: u8) -> Option<usize> {
+    // Shared with the raw extractor and the decoder: one table, and the
+    // 44.1 kHz odd-`frmsizecod` padding word the local copy used to omit.
+    eac3::legacy_ac3_frame_size(fscod, frmsizecod)
+}
+
+fn read_bits(data: &[u8], bit_offset: usize, bit_count: usize) -> Option<u32> {
+    if bit_count > 32 || bit_offset + bit_count > data.len() * 8 {
+        return None;
+    }
+    let mut value = 0u32;
+    for bit in bit_offset..bit_offset + bit_count {
+        let byte = *data.get(bit / 8)?;
+        let bit_value = (byte >> (7 - (bit % 8))) & 1;
+        value = (value << 1) | u32::from(bit_value);
+    }
+    Some(value)
+}
+
+fn eac3_frame_timing(frame: &[u8]) -> Option<(u32, u32)> {
+    if frame.len() < 5 || frame_bsid(frame)? < 11 {
+        return None;
+    }
+
+    let sr_code = (frame[4] >> 6) & 0x03;
+    let (sample_rate, blocks) = if sr_code == 3 {
+        let sr_code2 = (frame[4] >> 4) & 0x03;
+        if sr_code2 == 3 {
+            return None;
+        }
+        (EAC3_SAMPLE_RATES[usize::from(sr_code2)] / 2, 6)
+    } else {
+        let num_blocks_code = (frame[4] >> 4) & 0x03;
+        (
+            EAC3_SAMPLE_RATES[usize::from(sr_code)],
+            EAC3_BLOCKS[usize::from(num_blocks_code)],
+        )
+    };
+
+    Some((sample_rate, blocks * 256))
+}
+
+/// The channel list the core decoder emits for an AC-3 / E-AC-3 `acmod` +
+/// `lfeon`: fullband channels in bitstream order, then LFE — exactly what
+/// [`build_eac3_channel_bed_frame`] and [`build_eac3_frame_from_core`] label a
+/// decoded frame with. Silence substituted for a frame that could not be
+/// decoded has to carry this same list: the renderer keys its bed plan on the
+/// ordered labels, so any other order replans the bed twice around every
+/// dropped frame (audible, and Studio reorders its virtual speakers).
+fn bed_labels_for_channel_mode(channel_mode: u8, lfe_on: bool) -> RVec<RChannelLabel> {
+    let order = eac3::fullband_channel_order(channel_mode).unwrap_or(&[
+        BedChannel::FrontLeft,
+        BedChannel::Center,
+        BedChannel::FrontRight,
+        BedChannel::SurroundLeft,
+        BedChannel::SurroundRight,
+    ]);
+    let mut labels = RVec::with_capacity(order.len() + usize::from(lfe_on));
+    labels.extend(order.iter().map(|bed| bed_channel_to_r(*bed)));
+    if lfe_on {
+        labels.push(RChannelLabel::LFE);
+    }
+    labels
+}
+
+/// Channel list for silence standing in for an E-AC-3 access unit, read from
+/// its header (`acmod` + `lfeon` share byte 4 with `fscod`/`numblkscod`).
+fn eac3_header_bed_labels(frame: &[u8]) -> Option<RVec<RChannelLabel>> {
+    if frame.len() < 5 || frame_bsid(frame)? < 11 {
+        return None;
+    }
+    Some(bed_labels_for_channel_mode(
+        (frame[4] >> 1) & 0x07,
+        frame[4] & 0x01 != 0,
+    ))
+}
+
+/// One frame of silence in place of a legacy AC-3 core the native decoder
+/// rejected. The header is intact even when the body is not (the failures seen
+/// in the field are bit-reader exhaustion late in the frame), so the channel
+/// list is derived from it and matches the decoded neighbours. Returns `None`
+/// only when the header itself does not parse as legacy AC-3.
+pub(crate) fn build_legacy_ac3_core_failure_silence(
+    bridge: &mut DolbyPipeline,
+    frame: &[u8],
+) -> Option<RDecodedFrame> {
+    let info = legacy_ac3_info(frame)?;
+    Some(build_silence_frame(
+        info.sample_rate,
+        LEGACY_AC3_SAMPLE_COUNT,
+        bed_labels_for_channel_mode(info.channel_mode, info.lfe_on),
+        bridge,
+    ))
+}
+
+fn build_silence_frame(
+    sample_rate: u32,
+    sample_count: u32,
+    channel_labels: RVec<RChannelLabel>,
+    bridge: &mut DolbyPipeline,
+) -> RDecodedFrame {
+    let sample_count_usize = sample_count as usize;
+    let channel_count = channel_labels.len();
+    bridge.eac3_total_samples += sample_count as u64;
+
+    RDecodedFrame {
+        sampling_frequency: sample_rate,
+        sample_count,
+        channel_count: channel_count as u32,
+        pcm: vec![0; sample_count_usize * channel_count].into(),
+        channel_labels,
+        metadata: RVec::new(),
+        drc_gain: 1.0,
+        drc_ramp_duration: 0,
+        dialogue_level: bridge.current_dialogue_level.into(),
+        is_new_segment: false,
+    }
+}
+
+/// Build an [`RDecodedFrame`] from an E-AC3 object decode result.
+fn build_eac3_frame_from_object(
+    result: ObjectPcmPushResult,
+    base_sample_pos: u64,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+) -> RDecodedFrame {
+    let pcm_frame = &result.pcm;
+    let info = &result.info;
+    let core = &pcm_frame.core;
+    let sample_count = pcm_frame.samples_per_channel();
+    let sampling_frequency = core.sample_rate;
+    let bed_channels = usize::from(core.lfe_channel.is_some());
+    let object_channels = pcm_frame.object_channels.len();
+    let total_channel_count = bed_channels + object_channels;
+
+    // A bed-only presentation carries no positional object metadata: the
+    // reconstructed channels ARE the 7.1.x bed. When present, label the channels
+    // (so the channel-render path spatialises them) and skip OAMD event
+    // generation — emitting dynamic-object events for bed channels would route
+    // nothing (no matching object channel in the renderer) and the whole bed
+    // would render silent.
+    let bed_object_labels = eac3_pure_bed_object_labels(pcm_frame);
+    let (pcm, channel_labels) =
+        build_eac3_object_output_pcm_and_labels(pcm_frame, bed_object_labels.as_deref());
+
+    // Metadata from OAMD payloads.
+    #[cfg(feature = "bridge-perf")]
+    let metadata_started = Instant::now();
+    let mut metadata: RVec<RMetadataFrame> = RVec::new();
+    #[cfg(feature = "bridge-perf")]
+    let mut metadata_events = 0usize;
+    if bed_object_labels.is_none() {
+        let num_bed_channels = usize::from(core.lfe_channel.is_some());
+        for (oamd, sample_offset) in &pcm_frame.oamd_payloads {
+            let evo_base = base_sample_pos + sample_offset.unwrap_or(0) as u64;
+            let oamd_ref: &OamdPayload = oamd;
+            let meta = build_eac3_metadata_frame(
+                oamd_ref,
+                evo_base,
+                base_sample_pos,
+                num_bed_channels,
+                object_channels,
+                shared,
+            );
+            #[cfg(feature = "bridge-perf")]
+            {
+                metadata_events += meta.events.len();
+            }
+            metadata.push(meta);
+        }
+    }
+    #[cfg(feature = "bridge-perf")]
+    {
+        let elapsed = metadata_started.elapsed();
+        bridge.perf.record_build_metadata(elapsed);
+        bridge
+            .perf
+            .note_built_frame(metadata.len(), metadata_events);
+    }
+
+    let (drc_gain, drc_ramp_duration) = eac3_drc_params(bridge, info, sample_count as u32);
+
+    RDecodedFrame {
+        sampling_frequency,
+        sample_count: sample_count as u32,
+        channel_count: total_channel_count as u32,
+        pcm,
+        channel_labels,
+        metadata,
+        drc_gain,
+        drc_ramp_duration,
+        dialogue_level: bridge.current_dialogue_level.into(),
+        is_new_segment: false,
+    }
+}
+
+/// For a *bed-only* OAMD presentation — every object is a bed/ISF channel and
+/// there are no dynamic objects (common in broadcast Atmos, e.g. live sport) —
+/// return the bed-channel label of each JOC-reconstructed object channel, in
+/// PCM order.
+///
+/// The labels come from the program's bed assignment with the LFE removed: the
+/// LFE is carried by the core (`CorePcmFrame::lfe_channel`), not reconstructed
+/// by JOC, so it is not one of the `object_channels`. The remaining bed channels
+/// line up 1:1 with the reconstructed objects.
+///
+/// Returns `None` when the stream is not a pure bed, or when the assignment does
+/// not line up with the reconstructed channel count — the caller then keeps the
+/// regular dynamic-object path untouched.
+fn eac3_pure_bed_object_labels(pcm_frame: &eac3::ObjectPcmFrame) -> Option<Vec<BedChannel>> {
+    let (oamd, _) = pcm_frame.oamd_payloads.first()?;
+    if oamd.dynamic_objects != 0 {
+        return None;
+    }
+    let labels: Vec<BedChannel> = oamd
+        .bed_assignment
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|ch| {
+            !matches!(
+                ch,
+                BedChannel::LowFrequencyEffects | BedChannel::LowFrequencyEffects2
+            )
+        })
+        .collect();
+    (labels.len() == pcm_frame.object_channels.len()).then_some(labels)
+}
+
+fn build_eac3_object_output_pcm_and_labels(
+    pcm_frame: &eac3::ObjectPcmFrame,
+    bed_object_labels: Option<&[BedChannel]>,
+) -> (RVec<i32>, RVec<RChannelLabel>) {
+    let core = &pcm_frame.core;
+    let sample_count = pcm_frame.samples_per_channel();
+    let bed_channels = usize::from(core.lfe_channel.is_some());
+    let object_channels = pcm_frame.object_channels.len();
+    let total_channel_count = bed_channels + object_channels;
+
+    // Build interleaved PCM: LFE bed first, then dynamic-object channels.
+    // JOC output is dynamic-only and does not carry LFE. The fullband core bed
+    // is used as JOC input, so exposing it here would double-count the final mix.
+    let channels: Vec<&[f32]> = core
+        .lfe_channel
+        .iter()
+        .chain(&pcm_frame.object_channels)
+        .map(Vec::as_slice)
+        .collect();
+    let pcm = interleave_pcm(&channels, sample_count);
+
+    let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
+    if core.lfe_channel.is_some() {
+        channel_labels.push(RChannelLabel::LFE);
+    }
+    match bed_object_labels {
+        // Bed-only presentation: tag each reconstructed channel with its bed
+        // speaker so the engine's channel-render (virtual-bed) path spatialises
+        // it. `eac3_pure_bed_object_labels` guarantees one label per object.
+        Some(labels) => {
+            for &ch in labels {
+                channel_labels.push(bed_channel_to_r(ch));
+            }
+        }
+        // Dynamic objects: positions come from per-frame OAMD events, not labels.
+        None => {
+            for _ in 0..object_channels {
+                channel_labels.push(RChannelLabel::Object);
+            }
+        }
+    }
+
+    (pcm, channel_labels)
+}
+
+/// Interleave planar channels into the bridge's PCM, `sample_count` samples
+/// of each, in the order given.
+///
+/// Written into a zeroed buffer rather than pushed sample by sample, and each
+/// channel is cut to `sample_count` once, not bounds-checked per sample.
+fn interleave_pcm(channels: &[&[f32]], sample_count: usize) -> RVec<i32> {
+    const BLOCK: usize = 64;
+    let stride = channels.len();
+    let mut pcm = vec![0i32; sample_count * stride];
+    let channels: Vec<&[f32]> = channels
+        .iter()
+        .map(|channel| &channel[..sample_count])
+        .collect();
+    // A block of each channel is converted in one contiguous pass, then
+    // scattered into its slots. Converting while scattering read every
+    // channel at the same offset and wrote one interleaved row at a time, a
+    // pattern whose speed swung threefold with where the allocator happened
+    // to place the buffers.
+    let mut converted = [0i32; BLOCK];
+    for (block, frames) in pcm.chunks_mut(BLOCK * stride.max(1)).enumerate() {
+        let start = block * BLOCK;
+        let len = frames.len() / stride.max(1);
+        for (channel_index, channel) in channels.iter().enumerate() {
+            for (slot, &sample) in converted[..len]
+                .iter_mut()
+                .zip(&channel[start..start + len])
+            {
+                *slot = float_to_pcm_i32(sample);
+            }
+            for (frame, &value) in frames.chunks_exact_mut(stride).zip(&converted[..len]) {
+                frame[channel_index] = value;
+            }
+        }
+    }
+    pcm.into()
+}
+
+/// A decoded core interleaved fullband channels first, LFE last.
+fn interleave_core_pcm(core: &CorePcmFrame, sample_count: usize) -> RVec<i32> {
+    let channels: Vec<&[f32]> = core
+        .fullband_channels
+        .iter()
+        .chain(&core.lfe_channel)
+        .map(Vec::as_slice)
+        .collect();
+    interleave_pcm(&channels, sample_count)
+}
+
+/// Build an [`RDecodedFrame`] from a core-PCM-only E-AC3 decode result.
+pub(crate) fn build_eac3_frame_from_core(
+    core: &CorePcmFrame,
+    info: &AccessUnitInfo,
+    base_sample_pos: u64,
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+) -> RDecodedFrame {
+    let sampling_frequency = core.sample_rate;
+    let sample_count = core.samples_per_channel();
+    let total_channel_count = core.total_channels();
+
+    let pcm = interleave_core_pcm(core, sample_count);
+
+    // Channel labels.
+    let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
+    for bed in &core.fullband_channel_order {
+        channel_labels.push(bed_channel_to_r(*bed));
+    }
+    if core.lfe_channel.is_some() {
+        channel_labels.push(RChannelLabel::LFE);
+    }
+
+    // Extract metadata from OAMD payloads in the access unit info.
+    let mut metadata: RVec<RMetadataFrame> = RVec::new();
+    for payload in info.payloads() {
+        if let ParsedEmdfPayloadData::Oamd(oamd) = &payload.parsed {
+            let evo_base = base_sample_pos + payload.info.sample_offset.unwrap_or(0) as u64;
+            let meta = build_eac3_metadata_frame(oamd, evo_base, base_sample_pos, 0, 0, shared);
+            metadata.push(meta);
+        }
+    }
+
+    let (drc_gain, drc_ramp_duration) = eac3_drc_params(bridge, info, sample_count as u32);
+
+    RDecodedFrame {
+        sampling_frequency,
+        sample_count: sample_count as u32,
+        channel_count: total_channel_count as u32,
+        pcm,
+        channel_labels,
+        metadata,
+        drc_gain,
+        drc_ramp_duration,
+        dialogue_level: bridge.current_dialogue_level.into(),
+        is_new_segment: false,
+    }
+}
+
+/// Build a pure channel-bed frame (PCM + labels, **empty metadata**) from a
+/// decoded core. Used for non-object content (a plain 5.1 / 7.1 bed) so the
+/// renderer's channel-render modes (virtual / direct / host) spatialise it,
+/// rather than the object path. Unlike [`build_eac3_frame_from_core`] this never
+/// derives OAMD/object metadata. DRC and dialogue level are still carried.
+/// Emit a standalone AC-3 core (no E-AC3 dependent followed it) as a plain 5.1
+/// channel bed, so the renderer's channel-render modes can spatialise it. Plain
+/// AC-3 streams never deliver a dependent, so without this the buffered core
+/// would sit unpaired forever and the track would be silent. DRC/dialnorm come
+/// from the AC-3 frame itself (`frame`).
+pub(crate) fn build_standalone_ac3_core_frame(
+    bridge: &mut DolbyPipeline,
+    core: &CorePcmFrame,
+    frame: &[u8],
+) -> RDecodedFrame {
+    let info = inspect_access_unit(frame).ok();
+    if let Some(info) = info.as_ref() {
+        update_eac3_dialogue_level(bridge, info);
+    }
+    let sample_count = core.samples_per_channel();
+    bridge.eac3_total_samples += sample_count as u64;
+    bridge.eac3_diag_stats.standalone_ac3_core_beds += 1;
+    bridge.perf.maybe_report(bridge.eac3_frame_count);
+    build_eac3_channel_bed_frame(core, info.as_ref(), bridge)
+}
+
+fn build_eac3_channel_bed_frame(
+    core: &CorePcmFrame,
+    info: Option<&AccessUnitInfo>,
+    bridge: &mut DolbyPipeline,
+) -> RDecodedFrame {
+    let sample_count = core.samples_per_channel();
+    let total_channel_count = core.total_channels();
+
+    let pcm = interleave_core_pcm(core, sample_count);
+
+    let mut channel_labels: RVec<RChannelLabel> = RVec::with_capacity(total_channel_count);
+    for bed in &core.fullband_channel_order {
+        channel_labels.push(bed_channel_to_r(*bed));
+    }
+    if core.lfe_channel.is_some() {
+        channel_labels.push(RChannelLabel::LFE);
+    }
+
+    let (drc_gain, drc_ramp_duration) = info
+        .map(|info| eac3_drc_params(bridge, info, sample_count as u32))
+        .unwrap_or((1.0, 0));
+
+    RDecodedFrame {
+        sampling_frequency: core.sample_rate,
+        sample_count: sample_count as u32,
+        channel_count: total_channel_count as u32,
+        pcm,
+        channel_labels,
+        metadata: RVec::new(),
+        drc_gain,
+        drc_ramp_duration,
+        dialogue_level: bridge.current_dialogue_level.into(),
+        is_new_segment: false,
+    }
+}
+
+fn update_eac3_dialogue_level(bridge: &mut DolbyPipeline, info: &AccessUnitInfo) {
+    bridge.current_dialogue_level = Some(info.dialogue_normalization[0]);
+}
+
+fn eac3_drc_params(bridge: &DolbyPipeline, info: &AccessUnitInfo, sample_count: u32) -> (f32, u32) {
+    match bridge.drc_mode {
+        crate::dolby::DrcMode::Off => (1.0, 0),
+        crate::dolby::DrcMode::Standard => {
+            let gain = info
+                .block_drc
+                .iter()
+                .rev()
+                .find_map(|block| {
+                    block.dynamic_range_exists[0]
+                        .then(|| decode_ac3_dynamic_range_word(block.dynamic_range_word[0]))
+                })
+                .unwrap_or(1.0);
+            let ramp = if gain != 1.0 { sample_count } else { 0 };
+            (gain, ramp)
+        }
+        crate::dolby::DrcMode::Heavy => {
+            let gain = if info.heavy_compression_exists[0] {
+                decode_ac3_heavy_range_word(info.heavy_compression_word[0])
+            } else {
+                info.block_drc
+                    .iter()
+                    .rev()
+                    .find_map(|block| {
+                        block.dynamic_range_exists[0]
+                            .then(|| decode_ac3_dynamic_range_word(block.dynamic_range_word[0]))
+                    })
+                    .unwrap_or(1.0)
+            };
+            let ramp = if gain != 1.0 { sample_count } else { 0 };
+            (gain, ramp)
+        }
+    }
+}
+
+fn decode_ac3_dynamic_range_word(word: u8) -> f32 {
+    let v = ((word >> 5) as i32) - (((word >> 7) as i32) << 3) - 5;
+    2.0f32.powi(v) * (((word & 0x1F) | 0x20) as f32)
+}
+
+fn decode_ac3_heavy_range_word(word: u8) -> f32 {
+    let v = ((word >> 4) as i32) - (((word >> 7) as i32) << 4) - 4;
+    2.0f32.powi(v) * (((word & 0x0F) | 0x10) as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dolby::test_bridge::TestBridge;
+    use eac3::{
+        AccessUnitInfo, AudioFrameInfo, AuxParseStatus, BedChannel, BlockDrcInfo, CorePcmFrame,
+        EmdfSource, FrameType, JocPayload, OamdPayload, ObjectPcmFrame,
+    };
+
+    /// Local-only end-to-end check: decode a real non-JOC E-AC3 7.1 stream
+    /// (AC-3 core + dependent) through the full bridge and confirm it now emits a
+    /// non-silent multichannel bed (it used to drop the pair → silence). Skips
+    /// gracefully when the local capture is absent. Writes the decoded PCM next
+    /// to the fixture as `<fixture>.harletty_bridge.f32` for `compare_pcm`
+    /// against ffmpeg. The fixture path can be overridden with
+    /// `HARLETTY_EAC3_PAIR_FIXTURE` — keep such captures on disk, not tmpfs.
+    #[test]
+    fn aladdin_eac3_pair_emits_nonsilent_bed() {
+        use crate::dolby::test_bridge::TestBridge;
+        use abi_stable::std_types::RSlice;
+        use bridge_api::RInputTransport;
+
+        let path = std::env::var("HARLETTY_EAC3_PAIR_FIXTURE")
+            .unwrap_or_else(|_| "/tmp/aladdin/fr.eac3".to_string());
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("skip: {path} not present");
+            return;
+        };
+
+        let mut bridge = TestBridge::new(false);
+        let mut pcm_f32: Vec<f32> = Vec::new();
+        let mut channels = 0u32;
+        let mut frames = 0u64;
+        let mut labels = String::new();
+        // Feed in mpv-sized chunks so the raw extractor frames it like the host.
+        for chunk in bytes.chunks(4096) {
+            let r = bridge.push_packet(RSlice::from_slice(chunk), RInputTransport::Raw, 0);
+            for f in r.frames.iter() {
+                frames += 1;
+                channels = f.channel_count;
+                if labels.is_empty() {
+                    labels = format!("{:?}", f.channel_labels);
+                }
+                // Bridge PCM is i32 scaled to 24-bit (see `float_to_pcm_i32`).
+                for &s in f.pcm.iter() {
+                    pcm_f32.push(s as f32 / 8_388_608.0);
+                }
+            }
+        }
+        eprintln!("labels: {labels}");
+
+        let peak = pcm_f32.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        eprintln!("decoded {frames} frames, {channels} ch, peak={peak:.4}");
+        // Dump before asserting so an ad-hoc fixture (other layouts fed via
+        // HARLETTY_EAC3_PAIR_FIXTURE) still leaves PCM to compare against ffmpeg.
+        let _ = std::fs::write(
+            format!("{path}.harletty_bridge.f32"),
+            pcm_f32
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+        assert!(frames > 0, "no frames decoded from the E-AC3 pair stream");
+        assert!(channels >= 6, "expected >= 5.1, got {channels} channels");
+        assert!(peak > 1e-4, "decoded bed is silent (peak={peak})");
+    }
+
+    fn object_pcm_frame(core: CorePcmFrame, object_channels: Vec<Vec<f32>>) -> ObjectPcmFrame {
+        ObjectPcmFrame {
+            core,
+            object_active: vec![true; object_channels.len()],
+            object_channels,
+            joc: JocPayload {
+                downmix_config: 0,
+                channel_count: 0,
+                object_count: 0,
+                gain: 1.0,
+                sequence_counter: 0,
+                objects: Vec::new(),
+            },
+            oamd_payloads: Vec::new(),
+        }
+    }
+
+    fn minimal_access_unit_info() -> AccessUnitInfo {
+        AccessUnitInfo {
+            frame_size: 0,
+            bitstream_id: 16,
+            frame_type: FrameType::Independent,
+            substreamid: 0,
+            sample_rate: 48_000,
+            num_blocks: 6,
+            channel_mode: 2,
+            channels: 2,
+            fullband_channels: 2,
+            lfe_on: false,
+            dependent_channel_map: None,
+            dialogue_normalization: [-31, -31],
+            heavy_compression_exists: [false, false],
+            heavy_compression_word: [0, 0],
+            addbsi_present: false,
+            extension_type_a: false,
+            complexity_index_type_a: 0,
+            mixing_metadata_present: false,
+            informational_metadata_present: false,
+            addbsi_bytes: Vec::new(),
+            body_start_bit_offset: 0,
+            audio_frame: AudioFrameInfo {
+                exponent_strategies_embedded: true,
+                adaptive_hybrid_transform_enabled: false,
+                coupling_uses_aht: false,
+                channel_uses_aht: Vec::new(),
+                lfe_uses_aht: false,
+                snr_offset_strategy: 0,
+                transient_processing_enabled: false,
+                block_switching_enabled: false,
+                dithering_enabled: false,
+                bit_allocation_mode_enabled: false,
+                frame_gain_syntax_enabled: false,
+                delta_bit_allocation_enabled: false,
+                skip_field_syntax_enabled: false,
+                spectral_extension_attenuation_enabled: false,
+                coupling_strategy_updates: Vec::new(),
+                coupling_in_use: Vec::new(),
+                coupling_exponent_strategy: Vec::new(),
+                channel_exponent_strategy: Vec::new(),
+                lfe_exponent_strategy: Vec::new(),
+                converter_exponent_strategy_present: false,
+                converter_exponent_strategy: Vec::new(),
+                frame_csnr_offset: None,
+                frame_fsnr_offset: None,
+                transient_processors: Vec::new(),
+                spectral_extension_attenuation: Vec::new(),
+                block_start_info_present: false,
+                block_start_info_bit_len: 0,
+                block_payload_start_bit_offset: 0,
+            },
+            block_drc: Vec::new(),
+            skip_fields: Vec::new(),
+            trailing_aux_data: Vec::new(),
+            aux_data: Vec::new(),
+            aux_parse_status: AuxParseStatus::Disabled,
+            emdf_source: EmdfSource::None,
+            emdf_blocks: Vec::new(),
+            emdf_block_count: 0,
+            first_emdf_sync_offset: None,
+        }
+    }
+
+    #[test]
+    fn eac3_object_output_keeps_only_lfe_bed_before_dynamic_objects() {
+        let core = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![
+                BedChannel::FrontLeft,
+                BedChannel::FrontRight,
+                BedChannel::Center,
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+            ],
+            fullband_channels: vec![
+                vec![0.11, 0.12],
+                vec![0.21, 0.22],
+                vec![0.31, 0.32],
+                vec![0.41, 0.42],
+                vec![0.51, 0.52],
+            ],
+            lfe_channel: Some(vec![0.61, 0.62]),
+        };
+        let frame = object_pcm_frame(core.clone(), vec![vec![0.71, 0.72], vec![0.81, 0.82]]);
+
+        let (pcm, labels) = build_eac3_object_output_pcm_and_labels(&frame, None);
+
+        assert_eq!(
+            labels.as_slice(),
+            &[
+                RChannelLabel::LFE,
+                RChannelLabel::Object,
+                RChannelLabel::Object
+            ]
+        );
+        assert_eq!(
+            pcm.as_slice(),
+            &[
+                float_to_pcm_i32(0.61),
+                float_to_pcm_i32(0.71),
+                float_to_pcm_i32(0.81),
+                float_to_pcm_i32(0.62),
+                float_to_pcm_i32(0.72),
+                float_to_pcm_i32(0.82),
+            ]
+        );
+    }
+
+    #[test]
+    fn eac3_object_output_omits_bed_when_lfe_is_absent() {
+        let core = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![BedChannel::FrontLeft, BedChannel::FrontRight],
+            fullband_channels: vec![vec![0.11], vec![0.21]],
+            lfe_channel: None,
+        };
+        let frame = object_pcm_frame(core.clone(), vec![vec![0.31], vec![0.41]]);
+
+        let (pcm, labels) = build_eac3_object_output_pcm_and_labels(&frame, None);
+
+        assert_eq!(
+            labels.as_slice(),
+            &[RChannelLabel::Object, RChannelLabel::Object]
+        );
+        assert_eq!(
+            pcm.as_slice(),
+            &[float_to_pcm_i32(0.31), float_to_pcm_i32(0.41)]
+        );
+    }
+
+    /// A 7.1.4 bed-only OAMD payload: 12 bed channels, no dynamic objects.
+    fn bed_only_oamd(bed: Vec<BedChannel>) -> OamdPayload {
+        let object_count = bed.len();
+        OamdPayload {
+            version: 0,
+            object_count,
+            alternate_object_present: false,
+            element_count: 0,
+            beds: object_count,
+            bed_instances: 1,
+            bed_or_isf_objects: object_count,
+            dynamic_objects: 0,
+            isf_in_use: false,
+            isf_index: None,
+            bed_assignment: vec![bed],
+            elements: Vec::new(),
+        }
+    }
+
+    fn full_714_bed() -> Vec<BedChannel> {
+        vec![
+            BedChannel::FrontLeft,
+            BedChannel::FrontRight,
+            BedChannel::Center,
+            BedChannel::LowFrequencyEffects,
+            BedChannel::SurroundLeft,
+            BedChannel::SurroundRight,
+            BedChannel::RearLeft,
+            BedChannel::RearRight,
+            BedChannel::TopFrontLeft,
+            BedChannel::TopFrontRight,
+            BedChannel::TopRearLeft,
+            BedChannel::TopRearRight,
+        ]
+    }
+
+    #[test]
+    fn pure_bed_labels_skip_lfe_and_match_reconstructed_objects() {
+        let core = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![BedChannel::FrontLeft, BedChannel::FrontRight],
+            fullband_channels: vec![vec![0.0], vec![0.0]],
+            lfe_channel: Some(vec![0.0]),
+        };
+        // 11 reconstructed channels = the 12-channel 7.1.4 bed minus the LFE
+        // (carried by the core, not reconstructed by JOC).
+        let mut frame = object_pcm_frame(core, vec![vec![0.0]; 11]);
+        frame.oamd_payloads = vec![(bed_only_oamd(full_714_bed()), None)];
+
+        let labels = eac3_pure_bed_object_labels(&frame).expect("pure bed labels");
+        assert_eq!(
+            labels,
+            vec![
+                BedChannel::FrontLeft,
+                BedChannel::FrontRight,
+                BedChannel::Center,
+                BedChannel::SurroundLeft,
+                BedChannel::SurroundRight,
+                BedChannel::RearLeft,
+                BedChannel::RearRight,
+                BedChannel::TopFrontLeft,
+                BedChannel::TopFrontRight,
+                BedChannel::TopRearLeft,
+                BedChannel::TopRearRight,
+            ]
+        );
+
+        // The output channels carry their real bed labels (LFE first, then the
+        // reconstructed bed channels) so the engine spatialises them.
+        let (_pcm, channel_labels) = build_eac3_object_output_pcm_and_labels(&frame, Some(&labels));
+        assert_eq!(
+            channel_labels.as_slice(),
+            &[
+                RChannelLabel::LFE,
+                RChannelLabel::L,
+                RChannelLabel::R,
+                RChannelLabel::C,
+                RChannelLabel::Ls,
+                RChannelLabel::Rs,
+                RChannelLabel::Lb,
+                RChannelLabel::Rb,
+                RChannelLabel::Tfl,
+                RChannelLabel::Tfr,
+                RChannelLabel::Tbl,
+                RChannelLabel::Tbr,
+            ]
+        );
+    }
+
+    #[test]
+    fn pure_bed_detection_declines_dynamic_objects_and_count_mismatch() {
+        let core = CorePcmFrame {
+            sample_rate: 48_000,
+            fullband_channel_order: vec![BedChannel::FrontLeft, BedChannel::FrontRight],
+            fullband_channels: vec![vec![0.0], vec![0.0]],
+            lfe_channel: Some(vec![0.0]),
+        };
+
+        // Has a dynamic object → not a pure bed.
+        let mut dynamic = object_pcm_frame(core.clone(), vec![vec![0.0]; 11]);
+        let mut oamd = bed_only_oamd(full_714_bed());
+        oamd.dynamic_objects = 1;
+        dynamic.oamd_payloads = vec![(oamd, None)];
+        assert!(eac3_pure_bed_object_labels(&dynamic).is_none());
+
+        // Bed assignment does not line up with the reconstructed channel count.
+        let mut mismatch = object_pcm_frame(core, vec![vec![0.0]; 5]);
+        mismatch.oamd_payloads = vec![(bed_only_oamd(full_714_bed()), None)];
+        assert!(eac3_pure_bed_object_labels(&mismatch).is_none());
+    }
+
+    #[test]
+    fn legacy_ac3_not_eac3_frame_can_advance_as_silence() {
+        let mut bridge = TestBridge::new(false);
+        let mut frame = vec![0u8; 1234];
+        frame[..8].copy_from_slice(&[0x0B, 0x77, 0x2A, 0x68, 0x22, 0x30, 0xE1, 0xFF]);
+
+        let decoded = process_eac3_frame(
+            &mut bridge.dolby,
+            &mut bridge.shared,
+            &frame,
+            &inspect_eac3_frame(&frame),
+        )
+        .expect("legacy AC-3 silence frame");
+
+        assert_eq!(bridge.dolby.eac3_diag_stats.total_frames, 1);
+        assert_eq!(bridge.dolby.eac3_diag_stats.legacy_ac3_frames, 1);
+        assert_eq!(decoded.sampling_frequency, 48_000);
+        assert_eq!(decoded.sample_count, LEGACY_AC3_SAMPLE_COUNT);
+        assert_eq!(decoded.channel_count, LEGACY_AC3_CHANNEL_COUNT);
+        // Same channel list as a decoded 3/2 + LFE core: fullband order, LFE
+        // last — not WAV order, which would replan the renderer's bed.
+        assert_eq!(
+            decoded.channel_labels.as_slice(),
+            &[
+                RChannelLabel::L,
+                RChannelLabel::C,
+                RChannelLabel::R,
+                RChannelLabel::Ls,
+                RChannelLabel::Rs,
+                RChannelLabel::LFE,
+            ]
+        );
+        assert_eq!(
+            decoded.pcm.len(),
+            LEGACY_AC3_SAMPLE_COUNT as usize * LEGACY_AC3_CHANNEL_COUNT as usize
+        );
+        assert!(decoded.pcm.iter().all(|sample| *sample == 0));
+    }
+
+    #[test]
+    fn legacy_ac3_diag_extracts_header_shape() {
+        let mut frame = vec![0u8; 2304];
+        frame[..8].copy_from_slice(&[0x0B, 0x77, 0x2A, 0x68, 0x22, 0x30, 0xE1, 0xFF]);
+
+        let info = legacy_ac3_info(&frame).expect("legacy AC-3 info");
+
+        assert_eq!(info.bsid, 6);
+        assert_eq!(info.sample_rate, 48_000);
+        assert_eq!(info.frame_size, 2304);
+        assert_eq!(info.channel_mode, 7);
+        assert_eq!(info.channels, 6);
+        assert!(info.lfe_on);
+    }
+
+    #[test]
+    fn legacy_ac3_info_sizes_44_1_khz_odd_frmsizecod_frames() {
+        // 44.1 kHz / 384 kbps alternates 1670 / 1672 bytes (frmsizecod 28 /
+        // 29); the odd size carries the padding word.
+        let mut frame = vec![0u8; 1672];
+        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0xE1]);
+        let info = legacy_ac3_info(&frame).expect("legacy AC-3 info");
+        assert_eq!(info.sample_rate, 44_100);
+        assert_eq!(info.frame_size, 1672);
+        assert_eq!(info.channels, 6);
+
+        frame[4] = 0x5C;
+        assert_eq!(legacy_ac3_info(&frame).unwrap().frame_size, 1670);
+    }
+
+    #[test]
+    fn silence_labels_match_the_decoded_core_for_every_channel_mode() {
+        let mut bridge = TestBridge::new(false);
+        for channel_mode in 0u8..=7 {
+            for lfe_on in [false, true] {
+                let order = eac3::fullband_channel_order(channel_mode).unwrap();
+                let core = CorePcmFrame {
+                    sample_rate: 44_100,
+                    fullband_channel_order: order.to_vec(),
+                    fullband_channels: vec![vec![0.0]; order.len()],
+                    lfe_channel: lfe_on.then(|| vec![0.0]),
+                };
+                let decoded = build_eac3_channel_bed_frame(&core, None, &mut bridge.dolby);
+                let silence = bed_labels_for_channel_mode(channel_mode, lfe_on);
+                assert_eq!(
+                    silence.as_slice(),
+                    decoded.channel_labels.as_slice(),
+                    "acmod {channel_mode} lfe {lfe_on}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_ac3_core_failure_silence_follows_the_header() {
+        let mut bridge = TestBridge::new(false);
+        // 44.1 kHz, acmod=2 (2/0) without LFE, bsid=8: byte 6 = 0b010_00_0_0…
+        // (acmod, dsurmod, lfeon).
+        let mut frame = vec![0u8; 1672];
+        frame[..7].copy_from_slice(&[0x0B, 0x77, 0x00, 0x00, 0x5D, 0x40, 0x40]);
+
+        let silence = build_legacy_ac3_core_failure_silence(&mut bridge.dolby, &frame)
+            .expect("legacy AC-3 header");
+
+        assert_eq!(silence.sampling_frequency, 44_100);
+        assert_eq!(silence.sample_count, LEGACY_AC3_SAMPLE_COUNT);
+        assert_eq!(silence.channel_count, 2);
+        assert_eq!(
+            silence.channel_labels.as_slice(),
+            &[RChannelLabel::L, RChannelLabel::R]
+        );
+        assert_eq!(silence.pcm.len(), LEGACY_AC3_SAMPLE_COUNT as usize * 2);
+        assert!(silence.pcm.iter().all(|sample| *sample == 0));
+        assert_eq!(
+            bridge.dolby.eac3_total_samples,
+            u64::from(LEGACY_AC3_SAMPLE_COUNT)
+        );
+        // Not a legacy AC-3 header (E-AC-3 bsid=16): nothing to stand in for.
+        frame[5] = 0x80;
+        assert!(build_legacy_ac3_core_failure_silence(&mut bridge.dolby, &frame).is_none());
+    }
+
+    #[test]
+    fn dependent_eac3_timing_uses_header_blocks() {
+        let mut frame = vec![0u8; 2304];
+        frame[..8].copy_from_slice(&[0x0B, 0x77, 0x44, 0x7F, 0x3A, 0x87, 0xFF, 0x31]);
+
+        assert_eq!(frame_bsid(&frame), Some(16));
+        assert_eq!(eac3_frame_timing(&frame), Some((48_000, 1536)));
+    }
+
+    #[test]
+    fn standard_drc_uses_last_block_dynamic_range_word() {
+        let mut bridge = TestBridge::new(false);
+        bridge.dolby.drc_mode = crate::dolby::DrcMode::Standard;
+        let mut info = minimal_access_unit_info();
+        info.block_drc = vec![
+            BlockDrcInfo {
+                dynamic_range_exists: [true, false],
+                dynamic_range_word: [0x00, 0x00],
+            },
+            BlockDrcInfo {
+                dynamic_range_exists: [true, false],
+                dynamic_range_word: [0x20, 0x00],
+            },
+        ];
+
+        let (gain, ramp) = eac3_drc_params(&bridge.dolby, &info, 1536);
+
+        assert!((gain - decode_ac3_dynamic_range_word(0x20)).abs() < 1e-6);
+        assert_eq!(ramp, 1536);
+    }
+
+    #[test]
+    fn heavy_drc_prefers_heavy_word_and_falls_back_to_standard_word() {
+        let mut bridge = TestBridge::new(false);
+        bridge.dolby.drc_mode = crate::dolby::DrcMode::Heavy;
+
+        let mut heavy_info = minimal_access_unit_info();
+        heavy_info.heavy_compression_exists = [true, false];
+        heavy_info.heavy_compression_word = [0x20, 0x00];
+        heavy_info.block_drc = vec![BlockDrcInfo {
+            dynamic_range_exists: [true, false],
+            dynamic_range_word: [0x40, 0x00],
+        }];
+        let (heavy_gain, _) = eac3_drc_params(&bridge.dolby, &heavy_info, 1536);
+        assert!((heavy_gain - decode_ac3_heavy_range_word(0x20)).abs() < 1e-6);
+
+        let mut fallback_info = minimal_access_unit_info();
+        fallback_info.block_drc = vec![BlockDrcInfo {
+            dynamic_range_exists: [true, false],
+            dynamic_range_word: [0x40, 0x00],
+        }];
+        let (fallback_gain, _) = eac3_drc_params(&bridge.dolby, &fallback_info, 1536);
+        assert!((fallback_gain - decode_ac3_dynamic_range_word(0x40)).abs() < 1e-6);
+    }
+}
+
+/// Presentation assembly in the bridge: which access unit belongs with which.
+///
+/// A dependent substream belongs to the access unit it immediately follows.
+/// The bridge used to buffer only legacy AC-3 cores, so an independent E-AC-3
+/// frame was decoded and emitted the moment it arrived and the dependent behind
+/// it had nothing left to pair with - it was parked in a queue for some later,
+/// unrelated core to claim, and the extension channels it carried never reached
+/// the bed. These drive the real `push_packet` entry point and assert the
+/// invariant that fixes: one presentation in, one presentation out.
+///
+/// The repository carries no dependent-substream fixture, so the dependent here
+/// is a real independent frame with `strmtyp` set to 1. That is enough to prove
+/// the routing - which core a dependent is offered to, and how many frames come
+/// out - but not the decoded result of a genuine pair, which still needs a
+/// captured stream (see `aladdin_eac3_pair_emits_nonsilent_bed`).
+#[cfg(test)]
+mod presentation_assembly {
+    use crate::dolby::test_bridge::TestBridge;
+    use abi_stable::std_types::RSlice;
+    use bridge_api::RInputTransport;
+
+    /// A real independent E-AC-3 access unit, 2/0, carrying no JOC.
+    const INDEPENDENT: &[u8] = include_bytes!("../../eac3/tests/data/aht_independent_stereo.bin");
+
+    /// A real independent 5.1 access unit carrying a JOC payload whose downmix
+    /// configuration is a five-channel one, so the frame satisfies it alone.
+    const SELF_CONTAINED_JOC: &[u8] =
+        include_bytes!("../../eac3/tests/data/short_packet_independent_joc.bin");
+
+    /// The same access unit with `strmtyp` set to dependent. The two bits sit at
+    /// the top of the byte after the sync word.
+    fn dependent() -> Vec<u8> {
+        let mut frame = INDEPENDENT.to_vec();
+        frame[2] = (frame[2] & 0x3F) | 0x40;
+        frame
+    }
+
+    fn push(bridge: &mut TestBridge, frame: &[u8]) -> usize {
+        bridge
+            .push_packet(RSlice::from_slice(frame), RInputTransport::Raw, 0)
+            .frames
+            .len()
+    }
+
+    /// An independent core is held until the next access unit says whether a
+    /// dependent belongs to it, so two independents in a row emit the first
+    /// only. Emitting on arrival - what this used to do - is what left no core
+    /// for a following dependent to attach to.
+    #[test]
+    fn an_independent_core_waits_for_the_access_unit_that_follows_it() {
+        let mut bridge = TestBridge::new(false);
+        assert_eq!(
+            push(&mut bridge, INDEPENDENT),
+            0,
+            "the first independent must be held, not emitted on arrival"
+        );
+        assert_eq!(
+            push(&mut bridge, INDEPENDENT),
+            1,
+            "the second independent ends the first presentation, emitting exactly one frame"
+        );
+        assert!(
+            bridge.dolby.pending_eac3_core.is_some(),
+            "the second independent is now the one being held"
+        );
+    }
+
+    /// A JOC payload the frame's own channels satisfy still costs no latency.
+    ///
+    /// Holding a frame back is for one that might be half a presentation. This
+    /// one is not: its payload declares a five-channel downmix and the frame is
+    /// 5.1, so the reconstruction has everything it reads. Buffering it would
+    /// put an access unit of latency on the common Atmos stream for nothing.
+    #[test]
+    fn a_joc_frame_its_own_channels_satisfy_is_emitted_on_arrival() {
+        let mut bridge = TestBridge::new(false);
+        assert_eq!(
+            push(&mut bridge, SELF_CONTAINED_JOC),
+            1,
+            "a self-contained JOC presentation must be emitted, not held"
+        );
+        assert!(
+            bridge.dolby.pending_eac3_core.is_none(),
+            "and nothing must be left pending behind it"
+        );
+    }
+
+    /// A core and the dependents behind it resolve as one presentation, and it
+    /// really is emitted.
+    ///
+    /// The JOC payload rides in the last dependent, so a dependent without one
+    /// cannot be assumed to be the last: the group stays open until an access
+    /// unit that is not a dependent ends it. Asserting the frame count and not
+    /// just the pairing counter is what catches a pair that is attempted and
+    /// then quietly dropped.
+    #[test]
+    fn a_dependent_group_resolves_into_exactly_one_emitted_presentation() {
+        let mut bridge = TestBridge::new(false);
+        assert_eq!(push(&mut bridge, INDEPENDENT), 0, "the core is held");
+        assert_eq!(
+            push(&mut bridge, &dependent()),
+            0,
+            "a dependent without JOC might not be the last, so the group stays open"
+        );
+        assert_eq!(
+            push(&mut bridge, INDEPENDENT),
+            1,
+            "the next independent ends the group, emitting exactly one presentation"
+        );
+        assert_eq!(
+            bridge.dolby.eac3_diag_stats.dependent_pair_attempts, 1,
+            "the group must have been resolved as a pair, not as a bare core"
+        );
+        assert_eq!(
+            bridge.dolby.eac3_diag_stats.dependent_frames_dropped, 0,
+            "no dependent in a well-formed group is an orphan"
+        );
+    }
+
+    /// A second dependent joins the group rather than being orphaned.
+    ///
+    /// An independent may be followed by up to eight dependents. Resolving on
+    /// the first one took the core away from the rest - and since the JOC
+    /// payload rides in the *last* dependent, that dropped exactly the access
+    /// unit carrying the objects.
+    #[test]
+    fn a_second_dependent_joins_the_group_instead_of_being_orphaned() {
+        let mut bridge = TestBridge::new(false);
+        push(&mut bridge, INDEPENDENT);
+        push(&mut bridge, &dependent());
+        push(&mut bridge, &dependent());
+        assert_eq!(
+            bridge.dolby.eac3_diag_stats.dependent_frames_dropped, 0,
+            "the second dependent belongs to the same group, not to nothing"
+        );
+        assert_eq!(
+            bridge
+                .dolby
+                .pending_eac3_core
+                .as_ref()
+                .map(|pending| pending.dependents.len()),
+            Some(2),
+            "both dependents must be held against the one core"
+        );
+        assert_eq!(
+            push(&mut bridge, INDEPENDENT),
+            1,
+            "the whole group is still one presentation"
+        );
+    }
+
+    /// A dependent with nothing in front of it belongs to nothing. It used to be
+    /// parked for a later core to claim, which put one programme's extension
+    /// channels onto another's bed.
+    #[test]
+    fn an_orphan_dependent_emits_nothing_and_does_not_advance_the_timeline() {
+        let mut bridge = TestBridge::new(false);
+        let before = bridge.dolby.eac3_total_samples;
+        assert_eq!(
+            push(&mut bridge, &dependent()),
+            0,
+            "an orphan dependent must not produce a presentation"
+        );
+        assert_eq!(
+            bridge.dolby.eac3_total_samples, before,
+            "an orphan dependent must not advance the timeline"
+        );
+        assert!(
+            bridge.dolby.pending_eac3_core.is_none(),
+            "an orphan dependent must not become a pending core"
+        );
+    }
+
+    /// A stream of orphan dependents is counted, not logged on each one.
+    #[test]
+    fn orphan_dependents_are_counted_across_access_units() {
+        let mut bridge = TestBridge::new(false);
+        for orphans in 1..=20 {
+            assert_eq!(push(&mut bridge, &dependent()), 0);
+            assert_eq!(
+                bridge.dolby.eac3_warnings.orphan_dependents.count(),
+                orphans
+            );
+        }
+        bridge.dolby.reset(&bridge.shared);
+        assert_eq!(bridge.dolby.eac3_warnings.orphan_dependents.count(), 0);
+    }
+
+    /// Every group with more than eight dependents is counted, not logged on
+    /// each one.
+    #[test]
+    fn dependent_group_overflows_are_counted_across_groups() {
+        let mut bridge = TestBridge::new(false);
+        for groups in 1..=5 {
+            push(&mut bridge, INDEPENDENT);
+            for _ in 0..9 {
+                push(&mut bridge, &dependent());
+            }
+            assert_eq!(
+                bridge.dolby.eac3_warnings.dependent_group_overflows.count(),
+                groups
+            );
+        }
+    }
+
+    /// A dependent whose channels cannot be overlaid onto the core (the
+    /// stand-in dependent of these tests is one) is counted on every group,
+    /// not logged on each.
+    #[test]
+    fn dependent_merge_failures_are_counted_across_groups() {
+        let mut bridge = TestBridge::new(false);
+        push(&mut bridge, INDEPENDENT);
+        for groups in 1..=20 {
+            push(&mut bridge, &dependent());
+            assert_eq!(push(&mut bridge, INDEPENDENT), 1);
+            assert_eq!(
+                bridge.dolby.eac3_warnings.dependent_merge_failures.count(),
+                groups
+            );
+        }
+        assert_eq!(bridge.dolby.eac3_diag_stats.dependent_merge_failures, 20);
+    }
+
+    /// The timeline advances once per resolved presentation, not once per
+    /// syncframe: three independents resolve two of them and hold the third.
+    #[test]
+    fn the_timeline_advances_once_per_resolved_presentation() {
+        let mut bridge = TestBridge::new(false);
+        let mut emitted = 0;
+        for _ in 0..3 {
+            emitted += push(&mut bridge, INDEPENDENT);
+        }
+        assert_eq!(emitted, 2, "three independents resolve two presentations");
+        let samples = bridge.dolby.eac3_total_samples;
+        assert!(
+            samples > 0,
+            "the resolved presentations must advance the timeline"
+        );
+        assert_eq!(
+            samples % (emitted as u64),
+            0,
+            "each resolved presentation must contribute the same sample count ({samples} over {emitted})"
+        );
+    }
+}

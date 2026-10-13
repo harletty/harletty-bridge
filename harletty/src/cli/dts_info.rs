@@ -10,7 +10,8 @@
 
 use anyhow::Result;
 use dca::{
-    HdDecoder, HdError, PcmDecoder, XPresentation, exss_has_xll, exss_substream_size, parse_header,
+    ExssKind, HdDecoder, HdError, PcmDecoder, XPresentation, exss_kind, exss_substream_size,
+    parse_header,
 };
 
 use super::command::InfoArgs;
@@ -35,6 +36,9 @@ struct Survey {
     samples: u64,
     sample_rate: u32,
     lossless: bool,
+    /// A lossy DTS-HD carrier (XXCH and/or a DTS:X extension after the
+    /// asset) went through the HD decoder.
+    lossy_hd: bool,
     bed_channels: usize,
     presentation: Option<XPresentation>,
     auro: Option<auro::Detection>,
@@ -62,7 +66,7 @@ impl Survey {
     /// The same facts as [`Self::print`], for `--json`.
     fn report(&self) -> InfoReport {
         let mut report = InfoReport::new();
-        report.codec = Some(if self.lossless { "DTS-HD MA" } else { "DTS" });
+        report.codec = Some(self.codec_name());
         report.channels = Some(self.bed_channels as u32);
         report.sample_rate = Some(self.sample_rate);
         report.frames_seen = self.frames;
@@ -93,9 +97,24 @@ impl Survey {
         report
     }
 
+    /// The carrier's name, as ffprobe reports the profile.
+    fn codec_name(&self) -> &'static str {
+        if self.lossless {
+            "DTS-HD MA"
+        } else if self.lossy_hd {
+            "DTS-HD HRA"
+        } else {
+            "DTS"
+        }
+    }
+
     fn hd_frame(&mut self, frame: &dca::HdFrame, decoder: &HdDecoder) {
         self.frames += 1;
-        self.lossless = true;
+        if frame.lossless {
+            self.lossless = true;
+        } else {
+            self.lossy_hd = true;
+        }
         self.sample_rate = frame.sample_rate;
         self.bed_channels = frame.samples.iter().filter(|s| s.is_some()).count();
         let n = frame.bed_sample_count() as u64;
@@ -139,10 +158,7 @@ impl Survey {
     }
 
     fn print(&self) {
-        println!(
-            "Codec        : {}",
-            if self.lossless { "DTS-HD MA" } else { "DTS" }
-        );
+        println!("Codec        : {}", self.codec_name());
         println!("Channels     : {}", self.bed_channels);
         println!("Sample rate  : {} Hz", self.sample_rate);
         let spatial = if let Some(presentation) = self.presentation {
@@ -244,11 +260,11 @@ fn drain(buffer: &mut Vec<u8>, core: &mut PcmDecoder, hd: &mut HdDecoder, survey
             }
             frame_size = core_size + exss_size;
             let candidate = &rest[core_size..frame_size];
-            if exss_has_xll(candidate) {
+            if exss_kind(candidate) != ExssKind::Core {
                 exss = Some(candidate);
             }
         }
-        let decoded_lossless = match exss.map(|exss| hd.decode(&rest[..core_size], exss)) {
+        let decoded_hd = match exss.map(|exss| hd.decode(&rest[..core_size], exss)) {
             Some(Ok(frame)) => {
                 survey.hd_frame(&frame, hd);
                 true
@@ -256,7 +272,7 @@ fn drain(buffer: &mut Vec<u8>, core: &mut PcmDecoder, hd: &mut HdDecoder, survey
             Some(Err(HdError::Pending)) => true,
             Some(Err(_)) | None => false,
         };
-        if !decoded_lossless {
+        if !decoded_hd {
             if let Ok(push) = core.push_access_unit(&rest[..core_size]) {
                 survey.core_frame(&push);
             }

@@ -1,0 +1,583 @@
+use abi_stable::std_types::RVec;
+use bridge_api::{RChannelLabel, RDecodedFrame, RMetadataFrame, RPushResult};
+#[cfg(feature = "bridge-perf")]
+use std::time::Instant;
+use truehd::process::{
+    MAX_PRESENTATIONS,
+    decode::{DecodedAccessUnit, Decoder},
+    extract::Extractor,
+    parse::Parser,
+};
+use truehd::structs::access_unit::AccessUnit;
+
+use crate::dolby::{DolbyPipeline, DrcMode};
+use crate::labels::{channel_label_to_r, oamd_speaker_to_label};
+use crate::logging::{bridge_diag_log, bridge_log, drc_diag_log_enabled, panic_message};
+use crate::metadata::{OamdWarnings, build_metadata_frame_from_oamd};
+use crate::perf::PerfStats;
+use crate::shared::{AfterPush, SharedState};
+
+/// Applies everything a fresh [`Parser`] needs to match this bridge's contract.
+///
+/// The bridge replaces its parser wholesale in three places — construction, pipeline
+/// reset, and parse recovery — and each one used to re-apply the settings itself. A
+/// setting applied in two of the three is a setting that silently reverts at the third,
+/// so they all come from here.
+pub(crate) fn configure_parser(
+    parser: &mut Parser,
+    fail_level: log::Level,
+    presentation: u8,
+    drc_mode: DrcMode,
+) {
+    parser.set_fail_level(fail_level);
+
+    // The byte-domain FIFO depth model answers whether a stream is legal to author on a
+    // disc. A playback decode never asks that: the samples are the same either way, and
+    // the model otherwise accounts every access unit for an answer nothing reads.
+    parser.set_check_fifo(false);
+
+    parser.set_required_presentations(&required_presentations(presentation, drc_mode));
+}
+
+/// The presentations the parser is asked for, which decide the substreams it
+/// reads.
+///
+/// The one that is decoded, and the parser works out which substreams that
+/// takes: a 7.1 presentation often stands on its own substreams, next to those
+/// of a stereo one that nothing here listens to.
+///
+/// Heavy DRC takes every presentation below it as well. Its gain is looked for
+/// from the decoded presentation down, and is stated in a substream's restart
+/// header, which is only read with the substream. The standard gain is stated
+/// in the directory of the access unit, which is read whole whatever is asked
+/// for.
+pub(crate) fn required_presentations(
+    presentation: u8,
+    drc_mode: DrcMode,
+) -> [bool; MAX_PRESENTATIONS] {
+    let mut required = [false; MAX_PRESENTATIONS];
+
+    // The DRC log prints the heavy gain of every substream.
+    if drc_mode == DrcMode::Heavy || drc_diag_log_enabled() {
+        required[..=presentation as usize].fill(true);
+    } else {
+        required[presentation as usize] = true;
+    }
+
+    required
+}
+
+/// How many branch points the parser may hold before the list is dropped.
+///
+/// The parser records every point the stream's timing restarts at and never forgets
+/// one. A pass over a file reads the list at the end, where its size is bounded by the
+/// file; playback has no end to read it at, and a stream that restarts its timing on
+/// every access unit — a damaged one does — would grow it for as long as it plays.
+/// Nothing here reads the list, so it is emptied once it is past any plausible use.
+const MAX_RETAINED_BRANCHES: usize = 64;
+
+struct DrainContext<'a> {
+    extractor: &'a mut Extractor,
+    parser: &'a mut Parser,
+    decoder: &'a mut Decoder,
+    frame_count: &'a mut u64,
+    strict: bool,
+    presentation: u8,
+    current_substream_info: &'a mut Option<u8>,
+    current_extended_substream_info: &'a mut Option<u8>,
+    current_dialogue_level: &'a mut Option<i8>,
+    recovering_until_major_sync: &'a mut bool,
+    drc_mode: DrcMode,
+    /// See [`DolbyPipeline::truehd_presentations_stale`].
+    presentations_stale: &'a mut bool,
+    total_samples: &'a mut u64,
+    declared_object_channels: &'a mut Option<RVec<bridge_api::RObjectChannel>>,
+    spatial_labels: &'a mut Option<RVec<RChannelLabel>>,
+    oamd_warnings: &'a mut OamdWarnings,
+    perf: &'a mut PerfStats,
+}
+
+impl DrainContext<'_> {
+    fn reset_parse_recovery_state(&mut self) {
+        let fail_level = if self.strict {
+            log::Level::Warn
+        } else {
+            log::Level::Error
+        };
+
+        *self.parser = Parser::default();
+        *self.decoder = Decoder::default();
+        self.decoder.set_fail_level(fail_level);
+        configure_parser(self.parser, fail_level, self.presentation, self.drc_mode);
+        *self.presentations_stale = false;
+
+        *self.current_substream_info = None;
+        *self.current_extended_substream_info = None;
+        *self.current_dialogue_level = None;
+        *self.declared_object_channels = None;
+        *self.spatial_labels = None;
+        *self.recovering_until_major_sync = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TrueHD drain_frames — unchanged.
+// ---------------------------------------------------------------------------
+
+/// `access_unit` is where each frame is parsed and `decoded` where it is
+/// decoded: what they held is written over, and nothing of it is read past the
+/// frame's own blocks and samples.
+fn drain_frames(
+    ctx: &mut DrainContext<'_>,
+    access_unit: &mut AccessUnit,
+    decoded: &mut DecodedAccessUnit,
+) -> (Vec<RDecodedFrame>, Option<String>) {
+    let mut frames = Vec::new();
+    let mut error_msg: Option<String> = None;
+
+    loop {
+        #[cfg(feature = "bridge-perf")]
+        let extract_started = Instant::now();
+        let next_frame = ctx.extractor.next();
+        #[cfg(feature = "bridge-perf")]
+        ctx.perf.record_extract(extract_started.elapsed());
+
+        match next_frame {
+            Some(Ok(raw_frame)) => {
+                *ctx.frame_count += 1;
+
+                if *ctx.recovering_until_major_sync {
+                    if !raw_frame.is_major_sync() {
+                        continue;
+                    }
+
+                    bridge_log!(
+                        log::Level::Info,
+                        "Major sync found at frame {}; resuming after parse recovery",
+                        ctx.frame_count
+                    );
+                    *ctx.recovering_until_major_sync = false;
+                }
+
+                // A substream the parser takes up in mid-stream is read without the
+                // restart header it started from. A major sync brings one for
+                // every substream.
+                if *ctx.presentations_stale && raw_frame.is_major_sync() {
+                    ctx.parser
+                        .set_required_presentations(&required_presentations(
+                            ctx.presentation,
+                            ctx.drc_mode,
+                        ));
+                    *ctx.presentations_stale = false;
+                }
+
+                #[cfg(feature = "bridge-perf")]
+                let parse_started = Instant::now();
+                match ctx.parser.parse_into(&raw_frame, access_unit) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let msg = format!("Parse error at frame {}: {e}", ctx.frame_count);
+                        bridge_diag_log(log::Level::Error, &msg);
+                        if ctx.strict {
+                            error_msg = Some(msg);
+                            return (frames, error_msg);
+                        }
+                        ctx.reset_parse_recovery_state();
+                        continue;
+                    }
+                };
+                #[cfg(feature = "bridge-perf")]
+                {
+                    ctx.perf.record_parse(parse_started.elapsed());
+                    ctx.perf
+                        .record_parse_substats(ctx.parser.last_parse_stats());
+                }
+
+                // Reading the length is a slice length; the list is only ever taken
+                // once it has actually grown, which a stream with no splice in it
+                // never does.
+                if ctx.parser.branches().len() > MAX_RETAINED_BRANCHES {
+                    let dropped = ctx.parser.take_branches().len();
+                    bridge_log!(
+                        log::Level::Debug,
+                        "dropped {dropped} recorded branch points at frame {}",
+                        ctx.frame_count
+                    );
+                }
+
+                // Track substream info changes and extract dialogue level.
+                let mut substream_info_changed = false;
+                if let Some(major_sync) = &access_unit.major_sync_info {
+                    match *ctx.current_substream_info {
+                        Some(cur) if cur != major_sync.substream_info => {
+                            bridge_log!(
+                                log::Level::Info,
+                                "substream_info changed: {:#02X} -> {:#02X}",
+                                cur,
+                                major_sync.substream_info
+                            );
+                            substream_info_changed = true;
+                        }
+                        None => {
+                            *ctx.current_substream_info = Some(major_sync.substream_info);
+                        }
+                        _ => {}
+                    }
+                    match *ctx.current_extended_substream_info {
+                        Some(cur) if cur != major_sync.extended_substream_info => {
+                            bridge_log!(
+                                log::Level::Info,
+                                "extended_substream_info changed: {:#02X} -> {:#02X}",
+                                cur,
+                                major_sync.extended_substream_info
+                            );
+                            substream_info_changed = true;
+                        }
+                        None => {
+                            *ctx.current_extended_substream_info =
+                                Some(major_sync.extended_substream_info);
+                        }
+                        _ => {}
+                    }
+                    *ctx.current_substream_info = Some(major_sync.substream_info);
+                    *ctx.current_extended_substream_info = Some(major_sync.extended_substream_info);
+
+                    // Extract dialogue level. The other syntax puts an entirely
+                    // different structure in those bits, so a stream carrying one
+                    // states no dialogue level rather than one read from fields that
+                    // mean nothing of the sort.
+                    if let Some(cm) = major_sync.channel_meaning.fba() {
+                        let dialogue_level: i8 = match ctx.presentation {
+                            0 => -(cm.twoch_dialogue_norm as i8),
+                            1 => -(cm.sixch_dialogue_norm as i8),
+                            3 => match major_sync.channel_meaning.extra_channel_meaning() {
+                                Some(extra) => -(extra.sixteench_dialogue_norm as i8),
+                                None => -(cm.eightch_dialogue_norm as i8),
+                            },
+                            _ => -(cm.eightch_dialogue_norm as i8),
+                        };
+                        *ctx.current_dialogue_level = Some(dialogue_level);
+                        bridge_log!(
+                            log::Level::Debug,
+                            "Dialogue level: {} dBFS (presentation {})",
+                            dialogue_level,
+                            ctx.presentation
+                        );
+                    }
+                }
+
+                #[cfg(feature = "bridge-perf")]
+                let decode_started = Instant::now();
+                match ctx.decoder.decode_presentation_into(
+                    access_unit,
+                    ctx.presentation as usize,
+                    decoded,
+                ) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let msg = format!("Decode error at frame {}: {e}", ctx.frame_count);
+                        bridge_diag_log(log::Level::Error, &msg);
+                        if ctx.strict {
+                            error_msg = Some(msg);
+                        }
+                        return (frames, error_msg);
+                    }
+                };
+                #[cfg(feature = "bridge-perf")]
+                ctx.perf.record_decode(decode_started.elapsed());
+
+                // Extract DRC parameters based on active mode. DRC updates are
+                // typically authored on substream 0 (the 2-channel downmix),
+                // even for full Atmos presentations, so scan from the active
+                // presentation down to 0 and use the first substream that has
+                // a DRC update for the selected mode.
+                let mut drc_gain = 1.0f32;
+                let mut drc_ramp_duration = 0u32;
+                let mut drc_source_ss: Option<usize> = None;
+                for i in (0..=ctx.presentation as usize).rev() {
+                    let Some(ss_state) = ctx.parser.substream_state(i) else {
+                        continue;
+                    };
+                    match ctx.drc_mode {
+                        DrcMode::Standard if ss_state.drc_active => {
+                            drc_gain = (ss_state.drc_gain_update as f32 * 0.015625).exp2();
+                            drc_ramp_duration =
+                                ((1 << ss_state.drc_time_update) * decoded.sample_length) as u32;
+                            drc_source_ss = Some(i);
+                            break;
+                        }
+                        DrcMode::Heavy if ss_state.heavy_drc_active || ss_state.drc_active => {
+                            if ss_state.heavy_drc_active {
+                                drc_gain = (ss_state.heavy_drc_gain_update as f32 * 0.03125).exp2();
+                                drc_ramp_duration = ((1 << ss_state.heavy_drc_time_update)
+                                    * decoded.sample_length)
+                                    as u32;
+                            } else {
+                                drc_gain = (ss_state.drc_gain_update as f32 * 0.015625).exp2();
+                                drc_ramp_duration = ((1 << ss_state.drc_time_update)
+                                    * decoded.sample_length)
+                                    as u32;
+                            }
+                            drc_source_ss = Some(i);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if drc_diag_log_enabled() && *ctx.frame_count % 96 == 0 {
+                    let probe: Vec<_> = (0..=ctx.presentation as usize)
+                        .filter_map(|i| {
+                            ctx.parser.substream_state(i).map(|s| {
+                                (
+                                    i,
+                                    s.drc_active,
+                                    s.drc_gain_update,
+                                    s.heavy_drc_active,
+                                    s.heavy_drc_gain_update,
+                                )
+                            })
+                        })
+                        .collect();
+                    bridge_log!(
+                        log::Level::Info,
+                        "[harletty][drc] mode={:?} src_ss={:?} gain={:.4} ramp={} state={:?}",
+                        ctx.drc_mode,
+                        drc_source_ss,
+                        drc_gain,
+                        drc_ramp_duration,
+                        probe
+                    );
+                }
+
+                if substream_info_changed {
+                    decoded.substream_info_changed = true;
+                }
+
+                // Advance the timeline regardless; duplicate frames represent real
+                // audio time and must be counted for accurate metadata timestamping.
+                let base_sample_pos = *ctx.total_samples;
+                *ctx.total_samples += decoded.sample_length as u64;
+
+                if decoded.is_duplicate {
+                    #[cfg(feature = "bridge-perf")]
+                    ctx.perf.note_duplicate_frame();
+                    ctx.perf.maybe_report(*ctx.frame_count);
+                    continue;
+                }
+
+                #[cfg(feature = "bridge-perf")]
+                let build_started = Instant::now();
+                frames.push(build_thd_frame(
+                    ctx,
+                    decoded,
+                    base_sample_pos,
+                    drc_gain,
+                    drc_ramp_duration,
+                ));
+                #[cfg(feature = "bridge-perf")]
+                ctx.perf.record_build(build_started.elapsed());
+                ctx.perf.maybe_report(*ctx.frame_count);
+            }
+
+            Some(Err(ref e))
+                if matches!(e, truehd::utils::errors::ExtractError::InsufficientData) =>
+            {
+                break;
+            }
+
+            Some(Err(extract_error)) => {
+                let msg = format!(
+                    "Extract error at frame {}: {extract_error}",
+                    ctx.frame_count
+                );
+                bridge_diag_log(log::Level::Error, &msg);
+                if ctx.strict {
+                    error_msg = Some(msg);
+                }
+                return (frames, error_msg);
+            }
+
+            None => break,
+        }
+    }
+
+    (frames, None)
+}
+
+/// Build an [`RDecodedFrame`] from a TrueHD decoded access unit.
+fn build_thd_frame(
+    ctx: &mut DrainContext<'_>,
+    decoded: &DecodedAccessUnit,
+    base_sample_pos: u64,
+    drc_gain: f32,
+    drc_ramp_duration: u32,
+) -> RDecodedFrame {
+    #[cfg(feature = "bridge-perf")]
+    let pcm_started = Instant::now();
+    // Interleaved PCM, [s0c0, s0c1, …, s(M-1)c(N-1)], is the decoder's rows end to
+    // end, each cut to the channels the presentation has: a copy per row, where a
+    // push per sample checks the capacity every time.
+    let mut pcm = Vec::with_capacity(decoded.sample_length * decoded.channel_count);
+    for row in &decoded.pcm_data[..decoded.sample_length] {
+        pcm.extend_from_slice(&row[..decoded.channel_count]);
+    }
+    let pcm: RVec<i32> = pcm.into();
+    #[cfg(feature = "bridge-perf")]
+    ctx.perf.record_build_pcm(pcm_started.elapsed());
+
+    // Metadata: one RMetadataFrame per parsed OAMD payload.
+    #[cfg(feature = "bridge-perf")]
+    let metadata_started = Instant::now();
+    let mut metadata: RVec<RMetadataFrame> = RVec::new();
+    if decoded.substream_info_changed {
+        *ctx.declared_object_channels = None;
+        *ctx.spatial_labels = None;
+    }
+    #[cfg(feature = "bridge-perf")]
+    let mut metadata_events = 0usize;
+    for oamd in &decoded.oamd {
+        let evo_base = base_sample_pos + oamd.evo_sample_offset;
+        // Fixed-channel labels of the spatial presentation: bed labels from
+        // the OAMD bed assignment, then `Object` for the object channels.
+        let bed_labels: RVec<RChannelLabel> = oamd
+            .program_assignment
+            .bed_assignment
+            .first()
+            .map(|bed| bed.to_index_vec())
+            .unwrap_or_default()
+            .iter()
+            .map(|&idx| oamd_speaker_to_label(idx))
+            .collect();
+        let mut labels = bed_labels;
+        while labels.len() < decoded.channel_count {
+            labels.push(RChannelLabel::Object);
+        }
+        if ctx.spatial_labels.as_ref() != Some(&labels) {
+            *ctx.spatial_labels = Some(labels);
+        }
+        let meta = build_metadata_frame_from_oamd(
+            oamd,
+            evo_base,
+            base_sample_pos,
+            ctx.declared_object_channels,
+            ctx.oamd_warnings,
+            #[cfg(feature = "bridge-perf")]
+            ctx.perf,
+        );
+        #[cfg(feature = "bridge-perf")]
+        {
+            metadata_events += meta.events.len();
+        }
+        metadata.push(meta);
+    }
+    #[cfg(feature = "bridge-perf")]
+    {
+        ctx.perf.record_build_metadata(metadata_started.elapsed());
+        ctx.perf.note_built_frame(metadata.len(), metadata_events);
+    }
+
+    // Channel labels.
+    #[cfg(feature = "bridge-perf")]
+    let labels_started = Instant::now();
+    let channel_labels: RVec<RChannelLabel> = match ctx.spatial_labels.as_ref() {
+        // Spatial presentation: authoritative labels come from the OAMD bed
+        // assignment (cached across frames without a payload).
+        Some(labels) => labels.clone(),
+        None => decoded
+            .channel_labels
+            .iter()
+            .map(channel_label_to_r)
+            .collect(),
+    };
+    #[cfg(feature = "bridge-perf")]
+    ctx.perf.record_build_labels(labels_started.elapsed());
+
+    RDecodedFrame {
+        sampling_frequency: decoded.sampling_frequency,
+        sample_count: decoded.sample_length as u32,
+        channel_count: decoded.channel_count as u32,
+        pcm,
+        channel_labels,
+        metadata,
+        drc_gain,
+        drc_ramp_duration,
+        dialogue_level: (*ctx.current_dialogue_level).into(),
+        is_new_segment: decoded.substream_info_changed,
+    }
+}
+
+pub(crate) fn process_extractor_input(
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+    input: &[u8],
+    result: &mut RPushResult,
+) -> AfterPush {
+    if input.is_empty() {
+        return AfterPush::Continue;
+    }
+
+    #[cfg(feature = "bridge-perf")]
+    let push_started = Instant::now();
+    bridge.extractor.push_bytes(input);
+    #[cfg(feature = "bridge-perf")]
+    bridge.perf.record_extractor_push(push_started.elapsed());
+
+    let panic_result = {
+        let mut ctx = DrainContext {
+            extractor: &mut bridge.extractor,
+            parser: &mut bridge.parser,
+            decoder: &mut bridge.decoder,
+            frame_count: &mut bridge.frame_count,
+            strict: shared.strict,
+            presentation: bridge.presentation,
+            current_substream_info: &mut bridge.current_substream_info,
+            current_extended_substream_info: &mut bridge.current_extended_substream_info,
+            current_dialogue_level: &mut bridge.current_dialogue_level,
+            recovering_until_major_sync: &mut bridge.recovering_until_major_sync,
+            drc_mode: bridge.drc_mode,
+            presentations_stale: &mut bridge.truehd_presentations_stale,
+            total_samples: &mut shared.total_samples,
+            declared_object_channels: &mut shared.declared_object_channels,
+            spatial_labels: &mut bridge.truehd_spatial_labels,
+            oamd_warnings: &mut bridge.truehd_oamd_warnings,
+            perf: &mut bridge.perf,
+        };
+        #[cfg(feature = "bridge-perf")]
+        let drain_started = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drain_frames(
+                &mut ctx,
+                &mut bridge.truehd_access_unit,
+                &mut bridge.truehd_decoded,
+            )
+        }));
+        #[cfg(feature = "bridge-perf")]
+        bridge.perf.record_drain(drain_started.elapsed());
+        result
+    };
+
+    match panic_result {
+        Ok((frames, err)) => {
+            result.frames.extend(frames);
+            if let Some(msg) = err {
+                result.error_message = msg.into();
+                result.did_reset = true;
+                return AfterPush::ResetPipeline;
+            }
+            AfterPush::Continue
+        }
+        Err(panic_info) => {
+            let msg = panic_message(&panic_info);
+            bridge_log!(
+                log::Level::Warn,
+                "Panic caught during frame processing: {}. Resetting pipeline.",
+                msg
+            );
+            result.did_reset = true;
+            if shared.strict {
+                result.error_message = msg.into();
+            }
+            AfterPush::ResetPipeline
+        }
+    }
+}

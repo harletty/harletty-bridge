@@ -7,7 +7,14 @@ pub enum Codec {
     Truehd,
     Eac3,
     Dts,
+    /// A standalone IAMF OBU stream (an IA sequence: its header, the
+    /// descriptors, then temporal units). Decoded only by a build with the
+    /// `iamf` feature.
+    Iamf,
 }
+
+/// What `decode` and `info` say when asked for IAMF by a build without it.
+pub const NO_IAMF: &str = "this build has no IAMF decoder; build with --features iamf";
 
 const PROBE_BUFFER_SIZE: usize = 8 * 1024;
 
@@ -34,6 +41,77 @@ const SYNC_CANDIDATES: &[SyncCandidate] = &[
     SyncCandidate { codec: Codec::Eac3, pattern: &EAC3_SYNC_BE },
 ];
 
+/// An IA sequence header OBU (IAMF §3.5): OBU type 31 in the top five bits
+/// of the header byte, a leb128 size (and an extension, when the header says
+/// so), then the `iamf` code, the primary and the additional profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IamfSequenceHeader {
+    /// Where the OBU starts.
+    pub offset: usize,
+    pub primary_profile: u8,
+    pub additional_profile: u8,
+}
+
+/// The name of an IAMF profile number (§3.5), as Atmos Ranker shows it
+/// after `IAMF `.
+pub fn iamf_profile_name(profile: u8) -> &'static str {
+    match profile {
+        0 => "simple",
+        1 => "base",
+        2 => "base-enhanced",
+        3 => "base-advanced",
+        4 => "advanced-1",
+        5 => "advanced-2",
+        _ => "unknown",
+    }
+}
+
+/// Bytes of a sequence header OBU without an extension: header byte, a
+/// one-byte size, `iamf` and the two profiles. What it weighs against the
+/// sync words of the other codecs.
+const IAMF_SEQUENCE_HEADER_LEN: usize = 8;
+
+/// The first IA sequence header in `buffer`.
+pub fn find_iamf_sequence_header(buffer: &[u8]) -> Option<IamfSequenceHeader> {
+    (0..buffer.len()).find_map(|offset| iamf_sequence_header_at(buffer, offset))
+}
+
+fn iamf_sequence_header_at(buffer: &[u8], offset: usize) -> Option<IamfSequenceHeader> {
+    let header = *buffer.get(offset)?;
+    // Type 31; a sequence header is never trimmed.
+    if header >> 3 != 31 || header & 0x02 != 0 {
+        return None;
+    }
+    let mut at = offset + 1;
+    let size = read_leb128(buffer, &mut at)?;
+    if header & 0x01 != 0 {
+        let extension = read_leb128(buffer, &mut at)?;
+        at = at.checked_add(usize::try_from(extension).ok()?)?;
+    }
+    if size < 6 || buffer.get(at..at + 4)? != b"iamf" {
+        return None;
+    }
+    Some(IamfSequenceHeader {
+        offset,
+        primary_profile: *buffer.get(at + 4)?,
+        additional_profile: *buffer.get(at + 5)?,
+    })
+}
+
+/// A leb128 of at most eight bytes (IAMF §2.4) at `*at`, advancing past it.
+fn read_leb128(buffer: &[u8], at: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for i in 0..8 {
+        let byte = *buffer.get(*at)?;
+        *at += 1;
+        value |= u64::from(byte & 0x7F) << (7 * i);
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
 pub fn probe_codec(reader: &mut InputReader, hint: Codec) -> Result<(Codec, Vec<u8>)> {
     if hint != Codec::Auto {
         return Ok((hint, Vec::new()));
@@ -53,7 +131,7 @@ pub fn probe_codec(reader: &mut InputReader, hint: Codec) -> Result<(Codec, Vec<
     let codec = detect_codec(&buffer).ok_or_else(|| {
         anyhow!(
             "no TrueHD (0xF8726FBA), EAC3 (0x0B77) or DTS (0x7FFE8001 / 0x64582025) sync word \
-             found in first {} bytes; pass --codec explicitly",
+             nor IA sequence header found in first {} bytes; pass --codec explicitly",
             buffer.len()
         )
     })?;
@@ -71,14 +149,25 @@ pub fn probe_codec(reader: &mut InputReader, hint: Codec) -> Result<(Codec, Vec<
 /// coincidental 0x0B77 could outrank a real DTS or TrueHD sync sitting at the
 /// same offset. Streams in practice start on a sync word, so the earliest match
 /// is the true one.
+///
+/// An IA sequence header weighs in the same way, as an eight-byte pattern:
+/// its first byte is TrueHD's, but not the three after it.
 fn detect_codec(buffer: &[u8]) -> Option<Codec> {
+    let iamf = find_iamf_sequence_header(buffer).map(|header| {
+        (
+            Codec::Iamf,
+            sort_key(header.offset, IAMF_SEQUENCE_HEADER_LEN),
+        )
+    });
     SYNC_CANDIDATES
         .iter()
         .filter_map(|candidate| {
-            find_pattern(buffer, candidate.pattern).map(|offset| (candidate, offset))
+            find_pattern(buffer, candidate.pattern)
+                .map(|offset| (candidate.codec, sort_key(offset, candidate.pattern.len())))
         })
-        .min_by_key(|(candidate, offset)| sort_key(*offset, candidate.pattern.len()))
-        .map(|(candidate, _)| candidate.codec)
+        .chain(iamf)
+        .min_by_key(|(_, key)| *key)
+        .map(|(codec, _)| codec)
 }
 
 /// Earliest offset first, then longest pattern first.
@@ -101,6 +190,7 @@ pub fn describe_codec(codec: Codec) -> &'static str {
         Codec::Truehd => "TrueHD",
         Codec::Eac3 => "EAC3",
         Codec::Dts => "DTS",
+        Codec::Iamf => "IAMF",
     }
 }
 
@@ -192,6 +282,43 @@ mod tests {
             sort_key(8, 4) < sort_key(8, 2),
             "at equal offset a 4-byte sync must sort before a 2-byte one"
         );
+    }
+
+    /// The head of a standalone IAMF stream as harlettizer writes it: the
+    /// sequence header (`iamf`, advanced-2 twice), then a codec config.
+    const IAMF_HEAD: [u8; 12] = [0xF8, 0x06, b'i', b'a', b'm', b'f', 5, 5, 0x00, 0x02, 0, 0];
+
+    #[test]
+    fn detects_an_iamf_sequence_header() {
+        assert_eq!(detect_codec(&IAMF_HEAD), Some(Codec::Iamf));
+        assert_eq!(
+            find_iamf_sequence_header(&IAMF_HEAD),
+            Some(IamfSequenceHeader {
+                offset: 0,
+                primary_profile: 5,
+                additional_profile: 5
+            })
+        );
+        // Redundant copy flag, two-byte size: still one.
+        let mut redundant = vec![0xFC, 0x86, 0x00];
+        redundant.extend_from_slice(b"iamf\x00\x01");
+        assert_eq!(
+            find_iamf_sequence_header(&redundant)
+                .map(|h| (h.primary_profile, h.additional_profile)),
+            Some((0, 1))
+        );
+        // TrueHD's sync shares only its first byte: not a header.
+        assert_eq!(detect_codec(&TRUEHD_SYNC_BE), Some(Codec::Truehd));
+        assert_eq!(find_iamf_sequence_header(&TRUEHD_SYNC_BE), None);
+    }
+
+    /// FLAC or PCM payloads may hold any byte pattern: the stream's own
+    /// header, at its first byte, is the earliest.
+    #[test]
+    fn an_iamf_stream_wins_over_a_sync_word_in_its_payload() {
+        let mut buf = IAMF_HEAD.to_vec();
+        buf.extend_from_slice(&[0x0B, 0x77, 0x7F, 0xFE, 0x80, 0x01]);
+        assert_eq!(detect_codec(&buf), Some(Codec::Iamf));
     }
 
     #[test]

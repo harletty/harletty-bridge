@@ -3,6 +3,7 @@ use indicatif::ProgressBar;
 use std::sync::mpsc;
 use truehd::process::decode::DecodedAccessUnit;
 use truehd::process::{decode::Decoder, extract::Extractor, parse::Parser};
+use truehd::structs::access_unit::AccessUnit;
 use truehd::structs::channel::ChannelLabel;
 
 /// Shape of the last access unit that came through cleanly.
@@ -54,13 +55,21 @@ impl AccessUnitShape {
 pub struct ProcessFramesContext<'a> {
     pub extractor: &'a mut Extractor,
     pub parser: &'a mut Parser,
+    /// Where every frame is parsed: a new one for each allocates the blocks of
+    /// its substreams and the sample rows of each block, to free them once the
+    /// frame is decoded.
+    pub access_unit: &'a mut AccessUnit,
     pub decoder: &'a mut Decoder,
     pub frames_processed: &'a mut u64,
     pub frame_count: &'a mut u64,
     pub total_samples: &'a mut u64,
     pub presentation: u8,
     pub strict_mode: bool,
-    pub tx: &'a mpsc::Sender<Result<truehd::process::decode::DecodedAccessUnit>>,
+    pub tx: &'a mpsc::Sender<Result<Box<DecodedAccessUnit>>>,
+    /// Access units the writer has finished with, to decode the next ones into.
+    /// An access unit is 10 KiB whatever it holds, so one built and moved through
+    /// the channel for every 1/1200 s of audio costs more than its samples do.
+    pub spare: &'a mpsc::Receiver<Box<DecodedAccessUnit>>,
     pub pb_clone: &'a Option<ProgressBar>,
     pub current_substream_info: &'a mut Option<u8>,
     pub current_extended_substream_info: &'a mut Option<u8>,
@@ -91,7 +100,7 @@ fn emit_gap(ctx: &mut ProcessFramesContext) -> bool {
     *ctx.gap_samples += silence.sample_length as u64;
     *ctx.total_samples += silence.sample_length as u64;
 
-    ctx.tx.send(Ok(silence)).is_ok()
+    ctx.tx.send(Ok(Box::new(silence))).is_ok()
 }
 
 pub fn process_frames(ctx: &mut ProcessFramesContext) -> Result<bool> {
@@ -119,11 +128,11 @@ pub fn process_frames(ctx: &mut ProcessFramesContext) -> Result<bool> {
                     *ctx.recovering_until_major_sync = false;
                 }
 
-                match ctx.parser.parse(&frame) {
-                    Ok(access_unit) => {
+                match ctx.parser.parse_into(&frame, ctx.access_unit) {
+                    Ok(()) => {
                         // Check for substream_info changes after parsing
                         let mut substream_info_changed = false;
-                        if let Some(major_sync) = &access_unit.major_sync_info {
+                        if let Some(major_sync) = &ctx.access_unit.major_sync_info {
                             // Check if substream_info has changed
                             match *ctx.current_substream_info {
                                 Some(current) if current != major_sync.substream_info => {
@@ -165,11 +174,16 @@ pub fn process_frames(ctx: &mut ProcessFramesContext) -> Result<bool> {
                                 Some(major_sync.extended_substream_info);
                         }
 
-                        match ctx
-                            .decoder
-                            .decode_presentation(&access_unit, ctx.presentation as usize)
-                        {
-                            Ok(mut decoded) => {
+                        // Whatever a spare one held is written over or ignored:
+                        // only the rows this access unit decodes are read.
+                        let mut decoded = ctx.spare.try_recv().unwrap_or_default();
+
+                        match ctx.decoder.decode_presentation_into(
+                            ctx.access_unit,
+                            ctx.presentation as usize,
+                            &mut decoded,
+                        ) {
+                            Ok(()) => {
                                 // Set the substream_info_changed flag if we detected a change
                                 if substream_info_changed {
                                     decoded.substream_info_changed = true;
@@ -254,13 +268,24 @@ mod tests {
         run_in_chunks(bytes, bytes.len().max(1))
     }
 
+    fn run_in_chunks(bytes: &[u8], chunk_len: usize) -> Run {
+        run_with_spares(bytes, chunk_len, Vec::new())
+    }
+
     /// Pushes `bytes` to the extractor `chunk_len` bytes at a time and drains it
     /// after every push, the way the file and pipe readers do.
-    fn run_in_chunks(bytes: &[u8], chunk_len: usize) -> Run {
+    /// `spares` are what the writer would have handed back: the access units
+    /// decoded first are decoded into them.
+    fn run_with_spares(bytes: &[u8], chunk_len: usize, spares: Vec<Box<DecodedAccessUnit>>) -> Run {
         let (tx, rx) = mpsc::channel();
+        let (spare_tx, spare) = mpsc::channel();
+        for unit in spares {
+            spare_tx.send(unit).unwrap();
+        }
         let mut extractor = Extractor::default();
 
         let mut parser = Parser::default();
+        let mut access_unit = AccessUnit::default();
         let mut decoder = Decoder::default();
         let (mut frames_processed, mut frame_count, mut total_samples) = (0u64, 0u64, 0u64);
         let (mut substream_info, mut extended_substream_info) = (None, None);
@@ -271,6 +296,7 @@ mod tests {
         let mut ctx = ProcessFramesContext {
             extractor: &mut extractor,
             parser: &mut parser,
+            access_unit: &mut access_unit,
             decoder: &mut decoder,
             frames_processed: &mut frames_processed,
             frame_count: &mut frame_count,
@@ -278,6 +304,7 @@ mod tests {
             presentation: 3,
             strict_mode: false,
             tx: &tx,
+            spare: &spare,
             pb_clone: &None,
             current_substream_info: &mut substream_info,
             current_extended_substream_info: &mut extended_substream_info,
@@ -294,10 +321,50 @@ mod tests {
         drop(tx);
 
         Run {
-            access_units: rx.into_iter().map(|r| r.expect("no error sent")).collect(),
+            access_units: rx.into_iter().map(|r| *r.expect("no error sent")).collect(),
             total_samples,
             gap_access_units,
             gap_samples,
+        }
+    }
+
+    /// An access unit decoded into one the writer handed back reads as one
+    /// decoded into a new one, whatever the old one held: the samples, labels and
+    /// metadata of another access unit, of another stream.
+    #[test]
+    fn a_reused_access_unit_keeps_nothing_of_its_last_use() {
+        let fresh = run(&stream(4));
+        let stale = || {
+            Box::new(DecodedAccessUnit {
+                sampling_frequency: 192_000,
+                sample_length: 160,
+                channel_count: 16,
+                pcm_data: [[0x5a5a5a; 16]; 160],
+                channel_labels: vec![ChannelLabel::LFE; 16],
+                oamd: fresh
+                    .access_units
+                    .iter()
+                    .flat_map(|unit| unit.oamd.clone())
+                    .collect(),
+                is_duplicate: true,
+                substream_info_changed: true,
+            })
+        };
+        let reused = run_with_spares(&stream(4), usize::MAX, (0..8).map(|_| stale()).collect());
+
+        assert_eq!(reused.access_units.len(), fresh.access_units.len());
+        for (reused, fresh) in reused.access_units.iter().zip(&fresh.access_units) {
+            assert_eq!(reused.sampling_frequency, fresh.sampling_frequency);
+            assert_eq!(reused.sample_length, fresh.sample_length);
+            assert_eq!(reused.channel_count, fresh.channel_count);
+            assert_eq!(
+                reused.pcm_data[..reused.sample_length],
+                fresh.pcm_data[..fresh.sample_length]
+            );
+            assert_eq!(reused.channel_labels, fresh.channel_labels);
+            assert_eq!(format!("{:?}", reused.oamd), format!("{:?}", fresh.oamd));
+            assert_eq!(reused.is_duplicate, fresh.is_duplicate);
+            assert_eq!(reused.substream_info_changed, fresh.substream_info_changed);
         }
     }
 

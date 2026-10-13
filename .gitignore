@@ -4,3 +4,4 @@
 *.zip
 tools/cavern_pcm_dump/bin/
 tools/cavern_pcm_dump/obj/
+tools/host-baseline/Cargo.lock

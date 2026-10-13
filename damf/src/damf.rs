@@ -173,11 +173,15 @@ pub enum SourceCodec {
     Auro3d131,
     #[serde(rename = "Auro-3D")]
     Auro3d,
+    /// IAMF (AOMedia Immersive Audio Model and Formats), whatever its
+    /// profile: v2.0 objects, a v1.1 channel bed, or both.
+    #[serde(rename = "IAMF")]
+    Iamf,
 }
 
 impl SourceCodec {
     /// Every label, for the taxonomy checks.
-    pub const ALL: [SourceCodec; 14] = [
+    pub const ALL: [SourceCodec; 15] = [
         SourceCodec::TrueHD,
         SourceCodec::Eac3Joc,
         SourceCodec::DtsX714,
@@ -192,6 +196,7 @@ impl SourceCodec {
         SourceCodec::Auro3d111,
         SourceCodec::Auro3d131,
         SourceCodec::Auro3d,
+        SourceCodec::Iamf,
     ];
 
     /// The string this codec is written as: the `sourceCodec` of the DAMF
@@ -214,6 +219,7 @@ impl SourceCodec {
             SourceCodec::Auro3d111 => "Auro-3D-11.1",
             SourceCodec::Auro3d131 => "Auro-3D-13.1",
             SourceCodec::Auro3d => "Auro-3D",
+            SourceCodec::Iamf => "IAMF",
         }
     }
 }
@@ -770,6 +776,27 @@ impl Event {
         }
     }
 
+    /// An object moving to `pos`, reached `ramp_length` samples after
+    /// `sample_pos`, and nothing else restated: for a source that states
+    /// positions as a trajectory rather than as payloads repeating every
+    /// field, so there is nothing to diff (IAMF).
+    pub fn position_update(id: u32, sample_pos: u64, pos: [f64; 3], ramp_length: u32) -> Self {
+        Self {
+            id: Some(id),
+            sample_pos: Some(sample_pos),
+            pos: Some(VecDisplay(pos.to_vec())),
+            ramp_length: Some(ramp_length),
+            ..Default::default()
+        }
+    }
+
+    /// Restate where the object is, for a caller that holds the position
+    /// more exactly than the OAMD payload the event was projected from: its
+    /// encoding halves and offsets each coordinate, which rounds.
+    pub fn set_pos(&mut self, pos: [f64; 3]) {
+        self.pos = Some(VecDisplay(pos.to_vec()));
+    }
+
     fn diff(&self, b: &Self) -> Self {
         let mut out = Self::default();
 
@@ -836,6 +863,25 @@ impl Event {
                 *event = Event::default();
             }
         }
+    }
+
+    /// What the next payload is to be diffed against, once `drop_re_asserted_ramps` has run over
+    /// `written`: `payload` for every object whose event was written, `previous` for every object
+    /// whose event was dropped.
+    ///
+    /// A dropped restatement zeroed the object's ramp without the file saying so. Diffed against
+    /// it, a zero-ramp move that follows would carry no `rampLength`, and a reader carrying the
+    /// ramp forward would give that jump the ramp stated before the restatement. Diffed against
+    /// what was last written, the move states its ramp.
+    pub fn baseline_after(previous: &[Event], payload: &[Event], written: &[Event]) -> Vec<Event> {
+        payload
+            .iter()
+            .enumerate()
+            .map(|(i, now)| match (written.get(i), previous.get(i)) {
+                (Some(diff), Some(before)) if *diff == Event::default() => before.clone(),
+                _ => now.clone(),
+            })
+            .collect()
     }
 }
 
@@ -998,6 +1044,17 @@ fn source_codec_labels_are_the_serde_names() {
     );
 }
 
+/// An object audio metadata payload with trim and bed assignments, as `truehd`
+/// carried it for its own tests before the `oamd` crate took them over.
+#[cfg(test)]
+const TEST_DATA_TRIM: &[u8] = &[
+    0x1F, 0x88, 0x4B, 0x80, 0x00, 0xA2, 0x70, 0x00, 0x80, 0x40, 0xE4, 0x0B, 0x40, 0x81, 0xDF, 0x02,
+    0x01, 0x03, 0x80, 0xFC, 0x02, 0x07, 0xD4, 0x5A, 0x04, 0x0F, 0xF0, 0x10, 0x08, 0x1C, 0x0F, 0xA0,
+    0x10, 0x38, 0x00, 0x7C, 0x20, 0x7F, 0x9F, 0x80, 0x40, 0xFF, 0x7D, 0x00, 0x81, 0xFE, 0x03, 0xE1,
+    0x03, 0x81, 0xF7, 0xC2, 0x07, 0xFB, 0xEF, 0x84, 0x0E, 0x00, 0x10, 0x08, 0x1C, 0x00, 0x20, 0x10,
+    0x02, 0xB2, 0x20, 0xCC, 0xE6, 0xAB, 0xEF, 0x0C, 0xED, 0x0D, 0x29, 0x86, 0x85, 0x80,
+];
+
 #[cfg(test)]
 const TEST_TOOL: CreationTool = CreationTool {
     name: "harletty",
@@ -1086,8 +1143,6 @@ presentations:
 
 #[test]
 fn damf() {
-    use truehd::structs::oamd::TEST_DATA_TRIM;
-
     let test_str = format!(
         r#"version: {DAMF_VERSION}
 presentations:
@@ -1156,8 +1211,6 @@ presentations:
 /// Anything else and the DAMF will not open in a DAW.
 #[test]
 fn base_name_survives_yaml_formatting() {
-    use truehd::structs::oamd::TEST_DATA_TRIM;
-
     let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
 
     for base_name in [
@@ -1186,7 +1239,7 @@ fn base_name_survives_yaml_formatting() {
 /// with no way to finalize what it had already written. This affected every version.
 #[test]
 fn unsupported_payload_shapes_are_reported_rather_than_asserted() {
-    use truehd::structs::oamd::{BedAssignment, TEST_DATA_TRIM};
+    use truehd::structs::oamd::BedAssignment;
 
     let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
     assert!(
@@ -1216,8 +1269,6 @@ fn unsupported_payload_shapes_are_reported_rather_than_asserted() {
 /// into an event: the source never had one there.
 #[test]
 fn a_re_asserted_payload_writes_no_event() {
-    use truehd::structs::oamd::TEST_DATA_TRIM;
-
     let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
     let first = Configuration::with_oamd_payload(&oamd, 48000, 0).unwrap();
 
@@ -1247,8 +1298,6 @@ fn a_re_asserted_payload_writes_no_event() {
 /// and moves an object is still an event.
 #[test]
 fn a_re_asserted_payload_still_reports_a_move() {
-    use truehd::structs::oamd::TEST_DATA_TRIM;
-
     let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
     let first = Configuration::with_oamd_payload(&oamd, 48000, 0).unwrap();
 
@@ -1273,4 +1322,58 @@ fn a_re_asserted_payload_still_reports_a_move() {
     let written = later.serialize_events(true);
     assert!(written.contains("pos: [-0.5, -0.5, 0.5]"), "{written}");
     assert!(written.contains("samplePos: 5120"), "{written}");
+}
+
+/// After a dropped restatement, the next payload is diffed against what was last written. A
+/// zero-ramp move that follows one must state its ramp: the file never said the ramp had gone to
+/// nought, so a reader carrying it forward would otherwise give the jump the ramp stated before.
+#[test]
+fn a_move_after_a_dropped_restatement_states_its_zero_ramp() {
+    let oamd = ObjectAudioMetadataPayload::read(TEST_DATA_TRIM).unwrap();
+    let mut ramped = oamd.clone();
+    let blocks = &mut ramped
+        .object_element
+        .as_mut()
+        .unwrap()
+        .md_update_info
+        .block_update_info;
+    for block in blocks.iter_mut() {
+        block.ramp_duration = 1536;
+    }
+    let first = Configuration::with_oamd_payload(&ramped, 48000, 0).unwrap();
+
+    // The encoder re-asserts the same values with the timing zeroed: nothing is written, and
+    // the baseline stays the first payload.
+    let mut repeat = oamd.clone();
+    let update = &mut repeat.object_element.as_mut().unwrap().md_update_info;
+    update.sample_offset = 0;
+    for block in update.block_update_info.iter_mut() {
+        block.block_offset_factor_bits = 0;
+        block.ramp_duration = 0;
+    }
+    let mut restated = Configuration::with_oamd_payload(&repeat, 48000, 5120).unwrap();
+    let mut events = Event::compare_event_vectors(&first.events, &restated.events);
+    Event::drop_re_asserted_ramps(&mut events);
+    let baseline = Event::baseline_after(&first.events, &restated.events, &events);
+    restated.events = events;
+    assert_eq!(restated.serialize_events(true), "");
+    assert_eq!(baseline, first.events);
+
+    // Then one object jumps, the timing still zeroed: its event states the zero ramp.
+    let mut moved = repeat.clone();
+    let render = &mut moved.object_element.as_mut().unwrap().object_data[1][0].object_render_info;
+    render.pos3d = [0.25, 0.75, 0.5];
+    let mut jump = Configuration::with_oamd_payload(&moved, 48000, 10240).unwrap();
+    let mut events = Event::compare_event_vectors(&baseline, &jump.events);
+    Event::drop_re_asserted_ramps(&mut events);
+    let baseline = Event::baseline_after(&baseline, &jump.events, &events);
+    jump.events = events;
+    let written = jump.serialize_events(true);
+    assert!(written.contains("samplePos: 10240"), "{written}");
+    assert!(written.contains("pos: [-0.5, -0.5, 0.5]"), "{written}");
+    assert!(written.contains("rampLength: 0"), "{written}");
+    assert_eq!(written.matches("- ID:").count(), 1, "{written}");
+    // The object that jumped is at a zero ramp from here; the others keep the ramp last written.
+    assert_eq!(baseline[1].ramp_length, Some(0));
+    assert_eq!(baseline[0].ramp_length, Some(1536));
 }

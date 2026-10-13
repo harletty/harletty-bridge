@@ -34,7 +34,18 @@ pub const SCHEMA: u32 = 1;
 /// start reporting this label. A consumer holding the old label should map it
 /// onto the new one and re-probe, since the feed count did not change but its
 /// meaning did.
-pub const TAXONOMY_VERSION: u32 = 2;
+///
+/// 3: DTS:X on a lossy carrier (DTS-HD High Resolution Audio: core + XXCH
+/// with the extension after the asset) is decoded. Such tracks reported no
+/// spatial metadata and `codec` `DTS`; they now report `DTS:X-7.1.4` and the
+/// new `codec` value `DTS-HD HRA`. A consumer holding a `DTS` verdict for a
+/// track whose container says DTS-HD HRA should re-probe it.
+///
+/// 4: `IAMF`, for a standalone IAMF stream (a build with the `iamf`
+/// feature decodes it): objects and channel bed alike, whatever the profile.
+/// Such tracks reported no frame found; a consumer holding that verdict for
+/// an IAMF track should re-probe it.
+pub const TAXONOMY_VERSION: u32 = 4;
 
 /// The versions alone, for `harletty taxonomy`.
 #[derive(Debug, Serialize)]
@@ -54,8 +65,8 @@ pub struct InfoReport {
     /// The build: git describe, decoder library version, timestamp.
     pub build: &'static str,
     pub taxonomy: u32,
-    /// `TrueHD`, `EAC3`, `DTS` (core only) or `DTS-HD MA`; `null` when no
-    /// frame was found, with `error` saying why.
+    /// `TrueHD`, `EAC3`, `DTS` (core only), `DTS-HD HRA`, `DTS-HD MA` or
+    /// `IAMF`; `null` when no frame was found, with `error` saying why.
     pub codec: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -71,6 +82,13 @@ pub struct InfoReport {
     pub eac3: Option<Eac3Facts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auro: Option<AuroFacts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iamf: Option<IamfFacts>,
+    /// Whether the stream's metadata is signed by the key this machine
+    /// holds. Absent for a codec whose signature this binary cannot check,
+    /// which today is every codec but TrueHD.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
     /// Frames read before the report settled or the bound was reached.
     pub frames_seen: u64,
     /// Audio those frames cover.
@@ -82,7 +100,7 @@ pub struct InfoReport {
 pub struct Spatial {
     /// The DAMF `sourceCodec` label.
     pub label: String,
-    /// `atmos`, `joc`, `dtsx` or `auro`.
+    /// `atmos`, `joc`, `dtsx`, `auro` or `iamf`.
     pub kind: &'static str,
     /// Waveforms presented as objects, when the presentation says.
     pub objects: Option<u32>,
@@ -116,12 +134,77 @@ pub struct Eac3Facts {
     pub bitstream_id: u8,
 }
 
+/// The Evolution protection word, as the frames read report it.
+///
+/// `state` is the verdict a caller displays:
+///
+/// - `verified`: no word in a unit without a major sync failed and at least
+///   one word is the digest the key produces, so the metadata and the audio
+///   under it are the encoder's, unaltered;
+/// - `mismatch`: a word in a unit without a major sync is not the key's
+///   digest, so something was rewritten after signing, or another key
+///   signed it;
+/// - `unsigned`: Evolution frames were read and none carried a word;
+/// - `absent`: no Evolution frame was read — a stream without object
+///   metadata, or a read too short to reach the first one — so there was
+///   nothing to sign;
+/// - `unchecked`: no key on this machine, so nothing was asked. Not a
+///   verdict on the stream.
+///
+/// The counts are over the frames read, which `--max-seconds` bounds: a
+/// verdict is about the head of the stream when the read was bounded.
+///
+/// Each digest covers the access unit carrying it, and about one access unit
+/// in forty carries one, so `verified` says the stream came from an encoder
+/// holding the key and was not re-encoded since — not that every sample is
+/// accounted for.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Signature {
+    pub state: &'static str,
+    /// Access units parsed.
+    pub units: u64,
+    /// Of those, the ones carrying an Evolution frame, which is where the
+    /// object metadata and the word that signs it live.
+    pub frames: u64,
+    /// Of those, in units without a major sync, the ones carrying a
+    /// protection word: the words the verdict rests on.
+    pub checked: u64,
+    /// Of those, the ones whose word is the digest of the key.
+    pub verified: u64,
+    /// Of those, the ones whose word is not.
+    pub mismatched: u64,
+    /// Words in units that also carry a major sync, reported apart: on some
+    /// commercial discs they fail while every other unit verifies, so a
+    /// failure there does not decide the verdict. A match there counts.
+    pub sync_checked: u64,
+    pub sync_verified: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AuroFacts {
     /// The layout the lossless bed presents (`7.1`, `5.1`).
     pub carrier: Option<&'static str>,
     /// The layout the carrier unfolds to (`7.1_5H_1T`, …).
     pub original: Option<&'static str>,
+}
+
+/// What an IA sequence holds. The profiles come from its header; the rest
+/// from its descriptors, which only a build with the `iamf` feature reads
+/// (`null` otherwise).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IamfFacts {
+    /// The sequence header's primary profile: `simple`, `base`,
+    /// `base-enhanced`, `base-advanced`, `advanced-1` or `advanced-2`.
+    pub profile: &'static str,
+    pub additional_profile: &'static str,
+    /// The substreams' codec: `FLAC`, `Opus`, `AAC` or `PCM`.
+    pub codec: Option<&'static str>,
+    /// The mix presentation `decode` decodes.
+    pub mix: Option<u32>,
+    /// Audio elements in that mix.
+    pub elements: Option<u32>,
+    /// Objects it carries (IAMF v2.0).
+    pub objects: Option<u32>,
 }
 
 impl InfoReport {
@@ -140,6 +223,8 @@ impl InfoReport {
             truehd: None,
             eac3: None,
             auro: None,
+            iamf: None,
+            signature: None,
             frames_seen: 0,
             seconds_seen: 0.0,
         }

@@ -2,7 +2,7 @@ use anyhow::Result;
 use damf::caf::CAFWriter;
 use damf::wav::WAVWriter;
 use std::fs::File;
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use truehd::structs::channel::ChannelLabel;
 
@@ -300,6 +300,136 @@ impl AudioWriter {
     }
 }
 
+/// The samples of audio files an [`AudioWriter`] wrote and has closed, read
+/// back in the order they were written.
+///
+/// What rewriting an output in another channel layout starts from. The files
+/// are moved aside under a `.tmp` name on opening, so that the rewrite can
+/// take their names, and [`PcmReadBack::remove`] deletes them once read.
+pub struct PcmReadBack {
+    /// One file for an interleaved container, one per channel for a mono set.
+    files: Vec<(PathBuf, BufReader<File>)>,
+    channel_count: usize,
+    big_endian: bool,
+    frames_left: u64,
+    /// Scratch, reused across calls.
+    bytes: Vec<u8>,
+}
+
+impl PcmReadBack {
+    /// The `frames` sample frames of `channel_count` channels that were
+    /// written to the interleaved file at `path`, a `format` container.
+    pub fn interleaved(
+        path: &Path,
+        format: AudioFormat,
+        channel_count: usize,
+        frames: u64,
+    ) -> Result<Self> {
+        let aside = create_path_with_suffix(path, "tmp");
+        std::fs::rename(path, &aside)?;
+        let mut file = File::open(&aside)?;
+        let data_len = frames * channel_count as u64 * 3;
+        let file_len = file.metadata()?.len();
+        let (data_start, big_endian) = match format {
+            AudioFormat::Pcm => (0, false),
+            AudioFormat::Caf => {
+                let info = damf::caf::parse_caf_file(&mut file)?;
+                (
+                    info.data_chunk_start,
+                    matches!(info.endianness, damf::caf::Endianness::BigEndian),
+                )
+            }
+            // Wave64: the data chunk is the last one and nothing follows the
+            // samples, so they are the tail of the file.
+            AudioFormat::W64 => (file_len.saturating_sub(data_len), false),
+        };
+        if file_len < data_start + data_len {
+            anyhow::bail!(
+                "{}: {} bytes of audio expected from byte {}, in a file of {}",
+                aside.display(),
+                data_len,
+                data_start,
+                file_len
+            );
+        }
+        file.seek(SeekFrom::Start(data_start))?;
+        Ok(Self {
+            files: vec![(aside, BufReader::new(file))],
+            channel_count,
+            big_endian,
+            frames_left: frames,
+            bytes: Vec::new(),
+        })
+    }
+
+    /// The `frames` samples that were written to each of the `channel_count`
+    /// files of the mono set at `prefix`.
+    pub fn mono(prefix: &Path, channel_count: usize, frames: u64) -> Result<Self> {
+        let mut files = Vec::with_capacity(channel_count);
+        for n in 0..channel_count {
+            let path = mono_path(prefix, n);
+            let aside = create_path_with_suffix(&path, "tmp");
+            std::fs::rename(&path, &aside)?;
+            let mut file = File::open(&aside)?;
+            file.seek(SeekFrom::Start(MonoWavSet::HEADER))?;
+            files.push((aside, BufReader::new(file)));
+        }
+        Ok(Self {
+            files,
+            channel_count,
+            big_endian: false,
+            frames_left: frames,
+            bytes: Vec::new(),
+        })
+    }
+
+    /// Read up to `max_frames` sample frames into `samples`, interleaved, and
+    /// return how many there were: 0 once everything has been read.
+    pub fn read(&mut self, max_frames: usize, samples: &mut Vec<i32>) -> Result<usize> {
+        let frames = self.frames_left.min(max_frames as u64) as usize;
+        self.frames_left -= frames as u64;
+        samples.clear();
+        samples.resize(frames * self.channel_count, 0);
+        if self.channel_count == 0 {
+            return Ok(frames);
+        }
+        // An interleaved file holds every channel of a frame side by side; a
+        // mono set holds one channel per file, which is a stride of the
+        // interleaved frame.
+        let channels_per_file = self.channel_count / self.files.len().max(1);
+        let big_endian = self.big_endian;
+        for (file_index, (_, file)) in self.files.iter_mut().enumerate() {
+            self.bytes.resize(frames * channels_per_file * 3, 0);
+            file.read_exact(&mut self.bytes)?;
+            for (frame, bytes) in self.bytes.chunks_exact(channels_per_file * 3).enumerate() {
+                let first = frame * self.channel_count + file_index;
+                for (sample, b) in samples[first..first + channels_per_file]
+                    .iter_mut()
+                    .zip(bytes.chunks_exact(3))
+                {
+                    let unsigned = if big_endian {
+                        i32::from_be_bytes([0, b[0], b[1], b[2]])
+                    } else {
+                        i32::from_le_bytes([b[0], b[1], b[2], 0])
+                    };
+                    // Sign-extend the 24 bits.
+                    *sample = (unsigned << 8) >> 8;
+                }
+            }
+        }
+        Ok(frames)
+    }
+
+    /// Delete the files that were moved aside.
+    pub fn remove(self) -> Result<()> {
+        for (path, file) in self.files {
+            drop(file);
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+}
+
 /// Largest positive 24-bit sample. Note this is *not* the scale factor: see
 /// [`float_to_i24`].
 const I24_MAX: i32 = 8_388_607;
@@ -327,7 +457,14 @@ pub fn float_to_i24(sample: f32) -> i32 {
     if !sample.is_finite() {
         return 0;
     }
-    ((sample.clamp(-1.0, 1.0) * I24_SCALE).round_ties_even() as i32).clamp(I24_MIN, I24_MAX)
+    let scaled = sample.clamp(-1.0, 1.0) * I24_SCALE;
+    // `round_ties_even`, which baseline x86-64 can only do through a libm
+    // call per sample. |scaled| <= 2^23, so moving it 2^23 further from zero
+    // lands where consecutive f32 values are exactly 1 apart: the addition
+    // itself rounds to the nearest integer, ties to even, and the
+    // subtraction is exact. Same result as `round_ties_even` for every f32.
+    let shift = I24_SCALE.copysign(scaled);
+    (((scaled + shift) - shift) as i32).clamp(I24_MIN, I24_MAX)
 }
 
 pub fn create_caf_writer_from_existing_file(file: File) -> Result<CAFWriter<BufWriter<File>>> {
@@ -419,6 +556,35 @@ mod tests {
             I24_MAX,
         ] {
             assert_eq!(float_to_i24(n as f32 / 8_388_608.0), n, "round trip of {n}");
+        }
+    }
+
+    /// The rounding matches `round_ties_even` off the 24-bit grid too: ties,
+    /// near-ties and arbitrary values at every magnitude, past both ends, and
+    /// the non-finite inputs. (Checked against it over all 2^32 f32 inputs
+    /// once; this keeps a strided slice of that sweep.)
+    #[test]
+    fn float_to_i24_rounds_like_round_ties_even() {
+        let reference = |sample: f32| -> i32 {
+            if !sample.is_finite() {
+                return 0;
+            }
+            ((sample.clamp(-1.0, 1.0) * 8_388_608.0).round_ties_even() as i32)
+                .clamp(I24_MIN, I24_MAX)
+        };
+        for n in [
+            0i32, 1, 2, 3, 1000, 4_194_303, 4_194_304, 8_388_606, 8_388_607,
+        ] {
+            for frac in [0.5f32, 0.25, 0.75, 0.499_999_97, 0.500_000_06] {
+                for sign in [1.0f32, -1.0] {
+                    let x = sign * (n as f32 + frac) / 8_388_608.0;
+                    assert_eq!(float_to_i24(x), reference(x), "{x:e}");
+                }
+            }
+        }
+        for bits in (0..=u32::MAX).step_by(65_537) {
+            let x = f32::from_bits(bits);
+            assert_eq!(float_to_i24(x), reference(x), "{x:e} ({bits:#010x})");
         }
     }
 

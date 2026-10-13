@@ -354,7 +354,7 @@ pub struct FrameHandlerContext<'a> {
 impl DecodeHandler {
     pub fn handle_decoded_frame(
         &mut self,
-        decoded: truehd::process::decode::DecodedAccessUnit,
+        decoded: &truehd::process::decode::DecodedAccessUnit,
         ctx: &FrameHandlerContext,
     ) -> Result<()> {
         let sample_rate = decoded.sampling_frequency;
@@ -369,7 +369,7 @@ impl DecodeHandler {
         self.au_index += 1;
 
         self.handle_atmos_metadata(
-            &decoded,
+            decoded,
             ctx.base_path,
             ctx.format,
             ctx.state,
@@ -406,9 +406,9 @@ impl DecodeHandler {
 
         if !ctx.no_audio {
             if ctx.bed_conform && self.has_atmos {
-                self.write_audio_samples_bed_conform(&decoded, channel_count)?;
+                self.write_audio_samples_bed_conform(decoded, channel_count)?;
             } else {
-                self.write_audio_samples(&decoded, channel_count)?;
+                self.write_audio_samples(decoded, channel_count)?;
             }
         }
 
@@ -727,11 +727,16 @@ impl DecodeHandler {
             (conf.events.clone(), false)
         };
 
-        if conf.restates_current_state && remove_header {
+        // The next payload is diffed against what was written. An object whose
+        // restatement was dropped keeps its last written state: the restatement
+        // zeroed its ramp without the file saying so, and a zero-ramp move
+        // diffed against it would come out without a ramp.
+        self.prev_events = if conf.restates_current_state && remove_header {
             Event::drop_re_asserted_ramps(&mut events_diff);
-        }
-
-        self.prev_events = conf.events.clone();
+            Event::baseline_after(&self.prev_events, &conf.events, &events_diff)
+        } else {
+            conf.events.clone()
+        };
         conf.events = events_diff;
         let oamd_str = conf.serialize_events(remove_header);
 

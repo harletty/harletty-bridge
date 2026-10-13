@@ -30,6 +30,10 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
     match codec {
         Codec::Eac3 => return cmd_decode_eac3(args, cli, multi, prefix),
         Codec::Dts => return cmd_decode_dts(args, cli, multi, prefix),
+        #[cfg(feature = "iamf")]
+        Codec::Iamf => return cmd_decode_iamf(args, cli, multi, prefix),
+        #[cfg(not(feature = "iamf"))]
+        Codec::Iamf => anyhow::bail!(crate::codec_probe::NO_IAMF),
         Codec::Truehd | Codec::Auto => {}
     }
 
@@ -71,6 +75,9 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
 
     // Setup decoder components
     let (tx, rx) = mpsc::channel();
+    // The way back for the access units written out, which the decoder thread
+    // decodes the next ones into.
+    let (spare_tx, spare) = mpsc::channel();
     let pb_clone = pb.clone();
     let strict_mode = cli.strict;
     let presentation = args.presentation;
@@ -90,11 +97,16 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
 
     let state = WriterState { fail_level };
 
-    // Setup required presentations
+    // Only the substreams the presentation is made of are parsed: a 7.1
+    // presentation often stands on its own substreams, next to those of a
+    // stereo one it has no use for. Strict mode parses those of every
+    // presentation below it as well, which is what checks them.
     let mut required_presentations = [false; MAX_PRESENTATIONS];
-    required_presentations[..=presentation as usize]
-        .iter_mut()
-        .for_each(|p| *p = true);
+    if strict_mode {
+        required_presentations[..=presentation as usize].fill(true);
+    } else {
+        required_presentations[presentation as usize] = true;
+    }
     parser.set_required_presentations(&required_presentations);
 
     // Spawn decoder thread
@@ -103,6 +115,7 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
         presentation,
         strict_mode,
         tx,
+        spare,
         pb_clone,
         extractor,
         parser,
@@ -163,7 +176,9 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
                     bed_conform: args.bed_conform,
                     warp_mode: args.warp_mode,
                 };
-                handler.handle_decoded_frame(decoded, &ctx)?;
+                handler.handle_decoded_frame(&decoded, &ctx)?;
+                // Nobody to hand it back to once the decoder thread is done.
+                let _ = spare_tx.send(decoded);
             }
             Err(e) => {
                 if let Some(pb) = pb {
@@ -258,7 +273,7 @@ fn cmd_decode_eac3(
         }
     }
 
-    handler.finalize()?;
+    handler.finalize(&base_path, args.format, args.no_audio)?;
 
     match decode_thread.join() {
         Ok(Ok(())) => {
@@ -322,6 +337,7 @@ fn cmd_decode_dts(
     let mut handler = DtsDecodeHandler::default();
     handler.warp_mode = args.warp_mode;
     handler.estimate_folds = !args.no_fold_estimate;
+    handler.render_folds = !args.no_fold_render;
     handler.bed_conform = args.bed_conform;
     handler.mono_prefix = args.mono_prefix.clone();
     let start_time = std::time::Instant::now();
@@ -367,6 +383,82 @@ fn cmd_decode_dts(
         }
     }
 
+    Ok(())
+}
+
+/// Decode a standalone IAMF OBU stream into a master set: the objects of
+/// the selected mix as objects, its other elements as the bed.
+///
+/// One thread: the decoder hands out each temporal unit's buffers in place,
+/// and writing them is a small share of the cost of decoding them.
+#[cfg(feature = "iamf")]
+fn cmd_decode_iamf(
+    args: &DecodeArgs,
+    cli: &Cli,
+    multi: Option<&MultiProgress>,
+    prefix: Vec<u8>,
+) -> Result<()> {
+    use super::iamf_handler::IamfDecodeHandler;
+    use crate::iamf::IamfReader;
+
+    log::info!(
+        "Decoding IAMF stream: {} (strict mode: {})",
+        args.input.display(),
+        cli.strict
+    );
+
+    // Spinner only: temporal units are not counted ahead.
+    let pb = if let Some(multi) = multi {
+        Some(create_progress_bar(multi, None)?)
+    } else {
+        None
+    };
+
+    let mut handler = IamfDecodeHandler::new(args.output_path.clone());
+    handler.mono_prefix = args.mono_prefix.clone();
+    handler.no_audio = args.no_audio;
+    handler.warp_mode = args.warp_mode;
+    handler.bed_conform = args.bed_conform;
+    handler.pb = pb.clone();
+    let start_time = std::time::Instant::now();
+
+    let mut reader = IamfReader::new(cli.strict);
+    let mut decode = || -> Result<()> {
+        // What the probe read off a pipe comes first.
+        reader.push(&prefix, &mut handler)?;
+        let mut input = InputReader::new(&args.input)?;
+        input.process_chunks(1 << 20, |chunk| {
+            reader.push(chunk, &mut handler)?;
+            Ok(true)
+        })?;
+        reader.finish(&mut handler)?;
+        handler.finalize()
+    };
+    if let Err(e) = decode() {
+        if let Some(pb) = &pb {
+            pb.finish_with_message("decode failed");
+        }
+        return Err(e);
+    }
+    if reader.skipped > 0 {
+        log::warn!(
+            "{} bytes before the first IA sequence header were skipped",
+            reader.skipped
+        );
+    }
+
+    finalize_progress_bar(
+        &pb,
+        None,
+        handler.decoded_samples,
+        handler.final_sample_rate,
+        start_time,
+    );
+    log::info!(
+        "IAMF decoding completed successfully: {} temporal units, {} samples",
+        reader.units,
+        handler.decoded_samples
+    );
     Ok(())
 }
 

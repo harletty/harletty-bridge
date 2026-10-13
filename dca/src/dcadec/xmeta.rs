@@ -140,7 +140,7 @@ const STANDARD_HEIGHTS: [SpatialChannel; 4] = [
     SpatialChannel::TopBackLeft,
     SpatialChannel::TopBackRight,
 ];
-const FIXED_HEIGHT_COUNT: usize = 4;
+pub(crate) const FIXED_HEIGHT_COUNT: usize = 4;
 /// Unread type-3 control word; every corpus stream carries this value.
 const TYPE3_CONTROL: u32 = 0x3fa;
 const UNITY_CODE: u32 = 61;
@@ -278,8 +278,11 @@ pub enum BedFold {
     /// Linear gain of the waveform in each reference column; 0.0 is absent.
     Known([f32; REFERENCE_CHANNELS]),
     /// The waveform is in the bed, but the stream does not say at which
-    /// gains (an object record without reference rows). Nothing can be
-    /// subtracted, so the waveform must not be rendered a second time.
+    /// gains (an object record without reference rows). When the metadata
+    /// marks it rendered ([`XMetadata::fold_is_rendered`]) the encoder panned
+    /// it from its position and [`crate::FoldRenderer`] recomputes the gains;
+    /// otherwise nothing can be subtracted, so the waveform must not be
+    /// rendered a second time.
     Unknown,
 }
 
@@ -310,6 +313,12 @@ pub struct XMetadata {
     count: usize,
     reference_speakers: [u8; REFERENCE_CHANNELS],
     reference_count: usize,
+    /// Bit `k` set when waveform `k`'s fold is the encoder's render of its
+    /// position (a mode-0 object record).
+    rendered: u16,
+    /// Bit `k` set when that render folds its virtual speakers directly into
+    /// the bed speaker under each.
+    direct: u16,
 }
 
 impl XMetadata {
@@ -353,6 +362,8 @@ impl XMetadata {
             count: sources.len(),
             reference_speakers,
             reference_count,
+            rendered: 0,
+            direct: 0,
         })
     }
 
@@ -371,6 +382,31 @@ impl XMetadata {
 
     pub fn sources(&self) -> impl Iterator<Item = &SourceMetadata> {
         self.sources[..self.count].iter().flatten()
+    }
+
+    /// Whether waveform `feed` is an object the encoder rendered into the bed
+    /// from its transmitted position, without stating the gains.
+    pub fn fold_is_rendered(&self, feed: usize) -> bool {
+        feed < self.count && self.rendered & (1 << feed) != 0
+    }
+
+    /// Whether that render folds its virtual speakers directly into the bed
+    /// speaker under each, rather than spreading them.
+    pub fn fold_is_direct(&self, feed: usize) -> bool {
+        self.fold_is_rendered(feed) && self.direct & (1 << feed) != 0
+    }
+
+    /// Mark waveform `feed` as rendered from its position (see
+    /// [`Self::fold_is_rendered`]), for metadata assembled by hand.
+    pub fn mark_rendered(&mut self, feed: usize, direct: bool) {
+        if feed < self.count {
+            self.rendered |= 1 << feed;
+            if direct {
+                self.direct |= 1 << feed;
+            } else {
+                self.direct &= !(1 << feed);
+            }
+        }
     }
 }
 
@@ -453,6 +489,29 @@ impl FoldPlan {
         self.unknown != 0
     }
 
+    /// Give waveform `feed` a gain in `speaker` that ramps from `start` to
+    /// `target` over `length` samples. Both zero leaves the speaker alone.
+    pub(crate) fn set_ramp(
+        &mut self,
+        speaker: usize,
+        feed: usize,
+        start: f32,
+        target: f32,
+        length: usize,
+    ) {
+        if speaker >= FOLD_SPEAKERS || feed >= self.count || (start == 0.0 && target == 0.0) {
+            return;
+        }
+        self.gains[speaker][feed] = start;
+        self.slope[speaker][feed] = (target - start) / length.max(1) as f32;
+        self.used[speaker] |= 1 << feed;
+    }
+
+    /// Waveform `feed` now has a fold and may be rendered on its own channel.
+    pub(crate) fn mark_known(&mut self, feed: usize) {
+        self.unknown &= !(1u16 << feed);
+    }
+
     /// The gain of waveform `feed` in `speaker` at the start of the frame
     /// (zero when it contributes nothing there).
     pub fn gain(&self, speaker: usize, feed: usize) -> f32 {
@@ -490,6 +549,39 @@ impl FoldPlan {
             }
         }
         value
+    }
+
+    /// [`Self::clean`] over a whole channel: `out[s]` becomes
+    /// `clean(speaker, bed[s], s, sources)` for every sample `s` of `bed`,
+    /// with the same arithmetic in the same order, so the same bits.
+    /// `out` must be at least as long as `bed`.
+    pub fn clean_channel(
+        &self,
+        speaker: usize,
+        bed: &[f32],
+        sources: &[Vec<f32>],
+        out: &mut [f32],
+    ) {
+        let out = &mut out[..bed.len()];
+        out.copy_from_slice(bed);
+        let Some(&used) = self.used.get(speaker) else {
+            return;
+        };
+        for (feed, source) in sources.iter().enumerate().take(self.count) {
+            if used & (1 << feed) == 0 {
+                continue;
+            }
+            let gain = self.gains[speaker][feed];
+            let slope = self.slope[speaker][feed];
+            let n = source.len().min(out.len());
+            for (s, (value, &x)) in out[..n].iter_mut().zip(&source[..n]).enumerate() {
+                *value -= (gain + slope * s as f32) * x;
+            }
+            // Past the end of a short waveform `clean` reads a zero sample.
+            for (s, value) in out.iter_mut().enumerate().skip(n) {
+                *value -= (gain + slope * s as f32) * 0.0;
+            }
+        }
     }
 }
 
@@ -723,11 +815,18 @@ fn parse_standard(payload: &[u8], source_count: usize) -> R<XMetadata> {
     }
     b.expect(5, 2, "matrix header field")?;
     b.expect(6, 0, "matrix header value")?;
-    b.expect(1, 1, "matrix mode")?;
+    // Set on a lossless carrier (XLL-X), clear on a lossy one (the
+    // extension after an XXCH asset), which also states no level in its
+    // layout header, carries two reserved bits before its rows and one
+    // trailing byte after them. Its rows read the same.
+    let lossless_form = b.read(1)? != 0;
     b.expect(1, 0, "optional matrix parameters")?;
     b.expect(1, 1, "inline matrix flag")?;
     b.expect(6, UNITY_CODE, "matrix scale")?;
     b.expect(1, 0, "additional scales")?;
+    if !lossless_form {
+        b.expect(2, 0, "lossy matrix reserved")?;
+    }
     let mut sources = [None; MAX_SOURCES];
     for (feed, &height) in STANDARD_HEIGHTS.iter().enumerate() {
         let mask = b.read(REFERENCE_CHANNELS)?;
@@ -741,6 +840,11 @@ fn parse_standard(payload: &[u8], source_count: usize) -> R<XMetadata> {
         });
     }
     b.align("matrix padding")?;
+    if !lossless_form {
+        // Meaning unknown (0x54 across the corpus); it follows the rows, so
+        // it cannot change what they said, and the CRC still covers it.
+        b.read(8)?;
+    }
     let protected = b.pos / 8 + 2;
     let bytes = payload.get(..protected).ok_or(XMetadataError::Truncated)?;
     if crc16_ccitt(bytes) != 0 {
@@ -751,6 +855,8 @@ fn parse_standard(payload: &[u8], source_count: usize) -> R<XMetadata> {
         count: FIXED_HEIGHT_COUNT,
         reference_speakers: REFERENCE_SPEAKERS.map(|speaker| speaker as u8),
         reference_count: REFERENCE_CHANNELS,
+        rendered: 0,
+        direct: 0,
     })
 }
 
@@ -774,9 +880,11 @@ fn layout_header(b: &mut Bits<'_>, kind: u32, inherited: u32) -> R<(u32, u32)> {
         b.expect(4, 0, "implicit reference field")?;
         inherited
     };
-    b.expect(1, 1, "level field present")?;
-    b.expect(6, UNITY_CODE, "level code")?;
-    b.expect(1, 0, "additional level")?;
+    // A lossless carrier states a unity level here; a lossy one none.
+    if b.read(1)? != 0 {
+        b.expect(6, UNITY_CODE, "level code")?;
+        b.expect(1, 0, "additional level")?;
+    }
     let width = 4 * (b.read(3)? as usize + 1);
     let output_mask = b.read(width)?;
     if output_mask & reference_mask != reference_mask {
@@ -811,7 +919,9 @@ fn parse_alternate(payload: &[u8], source_count: usize) -> R<XMetadata> {
     // envelope CRC follows it directly (object-only variant), or a type-3
     // element describing the height quartet does and must end exactly at
     // the CRC.
-    let (type3_start, object_count, reference_mask) = parse_type241(prefix, &mut sources)?;
+    let mut renders = RenderedFolds::default();
+    let (type3_start, object_count, reference_mask) =
+        parse_type241(prefix, &mut sources, &mut renders)?;
     let (reference_speakers, reference_count) = reference_speakers(reference_mask)
         .ok_or(XMetadataError::Unsupported("reference layout"))?;
     let heights_present = type3_start + 2 != prefix.len();
@@ -834,6 +944,8 @@ fn parse_alternate(payload: &[u8], source_count: usize) -> R<XMetadata> {
         count: source_count,
         reference_speakers,
         reference_count,
+        rendered: renders.rendered,
+        direct: renders.direct,
     })
 }
 
@@ -897,7 +1009,22 @@ fn parse_type3(bytes: &[u8], reference_mask: u32) -> R<[SourceMetadata; FIXED_HE
 /// fixed-channel alternatives. Fills `objects` by declared index and returns
 /// the byte offset at which the next element starts, the declared object
 /// count and the reference mask the rows are expressed over.
-fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<(usize, usize, u32)> {
+/// Which type-241 records leave their fold to the renderer, by waveform.
+#[derive(Default)]
+struct RenderedFolds {
+    rendered: u16,
+    direct: u16,
+}
+
+/// Position-options bit that folds a rendered object's virtual speakers
+/// directly into the bed speaker under each (0x24 rather than 0x20).
+const POSITION_DIRECT_FOLD: u32 = 0x04;
+
+fn parse_type241(
+    bytes: &[u8],
+    objects: &mut [Option<SourceMetadata>],
+    renders: &mut RenderedFolds,
+) -> R<(usize, usize, u32)> {
     let mut b = Bits { bytes, pos: 0 };
     for (width, value) in [
         (8, 241),
@@ -990,9 +1117,11 @@ fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<(usi
         }
         // 0x20 on every stream but one, which sets one further bit without
         // adding a field: the element still ends exactly on its CRC boundary.
-        match b.read(7)? {
-            0x20 | 0x24 => {}
-            _ => return Err(XMetadataError::Unsupported("type-241 position options")),
+        // That bit chooses how a rendered object's virtual speakers fold into
+        // the bed (see `xrender`); 0x20 also flags the elevation as present.
+        let position_options = b.read(7)?;
+        if !matches!(position_options, 0x20 | 0x24) {
+            return Err(XMetadataError::Unsupported("type-241 position options"));
         }
         b.expect(1, 1, "type-241 gain present")?;
         b.expect(1, 1, "type-241 position flag")?;
@@ -1016,6 +1145,13 @@ fn parse_type241(bytes: &[u8], objects: &mut [Option<SourceMetadata>]) -> R<(usi
             }
             BedFold::Known(fold)
         } else {
+            // Mode 0: no rows. The encoder rendered the object into the bed
+            // from this position.
+            let bit = 1u16 << indices[record];
+            renders.rendered |= bit;
+            if position_options & POSITION_DIRECT_FOLD != 0 {
+                renders.direct |= bit;
+            }
             BedFold::Unknown
         };
         objects[indices[record]] = Some(SourceMetadata {
@@ -1672,6 +1808,44 @@ mod tests {
 
     const Q55: f32 = 23170.0 / 32768.0;
 
+    /// The type-2 matrix a lossy carrier's extension opens with reads the
+    /// same fold as the lossless profile's: the four fixed heights into
+    /// L, R, Lsr and Rsr at 0.707. Its envelope differs (no level field,
+    /// matrix form flag clear, two reserved bits, a trailing byte).
+    #[test]
+    fn lossy_carrier_wrapper_states_the_standard_fold() {
+        let lossless: [u8; 22] = [
+            0x02, 0x00, 0x08, 0x50, 0x28, 0x4b, 0xfa, 0x71, 0x0d, 0x62, 0x02, 0xfa, 0x02, 0xdc,
+            0x13, 0x71, 0x0d, 0xc8, 0x37, 0x3c, 0xf1, 0x02,
+        ];
+        let lossy: [u8; 22] = [
+            0x02, 0x00, 0x08, 0x50, 0x28, 0x4b, 0x38, 0x86, 0xb1, 0x00, 0x7d, 0x00, 0x5b, 0x82,
+            0x6e, 0x21, 0xb9, 0x06, 0xe0, 0x54, 0x8f, 0x00,
+        ];
+        let from_lossless = XMetadata::parse(&lossless, 4).expect("lossless wrapper");
+        let from_lossy = XMetadata::parse(&lossy, 4).expect("lossy wrapper");
+        assert_eq!(from_lossless, from_lossy);
+        assert_eq!(from_lossy.source_count(), 4);
+        for (feed, (height, column)) in STANDARD_HEIGHTS.iter().zip([1usize, 2, 4, 5]).enumerate() {
+            let source = from_lossy.source(feed).expect("height source");
+            assert_eq!(source.role, SourceRole::Height(*height));
+            let BedFold::Known(row) = source.fold else {
+                panic!("feed {feed}: fold not stated");
+            };
+            for (c, &gain) in row.iter().enumerate() {
+                let expected = if c == column { Q55 } else { 0.0 };
+                assert!(
+                    (gain - expected).abs() < 1e-6,
+                    "feed {feed} column {c}: {gain}"
+                );
+            }
+        }
+        // A corrupted trailer fails the CRC, as any other byte would.
+        let mut damaged = lossy;
+        damaged[19] ^= 0x01;
+        assert!(XMetadata::parse(&damaged, 4).is_err());
+    }
+
     #[test]
     fn gain_codes_follow_the_downmix_table_at_the_verified_points() {
         assert_eq!(gain_code_linear(61), Some(1.0));
@@ -1728,6 +1902,47 @@ mod tests {
         }
         .to_adm_cartesian();
         assert!(up[0].abs() < 1e-9 && up[1].abs() < 1e-9 && (up[2] - 0.5).abs() < 1e-9);
+    }
+
+    /// `clean_channel` gives `clean`'s bits on every sample, with ramped
+    /// gains, unused and unknown feeds, waveforms shorter than the bed and a
+    /// speaker past the table.
+    #[test]
+    fn clean_channel_matches_clean_bit_for_bit() {
+        let mut plan = FoldPlan::all_unknown(0);
+        plan.count = 5;
+        let mut state = 99u32;
+        let mut rand = || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((state >> 8) & 0xffff) as f32 / 65_536.0 - 0.5
+        };
+        for speaker in 0..FOLD_SPEAKERS {
+            for feed in 0..plan.count {
+                if (speaker + feed) % 3 != 0 {
+                    plan.gains[speaker][feed] = rand();
+                    plan.slope[speaker][feed] = rand() * 1e-3;
+                    plan.used[speaker] |= 1 << feed;
+                }
+            }
+        }
+        plan.unknown = 1 << 4;
+        let bed: Vec<f32> = (0..512).map(|_| rand()).collect();
+        let sources: Vec<Vec<f32>> = [512, 512, 300, 0, 512, 512]
+            .iter()
+            .map(|&n| (0..n).map(|_| rand()).collect())
+            .collect();
+        for speaker in [0, 1, 5, 15, FOLD_SPEAKERS + 2] {
+            let mut out = vec![0.0f32; bed.len() + 7];
+            plan.clean_channel(speaker, &bed, &sources, &mut out);
+            for (s, &x) in bed.iter().enumerate() {
+                let expected = plan.clean(speaker, x, s, &sources);
+                assert_eq!(
+                    out[s].to_bits(),
+                    expected.to_bits(),
+                    "speaker {speaker} sample {s}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1949,7 +2164,16 @@ mod tests {
                 if feed == 0 { -69 } else { 69 }
             );
             assert_eq!(position.elevation_half_degrees, 24);
+            assert!(
+                metadata.fold_is_rendered(feed),
+                "a mode-0 object is rendered"
+            );
+            assert!(
+                !metadata.fold_is_direct(feed),
+                "0x20 spreads the virtual folds"
+            );
         }
+        assert!((2..6).all(|feed| !metadata.fold_is_rendered(feed)));
         let plan = FoldPlan::from_metadata(&metadata);
         assert!(!plan.source_is_known(0) && !plan.source_is_known(1));
         assert!((2..6).all(|feed| plan.source_is_known(feed)));
@@ -2201,6 +2425,14 @@ mod tests {
         let plan = FoldPlan::from_metadata(&metadata);
         assert!(!plan.source_is_known(0), "the object's fold is withheld");
         assert!((1..5).all(|feed| plan.source_is_known(feed)));
+        assert!(metadata.fold_is_rendered(0) && metadata.fold_is_direct(0));
+
+        // Rendered from its position, the centre object folds into C alone.
+        let mut rendered = plan;
+        crate::dcadec::xrender::FoldRenderer::new().apply(&mut rendered, &metadata, 4);
+        assert!(rendered.source_is_known(0));
+        assert!((rendered.gain(0, 0) - 1.0).abs() < 1e-6);
+        assert!((1..FOLD_SPEAKERS).all(|speaker| rendered.gain(speaker, 0) == 0.0));
 
         // The corpus frame itself reads the same way.
         let corpus = XMetadata::parse(&D0_MODE_ZERO_PAYLOAD, 5).expect("corpus frame");

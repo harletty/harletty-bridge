@@ -4,7 +4,7 @@ events:
     samplePos: 0
     active: true
     importance: 0.0
-    gain: 1
+    gain: 0
     rampLength: 1536
     trimBypass: false
     headTrackMode: undefined

@@ -66,7 +66,7 @@ fn convert_object_block(
     };
 
     info.object_basic_info = ObjectBasicInfo {
-        object_gain: gain_to_i8(eac3_block.gain),
+        object_gain: gain_to_i8(eac3_block.gain_db),
         object_priority: eac3_block.priority.map(|p| p as f64 / 31.0).unwrap_or(0.0),
     };
 
@@ -228,6 +228,15 @@ mod tests {
     }
 
     #[test]
+    fn object_gain_converts_as_db() {
+        assert_eq!(gain_to_i8(Some(0.0)), 0);
+        assert_eq!(gain_to_i8(Some(-6.0)), -6);
+        assert_eq!(gain_to_i8(Some(15.0)), 15);
+        assert_eq!(gain_to_i8(Some(f32::NEG_INFINITY)), GAIN_MINUS_INFINITY);
+        assert_eq!(gain_to_i8(None), 0);
+    }
+
+    #[test]
     fn converts_object_with_position() {
         let block = OamdObjectBlock {
             inactive: false,
@@ -236,7 +245,8 @@ mod tests {
             render_info_status: 1,
             render_info_blocks: Some(15),
             anchor: ObjectAnchor::Room,
-            gain: Some(0.0),
+            gain_db: Some(0.0),
+            gain_from_previous_object: false,
             priority: Some(31),
             valid_position: true,
             differential_position: false,
@@ -286,7 +296,8 @@ mod tests {
             render_info_status: 0,
             render_info_blocks: None,
             anchor: ObjectAnchor::Speaker,
-            gain: Some(0.0),
+            gain_db: Some(0.0),
+            gain_from_previous_object: false,
             priority: Some(31),
             valid_position: false,
             differential_position: false,
@@ -304,7 +315,8 @@ mod tests {
             render_info_status: 1,
             render_info_blocks: Some(15),
             anchor: ObjectAnchor::Room,
-            gain: Some(0.0),
+            gain_db: Some(0.0),
+            gain_from_previous_object: false,
             priority: Some(31),
             valid_position: true,
             differential_position: false,

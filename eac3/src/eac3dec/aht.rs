@@ -66,12 +66,12 @@ const IDCT6_COEFF_2: i64 = 3070444;
 
 /// 6-point IDCT over one bin's pre-mantissas, 24-bit fixed point
 /// (FFmpeg `idct6`).
-fn idct6(pre_mant: &mut [i32; 6]) {
+const fn idct6(pre_mant: &mut [i32; 6]) {
     let odd1 = pre_mant[1] - pre_mant[3] - pre_mant[5];
 
-    let scaled2 = ((i64::from(pre_mant[2]) * IDCT6_COEFF_0) >> 23) as i32;
-    let scaled4 = ((i64::from(pre_mant[4]) * IDCT6_COEFF_1) >> 23) as i32;
-    let scaled15 = ((i64::from(pre_mant[1] + pre_mant[5]) * IDCT6_COEFF_2) >> 23) as i32;
+    let scaled2 = (((pre_mant[2] as i64) * IDCT6_COEFF_0) >> 23) as i32;
+    let scaled4 = (((pre_mant[4] as i64) * IDCT6_COEFF_1) >> 23) as i32;
+    let scaled15 = ((((pre_mant[1] + pre_mant[5]) as i64) * IDCT6_COEFF_2) >> 23) as i32;
 
     let base = pre_mant[0] + (scaled4 >> 1);
     let even1 = pre_mant[0] - scaled4;
@@ -89,15 +89,40 @@ fn idct6(pre_mant: &mut [i32; 6]) {
     pre_mant[5] = even0 - odd0;
 }
 
-fn vq_row(hebap: usize, code: usize) -> Option<&'static [i16; 6]> {
+// A VQ index already determines all six blocks, so its inverse transform
+// can be shared by every frame instead of recomputed for each coded bin.
+const fn transformed<const N: usize>(table: &[[i16; 6]; N]) -> [[i32; 6]; N] {
+    let mut out = [[0; 6]; N];
+    let mut row = 0;
+    while row < N {
+        let mut column = 0;
+        while column < 6 {
+            out[row][column] = (table[row][column] as i32) << 8;
+            column += 1;
+        }
+        idct6(&mut out[row]);
+        row += 1;
+    }
+    out
+}
+
+static IDCT_VQ_1: [[i32; 6]; 4] = transformed(&VQ_HEBAP1);
+static IDCT_VQ_2: [[i32; 6]; 8] = transformed(&VQ_HEBAP2);
+static IDCT_VQ_3: [[i32; 6]; 16] = transformed(&VQ_HEBAP3);
+static IDCT_VQ_4: [[i32; 6]; 32] = transformed(&VQ_HEBAP4);
+static IDCT_VQ_5: [[i32; 6]; 128] = transformed(&VQ_HEBAP5);
+static IDCT_VQ_6: [[i32; 6]; 256] = transformed(&VQ_HEBAP6);
+static IDCT_VQ_7: [[i32; 6]; 512] = transformed(&VQ_HEBAP7);
+
+fn vq_row(hebap: usize, code: usize) -> Option<&'static [i32; 6]> {
     match hebap {
-        1 => VQ_HEBAP1.get(code),
-        2 => VQ_HEBAP2.get(code),
-        3 => VQ_HEBAP3.get(code),
-        4 => VQ_HEBAP4.get(code),
-        5 => VQ_HEBAP5.get(code),
-        6 => VQ_HEBAP6.get(code),
-        7 => VQ_HEBAP7.get(code),
+        1 => IDCT_VQ_1.get(code),
+        2 => IDCT_VQ_2.get(code),
+        3 => IDCT_VQ_3.get(code),
+        4 => IDCT_VQ_4.get(code),
+        5 => IDCT_VQ_5.get(code),
+        6 => IDCT_VQ_6.get(code),
+        7 => IDCT_VQ_7.get(code),
         _ => None,
     }
 }
@@ -122,7 +147,14 @@ pub(super) fn decode_pre_mantissas(
         return Err(ParseError::InvalidHeader("aht-range"));
     }
 
-    let gaq_mode = reader.read_bits(2).ok_or(ParseError::ShortPacket)?;
+    // The channel's fields are read without a check each: past the end of
+    // the data they read as zeros, and where the channel stopped is held
+    // against the reader's limit once, when it is done.
+    let mut fields = Fields {
+        data: reader.data(),
+        position: reader.position(),
+    };
+    let gaq_mode = fields.take(2);
     let end_bap: u8 = if gaq_mode < 2 { 12 } else { 17 };
 
     // GAQ gain codes for bins with 8 <= hebap < end_bap, transmitted before
@@ -134,7 +166,7 @@ pub(super) fn decode_pre_mantissas(
         GAQ_MODE_12 | GAQ_MODE_14 => {
             for bin in start..end {
                 if hebap[bin] > 7 && hebap[bin] < end_bap {
-                    let bit = reader.read_bits(1).ok_or(ParseError::ShortPacket)? as i32;
+                    let bit = fields.take(1) as i32;
                     let Some(slot) = gaq_gain.get_mut(gain_count) else {
                         return Err(ParseError::InvalidHeader("aht-gaq-gain"));
                     };
@@ -151,8 +183,7 @@ pub(super) fn decode_pre_mantissas(
                     if group_slot == 2 {
                         // Out-of-range group codes clamp to the last valid
                         // group, matching FFmpeg's warn-and-clamp behavior.
-                        let group_code =
-                            (reader.read_bits(5).ok_or(ParseError::ShortPacket)? as usize).min(26);
+                        let group_code = (fields.take(5) as usize).min(26);
                         let Some(group) = gaq_gain.get_mut(gain_count..gain_count + 3) else {
                             return Err(ParseError::InvalidHeader("aht-gaq-gain"));
                         };
@@ -182,16 +213,13 @@ pub(super) fn decode_pre_mantissas(
             // here; this decoder deliberately leaves them silent (see the
             // non-AHT bap==0 path).
             *pre = [0; 6];
-            continue;
         } else if bap < 8 {
             // Vector quantization: one codebook index covers all six blocks.
-            let code = reader.read_bits(bits).ok_or(ParseError::ShortPacket)? as usize;
+            let code = fields.take(bits) as usize;
             let Some(row) = vq_row(bap, code) else {
                 return Err(ParseError::InvalidHeader("aht-vq"));
             };
-            for (slot, &value) in pre.iter_mut().zip(row) {
-                *slot = i32::from(value) << 8;
-            }
+            *pre = *row;
         } else {
             // Gain-adaptive quantization. `log_gain` is non-zero only for
             // `hebap < end_bap` (<= 16), which is what keeps the `hebap - 8`
@@ -210,16 +238,12 @@ pub(super) fn decode_pre_mantissas(
             let gbits = bits - log_gain;
 
             for slot in pre.iter_mut() {
-                let mut mant = reader
-                    .read_signed_bits(gbits)
-                    .ok_or(ParseError::ShortPacket)?;
+                let mut mant = fields.take_signed(gbits);
                 if log_gain > 0 && mant == -(1 << (gbits - 1)) {
                     // Escape code: a large mantissa follows, remapped for the
                     // asymmetric quantizer.
                     let mbits = bits - (2 - log_gain);
-                    mant = reader
-                        .read_signed_bits(mbits)
-                        .ok_or(ParseError::ShortPacket)?;
+                    mant = fields.take_signed(mbits);
                     mant = ((mant as u32) << (23 - (mbits - 1))) as i32;
                     let offset = if mant >= 0 {
                         1 << (23 - log_gain)
@@ -238,11 +262,39 @@ pub(super) fn decode_pre_mantissas(
                 }
                 *slot = mant;
             }
+            idct6(pre);
         }
-        idct6(pre);
     }
 
+    if fields.position > reader.limit_bits() {
+        return Err(ParseError::ShortPacket);
+    }
+    reader.set_position(fields.position);
     Ok(())
+}
+
+/// The bitstream from a position on, read a field at a time with no check:
+/// see [`BitReader::word_at`]. A field is 1 to 32 bits.
+struct Fields<'a> {
+    data: &'a [u8],
+    position: usize,
+}
+
+impl Fields<'_> {
+    #[inline(always)]
+    fn take(&mut self, bits: usize) -> u32 {
+        let word = BitReader::word_at(self.data, self.position);
+        self.position += bits;
+        (word >> (64 - bits)) as u32
+    }
+
+    /// A field as a two's complement number.
+    #[inline(always)]
+    fn take_signed(&mut self, bits: usize) -> i32 {
+        let word = BitReader::word_at(self.data, self.position) as i64;
+        self.position += bits;
+        (word >> (64 - bits)) as i32
+    }
 }
 
 // VQ codebooks for hebap 1..=7 (FFmpeg eac3_data.c vq_hebap1..7, ATSC A/52
@@ -1228,6 +1280,237 @@ pub(super) const VQ_HEBAP7: [[i16; 6]; 512] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_vq_row(hebap: usize, code: usize) -> Option<&'static [i16; 6]> {
+        match hebap {
+            1 => VQ_HEBAP1.get(code),
+            2 => VQ_HEBAP2.get(code),
+            3 => VQ_HEBAP3.get(code),
+            4 => VQ_HEBAP4.get(code),
+            5 => VQ_HEBAP5.get(code),
+            6 => VQ_HEBAP6.get(code),
+            7 => VQ_HEBAP7.get(code),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn every_precomputed_vq_row_matches_runtime_idct() {
+        let mut checked = 0;
+        for (bap, &bits) in BITS_VS_HEBAP.iter().enumerate().take(8).skip(1) {
+            for code in 0..1 << bits {
+                let mut expected = raw_vq_row(bap, code).unwrap().map(|v| i32::from(v) << 8);
+                idct6(&mut expected);
+                assert_eq!(vq_row(bap, code), Some(&expected), "bap={bap}, code={code}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 956);
+    }
+
+    /// The decode as it was first written: every field through the reader,
+    /// checked one by one.
+    fn decode_pre_mantissas_checked(
+        reader: &mut BitReader<'_>,
+        hebap: &[u8],
+        start: usize,
+        end: usize,
+        pre_mantissas: &mut [[i32; 6]],
+    ) -> Result<(), ParseError> {
+        debug_assert!(end <= hebap.len() && end <= pre_mantissas.len());
+        if end > hebap.len() || end > pre_mantissas.len() {
+            return Err(ParseError::InvalidHeader("aht-range"));
+        }
+
+        let gaq_mode = reader.read_bits(2).ok_or(ParseError::ShortPacket)?;
+        let end_bap: u8 = if gaq_mode < 2 { 12 } else { 17 };
+
+        // GAQ gain codes for bins with 8 <= hebap < end_bap, transmitted before
+        // any mantissas. Grouped codes are written three at a time, so up to two
+        // slots past the eligible-bin count (<= 256) can be touched.
+        let mut gaq_gain = [0i32; 258];
+        let mut gain_count = 0usize;
+        match gaq_mode {
+            GAQ_MODE_12 | GAQ_MODE_14 => {
+                for bin in start..end {
+                    if hebap[bin] > 7 && hebap[bin] < end_bap {
+                        let bit = reader.read_bits(1).ok_or(ParseError::ShortPacket)? as i32;
+                        let Some(slot) = gaq_gain.get_mut(gain_count) else {
+                            return Err(ParseError::InvalidHeader("aht-gaq-gain"));
+                        };
+                        *slot = bit << (gaq_mode - 1);
+                        gain_count += 1;
+                    }
+                }
+            }
+            GAQ_MODE_124 => {
+                // 1.67-bit gain codes: three ternary codes grouped in 5 bits.
+                let mut group_slot = 2usize;
+                for bin in start..end {
+                    if hebap[bin] > 7 && hebap[bin] < 17 {
+                        if group_slot == 2 {
+                            // Out-of-range group codes clamp to the last valid
+                            // group, matching FFmpeg's warn-and-clamp behavior.
+                            let group_code = (reader.read_bits(5).ok_or(ParseError::ShortPacket)?
+                                as usize)
+                                .min(26);
+                            let Some(group) = gaq_gain.get_mut(gain_count..gain_count + 3) else {
+                                return Err(ParseError::InvalidHeader("aht-gaq-gain"));
+                            };
+                            group[0] = (group_code / 9) as i32;
+                            group[1] = ((group_code % 9) / 3) as i32;
+                            group[2] = (group_code % 3) as i32;
+                            gain_count += 3;
+                            group_slot = 0;
+                        } else {
+                            group_slot += 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut gain_index = 0usize;
+        for bin in start..end {
+            let bap = usize::from(hebap[bin]);
+            let Some(&bits) = BITS_VS_HEBAP.get(bap) else {
+                return Err(ParseError::InvalidHeader("hebap"));
+            };
+            let pre = &mut pre_mantissas[bin];
+            if bap == 0 {
+                // Zero-bit mantissas: the reference decoder injects dither noise
+                // here; this decoder deliberately leaves them silent (see the
+                // non-AHT bap==0 path).
+                *pre = [0; 6];
+                continue;
+            } else if bap < 8 {
+                // Vector quantization: one codebook index covers all six blocks.
+                let code = reader.read_bits(bits).ok_or(ParseError::ShortPacket)? as usize;
+                let Some(row) = raw_vq_row(bap, code) else {
+                    return Err(ParseError::InvalidHeader("aht-vq"));
+                };
+                for (slot, &value) in pre.iter_mut().zip(row) {
+                    *slot = i32::from(value) << 8;
+                }
+            } else {
+                // Gain-adaptive quantization. `log_gain` is non-zero only for
+                // `hebap < end_bap` (<= 16), which is what keeps the `hebap - 8`
+                // remap indices inside the 9-entry Gk=2,4 tables; the explicit
+                // bound below makes that invariant enforced rather than implied.
+                let log_gain = if gaq_mode != GAQ_MODE_NONE && hebap[bin] < end_bap {
+                    let gain = gaq_gain.get(gain_index).copied().unwrap_or(0);
+                    gain_index += 1;
+                    (gain as usize).min(2)
+                } else {
+                    0
+                };
+                if log_gain > 0 && bap - 8 >= GAQ_REMAP_2_4_A.len() {
+                    return Err(ParseError::InvalidHeader("aht-gaq-range"));
+                }
+                let gbits = bits - log_gain;
+
+                for slot in pre.iter_mut() {
+                    let mut mant = reader
+                        .read_signed_bits(gbits)
+                        .ok_or(ParseError::ShortPacket)?;
+                    if log_gain > 0 && mant == -(1 << (gbits - 1)) {
+                        // Escape code: a large mantissa follows, remapped for the
+                        // asymmetric quantizer.
+                        let mbits = bits - (2 - log_gain);
+                        mant = reader
+                            .read_signed_bits(mbits)
+                            .ok_or(ParseError::ShortPacket)?;
+                        mant = ((mant as u32) << (23 - (mbits - 1))) as i32;
+                        let offset = if mant >= 0 {
+                            1 << (23 - log_gain)
+                        } else {
+                            i32::from(GAQ_REMAP_2_4_B[bap - 8][log_gain - 1]) << 8
+                        };
+                        let scale = i64::from(GAQ_REMAP_2_4_A[bap - 8][log_gain - 1]);
+                        mant += ((scale * i64::from(mant)) >> 15) as i32 + offset;
+                    } else {
+                        // Small mantissa, no GAQ, or Gk=1.
+                        mant <<= 24 - bits;
+                        if log_gain == 0 {
+                            let scale = i64::from(GAQ_REMAP_1[bap - 8]);
+                            mant += ((scale * i64::from(mant)) >> 15) as i32;
+                        }
+                    }
+                    *slot = mant;
+                }
+            }
+            idct6(pre);
+        }
+
+        Ok(())
+    }
+
+    /// The unchecked reads against the checked ones: the same pre-mantissas,
+    /// the same place in the stream after them, and a short packet where the
+    /// data runs out - over every `hebap`, every GAQ mode (the stream's first
+    /// two bits) and data that ends anywhere from well past the channel to
+    /// inside it.
+    #[test]
+    fn unchecked_fields_match_the_checked_reads() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut short = 0;
+        for round in 0..600 {
+            let end = 1 + (next() >> 20) as usize % 253;
+            let start = if round % 3 == 0 {
+                (next() >> 20) as usize % end
+            } else {
+                0
+            };
+            let mut hebap = [0u8; 256];
+            let mut value = 0u8;
+            for slot in hebap.iter_mut() {
+                if (next() >> 20) % 3 == 0 {
+                    value = ((next() >> 20) % 20) as u8;
+                }
+                *slot = value;
+            }
+            let length = match round % 4 {
+                0 => 4096,
+                _ => 1 + (next() >> 20) as usize % (2 + 6 * 16 * (end - start) / 8),
+            };
+            let data: Vec<u8> = (0..length).map(|_| next() as u8).collect();
+            let offset = ((next() >> 20) as usize % 8).min(length * 8);
+
+            let mut checked_reader = BitReader::with_offset(&data, offset);
+            let mut checked = vec![[0i32; 6]; end];
+            let expected =
+                decode_pre_mantissas_checked(&mut checked_reader, &hebap, start, end, &mut checked);
+            let mut reader = BitReader::with_offset(&data, offset);
+            let mut decoded = vec![[0i32; 6]; end];
+            let result = decode_pre_mantissas(&mut reader, &hebap, start, end, &mut decoded);
+            match expected {
+                Ok(()) => {
+                    assert_eq!(result, Ok(()), "round {round}");
+                    assert_eq!(decoded, checked, "round {round}");
+                    assert_eq!(
+                        reader.position(),
+                        checked_reader.position(),
+                        "round {round}"
+                    );
+                }
+                Err(error) => {
+                    assert_eq!(result, Err(error), "round {round}");
+                    short += 1;
+                }
+            }
+        }
+        assert!(
+            short > 50 && short < 550,
+            "{short} short packets out of 600"
+        );
+    }
 
     /// Reference 6-point IDCT in floating point, from the transform the
     /// fixed-point `idct6` approximates:
