@@ -18,7 +18,7 @@ use crate::dcadec::xll::{DCA_SYNCWORD_XLL_X, XllDecoder, XllError, crc16_ccitt};
 use crate::dcadec::xmeta::FIXED_HEIGHT_COUNT;
 use crate::parser::{ParseError, parse_header};
 
-const PCM_SCALE: f32 = 8_388_608.0; // 2^23
+pub(crate) const PCM_SCALE: f32 = 8_388_608.0; // 2^23
 
 /// The bytes of a lossy carrier's DTS:X extension before its channel set:
 /// the 22-byte wrapper the metadata reader parses (the fold matrix and its
