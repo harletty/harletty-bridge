@@ -32,6 +32,7 @@ use crate::dcadec::xll::{
     DCA_SYNCWORD_XLL_X, DCA_SYNCWORD_XLL_X_ALT_D0, DCA_SYNCWORD_XLL_X_ALT_D1,
     DCA_SYNCWORD_XLL_X_ALT_D3, DCA_SYNCWORD_XLL_X_ALT_D4, alternate_protected_prefix, crc16_ccitt,
 };
+use crate::hd::PCM_SCALE;
 use crate::spatial::SpatialChannel;
 
 /// Most extension waveforms any known profile carries (five objects plus the
@@ -423,6 +424,11 @@ pub struct FoldPlan {
     /// Bit `k` set when waveform `k` contributes to that speaker. Sixteen bits
     /// because the widest profile carries nine waveforms, one more than a byte.
     used: [u16; FOLD_SPEAKERS],
+    /// Bit `k` set when waveform `k`'s gain in that speaker is a stated Q15
+    /// fold, removed with the encoder's own rounded multiply (see
+    /// [`q15_fold`]) so the bed comes back bit for bit; clear for a gain that
+    /// was estimated or recomputed, removed in float.
+    q15: [u16; FOLD_SPEAKERS],
     /// Bit `k` set when waveform `k` has no known fold.
     unknown: u16,
     count: usize,
@@ -437,6 +443,7 @@ impl FoldPlan {
             gains: [[0.0; MAX_SOURCES]; FOLD_SPEAKERS],
             slope: [[0.0; MAX_SOURCES]; FOLD_SPEAKERS],
             used: [0; FOLD_SPEAKERS],
+            q15: [0; FOLD_SPEAKERS],
             unknown: (1u16 << count) - 1,
             count,
         }
@@ -444,15 +451,28 @@ impl FoldPlan {
 
     /// The standard profile's fixed-height fold at one gain for all four
     /// feeds (TFL→L, TFR→R, TBL→Lsr, TBR→Rsr), for a frame whose matrix could
-    /// not be read.
+    /// not be read. The encoder folds in Q15, so `gain` is taken to the
+    /// nearest Q15 step and removed exactly.
     pub fn standard_heights(gain: f32) -> Self {
         let mut plan = Self::all_unknown(0);
         plan.count = FIXED_HEIGHT_COUNT;
         for (feed, &speaker) in [1usize, 2, 7, 8].iter().enumerate() {
-            plan.gains[speaker][feed] = gain;
-            plan.used[speaker] |= 1 << feed;
+            plan.set_stated(speaker, feed, gain);
         }
         plan
+    }
+
+    /// Waveform `feed` was folded into `speaker` at the stated `gain`: a Q15
+    /// multiply when the gain is within reach of one, otherwise a float gain.
+    fn set_stated(&mut self, speaker: usize, feed: usize, gain: f32) {
+        let step = (gain * Q15_ONE).round();
+        if step.abs() <= MAX_Q15_STEP {
+            self.gains[speaker][feed] = step / Q15_ONE;
+            self.q15[speaker] |= 1 << feed;
+        } else {
+            self.gains[speaker][feed] = gain;
+        }
+        self.used[speaker] |= 1 << feed;
     }
 
     pub fn from_metadata(metadata: &XMetadata) -> Self {
@@ -463,9 +483,7 @@ impl FoldPlan {
                 BedFold::Known(columns) => {
                     for (&speaker, &gain) in metadata.reference_speakers().iter().zip(&columns) {
                         if gain != 0.0 {
-                            let speaker = usize::from(speaker);
-                            plan.gains[speaker][feed] = gain;
-                            plan.used[speaker] |= 1 << feed;
+                            plan.set_stated(usize::from(speaker), feed, gain);
                         }
                     }
                 }
@@ -505,6 +523,7 @@ impl FoldPlan {
         self.gains[speaker][feed] = start;
         self.slope[speaker][feed] = (target - start) / length.max(1) as f32;
         self.used[speaker] |= 1 << feed;
+        self.q15[speaker] &= !(1 << feed);
     }
 
     /// Waveform `feed` now has a fold and may be rendered on its own channel.
@@ -540,12 +559,18 @@ impl FoldPlan {
         }
         let gains = &self.gains[speaker];
         let slope = &self.slope[speaker];
+        let q15 = self.q15[speaker];
         let position = sample as f32;
         let mut value = bed;
         for (feed, source) in sources.iter().enumerate().take(self.count) {
-            if used & (1 << feed) != 0 {
-                value -= (gains[feed] + slope[feed] * position)
-                    * source.get(sample).copied().unwrap_or(0.0);
+            if used & (1 << feed) == 0 {
+                continue;
+            }
+            let x = source.get(sample).copied().unwrap_or(0.0);
+            if q15 & (1 << feed) != 0 {
+                value -= q15_fold(q15_factor(gains[feed]), x);
+            } else {
+                value -= (gains[feed] + slope[feed] * position) * x;
             }
         }
         value
@@ -563,17 +588,40 @@ impl FoldPlan {
         out: &mut [f32],
     ) {
         let out = &mut out[..bed.len()];
-        out.copy_from_slice(bed);
-        let Some(&used) = self.used.get(speaker) else {
-            return;
-        };
+        let used = self.used.get(speaker).copied().unwrap_or(0);
+        // The bed until it is copied into `out`: a stated fold reads it in
+        // its own pass rather than after a copy.
+        let mut uncopied = Some(bed);
         for (feed, source) in sources.iter().enumerate().take(self.count) {
             if used & (1 << feed) == 0 {
                 continue;
             }
+            let n = source.len().min(out.len());
+            if self.q15[speaker] & (1 << feed) != 0 {
+                // Past the end of a short waveform the fold of a zero sample
+                // is zero: nothing to remove.
+                let factor = q15_factor(self.gains[speaker][feed]);
+                let (head, tail) = out.split_at_mut(n);
+                match uncopied.take() {
+                    Some(bed) => {
+                        for ((value, &b), &x) in head.iter_mut().zip(&bed[..n]).zip(&source[..n]) {
+                            *value = b - q15_fold(factor, x);
+                        }
+                        tail.copy_from_slice(&bed[n..]);
+                    }
+                    None => {
+                        for (value, &x) in head.iter_mut().zip(&source[..n]) {
+                            *value -= q15_fold(factor, x);
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(bed) = uncopied.take() {
+                out.copy_from_slice(bed);
+            }
             let gain = self.gains[speaker][feed];
             let slope = self.slope[speaker][feed];
-            let n = source.len().min(out.len());
             for (s, (value, &x)) in out[..n].iter_mut().zip(&source[..n]).enumerate() {
                 *value -= (gain + slope * s as f32) * x;
             }
@@ -582,7 +630,45 @@ impl FoldPlan {
                 *value -= (gain + slope * s as f32) * 0.0;
             }
         }
+        if let Some(bed) = uncopied {
+            out.copy_from_slice(bed);
+        }
     }
+}
+
+/// One in Q15.
+const Q15_ONE: f32 = 32_768.0;
+/// Largest Q15 step [`q15_fold`] is exact for: a gain of 2, twice any gain
+/// code's.
+const MAX_Q15_STEP: f32 = 65_536.0;
+/// 1.5 × 2^52: adding then subtracting it rounds an `f64` below 2^51 to the
+/// nearest integer, ties to even.
+const ROUND_TO_INTEGER: f64 = 6_755_399_441_055_744.0;
+
+/// The factor [`q15_fold`] takes for the Q15 gain `gain` = `q / 2^15`:
+/// `q × 2^8`, which turns a sample `x = h / 2^23` into `h × q / 2^15`.
+#[inline]
+fn q15_factor(gain: f32) -> f64 {
+    f64::from(gain) * f64::from(PCM_SCALE)
+}
+
+/// The share `(h × q + 2^14) >> 15` of a waveform sample `x = h / 2^23`
+/// that the encoder folded into the bed at the Q15 gain behind `factor`
+/// (from [`q15_factor`]), as a sample at the bed's scale.
+///
+/// That is the lossless decoder's rounded multiply, `h × q / 2^15` rounded
+/// half up, which is what makes the unfold exact: subtracting it gives the
+/// corner the encoder had before the fold, bit for bit, where a float
+/// product misses by one LSB on about one corner sample in a hundred.
+/// It is computed in `f64` rather than `i64` to stay as cheap as that float
+/// product: `h × q / 2^15` is exact there (under 2^40, fifteen fractional
+/// bits), and adding 2^-16 moves every half-way case off the tie, so
+/// rounding to nearest even rounds those half up and leaves every other
+/// value where round-half-up puts it.
+#[inline(always)]
+fn q15_fold(factor: f64, x: f32) -> f32 {
+    let folded = (f64::from(x) * factor + 1.0 / 65_536.0 + ROUND_TO_INTEGER) - ROUND_TO_INTEGER;
+    (folded / f64::from(PCM_SCALE)) as f32
 }
 
 /// Estimates, from the audio itself, the fold of every waveform whose fold
@@ -1924,6 +2010,11 @@ mod tests {
                     plan.used[speaker] |= 1 << feed;
                 }
             }
+            // Every other speaker also takes a stated Q15 fold.
+            if speaker % 2 == 1 {
+                plan.slope[speaker][speaker % plan.count] = 0.0;
+                plan.set_stated(speaker, speaker % plan.count, rand());
+            }
         }
         plan.unknown = 1 << 4;
         let bed: Vec<f32> = (0..512).map(|_| rand()).collect();
@@ -1943,6 +2034,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The encoder's fold: `(a × b + 2^14) >> 15`.
+    fn rmul15(a: i32, b: i32) -> i32 {
+        ((i64::from(a) * i64::from(b) + (1 << 14)) >> 15) as i32
+    }
+
+    /// [`q15_fold`] is the encoder's rounded multiply on every gain code and
+    /// at its edges: the half-way products of both signs (rounded up, so
+    /// -0.5 goes to 0), the products just either side of them, ±1 LSB and
+    /// full scale.
+    #[test]
+    fn q15_fold_is_the_encoders_rounded_multiply() {
+        let mut steps: Vec<i32> = (1..=UNITY_CODE)
+            .map(|code| (gain_code_linear(code).unwrap() * Q15_ONE) as i32)
+            .collect();
+        steps.extend([1, 2, 32_767, MAX_Q15_STEP as i32]);
+        let mut samples: Vec<i32> = vec![
+            0,
+            1,
+            -1,
+            2,
+            -2,
+            (1 << 23) - 1,
+            -(1 << 23),
+            (1 << 22) + 1,
+            -(1 << 22) - 1,
+        ];
+        samples.extend(-70_000..70_000);
+        for &q in &steps {
+            let factor = q15_factor(q as f32 / Q15_ONE);
+            let mut ties = [0usize; 2];
+            for &h in &samples {
+                let product = i64::from(h) * i64::from(q);
+                if product.rem_euclid(1 << 15) == 1 << 14 {
+                    ties[usize::from(h < 0)] += 1;
+                }
+                let x = h as f32 / PCM_SCALE;
+                let expected = rmul15(h, q) as f32 / PCM_SCALE;
+                assert_eq!(
+                    q15_fold(factor, x).to_bits(),
+                    expected.to_bits(),
+                    "h {h} q {q}"
+                );
+            }
+            if q % 2 == 1 || q == 23_170 {
+                assert!(ties[0] > 0 && ties[1] > 0, "q {q}: no tie of each sign");
+            }
+        }
+        // -0.5 rounds up to 0, +0.5 up to 1.
+        let half = q15_factor(0.5);
+        assert_eq!(q15_fold(half, -1.0 / PCM_SCALE).to_bits(), 0.0f32.to_bits());
+        assert_eq!(q15_fold(half, 1.0 / PCM_SCALE), 1.0 / PCM_SCALE);
+    }
+
+    /// A corner folded as the encoder folds it comes back bit for bit from
+    /// a stated -3 dB fold, where the float product misses one LSB on some
+    /// samples; and the -3 dB of the realtime fallback is that same Q15 step.
+    #[test]
+    fn stated_fold_unfolds_the_corner_exactly() {
+        let payload = standard_payload([(1 << 1, 55), (1 << 2, 55), (1 << 4, 55), (1 << 5, 55)]);
+        let plan = FoldPlan::from_metadata(&XMetadata::parse(&payload, 4).unwrap());
+        let fallback = FoldPlan::standard_heights(10f32.powf(-3.010_478 / 20.0));
+        assert_eq!(fallback, plan);
+
+        let mut state = 7u32;
+        let mut sample = || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (state as i32) >> 9 // a 23-bit value, so the fold cannot clip
+        };
+        let n = 4096;
+        let corner: Vec<i32> = (0..n).map(|_| sample()).collect();
+        let heights: Vec<Vec<i32>> = (0..4).map(|_| (0..n).map(|_| sample()).collect()).collect();
+        let to_f32 = |v: &[i32]| v.iter().map(|&h| h as f32 / PCM_SCALE).collect::<Vec<_>>();
+        let sources: Vec<Vec<f32>> = heights.iter().map(|h| to_f32(h)).collect();
+        let mut misses = 0;
+        for (feed, speaker) in [1usize, 2, 7, 8].into_iter().enumerate() {
+            let folded: Vec<i32> = corner
+                .iter()
+                .zip(&heights[feed])
+                .map(|(&c, &h)| c + rmul15(h, 23_170))
+                .collect();
+            let mut out = vec![0.0; n];
+            plan.clean_channel(speaker, &to_f32(&folded), &sources, &mut out);
+            for (s, (&got, &want)) in out.iter().zip(&corner).enumerate() {
+                assert_eq!(got * PCM_SCALE, want as f32, "speaker {speaker} sample {s}");
+                let float = folded[s] as f32 / PCM_SCALE - Q55 * sources[feed][s];
+                misses += usize::from((float * PCM_SCALE).round() != want as f32);
+            }
+        }
+        assert!(misses > 0, "the float product should miss somewhere");
     }
 
     #[test]
