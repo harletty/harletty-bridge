@@ -790,19 +790,78 @@ mod tests {
 mod reference_parity {
     use super::ImdctState;
 
-    /// Reference IMDCT, windowing and overlap-add for one channel.
-    struct Reference;
+    /// Reference IMDCT, windowing and overlap-add for one channel, evaluated
+    /// directly as the inverse of the forward transform of TS 102 366 clause
+    /// 7.2.3.2: a plain cosine sum with no 1/N factor, carrying the minus
+    /// sign of that clause's leading `-2/N`. Its windowed overlap-add gives
+    /// back half the encoder's input, hence `SCALE`.
+    struct Reference {
+        /// Second half of the previous block's unwindowed 512-sample inverse
+        /// transform output, waiting to be overlap-added.
+        previous: [f64; 256],
+    }
 
-    #[allow(unused_variables)]
     impl Reference {
         fn new() -> Self {
-            unimplemented!("clean-room: see CONTRACTS.md")
+            Self {
+                previous: [0.0; 256],
+            }
         }
 
         /// One block: 256 transform coefficients in, 256 samples out.
         fn apply(&mut self, coeffs: &[f64; 256], block_switch: bool) -> [f64; 256] {
-            unimplemented!("clean-room: see CONTRACTS.md")
+            let mut time = [0.0f64; 512];
+            if block_switch {
+                // Two N = 256 transforms (clause 7.2.3.2, alpha = -1 then +1),
+                // their coefficients interleaved bin by bin (clause 6.9.2):
+                // the first transform's bin k is coefficient 2k, the second's
+                // is 2k + 1. Each yields 256 samples of the 512-sample segment.
+                for (half, alpha) in [(0usize, -1.0f64), (1, 1.0)] {
+                    let spectrum: Vec<f64> = (0..128).map(|k| coeffs[2 * k + half]).collect();
+                    for n in 0..256 {
+                        time[256 * half + n] = inverse_sample(&spectrum, n, 256, alpha);
+                    }
+                }
+            } else {
+                // One N = 512 transform, alpha = 0.
+                for (n, sample) in time.iter_mut().enumerate() {
+                    *sample = inverse_sample(coeffs, n, 512, 0.0);
+                }
+            }
+
+            // 512-point symmetric window built from the 256 values of Table
+            // 6.33 back to back (clause 7.2.3.1), then overlap-add of the
+            // first half with the previous block's second half.
+            let window = |n: usize| -> f64 {
+                if n < 256 {
+                    super::WINDOW[n] as f64
+                } else {
+                    super::WINDOW[511 - n] as f64
+                }
+            };
+            let output: [f64; 256] =
+                std::array::from_fn(|n| window(n) * time[n] + window(n + 256) * self.previous[n]);
+            self.previous.copy_from_slice(&time[256..]);
+            output
         }
+    }
+
+    /// Sample `n` of the inverse of the clause 7.2.3.2 transform of length
+    /// `big_n`: minus the sum over its `big_n / 2` coefficients of
+    /// `X[k] * cos(2 pi / (4 N) * (2n + 1)(2k + 1) + pi / 4 * (2k + 1)(1 + alpha))`.
+    fn inverse_sample(spectrum: &[f64], n: usize, big_n: usize, alpha: f64) -> f64 {
+        use std::f64::consts::PI;
+        let n_term = (2 * n + 1) as f64;
+        -spectrum[..big_n / 2]
+            .iter()
+            .enumerate()
+            .map(|(k, &x)| {
+                let k_term = (2 * k + 1) as f64;
+                let phase = 2.0 * PI / (4 * big_n) as f64 * n_term * k_term
+                    + PI / 4.0 * k_term * (1.0 + alpha);
+                x * phase.cos()
+            })
+            .sum::<f64>()
     }
 
     /// Spectrally shaped pseudo-random coefficients, so the blocks look more
