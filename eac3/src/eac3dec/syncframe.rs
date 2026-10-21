@@ -911,6 +911,19 @@ impl CoreDecodeState {
             .unwrap_or(&[])
     }
 
+    /// Snapshot of the stereo rematrixing flags (`rematflg[rbnd]`, one per
+    /// active rematrixing band) at the end of the most recently decoded
+    /// block. Empty outside 2/0 mode or before the first frame.
+    pub(crate) fn rematrixing_flags_snapshot(&self) -> &[bool] {
+        self.block_syntax
+            .as_ref()
+            .map(|b| {
+                let bands = b.num_rematrixing_bands.min(b.rematrixing_flags.len());
+                &b.rematrixing_flags[..bands]
+            })
+            .unwrap_or(&[])
+    }
+
     fn reconfigure(&mut self, fullband_channels: usize, lfe_on: bool, sample_rate_index: usize) {
         let needs_reset = self.sample_rate_index != Some(sample_rate_index)
             || self.fullband_channels != fullband_channels
@@ -2582,30 +2595,17 @@ fn read_spx(
                     state.chinspx[channel] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
                 }
             }
-            let dst_start_code = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as usize;
+            let spxstrtf = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as usize;
             state.spxbegf = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as usize;
             let spxendf = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as usize;
-            let mut begin_subbnd = state.spxbegf + 2;
-            if begin_subbnd > 7 {
-                begin_subbnd += begin_subbnd - 7;
-            }
-            let mut end_subbnd = spxendf + 5;
-            if end_subbnd > 7 {
-                end_subbnd += end_subbnd - 7;
-            }
-            // Both are hard errors: bailing out mid-syntax would desync every
-            // field after the band structure (FFmpeg rejects them the same
-            // way).
-            if begin_subbnd >= end_subbnd {
-                return Err(ParseError::InvalidHeader("spx-range"));
-            }
+            let SpxLayout {
+                begin_subbnd,
+                end_subbnd,
+            } = spx_layout(spxstrtf, state.spxbegf, spxendf)?;
             state.spx_begin_subbnd = begin_subbnd;
             state.spx_end_subbnd = end_subbnd;
-            state.spx_dst_start_freq = dst_start_code * 12 + 25;
+            state.spx_dst_start_freq = spxstrtf * 12 + 25;
             state.spx_dst_end_freq = end_subbnd * 12 + 25;
-            if state.spx_dst_start_freq >= begin_subbnd * 12 + 25 {
-                return Err(ParseError::InvalidHeader("spx-copy-start"));
-            }
 
             // Banding structure (FFmpeg decode_band_structure): reset to the
             // default table on block 0, optionally overridden from the
@@ -2649,44 +2649,36 @@ fn read_spx(
                     reader.read_bit().ok_or(ParseError::ShortPacket)?
                 };
                 if coordinates_present {
-                    // Field order per A/52 Annex E / FFmpeg spx_coordinates:
-                    // spxblnd (5), mstrspxco (2), then per band spxcoexp (4) +
-                    // spxcomant (2).
-                    let spx_blend =
-                        reader.read_bits(5).ok_or(ParseError::ShortPacket)? as f32 / 32.0;
-                    let master = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as usize * 3;
+                    // spxblnd (5), mstrspxco (2), then per band spxcoexp (4)
+                    // and spxcomant (2): TS 102 366 clause E.1.2.4.
+                    let spxblnd = reader.read_bits(5).ok_or(ParseError::ShortPacket)? as u8;
+                    let mstrspxco = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as u8;
+                    let bands = state.nspxbnds.min(SPX_MAX_SUBBANDS);
+                    let mut spxcoexp = [0u8; SPX_MAX_SUBBANDS];
+                    let mut spxcomant = [0u8; SPX_MAX_SUBBANDS];
+                    for band in 0..bands {
+                        spxcoexp[band] = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as u8;
+                        spxcomant[band] = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as u8;
+                    }
                     while state.spx_signal_blend.len() <= channel {
                         state.spx_signal_blend.push(Vec::new());
                     }
-                    let mut blends = std::mem::take(&mut state.spx_signal_blend[channel]);
-                    blends.clear();
-                    blends.reserve(state.nspxbnds);
-                    let mut bin = state.spx_begin_subbnd * 12 + 25;
-                    for band in 0..state.nspxbnds {
-                        let band_size = state.spx_band_sizes.get(band).copied().unwrap_or_default();
-                        // Signal blending factor: sqrt(1 - nratio), the
-                        // counterpart noise term sqrt(3 * nratio) is not
-                        // modeled (no dither noise in this decoder).
-                        let nratio = ((bin + (band_size >> 1)) as f32
-                            / state.spx_dst_end_freq.max(1) as f32
-                            - spx_blend)
-                            .clamp(0.0, 1.0);
-                        let sblend = (1.0 - nratio).sqrt();
-                        bin += band_size;
-
-                        let exponent = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as usize;
-                        let mut mantissa =
-                            reader.read_bits(2).ok_or(ParseError::ShortPacket)? as i32;
-                        if exponent == 15 {
-                            mantissa <<= 1;
-                        } else {
-                            mantissa += 4;
-                        }
-                        mantissa <<= 25 - exponent - master;
-                        let spx_coord = mantissa as f32 / (1 << 23) as f32;
-                        blends.push(sblend * spx_coord);
-                    }
-                    state.spx_signal_blend[channel] = blends;
+                    let mut scales = std::mem::take(&mut state.spx_signal_blend[channel]);
+                    scales.clear();
+                    scales.resize(bands, 0.0);
+                    spx_band_scales(
+                        &SpxLayout {
+                            begin_subbnd: state.spx_begin_subbnd,
+                            end_subbnd: state.spx_end_subbnd,
+                        },
+                        state.spx_band_sizes.get(..bands).unwrap_or(&[]),
+                        spxblnd,
+                        mstrspxco,
+                        &spxcoexp[..bands],
+                        &spxcomant[..bands],
+                        &mut scales,
+                    );
+                    state.spx_signal_blend[channel] = scales;
                 }
             } else {
                 state.first_spx_coords[channel] = true;
@@ -2695,6 +2687,72 @@ fn read_spx(
     }
 
     Ok(())
+}
+
+/// Spectral extension sub-band range derived from one SPX strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpxLayout {
+    /// `spx_begin_subbnd`: the first spectral extension sub-band.
+    begin_subbnd: usize,
+    /// `spx_end_subbnd`: one past the last spectral extension sub-band.
+    end_subbnd: usize,
+}
+
+/// Derive the spectral extension sub-band range from the transmitted
+/// frequency codes and check it against the copy start.
+fn spx_layout(spxstrtf: usize, spxbegf: usize, spxendf: usize) -> Result<SpxLayout, ParseError> {
+    let mut begin_subbnd = spxbegf + 2;
+    if begin_subbnd > 7 {
+        begin_subbnd += begin_subbnd - 7;
+    }
+    let mut end_subbnd = spxendf + 5;
+    if end_subbnd > 7 {
+        end_subbnd += end_subbnd - 7;
+    }
+    if begin_subbnd >= end_subbnd {
+        return Err(ParseError::InvalidHeader("spx-range"));
+    }
+    if spxstrtf * 12 + 25 >= begin_subbnd * 12 + 25 {
+        return Err(ParseError::InvalidHeader("spx-copy-start"));
+    }
+    Ok(SpxLayout {
+        begin_subbnd,
+        end_subbnd,
+    })
+}
+
+/// One channel's per-band spectral extension scale factors.
+fn spx_band_scales(
+    layout: &SpxLayout,
+    band_sizes: &[usize],
+    spxblnd: u8,
+    mstrspxco: u8,
+    spxcoexp: &[u8],
+    spxcomant: &[u8],
+    scales: &mut [f32],
+) {
+    let spx_blend = spxblnd as f32 / 32.0;
+    let master = mstrspxco as usize * 3;
+    let end_freq = layout.end_subbnd * 12 + 25;
+    let mut bin = layout.begin_subbnd * 12 + 25;
+    for band in 0..scales.len() {
+        let band_size = band_sizes.get(band).copied().unwrap_or_default();
+        let nratio =
+            ((bin + (band_size >> 1)) as f32 / end_freq.max(1) as f32 - spx_blend).clamp(0.0, 1.0);
+        let sblend = (1.0 - nratio).sqrt();
+        bin += band_size;
+
+        let exponent = spxcoexp[band] as usize;
+        let mut mantissa = spxcomant[band] as i32;
+        if exponent == 15 {
+            mantissa <<= 1;
+        } else {
+            mantissa += 4;
+        }
+        mantissa <<= 25 - exponent - master;
+        let spx_coord = mantissa as f32 / (1 << 23) as f32;
+        scales[band] = sblend * spx_coord;
+    }
 }
 
 fn read_coupling_strategy(
