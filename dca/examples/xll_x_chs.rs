@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Search the variable part of an XLL-X payload for a plausible bare XLL
 // channel-set header.  DTS-UHD (ETSI TS 103 491) explicitly permits XLL audio

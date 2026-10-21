@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //! Private DTS:X extension metadata: what the wrapper around the XLL-X channel
 //! sets says about the extension waveforms.
 //!

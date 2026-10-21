@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Hypothesis test: is the DTS:X object payload ([27:]) a stream of N*F Rice
 // codes (N = object count at byte 22, F = fixed values per object)? With Rice

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Characterize the 64 profile-specific bits in the EXSS asset descriptor of
 // XLL-X streams. Legacy TS 102 114 decoders skip this reserved region.

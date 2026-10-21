@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // DTS-HD Master Audio lossless (XLL) decoder. Ported from ffmpeg's dca_xll.c.
 // Supports the single-frequency-band path (freq <= 96 kHz, the common BluRay

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Probe the DTS:X extension of a lossy DTS-HD stream (core + XXCH, no XLL):
 // decode every frame through the HD decoder, report what came out of the

@@ -1,0 +1,46 @@
+dca — DTS Coherent Acoustics parser and decoder
+Licence: GNU Lesser General Public License, version 2.1 or (at your option)
+any later version (LGPL-2.1-or-later). The full text is in LICENSE.
+
+Most of this crate is a Rust translation of FFmpeg's DCA decoder, and is a
+work based on it. The FFmpeg files it was translated from, or whose tables it
+generates from (dca/scripts/gen_tables.py), are all distributed by FFmpeg
+under the LGPL, version 2.1 or later. Their copyright holders, as stated in
+each file's header (libavcodec, FFmpeg 8.0):
+
+  dca.c, dca.h, dca_sample_rate_tab.h
+      Copyright (C) 2004 Gildas Bazin
+      Copyright (C) 2004 Benjamin Zores
+      Copyright (C) 2006 Benjamin Larsson
+      Copyright (C) 2007 Konstantin Shishkov
+      (dca.h also: Copyright (C) 2016 foo86)
+  dca_core.c, dca_core.h, dca_xll.c, dca_exss.c, dcadsp.c, dcadct.c,
+  dcamath.h
+      Copyright (C) 2016 foo86
+  dcaadpcm.h
+      Copyright (C) 2017 Daniil Cherednik
+  synth_filter.c
+      Copyright (c) 2008 Michael Niedermayer
+      Copyright (C) 2016 foo86
+  get_bits.h
+      Copyright (c) 2004 Michael Niedermayer
+  dcadata.c
+      Copyright (C) 2004 Gildas Bazin
+      Copyright (c) 2006 Benjamin Larsson
+  dcahuff.c
+      Copyright (C) 2004 Gildas Bazin
+      Copyright (C) 2007 Konstantin Shishkov
+
+FFmpeg: https://ffmpeg.org/ — source: https://git.ffmpeg.org/ffmpeg.git
+
+The rest of the crate (the DTS:X object metadata and rendering in
+src/dcadec/xmeta.rs and src/dcadec/xrender.rs, src/spatial.rs, the SIMD
+kernels — themselves built on the translated code — the tests, examples and
+fuzz targets) was written by the harletty contributors and is likewise
+distributed under LGPL-2.1-or-later, so that the crate as a whole carries one
+licence.
+
+Releases of this crate made before this notice was added (up to 0.9.0) were
+mislabelled Apache-2.0. That label was wrong: the FFmpeg-derived parts were never
+available under Apache-2.0, and those releases are governed by the LGPL
+terms above.

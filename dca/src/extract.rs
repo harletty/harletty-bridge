@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Streaming DCA core syncframe extractor. Mirrors `eac3/src/extract.rs` but
 // frames on the 4-byte big-endian core syncword `0x7FFE8001` and uses the core
