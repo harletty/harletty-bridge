@@ -106,9 +106,14 @@ jobs:
       - name: Package (zip)
         run: |
           cd harletty-bridge/target/release
+          cp ../../dca/LICENSE LICENSE.dca.LGPL-2.1
+          cp ../../dca/NOTICE NOTICE.dca
+          cp ../../LICENSE LICENSE.Apache-2.0
           zip "harletty-bridge-${GITHUB_REF_NAME}-linux-x86_64.zip" \
-            libharletty_dolby_bridge.so libharletty_dts_bridge.so libharletty_iamf_bridge.so
-          zip "harletty-cli-${GITHUB_REF_NAME}-linux-x86_64.zip" harletty
+            libharletty_dolby_bridge.so libharletty_dts_bridge.so libharletty_iamf_bridge.so \
+            LICENSE.dca.LGPL-2.1 NOTICE.dca
+          zip "harletty-cli-${GITHUB_REF_NAME}-linux-x86_64.zip" harletty \
+            LICENSE.Apache-2.0 LICENSE.dca.LGPL-2.1 NOTICE.dca
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -186,8 +191,11 @@ jobs:
       - name: Package (zip)
         run: |
           cd harletty-bridge/target/release
-          Compress-Archive -Path harletty_dolby_bridge.dll,harletty_dts_bridge.dll,harletty_iamf_bridge.dll -DestinationPath "harletty-bridge-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
-          Compress-Archive -Path harletty.exe -DestinationPath "harletty-cli-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
+          Copy-Item ../../dca/LICENSE LICENSE.dca.LGPL-2.1
+          Copy-Item ../../dca/NOTICE NOTICE.dca
+          Copy-Item ../../LICENSE LICENSE.Apache-2.0
+          Compress-Archive -Path harletty_dolby_bridge.dll,harletty_dts_bridge.dll,harletty_iamf_bridge.dll,LICENSE.dca.LGPL-2.1,NOTICE.dca -DestinationPath "harletty-bridge-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
+          Compress-Archive -Path harletty.exe,LICENSE.Apache-2.0,LICENSE.dca.LGPL-2.1,NOTICE.dca -DestinationPath "harletty-cli-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -247,9 +255,14 @@ jobs:
       - name: Package (zip)
         run: |
           cd harletty-bridge/target/release
+          cp ../../dca/LICENSE LICENSE.dca.LGPL-2.1
+          cp ../../dca/NOTICE NOTICE.dca
+          cp ../../LICENSE LICENSE.Apache-2.0
           zip "harletty-bridge-${GITHUB_REF_NAME}-macos-arm64.zip" \
-            libharletty_dolby_bridge.dylib libharletty_dts_bridge.dylib libharletty_iamf_bridge.dylib
-          zip "harletty-cli-${GITHUB_REF_NAME}-macos-arm64.zip" harletty
+            libharletty_dolby_bridge.dylib libharletty_dts_bridge.dylib libharletty_iamf_bridge.dylib \
+            LICENSE.dca.LGPL-2.1 NOTICE.dca
+          zip "harletty-cli-${GITHUB_REF_NAME}-macos-arm64.zip" harletty \
+            LICENSE.Apache-2.0 LICENSE.dca.LGPL-2.1 NOTICE.dca
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

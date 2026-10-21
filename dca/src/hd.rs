@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // High-level DTS-HD decode. One DTS-HD frame = a core access unit + the
 // following EXSS substream. Two carriers come out of it:

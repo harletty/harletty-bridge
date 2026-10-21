@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Measure sample and frame-RMS correlations between decoded alternate-profile
 // extension sources and the lossless bed. Research tool only; it is not used by

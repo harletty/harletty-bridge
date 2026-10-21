@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // DTS extension substream (EXSS) parser. Ported from ffmpeg's dca_exss.c.
 // Locates the per-asset extension components — in particular the XLL (DTS-HD

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // DTS Coherent Acoustics core decoder — subband-domain decode. Ported from
 // ffmpeg's dca_core.c (HEADER_CORE and HEADER_XXCH paths) + dcadsp.c kernels +

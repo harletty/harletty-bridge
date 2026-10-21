@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Regression: the core decoder picked the lossless quantiser table when the
 // header's 5-bit rate *code* was 3. Code 3 is 96 kb/s; the lossless sentinel

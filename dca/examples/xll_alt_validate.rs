@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Stream an alternate extension profile through the high-level decoder and
 // report bounded-memory PCM integrity statistics. This diagnostic deliberately

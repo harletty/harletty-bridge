@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // The fixed-point QMF synthesis of `synth.rs` written with AVX-512
 // intrinsics: `synth_avx2.rs` on vectors of sixteen values instead of eight.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Does the DTS:X object blob reuse DCA framing? Scan each captured X-extension
 // payload (syncword..frame-end, the bed's own XLL excluded) for known DCA

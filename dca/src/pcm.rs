@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // DCA core PCM decoder. The public shape mirrors `eac3::PcmDecoder` /
 // `eac3::CorePcmFrame` so the bridge can drive both through one code path.

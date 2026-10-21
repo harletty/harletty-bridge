@@ -382,7 +382,7 @@ damf/                # DAMF metadata + CAF/WAV writers (CLI-side only)
 truehdd-macros/      # proc macros used by the CAF writer and `info`
 truehd/              # TrueHD decoder crate (vendored, Apache-2.0)
 eac3/                # E-AC-3 (JOC) decoder crate
-dca/                 # DTS (core / XXCH / DTS-HD MA / XLL / DTS:X) decoder crate
+dca/                 # DTS (core / XXCH / DTS-HD MA / XLL / DTS:X) decoder crate (LGPL-2.1-or-later)
 auro/                # Auro-Codec side channel: detection and unfold
 docs/                # protocol notes (IEC61937, OAMD shape, …)
 tools/host-baseline/ # bit-exactness through Omniphony's own bridge router
@@ -412,9 +412,11 @@ Concretely, what is Rainbaby's:
   `info` report and `truehdd-macros/` are all upstream work.
 
 What is ours: the `bridge_api` ABI wrapper and the OAMD plumbing the
-renderer needs; the `eac3`, `dca` and `auro` crates; the E-AC-3 JOC,
-DTS/DTS:X and Auro-3D routing in the CLI; and decoder robustness fixes. Upstream is Apache-2.0,
-as is this repo.
+renderer needs; the `eac3` and `auro` crates; the DTS:X object metadata and
+rendering in `dca`, and its translation of FFmpeg's DCA decoder (the decoder
+itself is FFmpeg's work, see [License](#license)); the E-AC-3 JOC,
+DTS/DTS:X and Auro-3D routing in the CLI; and decoder robustness fixes.
+Upstream is Apache-2.0, as is this repo apart from `dca`.
 
 So: huge thanks to Rainbaby and the `truehdd` project. **If any of this
 is useful to you, go star [`truehdd`](https://github.com/truehdd/truehdd).**
@@ -422,19 +424,33 @@ That is where the hard part was done.
 
 ## License
 
-The sources in this repository are **Apache-2.0**. The two things it builds
-are not distributable under the same terms, so they are worth separating:
+The sources in this repository are **Apache-2.0**, except the **`dca`**
+crate, which is **LGPL-2.1-or-later**. The things it builds are not
+distributable under the same terms, so they are worth separating:
 
-- **`harletty`, the CLI** — Apache-2.0. It depends only on this workspace, on
-  crates.io and on our fork of `truehd` (`truehd` and `truehdd-macros` are
-  Apache-2.0 too), so the binary carries no copyleft.
+- **`dca/`** — LGPL-2.1-or-later. Most of it is a Rust translation of
+  FFmpeg's DCA decoder (`libavcodec/dca*.c`), which FFmpeg distributes under
+  the LGPL 2.1 or later, so the crate is a work based on it and carries that
+  licence; our own parts of it are offered under the same terms.
+  [`dca/NOTICE`](dca/NOTICE) lists the FFmpeg files and their copyright
+  holders, and [`dca/LICENSE`](dca/LICENSE) is the licence text. Releases up
+  to 0.9.0 labelled the crate Apache-2.0; that label was wrong and has been
+  corrected.
+- **`harletty`, the CLI** — its own sources are Apache-2.0, but the binary
+  links `dca` statically, so it contains LGPL-2.1-or-later code. The complete
+  source of the binary is this repository, which is what lets you rebuild it
+  against a modified `dca`; the release archives carry the LGPL text and
+  `dca/NOTICE` next to the binary. Through the LGPL's "or later" option the
+  binary as a whole can be conveyed under LGPLv3 terms, which are compatible
+  with Apache-2.0.
 - **`libharletty_{dolby,dts,iamf}_bridge.so` / `.dll`, the decoder
   bridges** — **GPL-3.0-or-later**. It links `bridge_api` from
   [Omniphony](https://github.com/mgth/Omniphony), which is GPL-3.0-or-later,
-  and the resulting library is a combined work. Apache-2.0 code may be
-  combined into a GPLv3 work, so there is no licence conflict — but what you
-  receive is governed by the GPL, and linking it into a proprietary program is
-  not permitted. Source for both halves is public.
+  and the resulting library is a combined work. Apache-2.0 and
+  LGPL-2.1-or-later code may both be combined into a GPLv3 work, so there is
+  no licence conflict — but what you receive is governed by the GPL, and
+  linking it into a proprietary program is not permitted. Source for all of
+  it is public.
 
 Note that this is one-way: Apache-2.0 is incompatible with GPLv2 because of
 its patent clause, so anything built on `truehd` can be GPLv3 but never GPLv2.

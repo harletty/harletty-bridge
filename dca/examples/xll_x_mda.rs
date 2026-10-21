@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Test whether the DTS:X XLL-X extension directly embeds the open MDA
 // bitstream syntax from ETSI TS 103 223.  The MDA frame-header local label is

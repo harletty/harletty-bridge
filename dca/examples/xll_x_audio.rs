@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Decode the four lossless, speaker-unmapped waveforms carried by the XLL-X
 // extension and write them as a 32-bit float, four-channel WAV file.
