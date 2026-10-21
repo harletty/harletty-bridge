@@ -44,3 +44,7 @@ bench = false
 # the one it ships with.
 [patch.crates-io]
 truehd = { git = "https://github.com/harletty/truehdd", rev = "5c8b880405946e7ff1aee884cf9988415fe2c3a9" }
+# `oamd`, the object audio metadata parser `truehd` reads, from our fork: it has the
+# depth factor, chained object gain and basic info mask fixes of truehdd/oamd#1.
+# Drop this line once a release carries them.
+oamd = { git = "https://github.com/harletty/oamd", rev = "28520f01c011abf7f15b8af9563cbca4002e1150" }
