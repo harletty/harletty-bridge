@@ -295,6 +295,14 @@ impl PcmDecoder {
         self.core_state.chinspx_snapshot()
     }
 
+    /// Stereo rematrixing flags (`rematflg[rbnd]`) in force at the end of the
+    /// most recently decoded block, one per active rematrixing band. Empty
+    /// outside 2/0 mode or before the first frame. Useful for picking content
+    /// that exercises the rematrixing path.
+    pub fn last_rematrixing_flags(&self) -> &[bool] {
+        self.core_state.rematrixing_flags_snapshot()
+    }
+
     /// Configure the metadata / aux diagnostic log level for this decoder instance.
     pub fn set_debug_log_level(&mut self, level: log::Level) {
         self.debug_log_level = level;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod aht;
+mod aht_tables;
 mod allocation;
 mod bitstream;
 mod decoder;
