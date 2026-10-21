@@ -30,18 +30,16 @@ const DEF_CPL_BNDSTRC: [bool; 18] = [
     false, false, false, false, false, false, false, false, true, false, true, true, false, true,
     true, true, true, true,
 ];
-/// Stereo rematrixing band boundaries in transform-coefficient bins
-/// (A/52 Table; matches FFmpeg `ff_ac3_rematrix_band_tab`). Band `b` spans
-/// `[REMATRIX_BAND_TAB[b], REMATRIX_BAND_TAB[b + 1])`.
-const REMATRIX_BAND_TAB: [usize; 5] = [13, 25, 37, 61, 253];
+/// Most stereo rematrixing bands a block can carry (TS 102 366 Table 4.10).
+const MAX_REMATRIX_BANDS: usize = 4;
 const ECPL_SUBBAND_TAB: [usize; 23] = [
     13, 19, 25, 31, 37, 49, 61, 73, 85, 97, 109, 121, 133, 145, 157, 169, 181, 193, 205, 217, 229,
     241, 253,
 ];
 const SPX_MAX_SUBBANDS: usize = 17;
-/// Table E2.15 default spectral extension banding structure (FFmpeg
-/// `ff_eac3_default_spx_band_struct`). Applied at block 0 when the band
-/// structure is not transmitted; persists across the frame otherwise.
+/// Default spectral extension banding structure (TS 102 366 Table E.1.10),
+/// indexed by sub-band. Applied at block 0 when the band structure is not
+/// transmitted; persists across the frame otherwise.
 const DEF_SPX_BNDSTRC: [bool; SPX_MAX_SUBBANDS] = [
     false, false, false, false, false, false, false, false, true, false, true, false, true, false,
     true, false, true,
@@ -666,15 +664,15 @@ struct BlockSyntaxState {
     /// and the per-band flags. Persist across blocks (reused when a block omits
     /// the strategy); re-established by block 0 of every frame.
     num_rematrixing_bands: usize,
-    rematrixing_flags: [bool; REMATRIX_BAND_TAB.len() - 1],
+    rematrixing_flags: [bool; MAX_REMATRIX_BANDS],
     sample_rate_index: usize,
     spxbegf: usize,
     spx_begin_subbnd: usize,
     spx_end_subbnd: usize,
     spx_in_use: bool,
     nspxbnds: usize,
-    /// Persistent SPX banding structure, indexed by absolute subband
-    /// (FFmpeg `spx_band_struct`).
+    /// Persistent SPX banding structure (`spxbndstrc[]`), indexed by
+    /// absolute sub-band.
     spx_band_struct: [bool; SPX_MAX_SUBBANDS],
     /// Bin count of each SPX band, derived from the banding structure.
     spx_band_sizes: Vec<usize>,
@@ -767,7 +765,7 @@ impl BlockSyntaxState {
             ncplsubnd: 0,
             phsflginu: false,
             num_rematrixing_bands: 0,
-            rematrixing_flags: [false; REMATRIX_BAND_TAB.len() - 1],
+            rematrixing_flags: [false; MAX_REMATRIX_BANDS],
             sample_rate_index,
             spxbegf: 0,
             spx_begin_subbnd: 0,
@@ -2607,7 +2605,7 @@ fn read_spx(
             state.spx_dst_start_freq = spxstrtf * 12 + 25;
             state.spx_dst_end_freq = end_subbnd * 12 + 25;
 
-            // Banding structure (FFmpeg decode_band_structure): reset to the
+            // Banding structure (TS 102 366 clause E.2.6.2): reset to the
             // default table on block 0, optionally overridden from the
             // bitstream, and persistent across the remaining blocks.
             if block == 0 {
@@ -2700,28 +2698,13 @@ struct SpxLayout {
 
 /// Derive the spectral extension sub-band range from the transmitted
 /// frequency codes and check it against the copy start.
+#[allow(unused_variables)]
 fn spx_layout(spxstrtf: usize, spxbegf: usize, spxendf: usize) -> Result<SpxLayout, ParseError> {
-    let mut begin_subbnd = spxbegf + 2;
-    if begin_subbnd > 7 {
-        begin_subbnd += begin_subbnd - 7;
-    }
-    let mut end_subbnd = spxendf + 5;
-    if end_subbnd > 7 {
-        end_subbnd += end_subbnd - 7;
-    }
-    if begin_subbnd >= end_subbnd {
-        return Err(ParseError::InvalidHeader("spx-range"));
-    }
-    if spxstrtf * 12 + 25 >= begin_subbnd * 12 + 25 {
-        return Err(ParseError::InvalidHeader("spx-copy-start"));
-    }
-    Ok(SpxLayout {
-        begin_subbnd,
-        end_subbnd,
-    })
+    unimplemented!("clean-room: see CONTRACTS.md")
 }
 
 /// One channel's per-band spectral extension scale factors.
+#[allow(unused_variables)]
 fn spx_band_scales(
     layout: &SpxLayout,
     band_sizes: &[usize],
@@ -2731,28 +2714,7 @@ fn spx_band_scales(
     spxcomant: &[u8],
     scales: &mut [f32],
 ) {
-    let spx_blend = spxblnd as f32 / 32.0;
-    let master = mstrspxco as usize * 3;
-    let end_freq = layout.end_subbnd * 12 + 25;
-    let mut bin = layout.begin_subbnd * 12 + 25;
-    for band in 0..scales.len() {
-        let band_size = band_sizes.get(band).copied().unwrap_or_default();
-        let nratio =
-            ((bin + (band_size >> 1)) as f32 / end_freq.max(1) as f32 - spx_blend).clamp(0.0, 1.0);
-        let sblend = (1.0 - nratio).sqrt();
-        bin += band_size;
-
-        let exponent = spxcoexp[band] as usize;
-        let mut mantissa = spxcomant[band] as i32;
-        if exponent == 15 {
-            mantissa <<= 1;
-        } else {
-            mantissa += 4;
-        }
-        mantissa <<= 25 - exponent - master;
-        let spx_coord = mantissa as f32 / (1 << 23) as f32;
-        scales[band] = sblend * spx_coord;
-    }
+    unimplemented!("clean-room: see CONTRACTS.md")
 }
 
 fn read_coupling_strategy(
@@ -2949,11 +2911,9 @@ fn read_stereo_coupling_phase_flags(
     Ok(())
 }
 
-/// Stereo rematrixing strategy + band flags (A/52 §7.5.4), present only in 2/0
-/// mode. Mirrors FFmpeg `ac3dec.c` decode_audio_block: legacy AC-3 carries a
-/// `rematstr` bit every block; E-AC-3 omits it in block 0 (the flags are always
-/// present there). When the strategy is absent in a later block the previous
-/// bands/flags are reused; an absent strategy in block 0 means "no rematrixing".
+/// Stereo rematrixing strategy and flags (`rematstr`, `rematflg[rbnd]`),
+/// present only in 2/0 mode.
+#[allow(unused_variables)]
 fn read_rematrixing(
     reader: &mut BitReader<'_>,
     block: usize,
@@ -2962,26 +2922,7 @@ fn read_rematrixing(
     audio_frame: &AudioFrameInfo,
     state: &mut BlockSyntaxState,
 ) -> Result<(), ParseError> {
-    if channel_mode != 2 {
-        return Ok(());
-    }
-    let strategy = (is_eac3 && block == 0) || reader.read_bit().ok_or(ParseError::ShortPacket)?;
-    if strategy {
-        let mut bands = REMATRIX_BAND_TAB.len() - 1; // 4
-        let cpl_start_freq = state.cplbegf * 12 + 37;
-        if audio_frame.coupling_in_use[block] && cpl_start_freq <= 61 {
-            bands -= 1 + usize::from(cpl_start_freq == 37);
-        } else if state.spx_in_use && state.spx_begin_subbnd * 12 + 25 <= 61 {
-            bands -= 1;
-        }
-        state.num_rematrixing_bands = bands;
-        for band in 0..bands {
-            state.rematrixing_flags[band] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
-        }
-    } else if block == 0 {
-        state.num_rematrixing_bands = 0;
-    }
-    Ok(())
+    unimplemented!("clean-room: see CONTRACTS.md")
 }
 
 fn read_exponents(
@@ -4212,29 +4153,14 @@ fn decode_block_pcm_mantissas_into(
 }
 
 /// Apply stereo rematrixing to the two fullband channels' transform
-/// coefficients in place (A/52 §7.5.4). On each flagged band the channels are
-/// reconstructed from their transmitted sum/difference form: `L = c0 + c1`,
-/// `R = c0 - c1`. Only bins below the smaller of the two channels' end mantissas
-/// are touched (the coupled / SPX region above is shared, not rematrixed).
-/// Mirrors FFmpeg `do_rematrixing`.
+/// coefficients in place.
+#[allow(unused_variables)]
 fn apply_rematrixing(
     coeffs: &mut [[f32; 256]; 2],
     allocation: &BlockAllocationInfo,
     state: &BlockSyntaxState,
 ) {
-    let end_mantissas = allocation.channel_end_mantissas();
-    let end = end_mantissas[0].min(end_mantissas[1]);
-    for band in 0..state.num_rematrixing_bands {
-        if !state.rematrixing_flags[band] {
-            continue;
-        }
-        let band_end = end.min(REMATRIX_BAND_TAB[band + 1]);
-        for bin in REMATRIX_BAND_TAB[band]..band_end {
-            let left_in = coeffs[0][bin];
-            coeffs[0][bin] += coeffs[1][bin];
-            coeffs[1][bin] = left_in - coeffs[1][bin];
-        }
-    }
+    unimplemented!("clean-room: see CONTRACTS.md")
 }
 
 /// Apply spectral extension to fill the high-frequency bins of `coeffs`.

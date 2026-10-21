@@ -780,75 +780,28 @@ mod tests {
     }
 }
 
-/// Parity against the reference decoder, for both transform lengths.
+/// Parity of [`ImdctState`] against an independent reference IMDCT, for
+/// both transform lengths.
 ///
-/// The reference is FFmpeg's own direct O(N^2) inverse MDCT
-/// (`ff_tx_mdct_naive_inv`, libavutil/tx_template.c), driven the way
-/// libavcodec/ac3dec.c `do_imdct` drives it and folded by
-/// `vector_fmul_window` (libavutil/float_dsp.c). Nothing here shares code
-/// with [`ImdctState`], so a shared misreading of the transform cannot make
-/// both sides agree, and no corpus is needed to run it.
+/// The reference must share no code with [`ImdctState`], so a shared
+/// misreading of the transform cannot make both sides agree, and no corpus is
+/// needed to run it. Being rewritten; see CONTRACTS.md (F5).
 #[cfg(test)]
 mod reference_parity {
-    use super::{ImdctState, WINDOW};
+    use super::ImdctState;
 
-    /// `ff_tx_mdct_naive_inv` with `s->len = len` and `scale = 1.0`: `len`
-    /// coefficients in, `len` samples out (the half-length transform).
-    fn naive_imdct(coeffs: &[f64], len: usize) -> Vec<f64> {
-        let half = len / 2;
-        let phase = std::f64::consts::PI / (4.0 * len as f64);
-        let mut out = vec![0.0f64; len];
-        for i in 0..half {
-            let down = phase * (4.0 * half as f64 - 2.0 * i as f64 - 1.0);
-            let up = phase * (3.0 * len as f64 + 2.0 * i as f64 + 1.0);
-            let mut sum_down = 0.0f64;
-            let mut sum_up = 0.0f64;
-            for (j, coeff) in coeffs.iter().enumerate().take(len) {
-                let odd = (2 * j + 1) as f64;
-                sum_down += (odd * down).cos() * coeff;
-                sum_up += (odd * up).cos() * coeff;
-            }
-            out[i] = sum_down;
-            out[i + half] = -sum_up;
-        }
-        out
-    }
+    /// Reference IMDCT, windowing and overlap-add for one channel.
+    struct Reference;
 
-    /// `do_imdct` for one channel: the long block runs one 256-coefficient
-    /// transform and splits it, the short block runs two 128-coefficient
-    /// transforms over the even and the odd coefficients. Either way the first
-    /// half folds against the delay and the second half becomes the new delay.
-    struct Reference {
-        delay: [f64; 128],
-    }
-
+    #[allow(unused_variables)]
     impl Reference {
         fn new() -> Self {
-            Self { delay: [0.0; 128] }
+            unimplemented!("clean-room: see CONTRACTS.md")
         }
 
+        /// One block: 256 transform coefficients in, 256 samples out.
         fn apply(&mut self, coeffs: &[f64; 256], block_switch: bool) -> [f64; 256] {
-            let (head, tail) = if block_switch {
-                let even: Vec<f64> = (0..128).map(|i| coeffs[2 * i]).collect();
-                let odd: Vec<f64> = (0..128).map(|i| coeffs[2 * i + 1]).collect();
-                (naive_imdct(&even, 128), naive_imdct(&odd, 128))
-            } else {
-                let full = naive_imdct(coeffs, 256);
-                (full[..128].to_vec(), full[128..].to_vec())
-            };
-
-            // vector_fmul_window(out, delay, head, WINDOW, 128).
-            let mut out = [0.0f64; 256];
-            for k in 0..128 {
-                let delayed = self.delay[k];
-                let fresh = head[127 - k];
-                let rising = WINDOW[k] as f64;
-                let falling = WINDOW[255 - k] as f64;
-                out[k] = delayed * falling - fresh * rising;
-                out[255 - k] = delayed * rising + fresh * falling;
-            }
-            self.delay.copy_from_slice(&tail);
-            out
+            unimplemented!("clean-room: see CONTRACTS.md")
         }
     }
 
@@ -870,7 +823,8 @@ mod reference_parity {
         }
     }
 
-    /// `ImdctState` doubles the overlap-add sum where the reference does not.
+    /// Ratio of `ImdctState`'s output to the reference's; it depends on the
+    /// normalisation the reference uses (see CONTRACTS.md, F5).
     const SCALE: f64 = 2.0;
 
     fn assert_matches_reference(pattern: &[bool], seed: u64) {
