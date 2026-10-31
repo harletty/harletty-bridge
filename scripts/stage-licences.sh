@@ -5,7 +5,8 @@
 # `cli`: the CLI binary is conveyed under LGPL-3.0 (LICENSES/binary-cli.txt),
 # so it ships the LGPL-3.0 and GPL-3.0 texts besides the Apache-2.0 and
 # LGPL-2.1 texts of its sources. `bridge`: the bridges are GPL-3.0-or-later
-# (LICENSES/binary-bridge.txt).
+# (LICENSES/binary-bridge.txt); they add libopus's BSD notice, which the IAMF
+# bridge links in on Windows and macOS.
 set -euo pipefail
 kind="${1:?usage: stage-licences.sh cli|bridge DEST}"
 dest="${2:?usage: stage-licences.sh cli|bridge DEST}"
@@ -22,6 +23,7 @@ case "$kind" in
     ;;
   bridge)
     cp "$repo/LICENSES/binary-bridge.txt" "$dest/LICENSES.txt"
+    cp "$repo/LICENSES/Opus.txt" "$dest/LICENSE.Opus"
     ;;
   *)
     echo "unknown kind: $kind" >&2

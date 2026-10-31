@@ -389,7 +389,7 @@ tools/host-baseline/ # bit-exactness through Omniphony's own bridge router
 EAC3_PATCH_NOTES.md  # upstream patches to the E-AC-3 decoder
 OBJECT_SIZE_NOTES.md # notes on OAMD object_size handling
 .omniphony-ref       # the Omniphony commit CI and releases build against
-LICENSES/            # GPL-3.0 / LGPL-3.0 texts and the binaries' licence notes
+LICENSES/            # GPL-3.0 / LGPL-3.0 / Opus texts and the binaries' licence notes
 .github/workflows/   # CI on pushes and pull requests; release builds on `v*` tags
 ```
 
@@ -457,7 +457,9 @@ distributable under the same terms, so they are worth separating:
   it is public. The release archive carries
   [`LICENSES/binary-bridge.txt`](LICENSES/binary-bridge.txt) as
   `LICENSES.txt`, the GPL-3.0 text, the Apache-2.0 and LGPL-2.1 texts of the
-  sources, and `dca/NOTICE`.
+  sources, `dca/NOTICE`, and libopus's BSD notice
+  ([`LICENSES/Opus.txt`](LICENSES/Opus.txt)), which the IAMF bridge links in
+  on Windows and macOS.
 
 Note that this is one-way: Apache-2.0 is incompatible with GPLv2 because of
 its patent clause, so anything built on `truehd` can be GPLv3 but never GPLv2.

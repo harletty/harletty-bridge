@@ -14,10 +14,13 @@ What they are made of:
 - The DTS bridge statically links the `dca` crate, which is
   LGPL-2.1-or-later (LICENSE.LGPL-2.1) because it is based on FFmpeg's DCA
   decoder; its copyright holders are listed in NOTICE.dca.
+- The IAMF bridge decodes Opus with libopus (Xiph.Org and contributors,
+  BSD-3-Clause, LICENSE.Opus). On Windows and macOS libopus is linked into
+  the library; on Linux it is the system's, loaded at run time.
 
-Apache-2.0 and LGPL-2.1-or-later code may both be combined into a work
-under GPL-3.0. Linking these libraries into a proprietary program is not
-permitted.
+Apache-2.0, BSD-3-Clause and LGPL-2.1-or-later code may all be combined
+into a work under GPL-3.0. Linking these libraries into a proprietary
+program is not permitted.
 
 The complete corresponding source is the harletty-bridge repository at the
 tag of this release (https://github.com/harletty/harletty-bridge),
