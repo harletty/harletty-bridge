@@ -1,3 +1,9 @@
+SPDX-License-Identifier: LGPL-2.1-or-later
+This file is a diff against FFmpeg's libavcodec/ac3dec.c and carries FFmpeg
+source lines, so it is under FFmpeg's licence (LGPL-2.1-or-later), not the
+eac3 crate's. It is used only as a local test oracle (bit-position traces)
+and is excluded from the published crate (see Cargo.toml `exclude`).
+
 diff --git a/libavcodec/ac3dec.c b/libavcodec/ac3dec.c
 index 2f0e7f5344..f3c0e453c3 100644
 --- a/libavcodec/ac3dec.c

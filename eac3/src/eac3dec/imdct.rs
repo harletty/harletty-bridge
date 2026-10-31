@@ -780,76 +780,88 @@ mod tests {
     }
 }
 
-/// Parity against the reference decoder, for both transform lengths.
+/// Parity of [`ImdctState`] against an independent reference IMDCT, for
+/// both transform lengths.
 ///
-/// The reference is FFmpeg's own direct O(N^2) inverse MDCT
-/// (`ff_tx_mdct_naive_inv`, libavutil/tx_template.c), driven the way
-/// libavcodec/ac3dec.c `do_imdct` drives it and folded by
-/// `vector_fmul_window` (libavutil/float_dsp.c). Nothing here shares code
-/// with [`ImdctState`], so a shared misreading of the transform cannot make
-/// both sides agree, and no corpus is needed to run it.
+/// The reference must share no code with [`ImdctState`], so a shared
+/// misreading of the transform cannot make both sides agree, and no corpus is
+/// needed to run it. Being rewritten; see CONTRACTS.md (F5).
 #[cfg(test)]
 mod reference_parity {
-    use super::{ImdctState, WINDOW};
+    use super::ImdctState;
 
-    /// `ff_tx_mdct_naive_inv` with `s->len = len` and `scale = 1.0`: `len`
-    /// coefficients in, `len` samples out (the half-length transform).
-    fn naive_imdct(coeffs: &[f64], len: usize) -> Vec<f64> {
-        let half = len / 2;
-        let phase = std::f64::consts::PI / (4.0 * len as f64);
-        let mut out = vec![0.0f64; len];
-        for i in 0..half {
-            let down = phase * (4.0 * half as f64 - 2.0 * i as f64 - 1.0);
-            let up = phase * (3.0 * len as f64 + 2.0 * i as f64 + 1.0);
-            let mut sum_down = 0.0f64;
-            let mut sum_up = 0.0f64;
-            for (j, coeff) in coeffs.iter().enumerate().take(len) {
-                let odd = (2 * j + 1) as f64;
-                sum_down += (odd * down).cos() * coeff;
-                sum_up += (odd * up).cos() * coeff;
-            }
-            out[i] = sum_down;
-            out[i + half] = -sum_up;
-        }
-        out
-    }
-
-    /// `do_imdct` for one channel: the long block runs one 256-coefficient
-    /// transform and splits it, the short block runs two 128-coefficient
-    /// transforms over the even and the odd coefficients. Either way the first
-    /// half folds against the delay and the second half becomes the new delay.
+    /// Reference IMDCT, windowing and overlap-add for one channel, evaluated
+    /// directly as the inverse of the forward transform of TS 102 366 clause
+    /// 7.2.3.2: a plain cosine sum with no 1/N factor, carrying the minus
+    /// sign of that clause's leading `-2/N`. Its windowed overlap-add gives
+    /// back half the encoder's input, hence `SCALE`.
     struct Reference {
-        delay: [f64; 128],
+        /// Second half of the previous block's unwindowed 512-sample inverse
+        /// transform output, waiting to be overlap-added.
+        previous: [f64; 256],
     }
 
     impl Reference {
         fn new() -> Self {
-            Self { delay: [0.0; 128] }
-        }
-
-        fn apply(&mut self, coeffs: &[f64; 256], block_switch: bool) -> [f64; 256] {
-            let (head, tail) = if block_switch {
-                let even: Vec<f64> = (0..128).map(|i| coeffs[2 * i]).collect();
-                let odd: Vec<f64> = (0..128).map(|i| coeffs[2 * i + 1]).collect();
-                (naive_imdct(&even, 128), naive_imdct(&odd, 128))
-            } else {
-                let full = naive_imdct(coeffs, 256);
-                (full[..128].to_vec(), full[128..].to_vec())
-            };
-
-            // vector_fmul_window(out, delay, head, WINDOW, 128).
-            let mut out = [0.0f64; 256];
-            for k in 0..128 {
-                let delayed = self.delay[k];
-                let fresh = head[127 - k];
-                let rising = WINDOW[k] as f64;
-                let falling = WINDOW[255 - k] as f64;
-                out[k] = delayed * falling - fresh * rising;
-                out[255 - k] = delayed * rising + fresh * falling;
+            Self {
+                previous: [0.0; 256],
             }
-            self.delay.copy_from_slice(&tail);
-            out
         }
+
+        /// One block: 256 transform coefficients in, 256 samples out.
+        fn apply(&mut self, coeffs: &[f64; 256], block_switch: bool) -> [f64; 256] {
+            let mut time = [0.0f64; 512];
+            if block_switch {
+                // Two N = 256 transforms (clause 7.2.3.2, alpha = -1 then +1),
+                // their coefficients interleaved bin by bin (clause 6.9.2):
+                // the first transform's bin k is coefficient 2k, the second's
+                // is 2k + 1. Each yields 256 samples of the 512-sample segment.
+                for (half, alpha) in [(0usize, -1.0f64), (1, 1.0)] {
+                    let spectrum: Vec<f64> = (0..128).map(|k| coeffs[2 * k + half]).collect();
+                    for n in 0..256 {
+                        time[256 * half + n] = inverse_sample(&spectrum, n, 256, alpha);
+                    }
+                }
+            } else {
+                // One N = 512 transform, alpha = 0.
+                for (n, sample) in time.iter_mut().enumerate() {
+                    *sample = inverse_sample(coeffs, n, 512, 0.0);
+                }
+            }
+
+            // 512-point symmetric window built from the 256 values of Table
+            // 6.33 back to back (clause 7.2.3.1), then overlap-add of the
+            // first half with the previous block's second half.
+            let window = |n: usize| -> f64 {
+                if n < 256 {
+                    super::WINDOW[n] as f64
+                } else {
+                    super::WINDOW[511 - n] as f64
+                }
+            };
+            let output: [f64; 256] =
+                std::array::from_fn(|n| window(n) * time[n] + window(n + 256) * self.previous[n]);
+            self.previous.copy_from_slice(&time[256..]);
+            output
+        }
+    }
+
+    /// Sample `n` of the inverse of the clause 7.2.3.2 transform of length
+    /// `big_n`: minus the sum over its `big_n / 2` coefficients of
+    /// `X[k] * cos(2 pi / (4 N) * (2n + 1)(2k + 1) + pi / 4 * (2k + 1)(1 + alpha))`.
+    fn inverse_sample(spectrum: &[f64], n: usize, big_n: usize, alpha: f64) -> f64 {
+        use std::f64::consts::PI;
+        let n_term = (2 * n + 1) as f64;
+        -spectrum[..big_n / 2]
+            .iter()
+            .enumerate()
+            .map(|(k, &x)| {
+                let k_term = (2 * k + 1) as f64;
+                let phase = 2.0 * PI / (4 * big_n) as f64 * n_term * k_term
+                    + PI / 4.0 * k_term * (1.0 + alpha);
+                x * phase.cos()
+            })
+            .sum::<f64>()
     }
 
     /// Spectrally shaped pseudo-random coefficients, so the blocks look more
@@ -870,7 +882,8 @@ mod reference_parity {
         }
     }
 
-    /// `ImdctState` doubles the overlap-add sum where the reference does not.
+    /// Ratio of `ImdctState`'s output to the reference's; it depends on the
+    /// normalisation the reference uses (see CONTRACTS.md, F5).
     const SCALE: f64 = 2.0;
 
     fn assert_matches_reference(pattern: &[bool], seed: u64) {
