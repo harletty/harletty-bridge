@@ -389,6 +389,7 @@ tools/host-baseline/ # bit-exactness through Omniphony's own bridge router
 EAC3_PATCH_NOTES.md  # upstream patches to the E-AC-3 decoder
 OBJECT_SIZE_NOTES.md # notes on OAMD object_size handling
 .omniphony-ref       # the Omniphony commit CI and releases build against
+LICENSES/            # GPL-3.0 / LGPL-3.0 texts and the binaries' licence notes
 .github/workflows/   # CI on pushes and pull requests; release builds on `v*` tags
 ```
 
@@ -439,10 +440,13 @@ distributable under the same terms, so they are worth separating:
 - **`harletty`, the CLI** — its own sources are Apache-2.0, but the binary
   links `dca` statically, so it contains LGPL-2.1-or-later code. The complete
   source of the binary is this repository, which is what lets you rebuild it
-  against a modified `dca`; the release archives carry the LGPL text and
-  `dca/NOTICE` next to the binary. Through the LGPL's "or later" option the
-  binary as a whole can be conveyed under LGPLv3 terms, which are compatible
-  with Apache-2.0.
+  against a modified `dca`. Apache-2.0 is not compatible with LGPL 2.1, so
+  the binary uses `dca` through the LGPL's "or later" option and is conveyed
+  as a whole under LGPL-3.0, which is compatible with Apache-2.0
+  ([`LICENSES/binary-cli.txt`](LICENSES/binary-cli.txt)). The release
+  archive carries that note as `LICENSES.txt`, the LGPL-3.0 and GPL-3.0 texts
+  it requires, the Apache-2.0 and LGPL-2.1 texts of the sources, and
+  `dca/NOTICE`.
 - **`libharletty_{dolby,dts,iamf}_bridge.so` / `.dll`, the decoder
   bridges** — **GPL-3.0-or-later**. It links `bridge_api` from
   [Omniphony](https://github.com/mgth/Omniphony), which is GPL-3.0-or-later,
@@ -450,7 +454,10 @@ distributable under the same terms, so they are worth separating:
   LGPL-2.1-or-later code may both be combined into a GPLv3 work, so there is
   no licence conflict — but what you receive is governed by the GPL, and
   linking it into a proprietary program is not permitted. Source for all of
-  it is public.
+  it is public. The release archive carries
+  [`LICENSES/binary-bridge.txt`](LICENSES/binary-bridge.txt) as
+  `LICENSES.txt`, the GPL-3.0 text, the Apache-2.0 and LGPL-2.1 texts of the
+  sources, and `dca/NOTICE`.
 
 Note that this is one-way: Apache-2.0 is incompatible with GPLv2 because of
 its patent clause, so anything built on `truehd` can be GPLv3 but never GPLv2.
