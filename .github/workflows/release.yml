@@ -103,12 +103,22 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
 
+      - name: Stage licence files
+        shell: bash
+        run: |
+          mkdir -p target/release/licences-cli target/release/licences-bridge
+          scripts/stage-licences.sh cli target/release/licences-cli
+          scripts/stage-licences.sh bridge target/release/licences-bridge
+        working-directory: harletty-bridge
+
       - name: Package (zip)
         run: |
           cd harletty-bridge/target/release
           zip "harletty-bridge-${GITHUB_REF_NAME}-linux-x86_64.zip" \
             libharletty_dolby_bridge.so libharletty_dts_bridge.so libharletty_iamf_bridge.so
+          zip -j "harletty-bridge-${GITHUB_REF_NAME}-linux-x86_64.zip" licences-bridge/*
           zip "harletty-cli-${GITHUB_REF_NAME}-linux-x86_64.zip" harletty
+          zip -j "harletty-cli-${GITHUB_REF_NAME}-linux-x86_64.zip" licences-cli/*
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -183,11 +193,19 @@ jobs:
         run: python scripts/check-static-opus.py target/release/harletty_iamf_bridge.dll
         working-directory: harletty-bridge
 
+      - name: Stage licence files
+        shell: bash
+        run: |
+          mkdir -p target/release/licences-cli target/release/licences-bridge
+          scripts/stage-licences.sh cli target/release/licences-cli
+          scripts/stage-licences.sh bridge target/release/licences-bridge
+        working-directory: harletty-bridge
+
       - name: Package (zip)
         run: |
           cd harletty-bridge/target/release
-          Compress-Archive -Path harletty_dolby_bridge.dll,harletty_dts_bridge.dll,harletty_iamf_bridge.dll -DestinationPath "harletty-bridge-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
-          Compress-Archive -Path harletty.exe -DestinationPath "harletty-cli-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
+          Compress-Archive -Path harletty_dolby_bridge.dll,harletty_dts_bridge.dll,harletty_iamf_bridge.dll,licences-bridge/* -DestinationPath "harletty-bridge-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
+          Compress-Archive -Path harletty.exe,licences-cli/* -DestinationPath "harletty-cli-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -244,12 +262,22 @@ jobs:
         run: python3 scripts/check-static-opus.py target/release/libharletty_iamf_bridge.dylib
         working-directory: harletty-bridge
 
+      - name: Stage licence files
+        shell: bash
+        run: |
+          mkdir -p target/release/licences-cli target/release/licences-bridge
+          scripts/stage-licences.sh cli target/release/licences-cli
+          scripts/stage-licences.sh bridge target/release/licences-bridge
+        working-directory: harletty-bridge
+
       - name: Package (zip)
         run: |
           cd harletty-bridge/target/release
           zip "harletty-bridge-${GITHUB_REF_NAME}-macos-arm64.zip" \
             libharletty_dolby_bridge.dylib libharletty_dts_bridge.dylib libharletty_iamf_bridge.dylib
+          zip -j "harletty-bridge-${GITHUB_REF_NAME}-macos-arm64.zip" licences-bridge/*
           zip "harletty-cli-${GITHUB_REF_NAME}-macos-arm64.zip" harletty
+          zip -j "harletty-cli-${GITHUB_REF_NAME}-macos-arm64.zip" licences-cli/*
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

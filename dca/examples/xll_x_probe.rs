@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Characterize the DTS:X end-of-frame extension blob (syncword 0x02000850).
 // ffmpeg detects this syncword and discards the payload; we retain it (see

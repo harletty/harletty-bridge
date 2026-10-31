@@ -1,11 +1,15 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
 //! Independent DTS Coherent Acoustics (DCA) bitstream parser and decoder.
 //!
 //! A native Rust port of ffmpeg's `dca` decoder, structured like the sibling
 //! `eac3` crate. Phase 1 targets the DTS **core** (5.1 lossy bed); the EXSS +
 //! XLL lossless extension (7.1) is added in a later phase.
 //!
-//! Reference C sources live (read-only) under
-//! `reference-sources/ffmpeg_sources/libavcodec/dca*.c`.
+//! The reference C sources are FFmpeg's `libavcodec/dca*.c` (FFmpeg 8.0).
+//! Being a translation of them, this crate is distributed under their
+//! licence, LGPL-2.1-or-later; `NOTICE` lists the FFmpeg files and their
+//! copyright holders.
 
 mod bitstream;
 #[cfg(test)]

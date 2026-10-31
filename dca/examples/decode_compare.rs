@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Decode a raw DTS core .dts file and compare to an ffmpeg f32le reference.
 // Usage: cargo run -p dca --example decode_compare -- <in.dts> <ref.f32> [channels]

@@ -1,0 +1,26 @@
+harletty CLI binary — licence terms
+
+This program is distributed under the terms of the GNU Lesser General
+Public License, version 3 (LICENSE.LGPL-3.0, which incorporates the GNU
+General Public License, version 3, LICENSE.GPL-3.0), as described below.
+
+What it is made of:
+
+- The harletty CLI and most of the crates it is built from are Apache-2.0
+  (LICENSE.Apache-2.0).
+- It statically links the `dca` crate, which is LGPL-2.1-or-later
+  (LICENSE.LGPL-2.1) because it is based on FFmpeg's DCA decoder. Its
+  copyright holders are listed in NOTICE.dca.
+
+How the binary is distributed:
+
+Apache-2.0 is not compatible with version 2.1 of the LGPL, so for this
+combined binary `dca` is used under the "or any later version" option of
+its licence, as LGPL-3.0. The binary as a whole is conveyed under
+LGPL-3.0: the Apache-2.0 parts remain available under Apache-2.0 on their
+own, and Apache-2.0 code may be combined into a work under version 3 of
+the GNU licences.
+
+The complete corresponding source of this binary, which lets you rebuild
+it with a modified `dca`, is the harletty-bridge repository at the tag of
+this release: https://github.com/harletty/harletty-bridge

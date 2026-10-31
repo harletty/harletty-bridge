@@ -34,6 +34,14 @@ if [[ ! -f "$prefix/.built-$OPUS_VERSION" ]]; then
     exit 1
   fi
   tar -xzf "$tarball" -C "$work"
+  # The release archives ship LICENSES/Opus.txt as libopus's notice (BSD:
+  # binary redistributions must reproduce it); keep it that release's own.
+  # Line endings aside: a Windows checkout may turn the copy into CRLF.
+  if [[ "$(tr -d '\r' < "$work/opus-$OPUS_VERSION/COPYING")" != \
+        "$(tr -d '\r' < "$repo_dir/LICENSES/Opus.txt")" ]]; then
+    echo "LICENSES/Opus.txt differs from opus-$OPUS_VERSION's COPYING: update it" >&2
+    exit 1
+  fi
 
   # CMake on Windows is a native program: it reads C:/ paths, not the
   # shell's /c/ ones.

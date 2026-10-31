@@ -1,0 +1,27 @@
+harletty decoder bridges — licence terms
+
+The libraries libharletty_{dolby,dts,iamf}_bridge (.so / .dll / .dylib)
+are distributed under the terms of the GNU General Public License,
+version 3 or (at your option) any later version (LICENSE.GPL-3.0).
+
+What they are made of:
+
+- They link `bridge_api` and its companion crates from Omniphony
+  (https://github.com/mgth/Omniphony), which are GPL-3.0-or-later, so each
+  library is a combined work under the GPL.
+- Most of the harletty-bridge crates they are built from are Apache-2.0
+  (LICENSE.Apache-2.0).
+- The DTS bridge statically links the `dca` crate, which is
+  LGPL-2.1-or-later (LICENSE.LGPL-2.1) because it is based on FFmpeg's DCA
+  decoder; its copyright holders are listed in NOTICE.dca.
+- The IAMF bridge decodes Opus with libopus (Xiph.Org and contributors,
+  BSD-3-Clause, LICENSE.Opus). On Windows and macOS libopus is linked into
+  the library; on Linux it is the system's, loaded at run time.
+
+Apache-2.0, BSD-3-Clause and LGPL-2.1-or-later code may all be combined
+into a work under GPL-3.0. Linking these libraries into a proprietary
+program is not permitted.
+
+The complete corresponding source is the harletty-bridge repository at the
+tag of this release (https://github.com/harletty/harletty-bridge),
+together with the Omniphony commit named in its `.omniphony-ref` file.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Regression: decode a raw DTS core stream and compare to an ffmpeg f32le
 // reference, gating per-channel RMSE. The corpus lives outside the repo (it is

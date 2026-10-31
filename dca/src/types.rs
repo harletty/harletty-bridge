@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /// Speaker assignment for a decoded bed channel. Mirrors `eac3::BedChannel` so
 /// the bridge can map both decoders' output through the same `labels.rs` path.

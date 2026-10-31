@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // The fixed-point QMF synthesis of `synth.rs` written with AVX2 intrinsics.
 // Same integer arithmetic, value for value: every 64-bit product is taken

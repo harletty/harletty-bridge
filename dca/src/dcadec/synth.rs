@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // DCA fixed-point QMF synthesis. Ports the self-contained integer path
 // (dcadct.c `imdct_half_32`, synth_filter.c `synth_filter_fixed`,
