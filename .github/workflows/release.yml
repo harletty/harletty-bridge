@@ -216,7 +216,7 @@ jobs:
             harletty-bridge/target/release/harletty-cli-*-windows-x86_64.zip
 
   build-macos:
-    runs-on: macos-14
+    runs-on: macos-15
     needs: omniphony
     env:
       HARLETTY_OMNIPHONY_COMMIT: ${{ needs.omniphony.outputs.commit }}
