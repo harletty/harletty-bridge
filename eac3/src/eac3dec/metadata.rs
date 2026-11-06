@@ -220,9 +220,12 @@ struct OamdElementParseState {
     object: Option<OamdObjectElementParseState>,
 }
 
+/// One state per object, carried from block to block: a block that does not
+/// signal a property takes it from the object's previous block, the first
+/// block of a payload from the last block of the previous payload.
 #[derive(Debug, Clone, Default)]
 struct OamdObjectElementParseState {
-    object_blocks: Vec<Vec<OamdObjectBlockParseState>>,
+    objects: Vec<OamdObjectBlockParseState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -301,17 +304,13 @@ impl OamdElementParseState {
             return;
         };
 
-        let block_count = object_element.block_updates.len();
-        let needs_reset = self.object.as_ref().is_none_or(|state| {
-            state.object_blocks.len() != object_count
-                || state.object_blocks.first().map(Vec::len).unwrap_or(0) != block_count
-        });
+        let needs_reset = self
+            .object
+            .as_ref()
+            .is_none_or(|state| state.objects.len() != object_count);
         if needs_reset {
             self.object = Some(OamdObjectElementParseState {
-                object_blocks: vec![
-                    vec![OamdObjectBlockParseState::default(); block_count];
-                    object_count
-                ],
+                objects: vec![OamdObjectBlockParseState::default(); object_count],
             });
         }
 
@@ -327,22 +326,35 @@ impl OamdObjectElementParseState {
         element: &mut OamdObjectElement,
         bed_or_isf_objects: usize,
     ) {
-        for (object_index, blocks) in element.object_blocks.iter_mut().enumerate() {
-            for (block_index, block) in blocks.iter_mut().enumerate() {
+        // Blocks resolve in time order, and within a block the objects in
+        // order, so each object's state always holds its previous block.
+        let block_count = element
+            .object_blocks
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        for block_index in 0..block_count {
+            for (object_index, blocks) in element.object_blocks.iter_mut().enumerate() {
+                let Some(block) = blocks.get_mut(block_index) else {
+                    continue;
+                };
                 if block.gain_from_previous_object {
-                    // Objects resolve in order, so the previous object's state
-                    // already holds its gain for this block, −∞ dB if it is
-                    // inactive; the first object has no previous one and
-                    // defaults to 0 dB (table 18). A previous object that
-                    // reuses a gain the stream never gave it plays at 0 dB,
-                    // and so does the one that takes its gain.
+                    // The previous object's state already holds its gain for
+                    // this block, −∞ dB if it is inactive; the first object
+                    // has no previous one and defaults to 0 dB (table 18). A
+                    // previous object that reuses a gain the stream never
+                    // gave it plays at 0 dB, and so does the one that takes
+                    // its gain.
                     let previous = object_index
                         .checked_sub(1)
-                        .and_then(|prev| self.object_blocks[prev][block_index].gain_db);
+                        .and_then(|prev| self.objects[prev].gain_db);
                     block.gain_db = Some(previous.unwrap_or(0.0));
                 }
-                self.object_blocks[object_index][block_index]
-                    .resolve_block(block, object_index < bed_or_isf_objects);
+                let Some(state) = self.objects.get_mut(object_index) else {
+                    continue;
+                };
+                state.resolve_block(block, object_index < bed_or_isf_objects);
             }
         }
     }
@@ -401,8 +413,10 @@ impl OamdObjectBlockParseState {
                 self.size = Some(size);
             }
 
-            if (blocks & 8) != 0 && parsed.anchor == ObjectAnchor::Screen {
-                self.anchor = ObjectAnchor::Screen;
+            // A block that signals its anchor states it either way: one that
+            // is not screen anchored leaves the screen.
+            if (blocks & 8) != 0 {
+                self.anchor = parsed.anchor;
                 self.screen_factor = parsed.screen_factor;
                 self.depth_factor = parsed.depth_factor;
             }
@@ -2140,119 +2154,178 @@ mod tests {
         assert_eq!(first_block_gains(&silenced), [Some(f32::NEG_INFINITY); 2]);
     }
 
-    fn second_block(payload: &OamdPayload) -> &OamdObjectBlock {
+    fn object_blocks(payload: &OamdPayload) -> &[OamdObjectBlock] {
         let OamdElementKind::Object(object) = &payload.elements[0].kind else {
             panic!("expected object element");
         };
-        &object.object_blocks[0][1]
+        &object.object_blocks[0]
     }
 
+    /// A first block as the parser reads it: basic and render info all
+    /// signalled.
+    fn first_block(
+        gain_db: f32,
+        position: Vec3,
+        size: f32,
+        screen: Option<(f32, f32)>,
+    ) -> OamdObjectBlock {
+        OamdObjectBlock {
+            basic_info_status: 1,
+            basic_info_blocks: Some(3),
+            render_info_status: 1,
+            render_info_blocks: Some(15),
+            anchor: if screen.is_some() {
+                ObjectAnchor::Screen
+            } else {
+                ObjectAnchor::Room
+            },
+            gain_db: Some(gain_db),
+            priority: Some(7),
+            valid_position: true,
+            position: Some(position),
+            distance: Some(4.0),
+            size: Some([size; 3]),
+            screen_factor: screen.map(|(screen_factor, _)| screen_factor),
+            depth_factor: screen.map(|(_, depth_factor)| depth_factor),
+            ..OamdObjectBlock::default()
+        }
+    }
+
+    /// A later block that signals nothing new.
+    fn unchanged_block() -> OamdObjectBlock {
+        OamdObjectBlock {
+            basic_info_status: 2,
+            render_info_status: 0,
+            ..OamdObjectBlock::default()
+        }
+    }
+
+    const P: Vec3 = Vec3 {
+        x: 0.25,
+        y: 0.5,
+        z: -0.25,
+    };
+    const Q: Vec3 = Vec3 {
+        x: 0.75,
+        y: 0.125,
+        z: 0.5,
+    };
+
+    /// A block that signals nothing new keeps what the previous block of its
+    /// own payload stated, not what the same block of the previous payload
+    /// did.
     #[test]
-    fn oamd_state_reuses_omitted_fields_across_frames() {
-        let position = Vec3 {
-            x: 0.25,
-            y: 0.5,
-            z: -0.25,
-        };
-        let mut initial = payload_with_object_blocks(vec![vec![
-            OamdObjectBlock::default(),
-            OamdObjectBlock {
-                basic_info_status: 3,
-                basic_info_blocks: Some(3),
-                render_info_status: 3,
-                render_info_blocks: Some(13),
-                anchor: ObjectAnchor::Screen,
-                gain_db: Some(-6.0),
-                priority: Some(7),
-                valid_position: true,
-                differential_position: false,
-                position: Some(position),
-                distance: Some(4.0),
-                size: Some([0.25, 0.25, 0.25]),
-                screen_factor: Some(0.5),
-                depth_factor: Some(2.0),
-                ..OamdObjectBlock::default()
-            },
-        ]]);
-        let mut omitted = payload_with_object_blocks(vec![vec![
-            OamdObjectBlock::default(),
-            OamdObjectBlock {
-                basic_info_status: 2,
-                render_info_status: 0,
-                ..OamdObjectBlock::default()
-            },
-        ]]);
-
+    fn a_block_reuses_the_previous_block_of_its_payload() {
         let mut state = MetadataParseState::default();
-        state.oamd.resolve_payload(&mut initial);
-        state.oamd.resolve_payload(&mut omitted);
 
-        let resolved = second_block(&omitted);
+        let mut first = payload_with_object_blocks(vec![vec![
+            first_block(-6.0, P, 0.25, Some((0.5, 2.0))),
+            unchanged_block(),
+        ]]);
+        state.oamd.resolve_payload(&mut first);
+        let resolved = &object_blocks(&first)[1];
         assert_eq!(resolved.anchor, ObjectAnchor::Screen);
         assert_eq!(resolved.gain_db, Some(-6.0));
         assert_eq!(resolved.priority, Some(7));
         assert!(resolved.valid_position);
-        assert!(!resolved.differential_position);
-        assert_eq!(resolved.position, Some(position));
+        assert_eq!(resolved.position, Some(P));
         assert_eq!(resolved.distance, Some(4.0));
-        assert_eq!(resolved.size, Some([0.25, 0.25, 0.25]));
+        assert_eq!(resolved.size, Some([0.25; 3]));
         assert_eq!(resolved.screen_factor, Some(0.5));
         assert_eq!(resolved.depth_factor, Some(2.0));
+
+        let mut second = payload_with_object_blocks(vec![vec![
+            first_block(0.0, Q, 0.5, None),
+            unchanged_block(),
+        ]]);
+        state.oamd.resolve_payload(&mut second);
+        let resolved = &object_blocks(&second)[1];
+        assert_eq!(resolved.anchor, ObjectAnchor::Room);
+        assert_eq!(resolved.gain_db, Some(0.0));
+        assert_eq!(resolved.position, Some(Q));
+        assert_eq!(resolved.size, Some([0.5; 3]));
+        assert_eq!(resolved.screen_factor, None);
+        assert_eq!(resolved.depth_factor, None);
     }
 
+    /// What the first block of a payload leaves unstated (here a reserved
+    /// size mode) comes from the last block of the previous payload, even
+    /// when the two payloads carry a different number of blocks.
     #[test]
-    fn oamd_state_clears_valid_position_when_render_info_excludes_position() {
-        let position = Vec3 {
-            x: 0.75,
-            y: 0.125,
-            z: 0.5,
-        };
+    fn the_first_block_carries_on_from_the_last_block_of_the_previous_payload() {
+        let mut state = MetadataParseState::default();
+
         let mut first = payload_with_object_blocks(vec![vec![
-            OamdObjectBlock::default(),
-            OamdObjectBlock {
-                basic_info_status: 3,
-                basic_info_blocks: Some(3),
-                render_info_status: 3,
-                render_info_blocks: Some(13),
-                anchor: ObjectAnchor::Screen,
-                gain_db: Some(-2.0),
-                priority: Some(3),
-                valid_position: true,
-                differential_position: true,
-                position: Some(position),
-                distance: Some(3.2),
-                size: Some([0.4, 0.4, 0.4]),
-                screen_factor: Some(0.625),
-                depth_factor: Some(0.5),
-                ..OamdObjectBlock::default()
-            },
-        ]]);
-        let mut second = payload_with_object_blocks(vec![vec![
-            OamdObjectBlock::default(),
+            first_block(0.0, P, 0.25, None),
             OamdObjectBlock {
                 basic_info_status: 2,
                 render_info_status: 3,
                 render_info_blocks: Some(4),
-                size: Some([0.75, 0.75, 0.75]),
+                size: Some([0.75; 3]),
+                ..OamdObjectBlock::default()
+            },
+        ]]);
+        state.oamd.resolve_payload(&mut first);
+
+        let mut second = payload_with_object_blocks(vec![vec![OamdObjectBlock {
+            size: None,
+            ..first_block(0.0, P, 0.0, None)
+        }]]);
+        state.oamd.resolve_payload(&mut second);
+        assert_eq!(object_blocks(&second)[0].size, Some([0.75; 3]));
+    }
+
+    #[test]
+    fn oamd_state_clears_valid_position_when_render_info_excludes_position() {
+        let mut payload = payload_with_object_blocks(vec![vec![
+            first_block(-2.0, Q, 0.4, Some((0.625, 0.5))),
+            OamdObjectBlock {
+                basic_info_status: 2,
+                render_info_status: 3,
+                render_info_blocks: Some(4),
+                size: Some([0.75; 3]),
                 ..OamdObjectBlock::default()
             },
         ]]);
 
         let mut state = MetadataParseState::default();
-        state.oamd.resolve_payload(&mut first);
-        state.oamd.resolve_payload(&mut second);
+        state.oamd.resolve_payload(&mut payload);
 
-        let resolved = second_block(&second);
+        let resolved = &object_blocks(&payload)[1];
         assert_eq!(resolved.anchor, ObjectAnchor::Screen);
         assert_eq!(resolved.gain_db, Some(-2.0));
-        assert_eq!(resolved.priority, Some(3));
+        assert_eq!(resolved.priority, Some(7));
         assert!(!resolved.valid_position);
-        assert!(resolved.differential_position);
-        assert_eq!(resolved.position, Some(position));
-        assert_eq!(resolved.distance, Some(3.2));
-        assert_eq!(resolved.size, Some([0.75, 0.75, 0.75]));
+        assert_eq!(resolved.position, Some(Q));
+        assert_eq!(resolved.distance, Some(4.0));
+        assert_eq!(resolved.size, Some([0.75; 3]));
         assert_eq!(resolved.screen_factor, Some(0.625));
         assert_eq!(resolved.depth_factor, Some(0.5));
+    }
+
+    /// A block that signals its anchor and is not screen anchored leaves the
+    /// screen rather than keeping the anchor of an earlier block.
+    #[test]
+    fn a_block_that_signals_a_room_anchor_leaves_the_screen() {
+        let mut payload = payload_with_object_blocks(vec![vec![
+            first_block(0.0, P, 0.0, Some((0.5, 2.0))),
+            OamdObjectBlock {
+                basic_info_status: 2,
+                render_info_status: 3,
+                render_info_blocks: Some(8),
+                anchor: ObjectAnchor::Room,
+                ..OamdObjectBlock::default()
+            },
+        ]]);
+
+        let mut state = MetadataParseState::default();
+        state.oamd.resolve_payload(&mut payload);
+
+        let resolved = &object_blocks(&payload)[1];
+        assert_eq!(resolved.anchor, ObjectAnchor::Room);
+        assert_eq!(resolved.screen_factor, None);
+        assert_eq!(resolved.depth_factor, None);
+        assert_eq!(resolved.position, Some(P));
     }
 
     mod huffman_prefix_tests {
