@@ -92,6 +92,54 @@ pub fn cmd_info(args: &InfoArgs, cli: &Cli, multi: Option<&MultiProgress>) -> Re
     Ok(())
 }
 
+/// The speakers one E-AC-3 or AC-3 frame carries, in the order it codes them.
+#[derive(Debug, Clone, PartialEq)]
+struct Layout {
+    fullband: Vec<eac3::BedChannel>,
+    lfe: bool,
+}
+
+impl Layout {
+    /// A dependent frame names its speakers with `chanmap` when it has one,
+    /// and with its own `acmod` otherwise (TS 102 366 clause E.2.8.2).
+    fn of(info: &eac3::AccessUnitInfo) -> Option<Self> {
+        let fullband = match info.dependent_channel_map {
+            Some(chanmap) => eac3::dependent_chanmap_positions(chanmap),
+            None => eac3::fullband_channel_order(info.channel_mode)
+                .ok()?
+                .to_vec(),
+        };
+        Some(Self {
+            fullband,
+            lfe: info.lfe_on,
+        })
+    }
+}
+
+/// The channels a decode of the programme writes: the independent frame's,
+/// with each speaker of its dependent frame either replacing the one it
+/// shares or adding a new one, as the decoder merges them. A Blu-ray 7.1 —
+/// a 5.1 AC-3 frame and a dependent carrying Ls, Rs, Lrs and Rrs — is 8.
+///
+/// With JOC, the dependent feeds the objects, and the count stays the
+/// independent frame's. `None` when the independent frame could not be read.
+fn programme_channels(core: Option<&Layout>, dependent: Option<&Layout>, joc: bool) -> Option<u32> {
+    let core = core?;
+    let mut fullband = core.fullband.clone();
+    let mut lfe = core.lfe;
+    if let (Some(dependent), false) = (dependent, joc) {
+        for speaker in &dependent.fullband {
+            if !fullband.contains(speaker) {
+                fullband.push(*speaker);
+            }
+        }
+        lfe |= dependent.lfe;
+    }
+    u32::try_from(fullband.len())
+        .ok()
+        .map(|n| n + u32::from(lfe))
+}
+
 fn cmd_info_eac3(args: &InfoArgs, mut reader: InputReader) -> Result<()> {
     log::info!("Analyzing EAC3 stream: {}", args.input.display());
 
@@ -106,6 +154,10 @@ fn cmd_info_eac3(args: &InfoArgs, mut reader: InputReader) -> Result<()> {
     // The header of the first independent frame, for the report: a dependent
     // frame describes only the channels it adds to the programme.
     let mut first_header: Option<eac3::FrameInfo> = None;
+    // The channels of the first independent frame and of the first dependent
+    // one, as the decoder lays them out (see `programme_channels`).
+    let mut core_layout: Option<Layout> = None;
+    let mut dependent_layout: Option<Layout> = None;
     let mut frames = 0u64;
     // Samples of the independent frames, for the bound; a dependent frame
     // extends the same audio and is not counted twice.
@@ -119,13 +171,28 @@ fn cmd_info_eac3(args: &InfoArgs, mut reader: InputReader) -> Result<()> {
         } {
             frames += 1;
             let header = frame.info();
-            if header.stream_type != eac3::StreamType::Dependent {
+            let dependent = header.stream_type == eac3::StreamType::Dependent;
+            if !dependent {
                 samples += u64::from(header.samples);
                 if first_header.is_none() {
                     first_header = Some(header);
                 }
+                // A Blu-ray 7.1 carries its 5.1 as a legacy AC-3 frame, which
+                // the E-AC-3 header reader does not describe.
+                if core_layout.is_none() && header.bitstream_id <= 10 {
+                    core_layout = eac3::inspect_legacy_ac3_access_unit(frame.as_bytes())
+                        .ok()
+                        .and_then(|info| Layout::of(&info));
+                }
             }
             if let Ok(info) = eac3::inspect_access_unit(frame.as_bytes()) {
+                if dependent {
+                    if dependent_layout.is_none() {
+                        dependent_layout = Layout::of(&info);
+                    }
+                } else if core_layout.is_none() {
+                    core_layout = Layout::of(&info);
+                }
                 for payload in info.payloads() {
                     match payload.parsed {
                         eac3::ParsedEmdfPayloadData::Joc(_) => joc_seen = true,
@@ -160,7 +227,10 @@ fn cmd_info_eac3(args: &InfoArgs, mut reader: InputReader) -> Result<()> {
         };
         let mut report = InfoReport::new();
         report.codec = Some("EAC3");
-        report.channels = Some(u32::from(header.channels()));
+        report.channels = Some(
+            programme_channels(core_layout.as_ref(), dependent_layout.as_ref(), joc_seen)
+                .unwrap_or_else(|| u32::from(header.channels())),
+        );
         report.sample_rate = Some(header.sample_rate);
         report.spatial = joc_seen.then(|| Spatial {
             label: damf::SourceCodec::Eac3Joc.label().to_string(),
@@ -901,5 +971,56 @@ impl<'a> PresentationBuilder<'a> {
         presentation.presentation_type =
             Some(self.presentation_map.presentation_type_by_index(index));
         presentation
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eac3::BedChannel::*;
+
+    fn layout(fullband: &[eac3::BedChannel], lfe: bool) -> Layout {
+        Layout {
+            fullband: fullband.to_vec(),
+            lfe,
+        }
+    }
+
+    #[test]
+    fn a_core_and_its_dependent_count_as_the_decoder_merges_them() {
+        // A Blu-ray 7.1: the 5.1 as an AC-3 frame, then a dependent whose
+        // chanmap 0x1A00 carries Ls, Rs (replacing the core's) and Lrs/Rrs.
+        let core = layout(
+            &[FrontLeft, Center, FrontRight, SurroundLeft, SurroundRight],
+            true,
+        );
+        let dependent = layout(&eac3::dependent_chanmap_positions(0x1A00), false);
+        assert_eq!(dependent.fullband.len(), 4);
+        assert_eq!(
+            programme_channels(Some(&core), Some(&dependent), false),
+            Some(8)
+        );
+        // Alone, the core is its own 5.1.
+        assert_eq!(programme_channels(Some(&core), None, false), Some(6));
+        // With JOC, the dependent feeds the objects: the bed stays the core's.
+        assert_eq!(
+            programme_channels(Some(&core), Some(&dependent), true),
+            Some(6)
+        );
+        // Nothing read: the caller falls back to the header.
+        assert_eq!(programme_channels(None, Some(&dependent), false), None);
+    }
+
+    #[test]
+    fn a_dependent_that_only_replaces_adds_nothing_and_dual_mono_is_two() {
+        let stereo = layout(&[FrontLeft, FrontRight], false);
+        let replacing = layout(&[FrontLeft, FrontRight], true);
+        // Its LFE is the programme's too.
+        assert_eq!(
+            programme_channels(Some(&stereo), Some(&replacing), false),
+            Some(3)
+        );
+        let dual_mono = layout(eac3::fullband_channel_order(0).unwrap(), false);
+        assert_eq!(programme_channels(Some(&dual_mono), None, false), Some(2));
     }
 }

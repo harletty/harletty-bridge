@@ -12,8 +12,8 @@ pub use eac3dec::{
     OamdObjectElement, OamdPayload, ObjectPcmDecoder, ObjectPcmFrame, ObjectPcmPushResult,
     ParseError as AccessUnitParseError, ParsedEmdfPayloadData, ParsedEmdfPayloadKind, PayloadInfo,
     PcmDecoder, PcmPushResult, PushResult, SkipFieldInfo, dependent_chanmap_positions,
-    fullband_channel_order, inspect_access_unit, merge_core_with_decoded_dependent,
-    merge_core_with_dependent,
+    fullband_channel_order, inspect_access_unit, inspect_legacy_ac3_access_unit,
+    merge_core_with_decoded_dependent, merge_core_with_dependent,
 };
 pub use extract::{ExtractError, Extractor, Frame};
 pub use parser::{
