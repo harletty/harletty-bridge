@@ -10,6 +10,7 @@ pub mod handler;
 #[cfg(feature = "iamf")]
 pub mod iamf_handler;
 pub mod output;
+pub mod parallel;
 pub mod processor;
 pub mod progress;
 

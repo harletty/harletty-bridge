@@ -120,6 +120,13 @@ pub struct DecodeArgs {
     /// Specify warp mode when not present in metadata
     #[arg(long, value_enum)]
     pub warp_mode: Option<WarpMode>,
+
+    /// Decode a TrueHD stream on this many threads, 0 for one per core. The
+    /// stream is cut at major syncs and the runs decoded side by side; the
+    /// output is the same. With 1, and always with `--strict`, one thread
+    /// decodes the stream in order.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub threads: usize,
 }
 
 #[derive(Debug, Args)]
