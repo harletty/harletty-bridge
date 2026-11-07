@@ -23,6 +23,14 @@
 //! and its output discarded, and reaches the run in the state a decoder that
 //! never stopped would be in. That replay costs one interval per run.
 //!
+//! A run also holds at most [`MAX_RUN_FRAMES`] access units, so that a
+//! stream whose major syncs stop coming (lost to damage, or never sent) does
+//! not pile up into one run until the end of the input. A run that fills up
+//! is cut where it stands, inside an interval if need be, and the run after it
+//! takes over the parser and decoder the cut run ends with instead of
+//! replaying: such a stretch decodes one run after the other, as on the
+//! single-threaded path, but in bounded memory and with output flowing.
+//!
 //! The output matches the single-threaded path byte for byte, and so does
 //! the log of a clean stream. On a damaged one, a warning that counts access
 //! units since an event long past (the parser's late-DRC-update warning,
@@ -61,14 +69,37 @@ const DECODER_THREAD: &str = "harletty::cli::decode::decoder_thread";
 /// about 1.7 s of audio, and a feature film gives a few thousand of them.
 const CHUNK_INTERVALS: usize = 16;
 
-/// [`CHUNK_INTERVALS`], or `HARLETTY_TRUEHD_RUN_INTERVALS` when set: a
-/// verification knob, so that a short stream crosses many run boundaries.
-fn chunk_intervals() -> usize {
-    std::env::var("HARLETTY_TRUEHD_RUN_INTERVALS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(CHUNK_INTERVALS)
+/// Access units a run holds at most: twice a run of [`CHUNK_INTERVALS`]
+/// intervals of 128 access units, the interval of the streams we have.
+const MAX_RUN_FRAMES: usize = 2 * CHUNK_INTERVALS * 128;
+
+/// Where the reader cuts runs.
+#[derive(Clone, Copy)]
+struct RunSize {
+    /// Major-sync intervals per run.
+    intervals: usize,
+    /// Access units per run at most.
+    frames: usize,
+}
+
+impl RunSize {
+    /// [`CHUNK_INTERVALS`] and [`MAX_RUN_FRAMES`], or
+    /// `HARLETTY_TRUEHD_RUN_INTERVALS` and `HARLETTY_TRUEHD_RUN_FRAMES` when
+    /// set: verification knobs, so that a short stream crosses many run
+    /// boundaries, or is cut inside its intervals.
+    fn from_env() -> Self {
+        fn knob(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(default)
+        }
+        Self {
+            intervals: knob("HARLETTY_TRUEHD_RUN_INTERVALS", CHUNK_INTERVALS),
+            frames: knob("HARLETTY_TRUEHD_RUN_FRAMES", MAX_RUN_FRAMES),
+        }
+    }
 }
 
 pub struct ParallelDecoderConfig {
@@ -102,6 +133,13 @@ struct Run {
     outcomes: Vec<Outcome>,
     /// The rows of every decoded access unit of the run, back to back.
     rows: Vec<[i32; 16]>,
+    /// Where the run's parser and decoder come from when it does not start
+    /// afresh: the run before it, which ended where the interval before
+    /// this run's start cannot be replayed. `warmup` is then empty.
+    carry_in: Option<mpsc::Receiver<Box<Carry>>>,
+    /// Where the run hands its parser and decoder on, when the run after it
+    /// takes them over.
+    carry_out: Option<mpsc::SyncSender<Box<Carry>>>,
     /// Set when the worker panicked on this run.
     panic: Option<String>,
 }
@@ -113,8 +151,17 @@ impl Run {
         self.frames.clear();
         self.outcomes.clear();
         self.rows.clear();
+        self.carry_in = None;
+        self.carry_out = None;
         self.panic = None;
     }
+}
+
+/// The decoding state one run hands to the next.
+struct Carry {
+    parser: Parser,
+    decoder: Decoder,
+    recovering_until_major_sync: bool,
 }
 
 /// What became of one access unit, for the collector to act on in order.
@@ -183,7 +230,7 @@ fn run(config: ParallelDecoderConfig) -> Result<()> {
     run_on(
         &setup,
         threads,
-        chunk_intervals(),
+        RunSize::from_env(),
         tx,
         spare,
         &pb_clone,
@@ -201,7 +248,7 @@ fn run(config: ParallelDecoderConfig) -> Result<()> {
 fn run_on(
     setup: &WorkerSetup,
     threads: usize,
-    run_intervals: usize,
+    run_size: RunSize,
     tx: mpsc::SyncSender<Result<Box<DecodedAccessUnit>>>,
     spare: mpsc::Receiver<Box<DecodedAccessUnit>>,
     pb: &Option<ProgressBar>,
@@ -233,7 +280,7 @@ fn run_on(
 
         let collector = scope.spawn(move || collect(done_rx, ticket_tx, tx, spare));
 
-        let read = read_and_dispatch(feed, run_intervals, pb, job_tx, ticket_rx);
+        let read = read_and_dispatch(feed, run_size, pb, job_tx, ticket_rx);
         let totals = collector
             .join()
             .map_err(|_| anyhow!("TrueHD collector thread panicked"))??;
@@ -265,23 +312,13 @@ fn run_on(
 /// has stopped (the writer is gone or an error is on its way to it).
 fn read_and_dispatch(
     feed: impl FnOnce(Feed) -> Result<()>,
-    run_intervals: usize,
+    run_size: RunSize,
     pb: &Option<ProgressBar>,
     job_tx: mpsc::Sender<Run>,
     ticket_rx: mpsc::Receiver<Run>,
 ) -> Result<u64> {
     let mut extractor = Extractor::default();
-    let mut chunker = Chunker {
-        job_tx,
-        ticket_rx,
-        run_intervals,
-        seq: 0,
-        current: Vec::new(),
-        intervals: 0,
-        last_major_sync: None,
-        warmup: Vec::new(),
-        stopped: false,
-    };
+    let mut chunker = Chunker::new(job_tx, ticket_rx, run_size);
     let mut frame_count = 0u64;
 
     feed(&mut |chunk: &[u8]| {
@@ -308,14 +345,14 @@ fn read_and_dispatch(
         }
         Ok(true)
     })?;
-    chunker.dispatch();
+    chunker.dispatch(true);
     Ok(frame_count)
 }
 
 struct Chunker {
     job_tx: mpsc::Sender<Run>,
     ticket_rx: mpsc::Receiver<Run>,
-    run_intervals: usize,
+    run_size: RunSize,
     seq: u64,
     current: Vec<(u64, Frame)>,
     /// Major syncs in `current`.
@@ -324,22 +361,46 @@ struct Chunker {
     last_major_sync: Option<usize>,
     /// The interval the next run replays first.
     warmup: Vec<(u64, Frame)>,
+    /// Where the next run takes its parser and decoder from, when it cannot
+    /// replay the interval before it.
+    carry: Option<mpsc::Receiver<Box<Carry>>>,
     stopped: bool,
 }
 
 impl Chunker {
+    fn new(job_tx: mpsc::Sender<Run>, ticket_rx: mpsc::Receiver<Run>, run_size: RunSize) -> Self {
+        Self {
+            job_tx,
+            ticket_rx,
+            run_size,
+            seq: 0,
+            current: Vec::new(),
+            intervals: 0,
+            last_major_sync: None,
+            warmup: Vec::new(),
+            carry: None,
+            stopped: false,
+        }
+    }
+
     fn push(&mut self, number: u64, frame: Frame) {
+        let full = self.current.len() >= self.run_size.frames;
         if frame.is_major_sync() {
-            if self.intervals >= self.run_intervals {
-                self.dispatch();
+            if self.intervals >= self.run_size.intervals || full {
+                self.dispatch(true);
             }
             self.intervals += 1;
             self.last_major_sync = Some(self.current.len());
+        } else if full {
+            // No major sync to cut at: cut inside the interval.
+            self.dispatch(false);
         }
         self.current.push((number, frame));
     }
 
-    fn dispatch(&mut self) {
+    /// Hands `current` out as a run; `at_major_sync` when the run after it
+    /// starts at one (or there is none).
+    fn dispatch(&mut self, at_major_sync: bool) {
         if self.current.is_empty() || self.stopped {
             return;
         }
@@ -355,9 +416,21 @@ impl Chunker {
         // buffer it came with; likewise the interval it replays.
         std::mem::swap(&mut run.frames, &mut self.current);
         std::mem::swap(&mut run.warmup, &mut self.warmup);
-        if let Some(at) = self.last_major_sync {
-            // Frames are reference-counted: the copy is of the handles.
-            self.warmup.extend_from_slice(&run.frames[at..]);
+        run.carry_in = self.carry.take();
+        match self.last_major_sync {
+            // The next run starts at a major sync and this run holds the
+            // whole interval before it: the next run replays it.
+            Some(at) if at_major_sync => {
+                // Frames are reference-counted: the copy is of the handles.
+                self.warmup.extend_from_slice(&run.frames[at..]);
+            }
+            // The next run starts inside an interval, or after one that
+            // began in an earlier run: it takes this run's state over.
+            _ => {
+                let (carry_out, carry_in) = mpsc::sync_channel(1);
+                run.carry_out = Some(carry_out);
+                self.carry = Some(carry_in);
+            }
         }
         self.intervals = 0;
         self.last_major_sync = None;
@@ -388,20 +461,31 @@ fn worker_loop(
             rx.recv()
         };
         let Ok(mut run) = run else { return };
+        let carry_out = run.carry_out.take();
+        let hand_on = carry_out.is_some();
         let decoded_run = catch_unwind(AssertUnwindSafe(|| {
-            decode_run(&mut run, setup, &mut access_unit, &mut decoded)
+            decode_run(&mut run, setup, &mut access_unit, &mut decoded, hand_on)
         }));
-        if let Err(panic) = decoded_run {
-            run.panic = Some(
-                panic
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string()),
-            );
-            // State left half-updated by the panic is not reused.
-            access_unit = AccessUnit::default();
-            *decoded = DecodedAccessUnit::default();
+        match decoded_run {
+            // The next run may be waiting for it on another worker. A run
+            // that did not finish drops `carry_out`, which that run sees.
+            Ok(carry) => {
+                if let (Some(carry_out), Some(carry)) = (carry_out, carry) {
+                    let _ = carry_out.send(carry);
+                }
+            }
+            Err(panic) => {
+                run.panic = Some(
+                    panic
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string()),
+                );
+                // State left half-updated by the panic is not reused.
+                access_unit = AccessUnit::default();
+                *decoded = DecodedAccessUnit::default();
+            }
         }
         if done_tx.send(run).is_err() {
             return;
@@ -499,13 +583,27 @@ impl RunDecoder<'_> {
 }
 
 /// Decodes `run.frames` into `run.outcomes` and `run.rows`, after replaying
-/// `run.warmup`.
+/// `run.warmup` or taking over the state the run before ended with; returns
+/// the state this run ends with when `hand_on`, `None` when it could not
+/// start.
 fn decode_run(
     run: &mut Run,
     setup: &WorkerSetup,
     access_unit: &mut AccessUnit,
     decoded: &mut DecodedAccessUnit,
-) {
+    hand_on: bool,
+) -> Option<Box<Carry>> {
+    let carry = match run.carry_in.take() {
+        // The run before it is being decoded on another worker, or is done.
+        Some(carry_in) => match carry_in.recv() {
+            Ok(carry) => Some(carry),
+            Err(_) => {
+                run.panic = Some("the run before it did not finish".to_string());
+                return None;
+            }
+        },
+        None => None,
+    };
     let Run {
         warmup,
         frames,
@@ -513,13 +611,26 @@ fn decode_run(
         rows,
         ..
     } = run;
-    // A parser and decoder as the single-threaded path sets them up: state
-    // of fixed size, rebuilt for every run since a run starts afresh.
-    let mut parser = Parser::default();
-    parser.set_fail_level(setup.fail_level);
-    parser.set_required_presentations(&setup.required_presentations);
-    let mut decoder = Decoder::default();
-    decoder.set_fail_level(setup.fail_level);
+    let (parser, decoder, recovering_until_major_sync) = match carry {
+        Some(carry) => {
+            let Carry {
+                parser,
+                decoder,
+                recovering_until_major_sync,
+            } = *carry;
+            (parser, decoder, recovering_until_major_sync)
+        }
+        // A parser and decoder as the single-threaded path sets them up:
+        // state of fixed size, rebuilt for a run that starts afresh.
+        None => {
+            let mut parser = Parser::default();
+            parser.set_fail_level(setup.fail_level);
+            parser.set_required_presentations(&setup.required_presentations);
+            let mut decoder = Decoder::default();
+            decoder.set_fail_level(setup.fail_level);
+            (parser, decoder, false)
+        }
+    };
 
     let mut decoder = RunDecoder {
         parser,
@@ -527,7 +638,7 @@ fn decode_run(
         access_unit,
         decoded,
         presentation: setup.presentation,
-        recovering_until_major_sync: false,
+        recovering_until_major_sync,
         last_labels: None,
     };
 
@@ -543,6 +654,14 @@ fn decode_run(
     for (number, frame) in frames.iter() {
         decoder.step(*number, frame, Some((outcomes, rows)));
     }
+
+    hand_on.then(|| {
+        Box::new(Carry {
+            parser: decoder.parser,
+            decoder: decoder.decoder,
+            recovering_until_major_sync: decoder.recovering_until_major_sync,
+        })
+    })
 }
 
 /// Puts the runs back in order and sends their access units to the writer,
@@ -725,6 +844,56 @@ mod tests {
         EXAMPLE_DATA.repeat(copies)
     }
 
+    /// The access units of `bytes`, as the reader frames them.
+    fn frames_of(bytes: &[u8]) -> Vec<Frame> {
+        let mut extractor = Extractor::default();
+        extractor.push_bytes(bytes);
+        let mut frames = Vec::new();
+        loop {
+            match extractor.next() {
+                Some(Ok(frame)) => frames.push(frame),
+                Some(Err(ExtractError::InsufficientData)) | None => break,
+                Some(Err(_)) => {}
+            }
+        }
+        frames
+    }
+
+    /// The continuation access unit of `EXAMPLE_DATA`, `count` times: a
+    /// stretch with no major sync in it.
+    fn continuations(count: usize) -> Vec<u8> {
+        let frames = frames_of(EXAMPLE_DATA);
+        let continuation = frames
+            .iter()
+            .find(|f| !f.is_major_sync())
+            .expect("EXAMPLE_DATA holds a continuation access unit");
+        continuation.data.repeat(count)
+    }
+
+    /// Continuation access units ahead of the first major sync, a short
+    /// stretch, an interval far longer than a run, and more short ones.
+    fn long_interval_stream() -> Vec<u8> {
+        let mut bytes = continuations(5);
+        bytes.extend(stream(3));
+        bytes.extend(EXAMPLE_DATA);
+        bytes.extend(continuations(300));
+        bytes.extend(stream(4));
+        bytes
+    }
+
+    /// [`long_interval_stream`] with a continuation access unit damaged early
+    /// in the long interval: the decoders wait for a major sync from there,
+    /// across every cut after it.
+    fn damaged_long_interval_stream() -> Vec<u8> {
+        let mut bytes = long_interval_stream();
+        let continuation = continuations(1).len();
+        let at = 5 * continuation + 4 * EXAMPLE_DATA.len() + 40 * continuation + 6;
+        for byte in &mut bytes[at..at + 8] {
+            *byte ^= 0xFF;
+        }
+        bytes
+    }
+
     /// Scrambles 16 bytes of the major sync (`unit` 0) or the continuation
     /// access unit (1) of an interval, past the length field so framing holds.
     fn damage(bytes: &mut [u8], interval: usize, unit: usize) {
@@ -778,13 +947,21 @@ mod tests {
     }
 
     fn parallel(bytes: &[u8], threads: usize, run_intervals: usize) -> Vec<DecodedAccessUnit> {
+        let run_size = RunSize {
+            intervals: run_intervals,
+            frames: MAX_RUN_FRAMES,
+        };
+        parallel_in(bytes, threads, run_size)
+    }
+
+    fn parallel_in(bytes: &[u8], threads: usize, run_size: RunSize) -> Vec<DecodedAccessUnit> {
         // Room for the whole stream: nothing reads it until the decode is over.
         let (tx, rx) = mpsc::sync_channel(1 << 12);
         let (_spare_tx, spare) = mpsc::channel();
         run_on(
             &setup(),
             threads,
-            run_intervals,
+            run_size,
             tx,
             spare,
             &None,
@@ -862,5 +1039,132 @@ mod tests {
                 assert_same(&parallel(&bytes, threads, run_intervals), &serial, &case);
             }
         }
+    }
+
+    /// Runs cut inside an interval, and runs after an interval that began in
+    /// an earlier run, take over the state of the run before them: the
+    /// stream decodes as on the single-threaded path wherever it is cut.
+    #[test]
+    fn a_long_interval_decodes_the_same_cut_into_bounded_runs() {
+        let clean = long_interval_stream();
+        let damaged = damaged_long_interval_stream();
+        for (name, bytes) in [("clean", &clean), ("damaged", &damaged)] {
+            let serial = serial(bytes);
+            assert!(serial.len() > 300, "{name}: the long interval decodes");
+            for threads in [1, 2, 4] {
+                for intervals in [1, 2, 16] {
+                    for frames in [1, 2, 7, 50, MAX_RUN_FRAMES] {
+                        let case = format!(
+                            "{name}, {threads} threads, runs of {intervals} intervals \
+                             and at most {frames} access units"
+                        );
+                        let run_size = RunSize { intervals, frames };
+                        assert_same(&parallel_in(bytes, threads, run_size), &serial, &case);
+                    }
+                }
+            }
+        }
+    }
+
+    /// What became of each access unit (a parse failure, or one skipped while
+    /// waiting for a major sync), which the output alone does not tell apart:
+    /// both are silence.
+    fn kind(outcome: &Outcome) -> &'static str {
+        match outcome {
+            Outcome::Decoded { .. } => "decoded",
+            Outcome::DecodeFailed { .. } => "decode failed",
+            Outcome::ParseFailed => "parse failed",
+            Outcome::Skipped => "skipped",
+        }
+    }
+
+    /// The runs a reader cuts `frames` into decode, one after the other as
+    /// the workers hand state on, to what one run of them all decodes to.
+    #[test]
+    fn cut_runs_come_out_as_one_run() {
+        let frames = frames_of(&damaged_long_interval_stream());
+        let numbered: Vec<(u64, Frame)> = (1..).zip(frames).collect();
+        let setup = setup();
+        let mut access_unit = AccessUnit::default();
+        let mut decoded = DecodedAccessUnit::default();
+
+        let mut whole = Run {
+            frames: numbered.clone(),
+            ..Run::default()
+        };
+        decode_run(&mut whole, &setup, &mut access_unit, &mut decoded, false);
+        let expected: Vec<_> = whole.outcomes.iter().map(kind).collect();
+        assert!(expected.contains(&"parse failed") && expected.contains(&"skipped"));
+
+        for frames in [1, 7, 50] {
+            let (job_tx, job_rx) = mpsc::channel();
+            let (ticket_tx, ticket_rx) = mpsc::sync_channel(numbered.len());
+            for _ in 0..numbered.len() {
+                ticket_tx.send(Run::default()).unwrap();
+            }
+            let run_size = RunSize {
+                intervals: 2,
+                frames,
+            };
+            let mut chunker = Chunker::new(job_tx, ticket_rx, run_size);
+            for (number, frame) in numbered.iter().cloned() {
+                chunker.push(number, frame);
+            }
+            chunker.dispatch(true);
+            drop(chunker);
+
+            let (mut kinds, mut rows) = (Vec::new(), Vec::new());
+            for mut run in job_rx.try_iter() {
+                let carry_out = run.carry_out.take();
+                let hand_on = carry_out.is_some();
+                let carry = decode_run(&mut run, &setup, &mut access_unit, &mut decoded, hand_on);
+                assert!(run.panic.is_none(), "runs of {frames}: {:?}", run.panic);
+                if let (Some(carry_out), Some(carry)) = (carry_out, carry) {
+                    let _ = carry_out.send(carry);
+                }
+                kinds.extend(run.outcomes.iter().map(kind));
+                rows.extend_from_slice(&run.rows);
+            }
+            assert_eq!(kinds, expected, "runs of at most {frames} access units");
+            assert!(rows == whole.rows, "runs of at most {frames}: samples");
+        }
+    }
+
+    /// With no major sync coming, the reader still hands runs out as they
+    /// fill, and no run holds more than the most it may.
+    #[test]
+    fn a_run_stays_bounded_when_major_syncs_stop() {
+        let mut bytes = stream(1);
+        bytes.extend(continuations(1000));
+        let frames = frames_of(&bytes);
+        assert_eq!(frames.len(), 1002);
+
+        let (job_tx, job_rx) = mpsc::channel();
+        let (ticket_tx, ticket_rx) = mpsc::sync_channel(64);
+        for _ in 0..64 {
+            ticket_tx.send(Run::default()).unwrap();
+        }
+        let run_size = RunSize {
+            intervals: CHUNK_INTERVALS,
+            frames: 50,
+        };
+        let mut chunker = Chunker::new(job_tx, ticket_rx, run_size);
+        for (number, frame) in (1..).zip(frames) {
+            chunker.push(number, frame);
+            assert!(chunker.current.len() <= 50, "at access unit {number}");
+        }
+        let runs: Vec<Run> = job_rx.try_iter().collect();
+        assert_eq!(
+            runs.len(),
+            20,
+            "runs handed out before the end of the input"
+        );
+        for run in &runs {
+            assert_eq!(run.frames.len(), 50);
+            assert!(run.warmup.is_empty(), "a cut run is not replayed");
+            assert!(run.carry_out.is_some(), "a cut run hands its state on");
+        }
+        assert!(runs[0].carry_in.is_none());
+        assert!(runs[1..].iter().all(|run| run.carry_in.is_some()));
     }
 }
