@@ -27,6 +27,7 @@ mod iamf;
 #[cfg(feature = "iamf")]
 mod iamf_to_oamd;
 mod input;
+mod log_mute;
 mod settings;
 mod signature;
 pub(crate) mod timestamp;
@@ -66,12 +67,15 @@ fn main() -> Result<()> {
         }
     }
 
+    let logger = env_builder.build();
     let pb = if cli.progress {
-        let logger = env_builder.build();
-        LogWrapper::new(multi.clone(), logger).try_init()?;
+        LogWrapper::new(multi.clone(), log_mute::Mutable(logger)).try_init()?;
         Some(&multi)
     } else {
-        env_builder.try_init()?;
+        // What `env_logger`'s own `try_init` does, around the wrapper.
+        let max_level = logger.filter();
+        log::set_boxed_logger(Box::new(log_mute::Mutable(logger)))?;
+        log::set_max_level(max_level);
         None
     };
 

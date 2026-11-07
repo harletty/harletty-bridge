@@ -4,6 +4,7 @@ use super::dts_thread::{DtsDecoderThreadConfig, spawn_dts_decoder_thread};
 use super::eac3_handler::Eac3DecodeHandler;
 use super::eac3_thread::{Eac3DecoderThreadConfig, spawn_eac3_decoder_thread};
 use super::handler::{DecodeHandler, FrameHandlerContext, WriterState};
+use super::parallel::{ParallelDecoderConfig, spawn_parallel_decoder_thread};
 use super::progress::{create_progress_bar, estimate_total_frames};
 use crate::cli::command::{AudioFormat, Cli, DecodeArgs};
 use crate::codec_probe::{Codec, probe_codec};
@@ -74,7 +75,6 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
     };
 
     // Setup decoder components
-    let (tx, rx) = mpsc::channel();
     // The way back for the access units written out, which the decoder thread
     // decodes the next ones into.
     let (spare_tx, spare) = mpsc::channel();
@@ -109,19 +109,44 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
     }
     parser.set_required_presentations(&required_presentations);
 
+    let threads = match args.threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    };
+
     // Spawn decoder thread
-    let decode_thread = spawn_decoder_thread(DecoderThreadConfig {
-        input_path: args.input.clone(),
-        presentation,
-        strict_mode,
-        tx,
-        spare,
-        pb_clone,
-        extractor,
-        parser,
-        decoder,
-        prefix,
-    });
+    let (rx, decode_thread) = if threads > 1 && !strict_mode {
+        log::info!("Decoding on {threads} threads");
+        // About a second of 48 kHz audio waiting for the writer.
+        let (tx, rx) = mpsc::sync_channel(1024);
+        let thread = spawn_parallel_decoder_thread(ParallelDecoderConfig {
+            input_path: args.input.clone(),
+            presentation,
+            threads,
+            fail_level,
+            required_presentations,
+            tx,
+            spare,
+            pb_clone,
+            prefix,
+        });
+        (rx, thread)
+    } else {
+        let (tx, rx) = mpsc::channel();
+        let thread = spawn_decoder_thread(DecoderThreadConfig {
+            input_path: args.input.clone(),
+            presentation,
+            strict_mode,
+            tx,
+            spare,
+            pb_clone,
+            extractor,
+            parser,
+            decoder,
+            prefix,
+        });
+        (rx, thread)
+    };
 
     // Handle decoded frames
     let mut handler = DecodeHandler::default();

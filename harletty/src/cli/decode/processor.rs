@@ -26,7 +26,7 @@ impl AccessUnitShape {
         self.sampling_frequency
     }
 
-    fn of(decoded: &DecodedAccessUnit) -> Self {
+    pub(super) fn of(decoded: &DecodedAccessUnit) -> Self {
         Self {
             sampling_frequency: decoded.sampling_frequency,
             sample_length: decoded.sample_length,
@@ -35,7 +35,7 @@ impl AccessUnitShape {
         }
     }
 
-    fn to_silence(&self) -> DecodedAccessUnit {
+    pub(super) fn to_silence(&self) -> DecodedAccessUnit {
         DecodedAccessUnit {
             sampling_frequency: self.sampling_frequency,
             sample_length: self.sample_length,
