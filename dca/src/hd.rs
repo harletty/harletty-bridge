@@ -204,6 +204,52 @@ pub fn exss_has_xll(data: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// The hash behind [`HdDecoder::carried_state`]: one multiply and one
+/// xorshift per word, both bijections, so two states that differ in a single
+/// word never collide, and states that differ in several do with odds of
+/// about 2^-64. A word at a time, where the standard keyed hash pays a call
+/// per write.
+#[derive(Default)]
+struct StateHasher(u64);
+
+impl StateHasher {
+    #[inline]
+    fn word(&mut self, word: u64) {
+        let h = (self.0 ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 29);
+    }
+}
+
+impl std::hash::Hasher for StateHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.word(u64::from_le_bytes(word));
+        }
+    }
+
+    fn write_u8(&mut self, x: u8) {
+        self.word(u64::from(x));
+    }
+
+    fn write_u32(&mut self, x: u32) {
+        self.word(u64::from(x));
+    }
+
+    fn write_i32(&mut self, x: i32) {
+        self.word(u64::from(x as u32));
+    }
+
+    fn write_usize(&mut self, x: usize) {
+        self.word(x as u64);
+    }
+}
+
 pub struct HdDecoder {
     core: CoreDecoder,
     synth: SynthState,
@@ -247,6 +293,21 @@ impl HdDecoder {
             .iter()
             .enumerate()
             .filter_map(|(speaker, channel)| channel.as_deref().map(|v| (speaker, v)))
+    }
+
+    /// A fingerprint of everything this decoder carries from one frame into
+    /// the next: the core's ADPCM and LFE history, the filter banks' delay
+    /// lines and the XLL peak-bitrate buffer. Two decoders with the same
+    /// fingerprint decode whatever follows into the same samples, so a
+    /// decoder started part-way through a stream can be checked against
+    /// one that ran from the start.
+    pub fn carried_state(&self) -> u64 {
+        use std::hash::Hasher;
+        let mut state = StateHasher::default();
+        self.core.hash_carried(&mut state);
+        self.synth.hash_carried(&mut state);
+        self.xll.hash_carried(&mut state);
+        state.finish()
     }
 
     /// Decode one DTS-HD frame from its core access unit + EXSS substream bytes.

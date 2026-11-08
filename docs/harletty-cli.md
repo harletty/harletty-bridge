@@ -122,6 +122,7 @@ harletty decode [OPTIONS] <INPUT>
 | `--no-fold-estimate` | flag | off | DTS:X only. A waveform whose bed fold is still unknown (not stated, and not recomputed from its position) is normally given a fold estimated from the bed's audio, so it plays at its position and leaves the bed. With this flag it stays in the bed and its own channel is muted. |
 | `--warp-mode` | `normal`, `warping`, `prologiciix`, `loro` | *(from stream)* | Downmix warp mode to declare when the metadata does not carry one. |
 | `--no-estimate-progress` | flag | off | Skip the pre-pass that counts frames for the progress bar. Automatic for stdin, which cannot be pre-scanned. |
+| `--threads <N>` | count | `1` | Decode on this many threads, `0` for one per core. **TrueHD and DTS only**; E-AC-3 and IAMF always decode on one. The stream is cut into runs decoded side by side, and the output and the log are the same as on one thread. `--strict` always decodes on one thread. Memory grows with the count: about 150 MB at 16 threads. |
 
 ### `info`
 

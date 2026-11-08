@@ -9,11 +9,10 @@
 //! go out as they are and the stage steps aside.
 
 use super::dts_handler::{AuroFrame, DtsFrameMessage};
-use anyhow::Result;
+use super::dts_thread::FrameSink;
 use auro::{Detector, StreamId, Unfolder};
 use dca::HdFrame;
 use std::collections::VecDeque;
-use std::sync::mpsc;
 
 /// Samples to hold back while waiting for a verdict: three of the largest
 /// blocks, which is what the detector needs to latch.
@@ -65,6 +64,16 @@ struct HeldFrame {
 
 pub struct AuroStage {
     phase: Phase,
+    /// One channel of a frame as integers, for the detector or the unfolder.
+    ints: Vec<i32>,
+}
+
+/// `channel` as the 24-bit integers it was decoded from: a lossless frame's
+/// floats are them over 2^23, exactly, so the side channel in their low bits
+/// survives the round trip.
+fn to_ints(channel: &[f32], ints: &mut Vec<i32>) {
+    ints.clear();
+    ints.extend(channel.iter().map(|&v| (v * PCM_SCALE).round() as i32));
 }
 
 impl AuroStage {
@@ -75,22 +84,28 @@ impl AuroStage {
                 held: VecDeque::new(),
                 held_samples: 0,
             },
+            ints: Vec::new(),
         }
     }
 
-    /// One decoded HD frame, with the decoder's integer output for it.
-    /// Sends whatever can go out now.
+    /// One decoded HD frame with lossless output. Sends whatever can go out
+    /// now.
     pub fn frame(
         &mut self,
         frame: Box<HdFrame>,
         presentation: Option<dca::XPresentation>,
         metadata: Option<dca::XMetadata>,
-        lossless: impl Iterator<Item = (usize, Vec<i32>)>,
-        tx: &mpsc::Sender<Result<DtsFrameMessage>>,
+        tx: &impl FrameSink,
     ) {
+        let ints = &mut self.ints;
+        let channels = frame
+            .samples
+            .iter()
+            .enumerate()
+            .filter_map(|(speaker, channel)| channel.as_deref().map(|c| (speaker, c)));
         match &mut self.phase {
             Phase::Plain => {
-                let _ = tx.send(Ok(DtsFrameMessage::Hd {
+                tx.deliver(Ok(DtsFrameMessage::Hd {
                     frame,
                     presentation,
                     metadata,
@@ -103,9 +118,10 @@ impl AuroStage {
                 sample_rate,
                 scratch,
             } => {
-                for (speaker, samples) in lossless {
+                for (speaker, channel) in channels {
                     if let Some(index) = speakers.iter().position(|&s| s == speaker) {
-                        for chunk in samples.chunks(auro::unfold::MAX_PUSH) {
+                        to_ints(channel, ints);
+                        for chunk in ints.chunks(auro::unfold::MAX_PUSH) {
                             unfolder.push(index, chunk);
                         }
                     }
@@ -122,8 +138,9 @@ impl AuroStage {
                 }
                 let n = frame.bed_sample_count();
                 let mut latched = None;
-                for (speaker, samples) in lossless {
-                    if let Some(d) = detector.push(speaker, &samples) {
+                for (speaker, channel) in channels {
+                    to_ints(channel, ints);
+                    if let Some(d) = detector.push(speaker, ints) {
                         latched = Some(d);
                     }
                 }
@@ -134,7 +151,7 @@ impl AuroStage {
                 });
                 *held_samples += n;
                 if let Some(detection) = latched {
-                    let _ = tx.send(Ok(DtsFrameMessage::Auro(detection)));
+                    tx.deliver(Ok(DtsFrameMessage::Auro(detection)));
                     self.start_unfolding(detection, tx);
                 } else if *held_samples > HOLD_LIMIT {
                     self.give_up(tx);
@@ -144,14 +161,14 @@ impl AuroStage {
     }
 
     /// A frame without lossless output (core only): not a carrier.
-    pub fn not_a_carrier(&mut self, tx: &mpsc::Sender<Result<DtsFrameMessage>>) {
+    pub fn not_a_carrier(&mut self, tx: &impl FrameSink) {
         if matches!(self.phase, Phase::Undecided { .. }) {
             self.give_up(tx);
         }
     }
 
     /// Input is over: release what the latency held back.
-    pub fn finish(&mut self, tx: &mpsc::Sender<Result<DtsFrameMessage>>) {
+    pub fn finish(&mut self, tx: &impl FrameSink) {
         match &mut self.phase {
             Phase::Unfolding {
                 unfolder,
@@ -172,11 +189,11 @@ impl AuroStage {
         }
     }
 
-    fn give_up(&mut self, tx: &mpsc::Sender<Result<DtsFrameMessage>>) {
+    fn give_up(&mut self, tx: &impl FrameSink) {
         let phase = std::mem::replace(&mut self.phase, Phase::Plain);
         if let Phase::Undecided { held, .. } = phase {
             for h in held {
-                let _ = tx.send(Ok(DtsFrameMessage::Hd {
+                tx.deliver(Ok(DtsFrameMessage::Hd {
                     frame: h.frame,
                     presentation: h.presentation,
                     metadata: h.metadata,
@@ -185,11 +202,7 @@ impl AuroStage {
         }
     }
 
-    fn start_unfolding(
-        &mut self,
-        detection: auro::Detection,
-        tx: &mpsc::Sender<Result<DtsFrameMessage>>,
-    ) {
+    fn start_unfolding(&mut self, detection: auro::Detection, tx: &impl FrameSink) {
         let phase = std::mem::replace(&mut self.phase, Phase::Plain);
         let Phase::Undecided { held, .. } = phase else {
             return;
@@ -216,15 +229,12 @@ impl AuroStage {
         let mut unfolder = Unfolder::new(&carrier_ids, &outputs);
         unfolder.set_latency(usize::from(detection.block_size));
         let mut scratch = Vec::new();
-        // Replay what was held: the floats are the 24-bit integers exactly.
+        // Replay what was held.
         for h in held {
             for (index, &speaker) in speakers.iter().enumerate() {
                 if let Some(channel) = h.frame.samples.get(speaker).and_then(|c| c.as_ref()) {
-                    let ints: Vec<i32> = channel
-                        .iter()
-                        .map(|&v| (v * PCM_SCALE).round() as i32)
-                        .collect();
-                    for chunk in ints.chunks(auro::unfold::MAX_PUSH) {
+                    to_ints(channel, &mut self.ints);
+                    for chunk in self.ints.chunks(auro::unfold::MAX_PUSH) {
                         unfolder.push(index, chunk);
                     }
                 }
@@ -240,14 +250,10 @@ impl AuroStage {
         };
     }
 
-    fn give_up_with(
-        &mut self,
-        held: VecDeque<HeldFrame>,
-        tx: &mpsc::Sender<Result<DtsFrameMessage>>,
-    ) {
+    fn give_up_with(&mut self, held: VecDeque<HeldFrame>, tx: &impl FrameSink) {
         self.phase = Phase::Plain;
         for h in held {
-            let _ = tx.send(Ok(DtsFrameMessage::Hd {
+            tx.deliver(Ok(DtsFrameMessage::Hd {
                 frame: h.frame,
                 presentation: h.presentation,
                 metadata: h.metadata,
@@ -260,7 +266,7 @@ impl AuroStage {
         outputs: &[StreamId],
         sample_rate: u32,
         scratch: &mut Vec<i32>,
-        tx: &mpsc::Sender<Result<DtsFrameMessage>>,
+        tx: &impl FrameSink,
     ) {
         let ready = unfolder.ready();
         if ready == 0 {
@@ -270,7 +276,7 @@ impl AuroStage {
         scratch.resize(ready * outputs.len(), 0);
         let frames = unfolder.take(outputs, scratch);
         scratch.truncate(frames * outputs.len());
-        let _ = tx.send(Ok(DtsFrameMessage::AuroFrame(Box::new(AuroFrame {
+        tx.deliver(Ok(DtsFrameMessage::AuroFrame(Box::new(AuroFrame {
             sample_rate,
             streams: outputs.to_vec(),
             samples: std::mem::take(scratch),

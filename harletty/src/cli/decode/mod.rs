@@ -3,6 +3,7 @@ pub mod auro_stage;
 mod decode_impl;
 pub mod decoder_thread;
 pub mod dts_handler;
+pub mod dts_parallel;
 pub mod dts_thread;
 pub mod eac3_handler;
 pub mod eac3_thread;
