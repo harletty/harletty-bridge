@@ -894,6 +894,16 @@ impl XllDecoder {
         self.pool.give_slots(&mut self.output);
     }
 
+    /// Feed `state` what this decoder carries from one frame into the next:
+    /// the peak-bitrate smoothing buffer and its delay, and the stream they
+    /// belong to. Each frame's headers and band data are parsed afresh.
+    pub(crate) fn hash_carried(&self, state: &mut impl std::hash::Hasher) {
+        state.write_u32(self.hd_stream_id);
+        state.write_u32(self.pbr_delay);
+        state.write_usize(self.pbr_buffer.len());
+        state.write(&self.pbr_buffer);
+    }
+
     fn clear_pbr(&mut self) {
         self.pbr_buffer.clear();
         self.pbr_delay = 0;

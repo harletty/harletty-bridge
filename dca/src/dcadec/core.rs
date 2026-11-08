@@ -1182,6 +1182,25 @@ impl CoreDecoder {
         &self.bands[self.band_range(ch, band)][DCA_ADPCM_COEFFS..]
     }
 
+    /// Feed `state` what this decoder carries from one frame into the next:
+    /// the ADPCM history of every band and the LFE history, with the sizes
+    /// that decide whether the next frame keeps them. The rest of the
+    /// decoder is read afresh from each frame.
+    pub(crate) fn hash_carried(&self, state: &mut impl std::hash::Hasher) {
+        state.write_usize(self.band_len);
+        state.write_usize(self.lfe_samples.len());
+        if self.band_len > 0 {
+            for row in self.bands.chunks_exact(self.band_len) {
+                for &x in &row[..DCA_ADPCM_COEFFS] {
+                    state.write_i32(x);
+                }
+            }
+        }
+        for &x in &self.lfe_samples[..DCA_LFE_HISTORY.min(self.lfe_samples.len())] {
+            state.write_i32(x);
+        }
+    }
+
     pub(crate) fn lfe(&self) -> &[i32] {
         &self.lfe_samples
     }

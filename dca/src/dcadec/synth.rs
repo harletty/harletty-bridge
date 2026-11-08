@@ -413,6 +413,19 @@ impl Default for ChannelSynth {
 }
 
 impl ChannelSynth {
+    /// The filter-bank memory of a bank of `bands` bands, newest block
+    /// first: the transforms of the last 15 blocks, then the overlap of the
+    /// last one. The scalar bank keeps the transforms in a ring at
+    /// `offset`, the vector banks at the start of `hist1`.
+    fn memory(&self, isa: Isa, bands: usize) -> [&[i32]; 2] {
+        let history = match isa {
+            Isa::Baseline => &self.hist1[self.offset + bands..self.offset + 16 * bands],
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx2 | Isa::Avx512 => &self.hist1[..15 * bands],
+        };
+        [history, &self.hist2[..bands]]
+    }
+
     #[inline(always)]
     fn synth_filter(&mut self, window: &[i32; 512], out: &mut [i32; 32], input: &[i32; 32]) {
         let mut imdct = [0i32; 32];
@@ -646,6 +659,26 @@ impl Default for SynthState {
 }
 
 impl SynthState {
+    /// Feed `state` the delay lines this bank carries into the next frame,
+    /// as the bank will read them. A channel whose memory is all zeros is
+    /// left out, so a channel a stream never used and one it stopped using
+    /// once its memory was erased count the same.
+    pub(crate) fn hash_carried(&self, state: &mut impl std::hash::Hasher) {
+        state.write_u8(self.x96_mode as u8);
+        state.write_i32(self.lfe_x96_hist);
+        let bands = if self.x96_mode { 64 } else { 32 };
+        for (index, channel) in self.channels.iter().enumerate() {
+            let memory = channel.memory(self.isa, bands);
+            if memory.iter().all(|part| part.iter().all(|&x| x == 0)) {
+                continue;
+            }
+            state.write_usize(index);
+            for &x in memory.iter().flat_map(|part| part.iter()) {
+                state.write_i32(x);
+            }
+        }
+    }
+
     pub(crate) fn reset(&mut self) {
         for c in &mut self.channels {
             *c = ChannelSynth::default();
@@ -1104,6 +1137,49 @@ mod tests {
             }
             assert_eq!(all.last(), Some(&Isa::detect()));
             all
+        }
+    }
+
+    /// The fingerprint of the delay lines reads them as the bank does, so
+    /// the same frames give the same one on every build and through both
+    /// banks, though the scalar bank keeps its memory in a ring and the
+    /// vector banks do not.
+    #[test]
+    fn carried_state_is_the_same_on_every_bank() {
+        use std::hash::Hasher;
+        let stream: &[u8] =
+            include_bytes!("../../../harletty/tests/fixtures/dts_core_tone_10f.dts");
+        let run = |isa: Isa, x96: bool| -> Vec<u64> {
+            let mut core = CoreDecoder::default();
+            let mut synth = SynthState {
+                isa,
+                ..SynthState::default()
+            };
+            let mut out = CoreOutput::default();
+            let mut states = Vec::new();
+            let mut at = 0;
+            while at < stream.len() {
+                let info = crate::parser::parse_header(&stream[at..]).expect("fixture frame");
+                core.decode_frame(&info, &stream[at..at + info.frame_size])
+                    .expect("fixture frame");
+                synth.synthesize_fixed_by_speaker(&mut core, x96, &mut out);
+                let mut state = std::hash::DefaultHasher::new();
+                synth.hash_carried(&mut state);
+                states.push(state.finish());
+                at += info.frame_size;
+            }
+            states
+        };
+        for x96 in [false, true] {
+            let baseline = run(Isa::Baseline, x96);
+            assert_eq!(baseline.len(), 10);
+            assert!(
+                baseline.windows(2).all(|w| w[0] != w[1]),
+                "the memory moves on with every frame"
+            );
+            for isa in Isa::available() {
+                assert_eq!(run(isa, x96), baseline, "{isa:?}, 64 bands: {x96}");
+            }
         }
     }
 
