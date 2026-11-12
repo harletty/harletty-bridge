@@ -1033,7 +1033,9 @@ fn object_says(
 /// renderer clears the ones a metadata frame leaves out: an object that says
 /// nothing then is told again where it is going and how long it still has to
 /// get there. The first frame of a stream puts every object where the
-/// decoder evaluated it, before any move. A bed-only unit has none.
+/// decoder evaluated it, before any move. A bed-only unit has none. Every
+/// frame is dated on the unit's first sample (`frame_pos`), and each event
+/// on the sample it is said at.
 fn object_metadata(
     objects: &[DecodedObject],
     first_channel: usize,
@@ -1060,44 +1062,45 @@ fn object_metadata(
     let heartbeat_due = heartbeat_period > 0 && frame_pos % heartbeat_period < frame_len as u64;
     let announce = declaration_changed || heartbeat_due;
 
+    // `RMetadataFrame::sample_pos` is the origin the host dates the events
+    // from: stamped with the unit's first sample, an event said later in the
+    // unit starts its ramp on its own sample rather than on the unit's first.
     let mut frames = RVec::new();
-    let mut batch = |events: RVec<REvent>,
-                     at: u64,
-                     state: &mut ObjectState,
-                     frames: &mut RVec<RMetadataFrame>| {
-        let (object_channels, name_updates) = if declaration_changed {
-            declaration_changed = false;
-            let names = objects
-                .iter()
-                .enumerate()
-                .map(|(i, o)| RNameUpdate {
-                    id: i as u32,
-                    name: RString::from(if o.index == 0 {
-                        format!("IAMF {}", o.audio_element_id)
-                    } else {
-                        format!("IAMF {}.{}", o.audio_element_id, o.index)
-                    }),
-                })
-                .collect();
-            (
-                bridge_common::objects::declare_object_channels(
-                    &mut state.declared,
-                    current.clone(),
-                ),
-                names,
-            )
-        } else {
-            (RVec::new(), RVec::new())
+    let mut batch =
+        |events: RVec<REvent>, state: &mut ObjectState, frames: &mut RVec<RMetadataFrame>| {
+            let (object_channels, name_updates) = if declaration_changed {
+                declaration_changed = false;
+                let names = objects
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| RNameUpdate {
+                        id: i as u32,
+                        name: RString::from(if o.index == 0 {
+                            format!("IAMF {}", o.audio_element_id)
+                        } else {
+                            format!("IAMF {}.{}", o.audio_element_id, o.index)
+                        }),
+                    })
+                    .collect();
+                (
+                    bridge_common::objects::declare_object_channels(
+                        &mut state.declared,
+                        current.clone(),
+                    ),
+                    names,
+                )
+            } else {
+                (RVec::new(), RVec::new())
+            };
+            frames.push(RMetadataFrame {
+                events,
+                object_channels,
+                channel_gains: RVec::new(),
+                name_updates,
+                sample_pos: frame_pos,
+                ramp_duration: 0,
+            });
         };
-        frames.push(RMetadataFrame {
-            events,
-            object_channels,
-            channel_gains: RVec::new(),
-            name_updates,
-            sample_pos: at,
-            ramp_duration: 0,
-        });
-    };
 
     // A first sighting: every object where the decoder evaluated it at the
     // unit's start, before its moves.
@@ -1117,7 +1120,7 @@ fn object_metadata(
                 event(id, frame_pos, pos, 0)
             })
             .collect();
-        batch(events, frame_pos, state, &mut frames);
+        batch(events, state, &mut frames);
     }
 
     // What each object says over the unit, then the samples anything is
@@ -1172,7 +1175,7 @@ fn object_metadata(
             if !(consumed || first) {
                 break;
             }
-            batch(events, sample_pos, state, &mut frames);
+            batch(events, state, &mut frames);
             first = false;
         }
     }
@@ -1873,9 +1876,10 @@ mod tests {
         assert_eq!(frames[0].events.len(), 2);
         assert!(frames[0].events.iter().all(|e| e.ramp_duration == 0));
         assert!(close(event_of(&frames[0], 0).pos, [-1.0, 1.0, 0.0]));
-        // Then the ramp, with the other object restated at rest.
+        // Then the ramp, with the other object restated at rest: dated on
+        // the unit's first sample, its events on their own.
         let moved = &frames[1];
-        assert_eq!(moved.sample_pos, 500);
+        assert_eq!(moved.sample_pos, 0);
         assert!(moved.object_channels.is_empty());
         let ramp = event_of(moved, 0);
         assert_eq!((ramp.sample_pos, ramp.ramp_duration), (500, 1519));
@@ -1892,13 +1896,54 @@ mod tests {
         ];
         let frames = object_metadata(&objects, 0, 4096, 48_000, 4096, &mut state);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].sample_pos, 4196);
+        assert_eq!(frames[0].sample_pos, 4096);
         let jump = event_of(&frames[0], 1);
-        assert_eq!(jump.ramp_duration, 0);
+        assert_eq!((jump.sample_pos, jump.ramp_duration), (4196, 0));
         assert!(close(jump.pos, [-1.0, 1.0, 0.0]));
         let rest = event_of(&frames[0], 0);
-        assert_eq!(rest.ramp_duration, 0);
+        assert_eq!((rest.sample_pos, rest.ramp_duration), (4196, 0));
         assert!(close(rest.pos, [1.0, 1.0, 0.0]));
+    }
+
+    /// Every metadata frame of a unit is dated on the unit's first sample,
+    /// the origin the host dates the events from, and each event on the
+    /// sample it is said at: a move inside the unit starts on its own
+    /// sample, not on the unit's first.
+    #[test]
+    fn every_frame_is_dated_on_its_units_first_sample() {
+        let mut state = ObjectState::default();
+        let a = cart(-1.0, 1.0, 0.0);
+        let b = cart(1.0, 1.0, 0.0);
+        let c = cart(0.0, 0.0, 1.0);
+        let dates = |frames: &RVec<RMetadataFrame>| -> Vec<(u64, Vec<u64>)> {
+            frames
+                .iter()
+                .map(|f| {
+                    (
+                        f.sample_pos,
+                        f.events.iter().map(|e| e.sample_pos).collect(),
+                    )
+                })
+                .collect()
+        };
+        // The sighting, a ramp at 300, a step at 700.
+        let objects = [
+            object(300, vec![(0, a)], vec![line(300, 600, a, b)]),
+            object(301, vec![(0, c)], vec![step(700, 324, a)]),
+        ];
+        let frames = object_metadata(&objects, 0, 0, 48_000, 1024, &mut state);
+        assert_eq!(
+            dates(&frames),
+            [(0, vec![0, 0]), (0, vec![300, 300]), (0, vec![700, 700])]
+        );
+        // The next unit, from 1024: a ramp halfway through it.
+        let objects = [
+            object(300, vec![(0, b)], vec![]),
+            object(301, vec![(0, a)], vec![line(512, 512, a, c)]),
+        ];
+        let frames = object_metadata(&objects, 0, 1024, 48_000, 1024, &mut state);
+        assert_eq!(dates(&frames), [(1024, vec![1536, 1536])]);
+        assert_eq!(event_of(&frames[0], 1).ramp_duration, 512);
     }
 
     /// A line starting away from where the object is: a jump there, then
@@ -1912,13 +1957,11 @@ mod tests {
         let objects = [object(300, vec![(0, a)], vec![line(100, 1000, b, c)])];
         let frames = object_metadata(&objects, 0, 0, 48_000, 4096, &mut state);
         assert_eq!(frames.len(), 3, "{}", frames.len());
-        assert_eq!(frames[1].sample_pos, 100);
         let jump = event_of(&frames[1], 0);
-        assert_eq!(jump.ramp_duration, 0);
+        assert_eq!((jump.sample_pos, jump.ramp_duration), (100, 0));
         assert!(close(jump.pos, [-1.0, 0.0, 0.0]));
-        assert_eq!(frames[2].sample_pos, 100);
         let ramp = event_of(&frames[2], 0);
-        assert_eq!(ramp.ramp_duration, 1000);
+        assert_eq!((ramp.sample_pos, ramp.ramp_duration), (100, 1000));
         assert!(close(ramp.pos, [1.0, 0.0, 0.0]));
     }
 
@@ -1949,7 +1992,7 @@ mod tests {
         )];
         let frames = object_metadata(&objects, 0, 0, 48_000, 1024, &mut state);
         // The sighting at 0, then the three positions after the start.
-        let at: Vec<u64> = frames.iter().map(|f| f.sample_pos).collect();
+        let at: Vec<u64> = frames.iter().map(|f| event_of(f, 0).sample_pos).collect();
         assert_eq!(at, [0, 256, 512, 768], "{at:?}");
         let last = event_of(&frames[3], 0);
         assert!(close(last.pos, [0.75, 0.5625, 0.0]), "{:?}", last.pos);
@@ -1975,14 +2018,14 @@ mod tests {
         let frames = object_metadata(&objects, 0, 0, 48_000, 4096, &mut state);
         // The sighting at 0, the ramp at 0, the step at 1000.
         assert_eq!(frames.len(), 3, "{}", frames.len());
-        assert_eq!(frames[1].sample_pos, 0);
+        assert_eq!(event_of(&frames[1], 0).sample_pos, 0);
         assert_eq!(event_of(&frames[1], 0).ramp_duration, 3000);
         let later = &frames[2];
-        assert_eq!(later.sample_pos, 1000);
         let rest = event_of(later, 0);
-        assert_eq!(rest.ramp_duration, 2000);
+        assert_eq!((rest.sample_pos, rest.ramp_duration), (1000, 2000));
         assert!(close(rest.pos, [1.0, 1.0, 0.0]));
-        assert_eq!(event_of(later, 1).ramp_duration, 0);
+        let jump = event_of(later, 1);
+        assert_eq!((jump.sample_pos, jump.ramp_duration), (1000, 0));
         // A standstill coded as a step where the object already is says
         // nothing: the next unit has no frame.
         let objects = [
@@ -2006,9 +2049,13 @@ mod tests {
         let frames = decode_raw(&mut bridge, &std::fs::read(stream).unwrap());
         assert!(bridge.has_objects());
         assert_eq!(bridge.source_label().as_str(), "IAMF (PCM) 1 object");
+        let mut first_sample = 0;
         for frame in &frames {
             // No bed: the mix renders nothing in the decoder.
             assert_eq!(frame.channel_labels.as_slice(), [RChannelLabel::Object]);
+            // Its metadata is dated on its first sample.
+            assert!(frame.metadata.iter().all(|m| m.sample_pos == first_sample));
+            first_sample += u64::from(frame.sample_count);
         }
         let first = &frames[0].metadata[0];
         assert_eq!(first.object_channels.len(), 1);
