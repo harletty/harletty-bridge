@@ -920,8 +920,10 @@ fn build_eac3_frame_from_object(
     let mut metadata_events = 0usize;
     if bed_object_labels.is_none() {
         let num_bed_channels = usize::from(core.lfe_channel.is_some());
+        // Dated on the frame's own clock already (`oamd_payloads` includes the
+        // object frame's latency), so it adds to where this frame starts.
         for (oamd, sample_offset) in &pcm_frame.oamd_payloads {
-            let evo_base = base_sample_pos + sample_offset.unwrap_or(0) as u64;
+            let evo_base = base_sample_pos + u64::from(*sample_offset);
             let oamd_ref: &OamdPayload = oamd;
             let meta = build_eac3_metadata_frame(
                 oamd_ref,
@@ -1512,7 +1514,7 @@ mod tests {
         // 11 reconstructed channels = the 12-channel 7.1.4 bed minus the LFE
         // (carried by the core, not reconstructed by JOC).
         let mut frame = object_pcm_frame(core, vec![vec![0.0]; 11]);
-        frame.oamd_payloads = vec![(bed_only_oamd(full_714_bed()), None)];
+        frame.oamd_payloads = vec![(bed_only_oamd(full_714_bed()), 0)];
 
         let labels = eac3_pure_bed_object_labels(&frame).expect("pure bed labels");
         assert_eq!(
@@ -1567,12 +1569,12 @@ mod tests {
         let mut dynamic = object_pcm_frame(core.clone(), vec![vec![0.0]; 11]);
         let mut oamd = bed_only_oamd(full_714_bed());
         oamd.dynamic_objects = 1;
-        dynamic.oamd_payloads = vec![(oamd, None)];
+        dynamic.oamd_payloads = vec![(oamd, 0)];
         assert!(eac3_pure_bed_object_labels(&dynamic).is_none());
 
         // Bed assignment does not line up with the reconstructed channel count.
         let mut mismatch = object_pcm_frame(core, vec![vec![0.0]; 5]);
-        mismatch.oamd_payloads = vec![(bed_only_oamd(full_714_bed()), None)];
+        mismatch.oamd_payloads = vec![(bed_only_oamd(full_714_bed()), 0)];
         assert!(eac3_pure_bed_object_labels(&mismatch).is_none());
     }
 
@@ -1838,6 +1840,70 @@ mod presentation_assembly {
             bridge.dolby.pending_eac3_core.is_none(),
             "and nothing must be left pending behind it"
         );
+    }
+
+    /// The events of an object frame are dated where their audio comes out of
+    /// it, not where the bitstream dates them: the payload's own offsets plus
+    /// the object frame's latency, counted from the frame's first sample.
+    ///
+    /// The latency is added once, in the decoder. Adding it again here, or
+    /// reading the bitstream offset instead, moves every object 17 ms away
+    /// from its sound.
+    #[test]
+    fn object_events_are_dated_on_the_frame_clock() {
+        let decoded = eac3::ObjectPcmDecoder::default()
+            .push_access_unit(SELF_CONTAINED_JOC)
+            .expect("fixture must decode")
+            .expect("fixture carries JOC objects");
+        let in_bitstream: Vec<u64> = decoded
+            .info
+            .payloads()
+            .filter_map(|payload| match &payload.parsed {
+                eac3::ParsedEmdfPayloadData::Oamd(oamd) => {
+                    let update = oamd
+                        .elements
+                        .iter()
+                        .find_map(|element| match &element.kind {
+                            eac3::OamdElementKind::Object(object) => object.block_updates.first(),
+                            _ => None,
+                        })?;
+                    Some(
+                        u64::from(payload.info.sample_offset.unwrap_or(0))
+                            + update.offset.max(0) as u64,
+                    )
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !in_bitstream.is_empty(),
+            "the fixture must carry an object element for this to test anything"
+        );
+
+        let mut bridge = TestBridge::new(false);
+        let result = bridge.push_packet(
+            RSlice::from_slice(SELF_CONTAINED_JOC),
+            RInputTransport::Raw,
+            0,
+        );
+        let frame = result
+            .frames
+            .first()
+            .expect("the frame is emitted on arrival");
+        let latency = eac3::OAMD_LATENCY_SAMPLES as u64;
+        let mut seen = 0;
+        for (meta, at) in frame.metadata.iter().zip(&in_bitstream) {
+            for event in meta.events.iter() {
+                assert_eq!(
+                    event.sample_pos,
+                    at + latency,
+                    "object {} is not dated where its audio leaves the frame",
+                    event.id
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen > 0, "the frame must carry object events");
     }
 
     /// A core and the dependents behind it resolve as one presentation, and it
