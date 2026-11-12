@@ -710,7 +710,10 @@ fn parse_md_update_info(
     let blocks = read_bits(reader, 3, "num_obj_info_blocks")? as usize + 1;
     let mut updates = Vec::with_capacity(blocks);
     for _ in 0..blocks {
-        let offset = read_bits(reader, 6, "block_offset_factor")? as i16 + sample_offset as i16;
+        // Clause 5.3.2: update n starts at `sample_offset + 32 x block_offset_factor_n`,
+        // so the six bits reach 2 047 samples, past the end of the frame.
+        let offset =
+            32 * read_bits(reader, 6, "block_offset_factor")? as i16 + sample_offset as i16;
         let ramp_duration = match read_bits(reader, 2, "ramp_duration_code")? {
             code @ 0..=2 => RAMP_DURATIONS[code as usize],
             _ => {
@@ -2030,6 +2033,40 @@ mod tests {
             }
         }
         bytes
+    }
+
+    /// Clause 5.3.2: an update starts `32 x block_offset_factor` samples after
+    /// the `sample_offset` common to all the updates of a payload. Read as a
+    /// plain count of samples, the factor put every update after the first
+    /// within 94 samples of the frame's start.
+    #[test]
+    fn block_updates_start_32_samples_per_offset_factor() {
+        // sample_offset_code 2 (explicit, 5 bits) = 5, two updates
+        // (num_obj_info_blocks_bits 1): factor 0 with ramp_duration_code 2
+        // (1 536 samples), then factor 3 with ramp_duration_code 0.
+        let bytes = pack_bits(&[(2, 2), (5, 5), (1, 3), (0, 6), (2, 2), (3, 6), (0, 2)]);
+        let mut reader = BitReader::new(&bytes);
+        let (sample_offset, updates) = parse_md_update_info(&mut reader).expect("update info");
+        assert_eq!(sample_offset, 5);
+        assert_eq!(
+            updates,
+            vec![
+                OamdBlockUpdate {
+                    offset: 5,
+                    ramp_duration: 1536,
+                },
+                OamdBlockUpdate {
+                    offset: 5 + 3 * 32,
+                    ramp_duration: 0,
+                },
+            ]
+        );
+
+        // The largest start the syntax can state: 31 + 63 x 32.
+        let bytes = pack_bits(&[(2, 2), (31, 5), (0, 3), (63, 6), (0, 2)]);
+        let mut reader = BitReader::new(&bytes);
+        let (_, updates) = parse_md_update_info(&mut reader).expect("update info");
+        assert_eq!(updates[0].offset, 2047);
     }
 
     /// The first block of a bed object: active, then `gain_fields`, default

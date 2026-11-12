@@ -28,6 +28,37 @@ use crate::BedChannel;
 /// what closes that gap.
 pub const JOC_LATENCY_SAMPLES: usize = QMF_RECONSTRUCTION_DELAY;
 
+/// How much later than its OAMD dates it the decoded core plays the audio a
+/// payload describes, in samples: one 256-sample transform block.
+///
+/// An encoder dates object metadata on the PCM it was fed, and the core it
+/// writes decodes one block after that input. That is the 50 % overlap of the
+/// transform: the samples of a block are only complete once the next block's
+/// half has been added to them, and the delay is the priming encoders report
+/// for AC-3, which neither the bitstream nor the container takes back off.
+///
+/// Measured rather than assumed. An object that jumps while it is sounding is
+/// moved in the core by the encoder's own downmix, so the downmix shows when
+/// the encoder applied the jump: on a 7.1.4 channel check, the crossfade of
+/// every such jump starts 264 samples after the OAMD date on the decoded core,
+/// one block to within what the transform's smearing of the crossfade lets a
+/// measurement resolve. The E-AC-3 track of a Blu-ray release decodes 256
+/// samples after the TrueHD track it was authored beside, from the same master.
+pub const CORE_OAMD_LATENCY_SAMPLES: usize = 256;
+
+/// How much later than the bitstream dates them the OAMD payloads of an
+/// [`ObjectPcmFrame`] apply to the frame's PCM, in samples.
+///
+/// The core's own [`CORE_OAMD_LATENCY_SAMPLES`], plus the [`JOC_LATENCY_SAMPLES`]
+/// that every channel of an object frame is held back by, the bed to meet the
+/// objects and the objects by the reconstruction itself: 833 samples, 17 ms at
+/// 48 kHz. The payloads of [`ObjectPcmFrame::oamd_payloads`] are dated with it
+/// already, so that the metadata sits on the frame's one clock with its audio.
+/// Read at the bitstream's own offset, an object moves 17 ms before its sound
+/// does: on the channel check above, the downmix crossfade of every jump starts
+/// 841 samples after the payload's undelayed date in the decoded frame.
+pub const OAMD_LATENCY_SAMPLES: usize = JOC_LATENCY_SAMPLES + CORE_OAMD_LATENCY_SAMPLES;
+
 #[derive(Debug, Clone, PartialEq)]
 /// Decoded core channel PCM for one access unit.
 pub struct CorePcmFrame {
@@ -199,7 +230,15 @@ pub struct ObjectPcmFrame {
     pub object_channels: Vec<Vec<f32>>,
     pub object_active: Vec<bool>,
     pub joc: JocPayload,
-    pub oamd_payloads: Vec<(OamdPayload, Option<u16>)>,
+    /// The OAMD payloads of the access unit, each with the sample of this
+    /// frame's PCM its timing counts from: the payload's EMDF sample offset
+    /// (`smploffst`, 0 when it has none) plus [`OAMD_LATENCY_SAMPLES`].
+    ///
+    /// The per-object update offsets of the payload count on from there. Either
+    /// can carry it past the frame's last sample: the payload then applies from
+    /// a later frame on, which a caller keeping one running sample count places
+    /// by adding this to the count at the frame's first sample.
+    pub oamd_payloads: Vec<(OamdPayload, u32)>,
 }
 
 impl ObjectPcmFrame {
@@ -400,6 +439,10 @@ impl PcmDecoder {
 /// this decoder and a plain [`PcmDecoder`] — steps the bed by 577 samples at the
 /// boundary, once per crossing. That is deliberate and is not smoothed here; the
 /// reasoning is on `CoreAlignmentDelay`.
+///
+/// The metadata is on the same clock: each OAMD payload of a frame is dated
+/// [`OAMD_LATENCY_SAMPLES`] later than the bitstream dates it, where the audio
+/// it describes comes out of this decoder.
 pub struct ObjectPcmDecoder {
     frames_seen: u64,
     aux_state: AuxDataDecodeState,
@@ -446,6 +489,26 @@ fn find_joc_payload(info: &AccessUnitInfo) -> Option<JocPayload> {
         ParsedEmdfPayloadData::Joc(joc) => Some(joc.clone()),
         _ => None,
     })
+}
+
+/// The OAMD payloads of an access unit, dated on the clock of the object frame
+/// they ship in: see [`ObjectPcmFrame::oamd_payloads`].
+fn object_frame_oamd_payloads(info: &AccessUnitInfo) -> Vec<(OamdPayload, u32)> {
+    info.payloads()
+        .filter_map(|payload| match &payload.parsed {
+            ParsedEmdfPayloadData::Oamd(oamd) => Some((
+                oamd.clone(),
+                object_frame_oamd_offset(payload.info.sample_offset),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Where in an object frame's PCM a payload with this EMDF sample offset
+/// starts to apply.
+fn object_frame_oamd_offset(emdf_sample_offset: Option<u16>) -> u32 {
+    u32::from(emdf_sample_offset.unwrap_or(0)) + OAMD_LATENCY_SAMPLES as u32
 }
 
 /// Holds the core PCM back by [`JOC_LATENCY_SAMPLES`] so that everything in an
@@ -801,15 +864,7 @@ impl ObjectPcmDecoder {
         let core = self.core_delay.delayed(&joc_input_core);
         self.joc_input_core = Some(joc_input_core);
         let object_active = joc.objects.iter().map(|object| object.active).collect();
-        let oamd_payloads = info
-            .payloads()
-            .filter_map(|payload| match &payload.parsed {
-                ParsedEmdfPayloadData::Oamd(oamd) => {
-                    Some((oamd.clone(), payload.info.sample_offset))
-                }
-                _ => None,
-            })
-            .collect();
+        let oamd_payloads = object_frame_oamd_payloads(&info);
 
         self.frames_seen += 1;
         Ok(Some(ObjectPcmPushResult {
@@ -877,15 +932,7 @@ impl ObjectPcmDecoder {
         let core = self.core_delay.delayed(&joc_input_core);
         self.joc_input_core = Some(joc_input_core);
         let object_active = joc.objects.iter().map(|object| object.active).collect();
-        let oamd_payloads = info
-            .payloads()
-            .filter_map(|payload| match &payload.parsed {
-                ParsedEmdfPayloadData::Oamd(oamd) => {
-                    Some((oamd.clone(), payload.info.sample_offset))
-                }
-                _ => None,
-            })
-            .collect();
+        let oamd_payloads = object_frame_oamd_payloads(&info);
 
         self.frames_seen += 1;
         Ok(Some(ObjectPcmPushResult {
