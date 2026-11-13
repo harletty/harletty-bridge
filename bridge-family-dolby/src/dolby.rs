@@ -226,6 +226,9 @@ pub struct DolbyPipeline {
     /// Whether that access unit started a new layout, which the next frame then
     /// announces.
     pub(crate) truehd_carried_new_segment: bool,
+    /// The TrueHD samples last played, to fill a gap and smooth the join after
+    /// an overlap from.
+    pub(crate) truehd_concealer: conceal::Concealer,
     pub(crate) perf: PerfStats,
 }
 
@@ -282,6 +285,7 @@ impl DolbyPipeline {
             truehd_oamd_warnings: OamdWarnings::default(),
             truehd_carried_oamd: Vec::new(),
             truehd_carried_new_segment: false,
+            truehd_concealer: conceal::Concealer::default(),
             perf: PerfStats::default(),
         };
 
@@ -340,6 +344,7 @@ impl DolbyPipeline {
         self.truehd_oamd_warnings = OamdWarnings::default();
         self.truehd_carried_oamd.clear();
         self.truehd_carried_new_segment = false;
+        self.truehd_concealer.reset();
         self.recovering_until_major_sync = false;
     }
 
@@ -1311,42 +1316,55 @@ mod tests {
         assert_eq!(overlapped.1, clean.1, "nor counted on the clock");
     }
 
+    fn synthetic_unit(value: i32) -> truehd::process::decode::DecodedAccessUnit {
+        let mut unit = truehd::process::decode::DecodedAccessUnit {
+            sampling_frequency: 48000,
+            sample_length: 40,
+            channel_count: 2,
+            ..Default::default()
+        };
+        for row in &mut unit.pcm_data[..40] {
+            row[..2].fill(value);
+        }
+        unit
+    }
+
+    fn rows_of(unit: &truehd::process::decode::DecodedAccessUnit) -> Vec<conceal::Row> {
+        unit.pcm_data[..unit.sample_length].to_vec()
+    }
+
+    fn samples_of(rows: &[conceal::Row]) -> Vec<i32> {
+        rows.iter().flat_map(|r| r[..2].to_vec()).collect()
+    }
+
     /// What the stream's timing says of an access unit decides where it goes:
     /// one that overlaps the previous one is not played even when its samples
     /// differ (separate encodes of the same time), and the time a remux dropped
-    /// ahead of one goes out as silence, in its layout, opening the new layout
-    /// it announces.
+    /// ahead of one goes out interpolated from both sides, in its layout,
+    /// opening the new layout it announces.
     #[test]
     fn the_bridge_keeps_to_the_timeline_the_stream_states() {
         use crate::truehd_pipeline::place_decoded_for_test;
         use truehd::process::decode::DecodedAccessUnit;
 
-        const CHANNELS: usize = 2;
-        let unit = |value: i32| {
-            let mut unit = DecodedAccessUnit {
-                sampling_frequency: 48000,
-                sample_length: 40,
-                channel_count: CHANNELS,
-                ..DecodedAccessUnit::default()
-            };
-            for row in &mut unit.pcm_data[..40] {
-                row[..CHANNELS].fill(value);
-            }
-            unit
-        };
         let overlap = DecodedAccessUnit {
             overlaps_previous: true,
-            ..unit(2)
+            ..synthetic_unit(2)
         };
         let after_gap = DecodedAccessUnit {
             gap_before: 80,
             substream_info_changed: true,
-            ..unit(3)
+            ..synthetic_unit(3)
         };
 
         let mut bridge = TestBridge::new(false);
         let mut frames = Vec::new();
-        for mut decoded in [unit(1), overlap, after_gap, unit(4)] {
+        for mut decoded in [
+            synthetic_unit(1),
+            overlap.clone(),
+            after_gap.clone(),
+            synthetic_unit(4),
+        ] {
             frames.extend(place_decoded_for_test(
                 &mut bridge.dolby,
                 &mut bridge.shared,
@@ -1354,19 +1372,67 @@ mod tests {
             ));
         }
 
+        // The fill joins both sides by itself: the overlap leaves nothing to
+        // even out after it.
+        let mut reference = conceal::Concealer::default();
+        reference.push(&rows_of(&synthetic_unit(1)), 2);
+        reference.note_overlap(&rows_of(&overlap), 2);
+        let mut fill = vec![[0; conceal::MAX_CHANNELS]; 80];
+        reference.fill(&mut fill, &rows_of(&after_gap), 2);
+
         let pcm: Vec<i32> = frames.iter().flat_map(|f| f.pcm.iter().copied()).collect();
-        let mut expected = vec![1; 40 * CHANNELS];
-        expected.extend(vec![0; 80 * CHANNELS]);
-        expected.extend(vec![3; 40 * CHANNELS]);
-        expected.extend(vec![4; 40 * CHANNELS]);
+        let mut expected = vec![1; 80];
+        expected.extend(samples_of(&fill));
+        expected.extend(vec![3; 80]);
+        expected.extend(vec![4; 80]);
         assert_eq!(pcm, expected);
-        // 40 + 80 of silence + 40 + 40: the overlap adds nothing.
+        assert!(
+            fill.iter().all(|r| (1..=3).contains(&r[0])),
+            "between both sides"
+        );
+        // 40 + 80 filled + 40 + 40: the overlap adds nothing.
         assert_eq!(bridge.shared.total_samples, 200);
 
-        // unit(1), two frames of silence, unit(3), unit(4).
+        // unit(1), two frames of fill, unit(3), unit(4).
         let new_segment: Vec<bool> = frames.iter().map(|f| f.is_new_segment).collect();
         assert_eq!(new_segment, [false, true, false, false, false]);
-        assert!(frames.iter().all(|f| f.channel_count == CHANNELS as u32));
+        assert!(frames.iter().all(|f| f.channel_count == 2));
+    }
+
+    /// The frame after an overlap follows on from the rendering that was
+    /// dropped: it starts where the kept one ended and eases into its own.
+    #[test]
+    fn the_frame_after_an_overlap_starts_where_the_kept_rendering_ended() {
+        use crate::truehd_pipeline::place_decoded_for_test;
+        use truehd::process::decode::DecodedAccessUnit;
+
+        let overlap = DecodedAccessUnit {
+            overlaps_previous: true,
+            ..synthetic_unit(2)
+        };
+        let mut bridge = TestBridge::new(false);
+        let mut frames = Vec::new();
+        for mut decoded in [synthetic_unit(1), overlap.clone(), synthetic_unit(3)] {
+            frames.extend(place_decoded_for_test(
+                &mut bridge.dolby,
+                &mut bridge.shared,
+                &mut decoded,
+            ));
+        }
+
+        let mut reference = conceal::Concealer::default();
+        reference.push(&rows_of(&synthetic_unit(1)), 2);
+        reference.note_overlap(&rows_of(&overlap), 2);
+        let mut after = rows_of(&synthetic_unit(3));
+        reference.smooth(&mut after, 2);
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].pcm.to_vec(), samples_of(&after));
+        assert_eq!(
+            frames[1].pcm[0], 2,
+            "next to the kept 1, as the dropped 2 was"
+        );
+        assert_eq!(*frames[1].pcm.last().unwrap(), 3, "and into its own 3");
     }
 }
 

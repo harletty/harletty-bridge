@@ -1,0 +1,13 @@
+[package]
+name = "conceal"
+version = "0.9.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Fills the samples a stream is missing, and smooths a join where it repeated time, from the samples around them"
+repository = "https://github.com/harletty/harletty-bridge"
+rust-version = "1.87.0"
+publish = false
+
+[lib]
+name = "conceal"
+crate-type = ["lib"]

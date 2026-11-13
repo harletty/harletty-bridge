@@ -99,6 +99,8 @@ struct DrainContext<'a> {
     carried_oamd: &'a mut Vec<ObjectAudioMetadataPayload>,
     /// See [`DolbyPipeline::truehd_carried_new_segment`].
     carried_new_segment: &'a mut bool,
+    /// See [`DolbyPipeline::truehd_concealer`].
+    concealer: &'a mut conceal::Concealer,
     perf: &'a mut PerfStats,
 }
 
@@ -123,6 +125,7 @@ impl DrainContext<'_> {
         *self.spatial_labels = None;
         self.carried_oamd.clear();
         *self.carried_new_segment = false;
+        self.concealer.reset();
         *self.recovering_until_major_sync = true;
     }
 }
@@ -404,8 +407,12 @@ fn drain_frames(
 ///   restating its objects, goes out with the next frame, and so does a layout
 ///   change it announced;
 /// - an access unit dated past the end of the previous one follows time a remux
-///   dropped. That time goes out as silence in the access unit's layout, so the
-///   frames after it are not early.
+///   dropped. That time goes out in the access unit's layout, interpolated
+///   between the samples played and the access unit's own, so the frames after
+///   it are not early.
+///
+/// After an overlap, the access unit played next follows on from the rendering
+/// that was dropped: its start is evened out to where the kept one ended.
 fn place_decoded(
     ctx: &mut DrainContext<'_>,
     decoded: &mut DecodedAccessUnit,
@@ -418,7 +425,10 @@ fn place_decoded(
         decoded.substream_info_changed = true;
     }
 
+    let length = decoded.sample_length.min(decoded.pcm_data.len());
     if decoded.overlaps_previous || decoded.is_duplicate {
+        ctx.concealer
+            .note_overlap(&decoded.pcm_data[..length], decoded.channel_count);
         ctx.carried_oamd.extend(decoded.oamd.iter().cloned());
         *ctx.carried_new_segment |= decoded.substream_info_changed;
         #[cfg(feature = "bridge-perf")]
@@ -428,6 +438,25 @@ fn place_decoded(
     }
 
     let gap = decoded.gap_before;
+    let fill = if gap > 0 {
+        let mut rows = vec![[0; conceal::MAX_CHANNELS]; gap];
+        ctx.concealer.fill(
+            &mut rows,
+            &decoded.pcm_data[..length],
+            decoded.channel_count,
+        );
+        ctx.concealer.push(&rows, decoded.channel_count);
+        rows
+    } else {
+        Vec::new()
+    };
+    if ctx.concealer.has_overlap() {
+        ctx.concealer
+            .smooth(&mut decoded.pcm_data[..length], decoded.channel_count);
+    }
+    ctx.concealer
+        .push(&decoded.pcm_data[..length], decoded.channel_count);
+
     let base_sample_pos = *ctx.total_samples + gap as u64;
     *ctx.total_samples = base_sample_pos + decoded.sample_length as u64;
 
@@ -435,7 +464,7 @@ fn place_decoded(
     let build_started = Instant::now();
     let mut frame = build_thd_frame(ctx, decoded, base_sample_pos, drc_gain, drc_ramp_duration);
     if gap > 0 {
-        push_silence(frames, &mut frame, gap, decoded.sample_length);
+        push_fill(frames, &mut frame, &fill, decoded.sample_length);
     }
     frames.push(frame);
     #[cfg(feature = "bridge-perf")]
@@ -443,24 +472,26 @@ fn place_decoded(
     ctx.perf.maybe_report(*ctx.frame_count);
 }
 
-/// `length` samples of silence in the layout of `next`, the frame that follows
-/// them, in frames of at most `step` samples. A new layout `next` announces is
-/// announced by the first of them, the first frame in it.
-fn push_silence(
+/// `rows`, the samples filling a gap, in the layout of `next`, the frame that
+/// follows them, as frames of at most `step` samples. A new layout `next`
+/// announces is announced by the first of them, the first frame in it.
+fn push_fill(
     frames: &mut Vec<RDecodedFrame>,
     next: &mut RDecodedFrame,
-    length: usize,
+    rows: &[conceal::Row],
     step: usize,
 ) {
-    let channels = next.channel_count as usize;
-    let mut left = length;
-    while left > 0 {
-        let count = left.min(step.max(1));
+    let channels = (next.channel_count as usize).min(conceal::MAX_CHANNELS);
+    for chunk in rows.chunks(step.max(1)) {
+        let mut pcm = Vec::with_capacity(chunk.len() * channels);
+        for row in chunk {
+            pcm.extend_from_slice(&row[..channels]);
+        }
         frames.push(RDecodedFrame {
             sampling_frequency: next.sampling_frequency,
-            sample_count: count as u32,
+            sample_count: chunk.len() as u32,
             channel_count: next.channel_count,
-            pcm: vec![0; count * channels].into(),
+            pcm: pcm.into(),
             channel_labels: next.channel_labels.clone(),
             metadata: RVec::new(),
             drc_gain: next.drc_gain,
@@ -468,7 +499,6 @@ fn push_silence(
             dialogue_level: next.dialogue_level,
             is_new_segment: std::mem::take(&mut next.is_new_segment),
         });
-        left -= count;
     }
 }
 
@@ -499,6 +529,7 @@ pub(crate) fn place_decoded_for_test(
         oamd_warnings: &mut bridge.truehd_oamd_warnings,
         carried_oamd: &mut bridge.truehd_carried_oamd,
         carried_new_segment: &mut bridge.truehd_carried_new_segment,
+        concealer: &mut bridge.truehd_concealer,
         perf: &mut bridge.perf,
     };
     let mut frames = Vec::new();
@@ -651,6 +682,7 @@ pub(crate) fn process_extractor_input(
             oamd_warnings: &mut bridge.truehd_oamd_warnings,
             carried_oamd: &mut bridge.truehd_carried_oamd,
             carried_new_segment: &mut bridge.truehd_carried_new_segment,
+            concealer: &mut bridge.truehd_concealer,
             perf: &mut bridge.perf,
         };
         #[cfg(feature = "bridge-perf")]
