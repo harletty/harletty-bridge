@@ -43,7 +43,7 @@ bench = false
 # without it the bridge would be fuzzed against another TrueHD decoder than
 # the one it ships with.
 [patch.crates-io]
-truehd = { git = "https://github.com/harletty/truehdd", rev = "e9fb779fd4fe2f299ed0579f594288fdbec9c3e4" }
+truehd = { git = "https://github.com/harletty/truehdd", rev = "06035a9068da4bcea1955a223ae05c59063171c5" }
 # `oamd`, the object audio metadata parser `truehd` reads, from our fork: it has the
 # depth factor, chained object gain and basic info mask fixes of truehdd/oamd#1.
 # Drop this line once a release carries them.

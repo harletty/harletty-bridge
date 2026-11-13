@@ -48,6 +48,7 @@ impl AccessUnitShape {
             oamd: Vec::new(),
             is_duplicate: false,
             overlaps_previous: false,
+            gap_before: 0,
             substream_info_changed: false,
         }
     }
@@ -349,6 +350,7 @@ mod tests {
                     .collect(),
                 is_duplicate: true,
                 overlaps_previous: true,
+                gap_before: 40,
                 substream_info_changed: true,
             })
         };
@@ -367,6 +369,7 @@ mod tests {
             assert_eq!(format!("{:?}", reused.oamd), format!("{:?}", fresh.oamd));
             assert_eq!(reused.is_duplicate, fresh.is_duplicate);
             assert_eq!(reused.overlaps_previous, fresh.overlaps_previous);
+            assert_eq!(reused.gap_before, fresh.gap_before);
             assert_eq!(reused.substream_info_changed, fresh.substream_info_changed);
         }
     }

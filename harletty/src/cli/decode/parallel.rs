@@ -190,6 +190,7 @@ struct UnitHead {
     oamd: Vec<ObjectAudioMetadataPayload>,
     is_duplicate: bool,
     overlaps_previous: bool,
+    gap_before: usize,
     substream_info_changed: bool,
 }
 
@@ -559,6 +560,7 @@ impl RunDecoder<'_> {
                                 oamd: std::mem::take(&mut d.oamd),
                                 is_duplicate: d.is_duplicate,
                                 overlaps_previous: d.overlaps_previous,
+                                gap_before: d.gap_before,
                                 substream_info_changed: d.substream_info_changed,
                             },
                         });
@@ -742,6 +744,7 @@ impl CollectState {
                     unit.oamd = head.oamd;
                     unit.is_duplicate = head.is_duplicate;
                     unit.overlaps_previous = head.overlaps_previous;
+                    unit.gap_before = head.gap_before;
                     unit.substream_info_changed = head.substream_info_changed || changed;
 
                     self.last_shape = Some(AccessUnitShape::of(&unit));
@@ -998,6 +1001,7 @@ mod tests {
             assert_eq!(format!("{:?}", p.oamd), format!("{:?}", s.oamd), "{at}");
             assert_eq!(p.is_duplicate, s.is_duplicate, "{at}");
             assert_eq!(p.overlaps_previous, s.overlaps_previous, "{at}");
+            assert_eq!(p.gap_before, s.gap_before, "{at}");
             assert_eq!(p.substream_info_changed, s.substream_info_changed, "{at}");
         }
     }

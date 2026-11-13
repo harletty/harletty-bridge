@@ -1310,6 +1310,64 @@ mod tests {
         assert_eq!(overlapped.0, clean.0, "the copy's samples are not played");
         assert_eq!(overlapped.1, clean.1, "nor counted on the clock");
     }
+
+    /// What the stream's timing says of an access unit decides where it goes:
+    /// one that overlaps the previous one is not played even when its samples
+    /// differ (separate encodes of the same time), and the time a remux dropped
+    /// ahead of one goes out as silence, in its layout, opening the new layout
+    /// it announces.
+    #[test]
+    fn the_bridge_keeps_to_the_timeline_the_stream_states() {
+        use crate::truehd_pipeline::place_decoded_for_test;
+        use truehd::process::decode::DecodedAccessUnit;
+
+        const CHANNELS: usize = 2;
+        let unit = |value: i32| {
+            let mut unit = DecodedAccessUnit {
+                sampling_frequency: 48000,
+                sample_length: 40,
+                channel_count: CHANNELS,
+                ..DecodedAccessUnit::default()
+            };
+            for row in &mut unit.pcm_data[..40] {
+                row[..CHANNELS].fill(value);
+            }
+            unit
+        };
+        let overlap = DecodedAccessUnit {
+            overlaps_previous: true,
+            ..unit(2)
+        };
+        let after_gap = DecodedAccessUnit {
+            gap_before: 80,
+            substream_info_changed: true,
+            ..unit(3)
+        };
+
+        let mut bridge = TestBridge::new(false);
+        let mut frames = Vec::new();
+        for mut decoded in [unit(1), overlap, after_gap, unit(4)] {
+            frames.extend(place_decoded_for_test(
+                &mut bridge.dolby,
+                &mut bridge.shared,
+                &mut decoded,
+            ));
+        }
+
+        let pcm: Vec<i32> = frames.iter().flat_map(|f| f.pcm.iter().copied()).collect();
+        let mut expected = vec![1; 40 * CHANNELS];
+        expected.extend(vec![0; 80 * CHANNELS]);
+        expected.extend(vec![3; 40 * CHANNELS]);
+        expected.extend(vec![4; 40 * CHANNELS]);
+        assert_eq!(pcm, expected);
+        // 40 + 80 of silence + 40 + 40: the overlap adds nothing.
+        assert_eq!(bridge.shared.total_samples, 200);
+
+        // unit(1), two frames of silence, unit(3), unit(4).
+        let new_segment: Vec<bool> = frames.iter().map(|f| f.is_new_segment).collect();
+        assert_eq!(new_segment, [false, true, false, false, false]);
+        assert!(frames.iter().all(|f| f.channel_count == CHANNELS as u32));
+    }
 }
 
 /// The two raw-transport codecs of the Dolby family.

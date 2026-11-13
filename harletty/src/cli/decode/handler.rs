@@ -388,6 +388,14 @@ impl DecodeHandler {
             return metadata;
         }
 
+        // A remux that dropped an access unit where nothing overlapped leaves the
+        // next one dated past the end of the last one written. That time is
+        // written as silence in this access unit's layout, so that what follows,
+        // samples and metadata, stays on the stream's timeline.
+        if decoded.gap_before > 0 {
+            self.write_gap(decoded, ctx)?;
+        }
+
         self.decoded_frames += 1u64;
         self.final_sample_rate = sample_rate;
         self.au_index += 1;
@@ -439,6 +447,29 @@ impl DecodeHandler {
 
         self.update_progress_display(sample_rate, ctx.start_time, ctx.pb)?;
 
+        Ok(())
+    }
+
+    /// `decoded.gap_before` samples of silence in the layout of `decoded`, as
+    /// access units of at most as many samples as it holds.
+    fn write_gap(
+        &mut self,
+        decoded: &truehd::process::decode::DecodedAccessUnit,
+        ctx: &FrameHandlerContext,
+    ) -> Result<()> {
+        let mut silence = truehd::process::decode::DecodedAccessUnit {
+            sampling_frequency: decoded.sampling_frequency,
+            channel_count: decoded.channel_count,
+            channel_labels: decoded.channel_labels.clone(),
+            ..Default::default()
+        };
+        let step = decoded.pcm_data.len();
+        let mut left = decoded.gap_before;
+        while left > 0 {
+            silence.sample_length = left.min(step);
+            self.handle_decoded_frame(&silence, ctx)?;
+            left -= silence.sample_length;
+        }
         Ok(())
     }
 
@@ -1106,6 +1137,15 @@ mod tests {
         }
     }
 
+    /// An access unit dated past the end of the one before it: a remux dropped
+    /// `gap` samples ahead of it.
+    fn after_gap(value: i32, gap: usize) -> DecodedAccessUnit {
+        DecodedAccessUnit {
+            gap_before: gap,
+            ..unit(value)
+        }
+    }
+
     fn with_metadata(mut unit: DecodedAccessUnit) -> DecodedAccessUnit {
         unit.oamd = vec![
             ObjectAudioMetadataPayload::read(truehd::structs::oamd::EXAMPLE_DATA)
@@ -1165,6 +1205,47 @@ mod tests {
         expected.extend(vec![3; 40 * CHANNELS]);
         assert_eq!(samples, expected, "the overlap's own samples are dropped");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_time_a_remux_dropped_is_written_as_silence() {
+        let (dir, base) = out_dir("gap-audio");
+        let handler = decode(&base, false, &[unit(1), after_gap(3, 40), unit(4)]);
+
+        assert_eq!(handler.decoded_samples, 160, "the gap is time");
+        let bytes = std::fs::read(dir.join("out.pcm")).unwrap();
+        let samples: Vec<i32> = bytes
+            .chunks_exact(3)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], 0]))
+            .collect();
+        let mut expected = vec![1; 40 * CHANNELS];
+        expected.extend(vec![0; 40 * CHANNELS]);
+        expected.extend(vec![3; 40 * CHANNELS]);
+        expected.extend(vec![4; 40 * CHANNELS]);
+        assert_eq!(samples, expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The access unit after a gap, and its metadata, come where the stream
+    /// dates them: as if the dropped access unit had been there.
+    #[test]
+    fn metadata_after_a_gap_is_dated_where_the_stream_puts_it() {
+        let (dir, base) = out_dir("gap-metadata");
+        decode(&base, true, &[unit(1), with_metadata(after_gap(3, 40))]);
+        let gapped = std::fs::read_to_string(dir.join("out.atmos.metadata")).unwrap();
+
+        let (reference_dir, reference_base) = out_dir("gap-metadata-reference");
+        decode(
+            &reference_base,
+            true,
+            &[unit(1), unit(2), with_metadata(unit(3))],
+        );
+        let reference = std::fs::read_to_string(reference_dir.join("out.atmos.metadata")).unwrap();
+
+        assert!(gapped.contains("samplePos"), "{gapped}");
+        assert_eq!(gapped, reference);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&reference_dir);
     }
 
     /// The metadata of the overlapping access unit is the new stream restating

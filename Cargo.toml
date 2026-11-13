@@ -59,14 +59,15 @@ strip = "symbols"
 # commit: upstream's unreleased main plus the decode-speed series, which
 # decodes in a quarter of the time of 0.7.2 with the same output, and a fix
 # that takes compiling it from over 13 GB of memory to under 1 GB, and the
-# flag for an access unit that restates the previous one's output time at a
-# seamless branch (`DecodedAccessUnit::overlaps_previous`). The crates
+# timing an access unit's restart header states against the previous one's at
+# a seamless branch (`DecodedAccessUnit::overlaps_previous` and `gap_before`).
+# The crates
 # keep asking for the crates.io version, so dropping this section goes back
 # to it. Move the pin only to a commit that stays reachable on the fork.
 # bridge/fuzz/Cargo.toml, a workspace of its own, repeats this section: move
 # both together.
 [patch.crates-io]
-truehd = { git = "https://github.com/harletty/truehdd", rev = "e9fb779fd4fe2f299ed0579f594288fdbec9c3e4" }
+truehd = { git = "https://github.com/harletty/truehdd", rev = "06035a9068da4bcea1955a223ae05c59063171c5" }
 # `oamd`, the object audio metadata parser `truehd` reads, from our fork: it has the
 # depth factor, chained object gain and basic info mask fixes of truehdd/oamd#1.
 # Drop this line once a release carries them.
