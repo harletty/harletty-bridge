@@ -303,6 +303,9 @@ pub struct DecodeHandler {
     pub prev_events: Vec<Event>,
     pub decoded_frames: u64,
     pub decoded_samples: u64,
+    /// Samples the last access unit written added to `decoded_samples`: where an
+    /// access unit that restates its output time starts.
+    pub last_sample_length: u64,
     pub final_sample_rate: u32,
     pub bed_indices: Option<Vec<usize>>,
     pub au_index: u64,
@@ -328,6 +331,7 @@ impl Default for DecodeHandler {
             prev_events: Vec::new(),
             decoded_frames: 0,
             decoded_samples: 0,
+            last_sample_length: 0,
             final_sample_rate: 48000,
             bed_indices: None,
             au_index: 0,
@@ -360,8 +364,28 @@ impl DecodeHandler {
         let sample_rate = decoded.sampling_frequency;
         let channel_count = decoded.channel_count;
 
-        if decoded.is_duplicate {
-            return Ok(());
+        // At a seamless branch whose outgoing stream runs one access unit past the
+        // splice, the next stream's first access unit restates the output time of
+        // the one just written: its samples are a second rendering of that time.
+        // Blu-ray titles that branch between clips do this at many splices, and
+        // the separate encodes rarely match bit for bit. Writing them would play
+        // the time twice and put everything after it one access unit late against
+        // the stream's own timeline, at every such splice. The samples are
+        // dropped; the metadata, the new stream restating its objects, belongs to
+        // that time and is dated where the previous access unit starts.
+        if decoded.overlaps_previous || decoded.is_duplicate {
+            let after = self.decoded_samples;
+            self.decoded_samples = after.saturating_sub(self.last_sample_length);
+            let metadata = self.handle_atmos_metadata(
+                decoded,
+                ctx.base_path,
+                ctx.format,
+                ctx.state,
+                ctx.bed_conform,
+                ctx.warp_mode,
+            );
+            self.decoded_samples = after;
+            return metadata;
         }
 
         self.decoded_frames += 1u64;
@@ -378,6 +402,7 @@ impl DecodeHandler {
         )?;
 
         self.decoded_samples += decoded.sample_length as u64;
+        self.last_sample_length = decoded.sample_length as u64;
 
         let effective_channel_count = if ctx.bed_conform && self.has_atmos {
             let empty_vec = Vec::new();
@@ -1047,5 +1072,117 @@ impl DecodeHandler {
                 "Reset Atmos detection state for new segment - next OAMD will trigger DAMF header creation"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use truehd::process::decode::DecodedAccessUnit;
+    use truehd::structs::oamd::ObjectAudioMetadataPayload;
+
+    const CHANNELS: usize = 2;
+
+    /// An access unit of 40 samples, every one of them `value` on both channels.
+    fn unit(value: i32) -> DecodedAccessUnit {
+        let mut unit = DecodedAccessUnit {
+            sampling_frequency: 48000,
+            sample_length: 40,
+            channel_count: CHANNELS,
+            ..DecodedAccessUnit::default()
+        };
+        for row in &mut unit.pcm_data[..40] {
+            row[..CHANNELS].fill(value);
+        }
+        unit
+    }
+
+    /// The access unit of a new stream that restates the output time of the
+    /// one before it, with samples of its own: two encodes of the same time.
+    fn overlap(value: i32) -> DecodedAccessUnit {
+        DecodedAccessUnit {
+            overlaps_previous: true,
+            ..unit(value)
+        }
+    }
+
+    fn with_metadata(mut unit: DecodedAccessUnit) -> DecodedAccessUnit {
+        unit.oamd = vec![
+            ObjectAudioMetadataPayload::read(truehd::structs::oamd::EXAMPLE_DATA)
+                .expect("the example payload reads"),
+        ];
+        unit
+    }
+
+    /// An empty directory of this test's own, and the output base path in it.
+    fn out_dir(test: &str) -> (PathBuf, Option<PathBuf>) {
+        let dir = std::env::temp_dir().join(format!("harletty-thd-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = Some(dir.join("out"));
+        (dir, base)
+    }
+
+    fn decode(
+        base: &Option<PathBuf>,
+        no_audio: bool,
+        units: &[DecodedAccessUnit],
+    ) -> DecodeHandler {
+        let state = WriterState {
+            fail_level: Level::Error,
+        };
+        let ctx = FrameHandlerContext {
+            base_path: base,
+            format: AudioFormat::Pcm,
+            no_audio,
+            pb: &None,
+            state: &state,
+            start_time: std::time::Instant::now(),
+            bed_conform: false,
+            warp_mode: None,
+        };
+        let mut handler = DecodeHandler::default();
+        for unit in units {
+            handler.handle_decoded_frame(unit, &ctx).unwrap();
+        }
+        handler.finalize().unwrap();
+        handler
+    }
+
+    #[test]
+    fn an_access_unit_that_restates_the_previous_output_time_is_not_written() {
+        let (dir, base) = out_dir("overlap-audio");
+        let handler = decode(&base, false, &[unit(1), overlap(2), unit(3)]);
+
+        assert_eq!(handler.decoded_samples, 80, "the overlap adds no time");
+        assert_eq!(handler.decoded_frames, 2);
+        let bytes = std::fs::read(dir.join("out.pcm")).unwrap();
+        let samples: Vec<i32> = bytes
+            .chunks_exact(3)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], 0]))
+            .collect();
+        let mut expected = vec![1; 40 * CHANNELS];
+        expected.extend(vec![3; 40 * CHANNELS]);
+        assert_eq!(samples, expected, "the overlap's own samples are dropped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The metadata of the overlapping access unit is the new stream restating
+    /// its objects at the time it overlaps: it comes out as it would have, had
+    /// it come with the access unit it overlaps, not one access unit later.
+    #[test]
+    fn an_overlap_keeps_its_metadata_at_the_time_it_restates() {
+        let (dir, base) = out_dir("overlap-metadata");
+        decode(&base, true, &[unit(1), with_metadata(overlap(2)), unit(3)]);
+        let overlapped = std::fs::read_to_string(dir.join("out.atmos.metadata")).unwrap();
+
+        let (reference_dir, reference_base) = out_dir("overlap-metadata-reference");
+        decode(&reference_base, true, &[with_metadata(unit(1)), unit(3)]);
+        let reference = std::fs::read_to_string(reference_dir.join("out.atmos.metadata")).unwrap();
+
+        assert!(overlapped.contains("samplePos"), "{overlapped}");
+        assert_eq!(overlapped, reference);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&reference_dir);
     }
 }

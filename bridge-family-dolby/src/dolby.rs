@@ -17,6 +17,7 @@ use std::time::Instant;
 use truehd::process::decode::DecodedAccessUnit;
 use truehd::process::{MAX_PRESENTATIONS, decode::Decoder, extract::Extractor, parse::Parser};
 use truehd::structs::access_unit::AccessUnit;
+use truehd::structs::oamd::ObjectAudioMetadataPayload;
 
 use crate::ac3_native::NativeAc3Decoder;
 use crate::eac3_pipeline::{
@@ -218,6 +219,13 @@ pub struct DolbyPipeline {
         Option<abi_stable::std_types::RVec<bridge_api::RChannelLabel>>,
     /// TrueHD object metadata the bridge could not use, since the last reset.
     pub(crate) truehd_oamd_warnings: OamdWarnings,
+    /// The object metadata of a TrueHD access unit whose samples were dropped
+    /// because it restates the previous one's output time, held for the next
+    /// frame that goes out. Empty but at a seamless branch.
+    pub(crate) truehd_carried_oamd: Vec<ObjectAudioMetadataPayload>,
+    /// Whether that access unit started a new layout, which the next frame then
+    /// announces.
+    pub(crate) truehd_carried_new_segment: bool,
     pub(crate) perf: PerfStats,
 }
 
@@ -272,6 +280,8 @@ impl DolbyPipeline {
             frame_count: 0,
             truehd_spatial_labels: None,
             truehd_oamd_warnings: OamdWarnings::default(),
+            truehd_carried_oamd: Vec::new(),
+            truehd_carried_new_segment: false,
             perf: PerfStats::default(),
         };
 
@@ -328,6 +338,8 @@ impl DolbyPipeline {
         self.truehd_presentations_stale = false;
         self.truehd_spatial_labels = None;
         self.truehd_oamd_warnings = OamdWarnings::default();
+        self.truehd_carried_oamd.clear();
+        self.truehd_carried_new_segment = false;
         self.recovering_until_major_sync = false;
     }
 
@@ -1262,6 +1274,41 @@ mod tests {
         }
         // From the major sync after the mode was set, the gains too.
         assert_eq!(frames[4..], expected[4..]);
+    }
+
+    /// A major-sync access unit sent twice: the copy restates the output time
+    /// of the access unit before it, as the first access unit of a clip does
+    /// on a title that branches between clips. Its samples are not played and
+    /// the clock does not count them, so what comes out, and where the clock
+    /// stands, is what the stream without the copy gives.
+    #[test]
+    fn an_access_unit_that_restates_the_previous_output_time_is_not_played() {
+        // `EXAMPLE_DATA` is a 16-byte timestamp, a major-sync access unit and
+        // one access unit after it.
+        let data = truehd::process::EXAMPLE_DATA;
+        let length =
+            |at: usize| (u16::from_be_bytes([data[at], data[at + 1]]) & 0x0FFF) as usize * 2;
+        let sync = &data[16..16 + length(16)];
+        let next = &data[16 + sync.len()..];
+        assert_eq!(next.len(), length(16 + sync.len()));
+
+        let run = |units: &[&[u8]]| {
+            let mut bridge = TestBridge::new(false);
+            bridge.configure("input_codec".into(), "truehd".into());
+            let bytes = units.concat();
+            let result = bridge.push_packet(RSlice::from_slice(&bytes), RInputTransport::Raw, 0);
+            assert!(result.error_message.is_empty(), "{}", result.error_message);
+            assert!(!result.did_reset);
+            let frames: Vec<_> = result.frames.iter().map(|f| f.pcm.to_vec()).collect();
+            (frames, bridge.shared.total_samples)
+        };
+
+        let clean = run(&[sync, next, sync, next, sync, next]);
+        let overlapped = run(&[sync, sync, next, sync, next, sync, next]);
+
+        assert!(clean.0.len() >= 4, "{} frames", clean.0.len());
+        assert_eq!(overlapped.0, clean.0, "the copy's samples are not played");
+        assert_eq!(overlapped.1, clean.1, "nor counted on the clock");
     }
 }
 

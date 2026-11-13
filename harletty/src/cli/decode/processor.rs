@@ -47,6 +47,7 @@ impl AccessUnitShape {
             // between events.
             oamd: Vec::new(),
             is_duplicate: false,
+            overlaps_previous: false,
             substream_info_changed: false,
         }
     }
@@ -347,6 +348,7 @@ mod tests {
                     .flat_map(|unit| unit.oamd.clone())
                     .collect(),
                 is_duplicate: true,
+                overlaps_previous: true,
                 substream_info_changed: true,
             })
         };
@@ -364,6 +366,7 @@ mod tests {
             assert_eq!(reused.channel_labels, fresh.channel_labels);
             assert_eq!(format!("{:?}", reused.oamd), format!("{:?}", fresh.oamd));
             assert_eq!(reused.is_duplicate, fresh.is_duplicate);
+            assert_eq!(reused.overlaps_previous, fresh.overlaps_previous);
             assert_eq!(reused.substream_info_changed, fresh.substream_info_changed);
         }
     }
@@ -464,6 +467,10 @@ mod tests {
                 clean.access_units[0].sampling_frequency
             );
             assert!(!au.is_duplicate, "silence must not be discarded downstream");
+            assert!(
+                !au.overlaps_previous,
+                "silence must not be discarded downstream"
+            );
         }
     }
 }

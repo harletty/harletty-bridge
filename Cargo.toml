@@ -58,13 +58,15 @@ strip = "symbols"
 # The TrueHD decoder is built from our fork of the `truehd` crate, pinned to a
 # commit: upstream's unreleased main plus the decode-speed series, which
 # decodes in a quarter of the time of 0.7.2 with the same output, and a fix
-# that takes compiling it from over 13 GB of memory to under 1 GB. The crates
+# that takes compiling it from over 13 GB of memory to under 1 GB, and the
+# flag for an access unit that restates the previous one's output time at a
+# seamless branch (`DecodedAccessUnit::overlaps_previous`). The crates
 # keep asking for the crates.io version, so dropping this section goes back
 # to it. Move the pin only to a commit that stays reachable on the fork.
 # bridge/fuzz/Cargo.toml, a workspace of its own, repeats this section: move
 # both together.
 [patch.crates-io]
-truehd = { git = "https://github.com/harletty/truehdd", rev = "5c8b880405946e7ff1aee884cf9988415fe2c3a9" }
+truehd = { git = "https://github.com/harletty/truehdd", rev = "e9fb779fd4fe2f299ed0579f594288fdbec9c3e4" }
 # `oamd`, the object audio metadata parser `truehd` reads, from our fork: it has the
 # depth factor, chained object gain and basic info mask fixes of truehdd/oamd#1.
 # Drop this line once a release carries them.

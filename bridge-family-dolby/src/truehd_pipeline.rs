@@ -9,6 +9,7 @@ use truehd::process::{
     parse::Parser,
 };
 use truehd::structs::access_unit::AccessUnit;
+use truehd::structs::oamd::ObjectAudioMetadataPayload;
 
 use crate::dolby::{DolbyPipeline, DrcMode};
 use crate::labels::{channel_label_to_r, oamd_speaker_to_label};
@@ -94,6 +95,10 @@ struct DrainContext<'a> {
     declared_object_channels: &'a mut Option<RVec<bridge_api::RObjectChannel>>,
     spatial_labels: &'a mut Option<RVec<RChannelLabel>>,
     oamd_warnings: &'a mut OamdWarnings,
+    /// See [`DolbyPipeline::truehd_carried_oamd`].
+    carried_oamd: &'a mut Vec<ObjectAudioMetadataPayload>,
+    /// See [`DolbyPipeline::truehd_carried_new_segment`].
+    carried_new_segment: &'a mut bool,
     perf: &'a mut PerfStats,
 }
 
@@ -116,6 +121,8 @@ impl DrainContext<'_> {
         *self.current_dialogue_level = None;
         *self.declared_object_channels = None;
         *self.spatial_labels = None;
+        self.carried_oamd.clear();
+        *self.carried_new_segment = false;
         *self.recovering_until_major_sync = true;
     }
 }
@@ -349,21 +356,29 @@ fn drain_frames(
                     );
                 }
 
-                if substream_info_changed {
+                if substream_info_changed || std::mem::take(ctx.carried_new_segment) {
                     decoded.substream_info_changed = true;
                 }
 
-                // Advance the timeline regardless; duplicate frames represent real
-                // audio time and must be counted for accurate metadata timestamping.
-                let base_sample_pos = *ctx.total_samples;
-                *ctx.total_samples += decoded.sample_length as u64;
-
-                if decoded.is_duplicate {
+                // An access unit the stream dates at the previous one's output
+                // time covers time already played: a seamless branch whose
+                // outgoing stream runs one access unit past the splice, as Blu-ray
+                // titles that branch between clips do at many splices. Playing it
+                // would repeat those samples and put every frame after it one
+                // access unit late against the stream's own timeline. Its samples
+                // are dropped and the clock stays where it is; its metadata, the
+                // new stream restating its objects, goes out with the next frame.
+                if decoded.overlaps_previous || decoded.is_duplicate {
+                    ctx.carried_oamd.extend(decoded.oamd.iter().cloned());
+                    *ctx.carried_new_segment |= decoded.substream_info_changed;
                     #[cfg(feature = "bridge-perf")]
                     ctx.perf.note_duplicate_frame();
                     ctx.perf.maybe_report(*ctx.frame_count);
                     continue;
                 }
+
+                let base_sample_pos = *ctx.total_samples;
+                *ctx.total_samples += decoded.sample_length as u64;
 
                 #[cfg(feature = "bridge-perf")]
                 let build_started = Instant::now();
@@ -435,7 +450,11 @@ fn build_thd_frame(
     }
     #[cfg(feature = "bridge-perf")]
     let mut metadata_events = 0usize;
-    for oamd in &decoded.oamd {
+    // Metadata carried from a dropped access unit first, dated on this frame:
+    // the time it restated is behind us, and an event is applied no earlier
+    // than the block it comes with anyway.
+    let carried = std::mem::take(ctx.carried_oamd);
+    for oamd in carried.iter().chain(&decoded.oamd) {
         let evo_base = base_sample_pos + oamd.evo_sample_offset;
         // Fixed-channel labels of the spatial presentation: bed labels from
         // the OAMD bed assignment, then `Object` for the object channels.
@@ -470,6 +489,9 @@ fn build_thd_frame(
         }
         metadata.push(meta);
     }
+    // Back where it lives, emptied, with what it held allocated for the next time.
+    *ctx.carried_oamd = carried;
+    ctx.carried_oamd.clear();
     #[cfg(feature = "bridge-perf")]
     {
         ctx.perf.record_build_metadata(metadata_started.elapsed());
@@ -540,6 +562,8 @@ pub(crate) fn process_extractor_input(
             declared_object_channels: &mut shared.declared_object_channels,
             spatial_labels: &mut bridge.truehd_spatial_labels,
             oamd_warnings: &mut bridge.truehd_oamd_warnings,
+            carried_oamd: &mut bridge.truehd_carried_oamd,
+            carried_new_segment: &mut bridge.truehd_carried_new_segment,
             perf: &mut bridge.perf,
         };
         #[cfg(feature = "bridge-perf")]
