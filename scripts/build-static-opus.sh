@@ -27,7 +27,11 @@ if [[ ! -f "$prefix/.built-$OPUS_VERSION" ]]; then
   rm -rf "$work"
   mkdir -p "$work"
   tarball="$work/opus-$OPUS_VERSION.tar.gz"
-  curl -sSfL -o "$tarball" "https://downloads.xiph.org/releases/opus/opus-$OPUS_VERSION.tar.gz"
+  # downloads.xiph.org drops a TLS handshake now and then (curl error 35, on the
+  # Windows and macOS runners alike): retry that too, not only the transient
+  # HTTP errors curl retries by default.
+  curl -sSfL --retry 5 --retry-delay 5 --retry-all-errors -o "$tarball" \
+    "https://downloads.xiph.org/releases/opus/opus-$OPUS_VERSION.tar.gz"
   actual="$( (sha256sum "$tarball" 2>/dev/null || shasum -a 256 "$tarball") | cut -d' ' -f1)"
   if [[ "$actual" != "$OPUS_SHA256" ]]; then
     echo "opus-$OPUS_VERSION.tar.gz: sha256 $actual, expected $OPUS_SHA256" >&2
