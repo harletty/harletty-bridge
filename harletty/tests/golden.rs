@@ -95,6 +95,10 @@ fn joc_master_set_matches_golden() {
     // decoded audio (`eac3::OAMD_LATENCY_SAMPLES`): every samplePos moves 833
     // samples later, one core block plus the JOC reconstruction, and nothing
     // else in the file changes. The audio does not move with it.
+    //
+    // Rebased again when the signalled default object priority started
+    // decoding as 1.0 (clause 5.6.1.3) rather than as no priority: every
+    // importance goes from 0.0 to 1.0, nothing else changes.
     let produced_meta = std::fs::read_to_string(out_dir.join("out.atmos.metadata")).unwrap();
     let golden_meta = std::fs::read_to_string(fixture("joc_atmos_1s.atmos.metadata")).unwrap();
     assert_eq!(produced_meta, golden_meta, ".atmos.metadata drifted");
