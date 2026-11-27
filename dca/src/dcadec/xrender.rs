@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //! The bed fold of a DTS:X object whose record states no gains.
 //!
 //! An object record in mode 0 carries a position and no reference rows, yet

@@ -3,6 +3,7 @@ pub mod auro_stage;
 mod decode_impl;
 pub mod decoder_thread;
 pub mod dts_handler;
+pub mod dts_parallel;
 pub mod dts_thread;
 pub mod eac3_handler;
 pub mod eac3_thread;
@@ -10,6 +11,7 @@ pub mod handler;
 #[cfg(feature = "iamf")]
 pub mod iamf_handler;
 pub mod output;
+pub mod parallel;
 pub mod processor;
 pub mod progress;
 

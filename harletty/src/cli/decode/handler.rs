@@ -303,6 +303,12 @@ pub struct DecodeHandler {
     pub prev_events: Vec<Event>,
     pub decoded_frames: u64,
     pub decoded_samples: u64,
+    /// Samples the last access unit written added to `decoded_samples`: where an
+    /// access unit that restates its output time starts.
+    pub last_sample_length: u64,
+    /// The samples last written, to fill a gap and smooth the join after an
+    /// overlap from. Not kept without audio output.
+    pub concealer: conceal::Concealer,
     pub final_sample_rate: u32,
     pub bed_indices: Option<Vec<usize>>,
     pub au_index: u64,
@@ -328,6 +334,8 @@ impl Default for DecodeHandler {
             prev_events: Vec::new(),
             decoded_frames: 0,
             decoded_samples: 0,
+            last_sample_length: 0,
+            concealer: conceal::Concealer::default(),
             final_sample_rate: 48000,
             bed_indices: None,
             au_index: 0,
@@ -360,9 +368,56 @@ impl DecodeHandler {
         let sample_rate = decoded.sampling_frequency;
         let channel_count = decoded.channel_count;
 
-        if decoded.is_duplicate {
-            return Ok(());
+        // At a seamless branch whose outgoing stream runs one access unit past the
+        // splice, the next stream's first access unit restates the output time of
+        // the one just written: its samples are a second rendering of that time.
+        // Blu-ray titles that branch between clips do this at many splices, and
+        // the separate encodes rarely match bit for bit. Writing them would play
+        // the time twice and put everything after it one access unit late against
+        // the stream's own timeline, at every such splice. The samples are
+        // dropped; the metadata, the new stream restating its objects, belongs to
+        // that time and is dated where the previous access unit starts.
+        if decoded.overlaps_previous || decoded.is_duplicate {
+            if !ctx.no_audio {
+                let rows = &decoded.pcm_data[..decoded.sample_length.min(decoded.pcm_data.len())];
+                self.concealer.note_overlap(rows, decoded.channel_count);
+            }
+            let after = self.decoded_samples;
+            self.decoded_samples = after.saturating_sub(self.last_sample_length);
+            let metadata = self.handle_atmos_metadata(
+                decoded,
+                ctx.base_path,
+                ctx.format,
+                ctx.state,
+                ctx.bed_conform,
+                ctx.warp_mode,
+            );
+            self.decoded_samples = after;
+            return metadata;
         }
+
+        // A remux that dropped an access unit where nothing overlapped leaves the
+        // next one dated past the end of the last one written. That time is
+        // written, interpolated from both sides, in this access unit's layout,
+        // so that what follows, samples and metadata, stays on the stream's
+        // timeline.
+        if decoded.gap_before > 0 {
+            self.write_gap(decoded, ctx)?;
+        }
+
+        // After an overlap this access unit follows on from the rendering that
+        // was dropped: its start is evened out to where the kept one ended.
+        let smoothed;
+        let decoded = if self.concealer.has_overlap() && !ctx.no_audio {
+            let mut copy = decoded.clone();
+            let length = copy.sample_length.min(copy.pcm_data.len());
+            self.concealer
+                .smooth(&mut copy.pcm_data[..length], copy.channel_count);
+            smoothed = copy;
+            &smoothed
+        } else {
+            decoded
+        };
 
         self.decoded_frames += 1u64;
         self.final_sample_rate = sample_rate;
@@ -378,6 +433,7 @@ impl DecodeHandler {
         )?;
 
         self.decoded_samples += decoded.sample_length as u64;
+        self.last_sample_length = decoded.sample_length as u64;
 
         let effective_channel_count = if ctx.bed_conform && self.has_atmos {
             let empty_vec = Vec::new();
@@ -410,10 +466,41 @@ impl DecodeHandler {
             } else {
                 self.write_audio_samples(decoded, channel_count)?;
             }
+            let length = decoded.sample_length.min(decoded.pcm_data.len());
+            self.concealer
+                .push(&decoded.pcm_data[..length], channel_count);
         }
 
         self.update_progress_display(sample_rate, ctx.start_time, ctx.pb)?;
 
+        Ok(())
+    }
+
+    /// `decoded.gap_before` samples in the layout of `decoded`, interpolated
+    /// between the samples last written and those of `decoded` (silence without
+    /// audio output, where only the time counts), as access units of at most as
+    /// many samples as it holds.
+    fn write_gap(
+        &mut self,
+        decoded: &truehd::process::decode::DecodedAccessUnit,
+        ctx: &FrameHandlerContext,
+    ) -> Result<()> {
+        let mut rows = vec![[0; 16]; decoded.gap_before];
+        if !ctx.no_audio {
+            let next = &decoded.pcm_data[..decoded.sample_length.min(decoded.pcm_data.len())];
+            self.concealer.fill(&mut rows, next, decoded.channel_count);
+        }
+        let mut filler = truehd::process::decode::DecodedAccessUnit {
+            sampling_frequency: decoded.sampling_frequency,
+            channel_count: decoded.channel_count,
+            channel_labels: decoded.channel_labels.clone(),
+            ..Default::default()
+        };
+        for chunk in rows.chunks(filler.pcm_data.len()) {
+            filler.sample_length = chunk.len();
+            filler.pcm_data[..chunk.len()].copy_from_slice(chunk);
+            self.handle_decoded_frame(&filler, ctx)?;
+        }
         Ok(())
     }
 
@@ -1047,5 +1134,226 @@ impl DecodeHandler {
                 "Reset Atmos detection state for new segment - next OAMD will trigger DAMF header creation"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use truehd::process::decode::DecodedAccessUnit;
+    use truehd::structs::oamd::ObjectAudioMetadataPayload;
+
+    const CHANNELS: usize = 2;
+
+    /// An access unit of 40 samples, every one of them `value` on both channels.
+    fn unit(value: i32) -> DecodedAccessUnit {
+        let mut unit = DecodedAccessUnit {
+            sampling_frequency: 48000,
+            sample_length: 40,
+            channel_count: CHANNELS,
+            ..DecodedAccessUnit::default()
+        };
+        for row in &mut unit.pcm_data[..40] {
+            row[..CHANNELS].fill(value);
+        }
+        unit
+    }
+
+    /// The access unit of a new stream that restates the output time of the
+    /// one before it, with samples of its own: two encodes of the same time.
+    fn overlap(value: i32) -> DecodedAccessUnit {
+        DecodedAccessUnit {
+            overlaps_previous: true,
+            ..unit(value)
+        }
+    }
+
+    /// `overlap(value)` whose last sample is `last`: where it ends against the
+    /// access unit it overlaps decides the join after it.
+    fn overlap_ending_at(value: i32, last: i32) -> DecodedAccessUnit {
+        let mut unit = overlap(value);
+        unit.pcm_data[39][..CHANNELS].fill(last);
+        unit
+    }
+
+    fn rows(unit: &DecodedAccessUnit) -> Vec<conceal::Row> {
+        unit.pcm_data[..unit.sample_length].to_vec()
+    }
+
+    fn samples_of(rows: &[conceal::Row]) -> Vec<i32> {
+        rows.iter().flat_map(|r| r[..CHANNELS].to_vec()).collect()
+    }
+
+    fn written(dir: &Path) -> Vec<i32> {
+        std::fs::read(dir.join("out.pcm"))
+            .unwrap()
+            .chunks_exact(3)
+            .map(|b| (i32::from_le_bytes([b[0], b[1], b[2], 0]) << 8) >> 8)
+            .collect()
+    }
+
+    /// An access unit dated past the end of the one before it: a remux dropped
+    /// `gap` samples ahead of it.
+    fn after_gap(value: i32, gap: usize) -> DecodedAccessUnit {
+        DecodedAccessUnit {
+            gap_before: gap,
+            ..unit(value)
+        }
+    }
+
+    fn with_metadata(mut unit: DecodedAccessUnit) -> DecodedAccessUnit {
+        unit.oamd = vec![
+            ObjectAudioMetadataPayload::read(truehd::structs::oamd::EXAMPLE_DATA)
+                .expect("the example payload reads"),
+        ];
+        unit
+    }
+
+    /// An empty directory of this test's own, and the output base path in it.
+    fn out_dir(test: &str) -> (PathBuf, Option<PathBuf>) {
+        let dir = std::env::temp_dir().join(format!("harletty-thd-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = Some(dir.join("out"));
+        (dir, base)
+    }
+
+    fn decode(
+        base: &Option<PathBuf>,
+        no_audio: bool,
+        units: &[DecodedAccessUnit],
+    ) -> DecodeHandler {
+        let state = WriterState {
+            fail_level: Level::Error,
+        };
+        let ctx = FrameHandlerContext {
+            base_path: base,
+            format: AudioFormat::Pcm,
+            no_audio,
+            pb: &None,
+            state: &state,
+            start_time: std::time::Instant::now(),
+            bed_conform: false,
+            warp_mode: None,
+        };
+        let mut handler = DecodeHandler::default();
+        for unit in units {
+            handler.handle_decoded_frame(unit, &ctx).unwrap();
+        }
+        handler.finalize().unwrap();
+        handler
+    }
+
+    /// The overlap ends where the access unit it overlaps ends, so the join
+    /// after it has nothing to even out: only the dropping shows.
+    #[test]
+    fn an_access_unit_that_restates_the_previous_output_time_is_not_written() {
+        let (dir, base) = out_dir("overlap-audio");
+        let handler = decode(&base, false, &[unit(1), overlap_ending_at(2, 1), unit(3)]);
+
+        assert_eq!(handler.decoded_samples, 80, "the overlap adds no time");
+        assert_eq!(handler.decoded_frames, 2);
+        let mut expected = vec![1; 40 * CHANNELS];
+        expected.extend(vec![3; 40 * CHANNELS]);
+        assert_eq!(
+            written(&dir),
+            expected,
+            "the overlap's own samples are dropped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The access unit after an overlap follows on from the rendering that was
+    /// dropped: it starts where the kept one ended and eases into its own.
+    #[test]
+    fn the_join_after_an_overlap_is_evened_out() {
+        let (dir, base) = out_dir("overlap-join");
+        let dropped = overlap(2);
+        decode(&base, false, &[unit(1), dropped.clone(), unit(3)]);
+
+        let mut reference = conceal::Concealer::default();
+        reference.push(&rows(&unit(1)), CHANNELS);
+        reference.note_overlap(&rows(&dropped), CHANNELS);
+        let mut after = rows(&unit(3));
+        reference.smooth(&mut after, CHANNELS);
+
+        let mut expected = vec![1; 40 * CHANNELS];
+        expected.extend(samples_of(&after));
+        let samples = written(&dir);
+        assert_eq!(samples, expected);
+        assert_eq!(
+            samples[40 * CHANNELS],
+            2,
+            "next to the kept 1, as the dropped 2 was"
+        );
+        assert_eq!(samples[80 * CHANNELS - 1], 3, "and into its own 3");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The time a remux dropped is written as the concealer fills it from both
+    /// sides, not as silence.
+    #[test]
+    fn the_time_a_remux_dropped_is_written_interpolated() {
+        let (dir, base) = out_dir("gap-audio");
+        let gapped = after_gap(3, 40);
+        let handler = decode(&base, false, &[unit(1), gapped.clone(), unit(4)]);
+
+        assert_eq!(handler.decoded_samples, 160, "the gap is time");
+        let mut reference = conceal::Concealer::default();
+        reference.push(&rows(&unit(1)), CHANNELS);
+        let mut fill = vec![[0; conceal::MAX_CHANNELS]; 40];
+        reference.fill(&mut fill, &rows(&gapped), CHANNELS);
+
+        let mut expected = vec![1; 40 * CHANNELS];
+        expected.extend(samples_of(&fill));
+        expected.extend(vec![3; 40 * CHANNELS]);
+        expected.extend(vec![4; 40 * CHANNELS]);
+        assert_eq!(written(&dir), expected);
+        assert!(
+            fill.iter().all(|r| (1..=3).contains(&r[0])),
+            "between both sides"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The access unit after a gap, and its metadata, come where the stream
+    /// dates them: as if the dropped access unit had been there.
+    #[test]
+    fn metadata_after_a_gap_is_dated_where_the_stream_puts_it() {
+        let (dir, base) = out_dir("gap-metadata");
+        decode(&base, true, &[unit(1), with_metadata(after_gap(3, 40))]);
+        let gapped = std::fs::read_to_string(dir.join("out.atmos.metadata")).unwrap();
+
+        let (reference_dir, reference_base) = out_dir("gap-metadata-reference");
+        decode(
+            &reference_base,
+            true,
+            &[unit(1), unit(2), with_metadata(unit(3))],
+        );
+        let reference = std::fs::read_to_string(reference_dir.join("out.atmos.metadata")).unwrap();
+
+        assert!(gapped.contains("samplePos"), "{gapped}");
+        assert_eq!(gapped, reference);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&reference_dir);
+    }
+
+    /// The metadata of the overlapping access unit is the new stream restating
+    /// its objects at the time it overlaps: it comes out as it would have, had
+    /// it come with the access unit it overlaps, not one access unit later.
+    #[test]
+    fn an_overlap_keeps_its_metadata_at_the_time_it_restates() {
+        let (dir, base) = out_dir("overlap-metadata");
+        decode(&base, true, &[unit(1), with_metadata(overlap(2)), unit(3)]);
+        let overlapped = std::fs::read_to_string(dir.join("out.atmos.metadata")).unwrap();
+
+        let (reference_dir, reference_base) = out_dir("overlap-metadata-reference");
+        decode(&reference_base, true, &[with_metadata(unit(1)), unit(3)]);
+        let reference = std::fs::read_to_string(reference_dir.join("out.atmos.metadata")).unwrap();
+
+        assert!(overlapped.contains("samplePos"), "{overlapped}");
+        assert_eq!(overlapped, reference);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&reference_dir);
     }
 }

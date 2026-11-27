@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Extract a time range as interleaved f32le: active bed speakers in ascending
 // DCA index order, followed by the decoded XLL-X extension sources. The tool

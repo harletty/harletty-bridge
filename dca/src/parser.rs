@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // DTS Coherent Acoustics (DCA) core frame-header parser. Ported from ffmpeg's
 // `ff_dca_parse_core_frame_header` (libavcodec/dca.c) and the constants in

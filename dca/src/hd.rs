@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // High-level DTS-HD decode. One DTS-HD frame = a core access unit + the
 // following EXSS substream. Two carriers come out of it:
@@ -18,7 +18,7 @@ use crate::dcadec::xll::{DCA_SYNCWORD_XLL_X, XllDecoder, XllError, crc16_ccitt};
 use crate::dcadec::xmeta::FIXED_HEIGHT_COUNT;
 use crate::parser::{ParseError, parse_header};
 
-const PCM_SCALE: f32 = 8_388_608.0; // 2^23
+pub(crate) const PCM_SCALE: f32 = 8_388_608.0; // 2^23
 
 /// The bytes of a lossy carrier's DTS:X extension before its channel set:
 /// the 22-byte wrapper the metadata reader parses (the fold matrix and its
@@ -204,13 +204,66 @@ pub fn exss_has_xll(data: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// The hash behind [`HdDecoder::carried_state`]: one multiply and one
+/// xorshift per word, both bijections, so two states that differ in a single
+/// word never collide, and states that differ in several do with odds of
+/// about 2^-64. A word at a time, where the standard keyed hash pays a call
+/// per write.
 #[derive(Default)]
+struct StateHasher(u64);
+
+impl StateHasher {
+    #[inline]
+    fn word(&mut self, word: u64) {
+        let h = (self.0 ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 29);
+    }
+}
+
+impl std::hash::Hasher for StateHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.word(u64::from_le_bytes(word));
+        }
+    }
+
+    fn write_u8(&mut self, x: u8) {
+        self.word(u64::from(x));
+    }
+
+    fn write_u32(&mut self, x: u32) {
+        self.word(u64::from(x));
+    }
+
+    fn write_i32(&mut self, x: i32) {
+        self.word(u64::from(x as u32));
+    }
+
+    fn write_usize(&mut self, x: usize) {
+        self.word(x as u64);
+    }
+}
+
 pub struct HdDecoder {
     core: CoreDecoder,
     synth: SynthState,
     xll: XllDecoder,
     /// The core as synthesized for the current frame, kept for its buffers.
     core_out: CoreOutput,
+}
+
+impl Default for HdDecoder {
+    /// [`HdDecoder::new`]: a derived default would leave the XLL decoder
+    /// without its speaker output slots.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HdDecoder {
@@ -240,6 +293,21 @@ impl HdDecoder {
             .iter()
             .enumerate()
             .filter_map(|(speaker, channel)| channel.as_deref().map(|v| (speaker, v)))
+    }
+
+    /// A fingerprint of everything this decoder carries from one frame into
+    /// the next: the core's ADPCM and LFE history, the filter banks' delay
+    /// lines and the XLL peak-bitrate buffer. Two decoders with the same
+    /// fingerprint decode whatever follows into the same samples, so a
+    /// decoder started part-way through a stream can be checked against
+    /// one that ran from the start.
+    pub fn carried_state(&self) -> u64 {
+        use std::hash::Hasher;
+        let mut state = StateHasher::default();
+        self.core.hash_carried(&mut state);
+        self.synth.hash_carried(&mut state);
+        self.xll.hash_carried(&mut state);
+        state.finish()
     }
 
     /// Decode one DTS-HD frame from its core access unit + EXSS substream bytes.
@@ -649,6 +717,61 @@ mod tests {
             offset += core.frame_size + exss_size;
         }
         assert_eq!(frames, 100);
+    }
+
+    /// `HdDecoder::default()` is `new()`: the derived default left the XLL
+    /// decoder without speaker output slots, and the first lossless frame
+    /// panicked indexing them.
+    #[test]
+    fn default_decoder_has_the_xll_output_slots() {
+        assert_eq!(HdDecoder::default().xll.output.len(), 32);
+        assert_eq!(
+            HdDecoder::default().xll.output.len(),
+            HdDecoder::new().xll.output.len()
+        );
+    }
+
+    #[test]
+    fn default_decoder_decodes_like_new() {
+        use std::io::Read;
+
+        let Ok(dump) = std::env::var("HARLETTY_DTSX_STANDARD_CORPUS") else {
+            eprintln!("skipping: HARLETTY_DTSX_STANDARD_CORPUS is not set");
+            return;
+        };
+        if !std::path::Path::new(&dump).is_file() {
+            eprintln!("skipping: configured corpus is not readable");
+            return;
+        }
+        let mut bytes = Vec::new();
+        std::fs::File::open(dump)
+            .unwrap()
+            .take(1024 * 1024)
+            .read_to_end(&mut bytes)
+            .unwrap();
+
+        let mut by_default = HdDecoder::default();
+        let mut by_new = HdDecoder::new();
+        let mut offset = 0usize;
+        let mut frames = 0usize;
+        while frames < 16 && offset + 18 < bytes.len() {
+            let core = parse_header(&bytes[offset..]).unwrap();
+            let exss_offset = offset + core.frame_size;
+            let exss_size = ExssParser::parse(&bytes[exss_offset..])
+                .unwrap()
+                .substream_size();
+            let core_au = &bytes[offset..exss_offset];
+            let exss = &bytes[exss_offset..exss_offset + exss_size];
+            let expected = by_new.decode(core_au, exss).unwrap();
+            let frame = by_default.decode(core_au, exss).unwrap();
+            assert_ne!(frame.output_mask, 0);
+            assert_eq!(frame.output_mask, expected.output_mask);
+            assert_eq!(frame.samples, expected.samples);
+            assert_eq!(frame.x_samples, expected.x_samples);
+            frames += 1;
+            offset += core.frame_size + exss_size;
+        }
+        assert_eq!(frames, 16);
     }
 }
 

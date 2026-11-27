@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // The stereo tone fixture, decoded end to end through the decoder's own
 // choice of vector code. Every path gives the same samples (`src/cpu.rs`),

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Analyze the compact navigation word preceding the two bare XLL channel sets
 // in the alternate end-of-frame extension profile.

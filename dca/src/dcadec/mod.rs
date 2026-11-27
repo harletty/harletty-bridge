@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // DCA core decoder internals: generated tables, Huffman VLCs, and the subband
 // DSP decode (ported incrementally from ffmpeg's dca_core.c / dcadsp.c).

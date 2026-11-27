@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //! Corpus-gated checks of the private-metadata reader against real streams.
 //!
 //! Inputs come from the `HARLETTY_DTSX_STANDARD_CORPUS`, `HARLETTY_D0_CORPUS`,

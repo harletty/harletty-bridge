@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Probe a raw .dts elementary stream: run the core extractor and print the
 // first frames' parsed headers. Usage: cargo run -p dca --example probe -- <file> [max]

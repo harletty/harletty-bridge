@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Write one interleaved f32le RMS row per decoded XLL frame: the eight
 // compatible-bed channels followed by every XLL-X extension source. This is a

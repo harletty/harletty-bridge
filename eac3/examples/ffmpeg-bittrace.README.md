@@ -1,5 +1,12 @@
 # FFmpeg bittrace patch
 
+> **Licence.** `ffmpeg-bittrace.patch` is a diff against FFmpeg's
+> `libavcodec/ac3dec.c` and contains FFmpeg source lines, so it is licensed
+> `LGPL-2.1-or-later` (FFmpeg's licence), not under the crate's Apache-2.0.
+> It is used only as a local test oracle to compare bit positions with this
+> decoder, is not part of the crate, and is excluded from the published
+> package (`exclude` in `eac3/Cargo.toml`).
+
 Companion to `eac3/examples/bittrace.rs`. Patches `libavcodec/ac3dec.c`
 with the same `BITTRACE` checkpoint format harletty emits, so the two
 decoders' bit positions can be diff'd line-for-line.

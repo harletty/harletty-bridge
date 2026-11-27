@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 // Offline, deliberately narrow private-metadata investigation. Nothing here
 // runs in the decoder or determines a playback presentation.
 //

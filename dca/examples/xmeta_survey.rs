@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 // Per-frame survey of the private DTS:X metadata as the library reads it:
 // parse result per frame, and every change of object position or fold.
 // Research tool only; it is not used by the realtime decoder.

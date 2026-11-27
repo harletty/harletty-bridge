@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // DCA core Huffman (VLC) tables, built from the generated `{symbol, length}`
 // source pairs the same way ffmpeg's `ff_dca_init_vlcs` does:

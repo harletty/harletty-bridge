@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Export frame-level D3 structural fields for offline correlation studies.
 // Research tool only; it is not used by the realtime decoder.
