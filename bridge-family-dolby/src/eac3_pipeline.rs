@@ -932,6 +932,7 @@ fn build_eac3_frame_from_object(
                 num_bed_channels,
                 object_channels,
                 shared,
+                &mut bridge.eac3_oamd_warnings,
             );
             #[cfg(feature = "bridge-perf")]
             {
@@ -1119,7 +1120,15 @@ pub(crate) fn build_eac3_frame_from_core(
     for payload in info.payloads() {
         if let ParsedEmdfPayloadData::Oamd(oamd) = &payload.parsed {
             let evo_base = base_sample_pos + payload.info.sample_offset.unwrap_or(0) as u64;
-            let meta = build_eac3_metadata_frame(oamd, evo_base, base_sample_pos, 0, 0, shared);
+            let meta = build_eac3_metadata_frame(
+                oamd,
+                evo_base,
+                base_sample_pos,
+                0,
+                0,
+                shared,
+                &mut bridge.eac3_oamd_warnings,
+            );
             metadata.push(meta);
         }
     }
