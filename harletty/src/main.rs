@@ -28,6 +28,7 @@ mod iamf;
 mod iamf_to_oamd;
 mod input;
 mod log_mute;
+mod pcm;
 mod settings;
 mod signature;
 pub(crate) mod timestamp;

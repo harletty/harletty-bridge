@@ -11,6 +11,10 @@ pub enum Codec {
     /// descriptors, then temporal units). Decoded only by a build with the
     /// `iamf` feature.
     Iamf,
+    /// Integer PCM in a WAV container (RIFF/WAVE, RF64, BW64 or Wave64):
+    /// what a front end pipes in from a lossless track it decoded
+    /// bit-exactly. Decoded only when it carries Auro-3D.
+    Wav,
 }
 
 /// What `decode` and `info` say when asked for IAMF by a build without it.
@@ -130,8 +134,8 @@ pub fn probe_codec(reader: &mut InputReader, hint: Codec) -> Result<(Codec, Vec<
 
     let codec = detect_codec(&buffer).ok_or_else(|| {
         anyhow!(
-            "no TrueHD (0xF8726FBA), EAC3 (0x0B77) or DTS (0x7FFE8001 / 0x64582025) sync word \
-             nor IA sequence header found in first {} bytes; pass --codec explicitly",
+            "no TrueHD (0xF8726FBA), EAC3 (0x0B77) or DTS (0x7FFE8001 / 0x64582025) sync word, \
+             IA sequence header nor WAV header found in first {} bytes; pass --codec explicitly",
             buffer.len()
         )
     })?;
@@ -152,7 +156,13 @@ pub fn probe_codec(reader: &mut InputReader, hint: Codec) -> Result<(Codec, Vec<
 ///
 /// An IA sequence header weighs in the same way, as an eight-byte pattern:
 /// its first byte is TrueHD's, but not the three after it.
+///
+/// A WAV header is the one thing a stream can only open with, and the audio
+/// after it is PCM that may hold any byte pattern: it decides at once.
 fn detect_codec(buffer: &[u8]) -> Option<Codec> {
+    if crate::pcm::is_wav(buffer) {
+        return Some(Codec::Wav);
+    }
     let iamf = find_iamf_sequence_header(buffer).map(|header| {
         (
             Codec::Iamf,
@@ -191,6 +201,7 @@ pub fn describe_codec(codec: Codec) -> &'static str {
         Codec::Eac3 => "EAC3",
         Codec::Dts => "DTS",
         Codec::Iamf => "IAMF",
+        Codec::Wav => "PCM",
     }
 }
 
@@ -319,6 +330,21 @@ mod tests {
         let mut buf = IAMF_HEAD.to_vec();
         buf.extend_from_slice(&[0x0B, 0x77, 0x7F, 0xFE, 0x80, 0x01]);
         assert_eq!(detect_codec(&buf), Some(Codec::Iamf));
+    }
+
+    /// PCM may hold any byte pattern, sync words included: the header, at
+    /// the first byte, decides.
+    #[test]
+    fn a_wav_header_wins_over_a_sync_word_in_its_payload() {
+        for head in [
+            &b"RIFF\0\0\0\0WAVE"[..],
+            &b"RF64\xFF\xFF\xFF\xFFWAVE"[..],
+            &b"BW64\xFF\xFF\xFF\xFFWAVE"[..],
+        ] {
+            let mut buf = head.to_vec();
+            buf.extend_from_slice(&[0x0B, 0x77, 0x7F, 0xFE, 0x80, 0x01, 0xF8, 0x72, 0x6F, 0xBA]);
+            assert_eq!(detect_codec(&buf), Some(Codec::Wav));
+        }
     }
 
     #[test]

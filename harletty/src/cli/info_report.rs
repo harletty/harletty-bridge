@@ -65,8 +65,9 @@ pub struct InfoReport {
     /// The build: git describe, decoder library version, timestamp.
     pub build: &'static str,
     pub taxonomy: u32,
-    /// `TrueHD`, `EAC3`, `DTS` (core only), `DTS-HD HRA`, `DTS-HD MA` or
-    /// `IAMF`; `null` when no frame was found, with `error` saying why.
+    /// `TrueHD`, `EAC3`, `DTS` (core only), `DTS-HD HRA`, `DTS-HD MA`,
+    /// `IAMF` or `PCM`; `null` when no frame was found, with `error` saying
+    /// why.
     pub codec: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
