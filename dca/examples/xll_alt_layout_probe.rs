@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Survey the stable D0/D1/D3 payload prefix, channel-set mapping bits, and bytes
 // left after decoded audio in a bounded number of alternate-profile frames.

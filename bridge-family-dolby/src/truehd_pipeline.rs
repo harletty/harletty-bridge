@@ -9,6 +9,7 @@ use truehd::process::{
     parse::Parser,
 };
 use truehd::structs::access_unit::AccessUnit;
+use truehd::structs::oamd::ObjectAudioMetadataPayload;
 
 use crate::dolby::{DolbyPipeline, DrcMode};
 use crate::labels::{channel_label_to_r, oamd_speaker_to_label};
@@ -94,6 +95,12 @@ struct DrainContext<'a> {
     declared_object_channels: &'a mut Option<RVec<bridge_api::RObjectChannel>>,
     spatial_labels: &'a mut Option<RVec<RChannelLabel>>,
     oamd_warnings: &'a mut OamdWarnings,
+    /// See [`DolbyPipeline::truehd_carried_oamd`].
+    carried_oamd: &'a mut Vec<ObjectAudioMetadataPayload>,
+    /// See [`DolbyPipeline::truehd_carried_new_segment`].
+    carried_new_segment: &'a mut bool,
+    /// See [`DolbyPipeline::truehd_concealer`].
+    concealer: &'a mut conceal::Concealer,
     perf: &'a mut PerfStats,
 }
 
@@ -116,6 +123,9 @@ impl DrainContext<'_> {
         *self.current_dialogue_level = None;
         *self.declared_object_channels = None;
         *self.spatial_labels = None;
+        self.carried_oamd.clear();
+        *self.carried_new_segment = false;
+        self.concealer.reset();
         *self.recovering_until_major_sync = true;
     }
 }
@@ -349,34 +359,14 @@ fn drain_frames(
                     );
                 }
 
-                if substream_info_changed {
-                    decoded.substream_info_changed = true;
-                }
-
-                // Advance the timeline regardless; duplicate frames represent real
-                // audio time and must be counted for accurate metadata timestamping.
-                let base_sample_pos = *ctx.total_samples;
-                *ctx.total_samples += decoded.sample_length as u64;
-
-                if decoded.is_duplicate {
-                    #[cfg(feature = "bridge-perf")]
-                    ctx.perf.note_duplicate_frame();
-                    ctx.perf.maybe_report(*ctx.frame_count);
-                    continue;
-                }
-
-                #[cfg(feature = "bridge-perf")]
-                let build_started = Instant::now();
-                frames.push(build_thd_frame(
+                place_decoded(
                     ctx,
                     decoded,
-                    base_sample_pos,
+                    substream_info_changed,
                     drc_gain,
                     drc_ramp_duration,
-                ));
-                #[cfg(feature = "bridge-perf")]
-                ctx.perf.record_build(build_started.elapsed());
-                ctx.perf.maybe_report(*ctx.frame_count);
+                    &mut frames,
+                );
             }
 
             Some(Err(ref e))
@@ -402,6 +392,149 @@ fn drain_frames(
     }
 
     (frames, None)
+}
+
+/// Puts a decoded access unit on the bridge's timeline where the stream dates it.
+///
+/// At a seamless branch the stream's restart headers can disagree with the
+/// access units a remux kept:
+///
+/// - an access unit dated at the previous one's output time covers time already
+///   played: the outgoing stream ran one access unit past the splice, as Blu-ray
+///   titles that branch between clips do at many splices. Playing it would repeat
+///   those samples and put every frame after it one access unit late. Its samples
+///   are dropped and the clock stays where it is; its metadata, the new stream
+///   restating its objects, goes out with the next frame, and so does a layout
+///   change it announced;
+/// - an access unit dated past the end of the previous one follows time a remux
+///   dropped. That time goes out in the access unit's layout, interpolated
+///   between the samples played and the access unit's own, so the frames after
+///   it are not early.
+///
+/// After an overlap, the access unit played next follows on from the rendering
+/// that was dropped: its start is evened out to where the kept one ended.
+fn place_decoded(
+    ctx: &mut DrainContext<'_>,
+    decoded: &mut DecodedAccessUnit,
+    substream_info_changed: bool,
+    drc_gain: f32,
+    drc_ramp_duration: u32,
+    frames: &mut Vec<RDecodedFrame>,
+) {
+    if substream_info_changed || std::mem::take(ctx.carried_new_segment) {
+        decoded.substream_info_changed = true;
+    }
+
+    let length = decoded.sample_length.min(decoded.pcm_data.len());
+    if decoded.overlaps_previous || decoded.is_duplicate {
+        ctx.concealer
+            .note_overlap(&decoded.pcm_data[..length], decoded.channel_count);
+        ctx.carried_oamd.extend(decoded.oamd.iter().cloned());
+        *ctx.carried_new_segment |= decoded.substream_info_changed;
+        #[cfg(feature = "bridge-perf")]
+        ctx.perf.note_duplicate_frame();
+        ctx.perf.maybe_report(*ctx.frame_count);
+        return;
+    }
+
+    let gap = decoded.gap_before;
+    let fill = if gap > 0 {
+        let mut rows = vec![[0; conceal::MAX_CHANNELS]; gap];
+        ctx.concealer.fill(
+            &mut rows,
+            &decoded.pcm_data[..length],
+            decoded.channel_count,
+        );
+        ctx.concealer.push(&rows, decoded.channel_count);
+        rows
+    } else {
+        Vec::new()
+    };
+    if ctx.concealer.has_overlap() {
+        ctx.concealer
+            .smooth(&mut decoded.pcm_data[..length], decoded.channel_count);
+    }
+    ctx.concealer
+        .push(&decoded.pcm_data[..length], decoded.channel_count);
+
+    let base_sample_pos = *ctx.total_samples + gap as u64;
+    *ctx.total_samples = base_sample_pos + decoded.sample_length as u64;
+
+    #[cfg(feature = "bridge-perf")]
+    let build_started = Instant::now();
+    let mut frame = build_thd_frame(ctx, decoded, base_sample_pos, drc_gain, drc_ramp_duration);
+    if gap > 0 {
+        push_fill(frames, &mut frame, &fill, decoded.sample_length);
+    }
+    frames.push(frame);
+    #[cfg(feature = "bridge-perf")]
+    ctx.perf.record_build(build_started.elapsed());
+    ctx.perf.maybe_report(*ctx.frame_count);
+}
+
+/// `rows`, the samples filling a gap, in the layout of `next`, the frame that
+/// follows them, as frames of at most `step` samples. A new layout `next`
+/// announces is announced by the first of them, the first frame in it.
+fn push_fill(
+    frames: &mut Vec<RDecodedFrame>,
+    next: &mut RDecodedFrame,
+    rows: &[conceal::Row],
+    step: usize,
+) {
+    let channels = (next.channel_count as usize).min(conceal::MAX_CHANNELS);
+    for chunk in rows.chunks(step.max(1)) {
+        let mut pcm = Vec::with_capacity(chunk.len() * channels);
+        for row in chunk {
+            pcm.extend_from_slice(&row[..channels]);
+        }
+        frames.push(RDecodedFrame {
+            sampling_frequency: next.sampling_frequency,
+            sample_count: chunk.len() as u32,
+            channel_count: next.channel_count,
+            pcm: pcm.into(),
+            channel_labels: next.channel_labels.clone(),
+            metadata: RVec::new(),
+            drc_gain: next.drc_gain,
+            drc_ramp_duration: 0,
+            dialogue_level: next.dialogue_level,
+            is_new_segment: std::mem::take(&mut next.is_new_segment),
+        });
+    }
+}
+
+/// [`place_decoded`] on a bridge's state, for tests that hand it access units
+/// no stream they can build would decode to.
+#[cfg(test)]
+pub(crate) fn place_decoded_for_test(
+    bridge: &mut DolbyPipeline,
+    shared: &mut SharedState,
+    decoded: &mut DecodedAccessUnit,
+) -> Vec<RDecodedFrame> {
+    let mut ctx = DrainContext {
+        extractor: &mut bridge.extractor,
+        parser: &mut bridge.parser,
+        decoder: &mut bridge.decoder,
+        frame_count: &mut bridge.frame_count,
+        strict: shared.strict,
+        presentation: bridge.presentation,
+        current_substream_info: &mut bridge.current_substream_info,
+        current_extended_substream_info: &mut bridge.current_extended_substream_info,
+        current_dialogue_level: &mut bridge.current_dialogue_level,
+        recovering_until_major_sync: &mut bridge.recovering_until_major_sync,
+        drc_mode: bridge.drc_mode,
+        presentations_stale: &mut bridge.truehd_presentations_stale,
+        total_samples: &mut shared.total_samples,
+        declared_object_channels: &mut shared.declared_object_channels,
+        spatial_labels: &mut bridge.truehd_spatial_labels,
+        oamd_warnings: &mut bridge.truehd_oamd_warnings,
+        carried_oamd: &mut bridge.truehd_carried_oamd,
+        carried_new_segment: &mut bridge.truehd_carried_new_segment,
+        concealer: &mut bridge.truehd_concealer,
+        perf: &mut bridge.perf,
+    };
+    let mut frames = Vec::new();
+    place_decoded(&mut ctx, decoded, false, 1.0, 0, &mut frames);
+    frames
 }
 
 /// Build an [`RDecodedFrame`] from a TrueHD decoded access unit.
@@ -435,7 +568,11 @@ fn build_thd_frame(
     }
     #[cfg(feature = "bridge-perf")]
     let mut metadata_events = 0usize;
-    for oamd in &decoded.oamd {
+    // Metadata carried from a dropped access unit first, dated on this frame:
+    // the time it restated is behind us, and an event is applied no earlier
+    // than the block it comes with anyway.
+    let carried = std::mem::take(ctx.carried_oamd);
+    for oamd in carried.iter().chain(&decoded.oamd) {
         let evo_base = base_sample_pos + oamd.evo_sample_offset;
         // Fixed-channel labels of the spatial presentation: bed labels from
         // the OAMD bed assignment, then `Object` for the object channels.
@@ -470,6 +607,9 @@ fn build_thd_frame(
         }
         metadata.push(meta);
     }
+    // Back where it lives, emptied, with what it held allocated for the next time.
+    *ctx.carried_oamd = carried;
+    ctx.carried_oamd.clear();
     #[cfg(feature = "bridge-perf")]
     {
         ctx.perf.record_build_metadata(metadata_started.elapsed());
@@ -540,6 +680,9 @@ pub(crate) fn process_extractor_input(
             declared_object_channels: &mut shared.declared_object_channels,
             spatial_labels: &mut bridge.truehd_spatial_labels,
             oamd_warnings: &mut bridge.truehd_oamd_warnings,
+            carried_oamd: &mut bridge.truehd_carried_oamd,
+            carried_new_segment: &mut bridge.truehd_carried_new_segment,
+            concealer: &mut bridge.truehd_concealer,
             perf: &mut bridge.perf,
         };
         #[cfg(feature = "bridge-perf")]

@@ -277,8 +277,16 @@ spatial coordinates. Its observed bit layout is:
 
 - 8-bit marker `0x18`;
 - 11-bit XLL-X payload offset divided by four, followed by 13 zero bits;
-- 16-bit marker `0x8a28`;
-- 10-bit `(payload size - 24) / 4`, followed by 6 zero bits.
+- 15-bit marker `0x4514`;
+- 11-bit `(payload size - 24) / 4`, followed by 6 zero bits.
+
+The size field was first read as 10 bits behind a 16-bit `0x8a28` marker,
+because blocks of up to 4,116 bytes leave its top bit clear. Larger blocks
+(up to 5,056 bytes in the standard-profile demos) set it, so the low half reads
+`0x8a29…`: `0x18c8e000_8a290080` is offset 6,428 and size 4,128. With the
+10-bit reading about 2,800 of those frames failed the marker check and fell
+back to the band-end probe; with 11 bits the word matches the located block in
+34,311/34,311 frames of the four whole standard-profile demos.
 
 The decoded offset and size exactly match the XLL-X block located after the
 regular XLL band data: 93,243/93,243 frames across 64 MiB from each of the nine

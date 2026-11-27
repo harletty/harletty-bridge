@@ -27,13 +27,25 @@ if [[ ! -f "$prefix/.built-$OPUS_VERSION" ]]; then
   rm -rf "$work"
   mkdir -p "$work"
   tarball="$work/opus-$OPUS_VERSION.tar.gz"
-  curl -sSfL -o "$tarball" "https://downloads.xiph.org/releases/opus/opus-$OPUS_VERSION.tar.gz"
+  # downloads.xiph.org drops a TLS handshake now and then (curl error 35, on the
+  # Windows and macOS runners alike): retry that too, not only the transient
+  # HTTP errors curl retries by default.
+  curl -sSfL --retry 5 --retry-delay 5 --retry-all-errors -o "$tarball" \
+    "https://downloads.xiph.org/releases/opus/opus-$OPUS_VERSION.tar.gz"
   actual="$( (sha256sum "$tarball" 2>/dev/null || shasum -a 256 "$tarball") | cut -d' ' -f1)"
   if [[ "$actual" != "$OPUS_SHA256" ]]; then
     echo "opus-$OPUS_VERSION.tar.gz: sha256 $actual, expected $OPUS_SHA256" >&2
     exit 1
   fi
   tar -xzf "$tarball" -C "$work"
+  # The release archives ship LICENSES/Opus.txt as libopus's notice (BSD:
+  # binary redistributions must reproduce it); keep it that release's own.
+  # Line endings aside: a Windows checkout may turn the copy into CRLF.
+  if [[ "$(tr -d '\r' < "$work/opus-$OPUS_VERSION/COPYING")" != \
+        "$(tr -d '\r' < "$repo_dir/LICENSES/Opus.txt")" ]]; then
+    echo "LICENSES/Opus.txt differs from opus-$OPUS_VERSION's COPYING: update it" >&2
+    exit 1
+  fi
 
   # CMake on Windows is a native program: it reads C:/ paths, not the
   # shell's /c/ ones.

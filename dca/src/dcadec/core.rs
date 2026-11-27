@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // DTS Coherent Acoustics core decoder — subband-domain decode. Ported from
 // ffmpeg's dca_core.c (HEADER_CORE and HEADER_XXCH paths) + dcadsp.c kernels +
@@ -10,9 +10,9 @@
 
 use super::huffman::core_vlcs;
 use super::tables::{
-    ADPCM_VB, DMIXTABLE, HIGH_FREQ_VQ, INV_DMIXTABLE, JOINT_SCALE_FACTORS, LOSSLESS_QUANT,
-    LOSSY_QUANT, QUANT_INDEX_GROUP_SIZE, QUANT_INDEX_SEL_NBITS, QUANT_LEVELS, SCALE_FACTOR_ADJ,
-    SCALE_FACTOR_QUANT6, SCALE_FACTOR_QUANT7,
+    ADPCM_VB, BIT_RATES, DMIXTABLE, HIGH_FREQ_VQ, INV_DMIXTABLE, JOINT_SCALE_FACTORS,
+    LOSSLESS_QUANT, LOSSY_QUANT, QUANT_INDEX_GROUP_SIZE, QUANT_INDEX_SEL_NBITS, QUANT_LEVELS,
+    SCALE_FACTOR_ADJ, SCALE_FACTOR_QUANT6, SCALE_FACTOR_QUANT7,
 };
 use super::xll::crc16_ccitt;
 use crate::bitstream::BitReader;
@@ -340,9 +340,7 @@ impl CoreDecoder {
         self.predictor_history = info.predictor_history;
         self.crc_present = info.crc_present;
         self.audio_mode = info.audio_mode;
-        // bit_rate==3 marks the lossless quantizer; we don't parse br_code's
-        // exact value here (open core), default to lossy. (Affects only the
-        // step-size table selection; lossless core is rare.)
+        // Set from the header's rate code by skip_frame_header below.
         self.bit_rate_lossless = false;
         // A new access unit: any extension set is decoded after it.
         self.xxch_present = false;
@@ -375,7 +373,10 @@ impl CoreDecoder {
         rb(gb, 6)?; // audio_mode
         rb(gb, 4)?; // sr_code
         let br_code = rb(gb, 5)?;
-        self.bit_rate_lossless = br_code == 3;
+        // The lossless quantiser is selected by the rate the code names, not
+        // by the code: BIT_RATES[31] is the "lossless" sentinel 3, while code 3
+        // is 96 kb/s (ffmpeg dca_core.c: `s->bit_rate == 3`).
+        self.bit_rate_lossless = BIT_RATES[br_code as usize] == 3;
         rb1(gb)?; // reserved
         rb1(gb)?; // drc
         let _ts = rb1(gb)?;
@@ -1179,6 +1180,25 @@ impl CoreDecoder {
     /// Decoded samples for channel `ch`, band `band` (npcmblocks long).
     pub(crate) fn subband(&self, ch: usize, band: usize) -> &[i32] {
         &self.bands[self.band_range(ch, band)][DCA_ADPCM_COEFFS..]
+    }
+
+    /// Feed `state` what this decoder carries from one frame into the next:
+    /// the ADPCM history of every band and the LFE history, with the sizes
+    /// that decide whether the next frame keeps them. The rest of the
+    /// decoder is read afresh from each frame.
+    pub(crate) fn hash_carried(&self, state: &mut impl std::hash::Hasher) {
+        state.write_usize(self.band_len);
+        state.write_usize(self.lfe_samples.len());
+        if self.band_len > 0 {
+            for row in self.bands.chunks_exact(self.band_len) {
+                for &x in &row[..DCA_ADPCM_COEFFS] {
+                    state.write_i32(x);
+                }
+            }
+        }
+        for &x in &self.lfe_samples[..DCA_LFE_HISTORY.min(self.lfe_samples.len())] {
+            state.write_i32(x);
+        }
     }
 
     pub(crate) fn lfe(&self) -> &[i32] {

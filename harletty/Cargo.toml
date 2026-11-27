@@ -34,6 +34,7 @@ truehdd-macros = "0.1.1"
 # machine and is never part of this repository.
 truehd = { version = "0.7.2", features = ["evo-protection"] }
 eac3 = { version = "0.9.0", path = "../eac3" }
+conceal = { version = "0.9.0", path = "../conceal" }
 dca = { version = "0.9.0", path = "../dca" }
 auro = { version = "0.9.0", path = "../auro" }
 damf = { version = "0.9.0", path = "../damf" }

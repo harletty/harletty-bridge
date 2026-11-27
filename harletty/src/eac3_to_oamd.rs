@@ -140,9 +140,12 @@ fn synthesize_object_element(
     }
 }
 
+/// Convert one E-AC-3 OAMD payload. `sample_offset` is where in its frame's
+/// PCM the payload starts to apply, as `ObjectPcmFrame::oamd_payloads` dates
+/// it: the frame's latency included, not the bitstream's own offset.
 pub fn convert_oamd(
     eac3: &OamdPayload,
-    sample_offset: Option<u16>,
+    sample_offset: u32,
 ) -> ObjectAudioMetadataPayload {
     let bed_assignment = convert_bed_assignment(&eac3.bed_assignment);
 
@@ -164,7 +167,7 @@ pub fn convert_oamd(
         });
 
     ObjectAudioMetadataPayload {
-        evo_sample_offset: sample_offset.map(|s| s as u64).unwrap_or(0),
+        evo_sample_offset: u64::from(sample_offset),
         oamd_version: 0,
         object_count: eac3.object_count,
         program_assignment,
@@ -217,7 +220,7 @@ mod tests {
             BedChannel::SurroundLeft,
             BedChannel::SurroundRight,
         ]];
-        let out = convert_oamd(&payload, None);
+        let out = convert_oamd(&payload, 0);
         let bed = &out.program_assignment.bed_assignment[0];
         assert!(bed.0[SpeakerLabels::L as usize]);
         assert!(bed.0[SpeakerLabels::R as usize]);
@@ -274,7 +277,7 @@ mod tests {
             byte_length: 0,
             kind: OamdElementKind::Object(element),
         }];
-        let out = convert_oamd(&payload, Some(8));
+        let out = convert_oamd(&payload, 8);
         assert_eq!(out.evo_sample_offset, 8);
         let oe = out.object_element.expect("element");
         assert_eq!(oe.md_update_info.num_obj_info_blocks, 1);
@@ -349,7 +352,7 @@ mod tests {
             kind: OamdElementKind::Object(element),
         }];
 
-        let converted = convert_oamd(&payload, None);
+        let converted = convert_oamd(&payload, 0);
         let data = Data::with_oamd_payload(&converted, Path::new("sample"), SourceCodec::Eac3Joc, crate::CREATION_TOOL);
         let yaml = serde_yaml_ng::to_string(&data).unwrap();
         assert!(yaml.contains("sourceCodec: EAC3-JOC"));

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Compare two encodes of the same programme (for example two language tracks)
 // frame by frame.  Fields and independently coded object blocks shared by the

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // DTS extension substream (EXSS) parser. Ported from ffmpeg's dca_exss.c.
 // Locates the per-asset extension components — in particular the XLL (DTS-HD
@@ -553,12 +553,6 @@ impl ExssParser {
     }
 }
 
-/// Decode the profile-specific 64-bit XLL-X navigation word carried in the
-/// otherwise reserved asset-descriptor tail.
-///
-/// Observed syntax across the corpus:
-///   8-bit marker, 11-bit `offset / 4`, 13 zero bits,
-///   16-bit marker, 10-bit `(size - 24) / 4`, 6 zero bits.
 /// The largest asset descriptor (a 9-bit size field, in bytes, plus one).
 const DESCRIPTOR_MAX_BYTES: usize = 512;
 
@@ -588,13 +582,21 @@ impl ExssAsset {
     }
 }
 
+/// Decode the profile-specific 64-bit XLL-X navigation word carried in the
+/// otherwise reserved asset-descriptor tail.
+///
+/// Observed syntax across the corpus:
+///   8-bit marker `0x18`, 11-bit `offset / 4`, 13 zero bits,
+///   15-bit marker `0x4514`, 11-bit `(size - 24) / 4`, 6 zero bits.
+/// The size field's eleventh bit overlaps what reads as the last bit of a
+/// 16-bit `0x8a28` marker: blocks over 4,116 bytes set it (`0x8a29…`).
 fn parse_xll_x_navigation(tail: &[u8]) -> Option<(usize, usize)> {
     let bytes: [u8; 8] = tail.get(..8)?.try_into().ok()?;
     let word = u64::from_be_bytes(bytes);
     let high = (word >> 32) as u32;
     let low = word as u32;
     const OFFSET_FIELD_MASK: u32 = 0x00ff_e000;
-    const SIZE_FIELD_MASK: u32 = 0x0000_ffc0;
+    const SIZE_FIELD_MASK: u32 = 0x0001_ffc0;
     if high & !OFFSET_FIELD_MASK != 0x1800_0000 || low & !SIZE_FIELD_MASK != 0x8a28_0000 {
         return None;
     }
@@ -641,6 +643,21 @@ mod tests {
         let large = 0x1882_e000_8a28_3cc0u64.to_be_bytes();
         assert_eq!(parse_xll_x_navigation(&large), Some((4188, 996)));
         assert_eq!(parse_xll_x_navigation(&[0; 8]), None);
+    }
+
+    #[test]
+    fn parses_xll_x_navigation_word_with_eleven_size_bits() {
+        // A real word from a standard-profile stream: offset 6428 = 1607 * 4;
+        // size 4128 = 1026 * 4 + 24 sets the size field's eleventh bit
+        // (bit 16 of the low half), which a 10-bit reading rejected.
+        let word = 0x18c8_e000_8a29_0080u64.to_be_bytes();
+        assert_eq!(parse_xll_x_navigation(&word), Some((6428, 4128)));
+        // The widest size the field holds: 2047 * 4 + 24.
+        let widest = 0x1800_0000_8a29_ffc0u64.to_be_bytes();
+        assert_eq!(parse_xll_x_navigation(&widest), Some((0, 8212)));
+        // Bit 17 is still part of the marker.
+        let bad_marker = 0x18c8_e000_8a2a_0080u64.to_be_bytes();
+        assert_eq!(parse_xll_x_navigation(&bad_marker), None);
     }
 
     // Validate EXSS parsing on a real DTS-HD MA 7.1 stream.

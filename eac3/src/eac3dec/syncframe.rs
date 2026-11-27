@@ -30,18 +30,16 @@ const DEF_CPL_BNDSTRC: [bool; 18] = [
     false, false, false, false, false, false, false, false, true, false, true, true, false, true,
     true, true, true, true,
 ];
-/// Stereo rematrixing band boundaries in transform-coefficient bins
-/// (A/52 Table; matches FFmpeg `ff_ac3_rematrix_band_tab`). Band `b` spans
-/// `[REMATRIX_BAND_TAB[b], REMATRIX_BAND_TAB[b + 1])`.
-const REMATRIX_BAND_TAB: [usize; 5] = [13, 25, 37, 61, 253];
+/// Most stereo rematrixing bands a block can carry (TS 102 366 Table 4.10).
+const MAX_REMATRIX_BANDS: usize = 4;
 const ECPL_SUBBAND_TAB: [usize; 23] = [
     13, 19, 25, 31, 37, 49, 61, 73, 85, 97, 109, 121, 133, 145, 157, 169, 181, 193, 205, 217, 229,
     241, 253,
 ];
 const SPX_MAX_SUBBANDS: usize = 17;
-/// Table E2.15 default spectral extension banding structure (FFmpeg
-/// `ff_eac3_default_spx_band_struct`). Applied at block 0 when the band
-/// structure is not transmitted; persists across the frame otherwise.
+/// Default spectral extension banding structure (TS 102 366 Table E.1.10),
+/// indexed by sub-band. Applied at block 0 when the band structure is not
+/// transmitted; persists across the frame otherwise.
 const DEF_SPX_BNDSTRC: [bool; SPX_MAX_SUBBANDS] = [
     false, false, false, false, false, false, false, false, true, false, true, false, true, false,
     true, false, true,
@@ -666,15 +664,15 @@ struct BlockSyntaxState {
     /// and the per-band flags. Persist across blocks (reused when a block omits
     /// the strategy); re-established by block 0 of every frame.
     num_rematrixing_bands: usize,
-    rematrixing_flags: [bool; REMATRIX_BAND_TAB.len() - 1],
+    rematrixing_flags: [bool; MAX_REMATRIX_BANDS],
     sample_rate_index: usize,
     spxbegf: usize,
     spx_begin_subbnd: usize,
     spx_end_subbnd: usize,
     spx_in_use: bool,
     nspxbnds: usize,
-    /// Persistent SPX banding structure, indexed by absolute subband
-    /// (FFmpeg `spx_band_struct`).
+    /// Persistent SPX banding structure (`spxbndstrc[]`), indexed by
+    /// absolute sub-band.
     spx_band_struct: [bool; SPX_MAX_SUBBANDS],
     /// Bin count of each SPX band, derived from the banding structure.
     spx_band_sizes: Vec<usize>,
@@ -767,7 +765,7 @@ impl BlockSyntaxState {
             ncplsubnd: 0,
             phsflginu: false,
             num_rematrixing_bands: 0,
-            rematrixing_flags: [false; REMATRIX_BAND_TAB.len() - 1],
+            rematrixing_flags: [false; MAX_REMATRIX_BANDS],
             sample_rate_index,
             spxbegf: 0,
             spx_begin_subbnd: 0,
@@ -908,6 +906,19 @@ impl CoreDecodeState {
         self.block_syntax
             .as_ref()
             .map(|b| b.chinspx.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Snapshot of the stereo rematrixing flags (`rematflg[rbnd]`, one per
+    /// active rematrixing band) at the end of the most recently decoded
+    /// block. Empty outside 2/0 mode or before the first frame.
+    pub(crate) fn rematrixing_flags_snapshot(&self) -> &[bool] {
+        self.block_syntax
+            .as_ref()
+            .map(|b| {
+                let bands = b.num_rematrixing_bands.min(b.rematrixing_flags.len());
+                &b.rematrixing_flags[..bands]
+            })
             .unwrap_or(&[])
     }
 
@@ -1755,9 +1766,9 @@ fn parse_audio_frame(
     // Determine which channels use AHT (`chahtinu`). The flag is only present
     // for channels whose exponent strategy reuses block 0's exponents in every
     // later block; the coupling channel additionally requires coupling in use
-    // in all six blocks with no mid-frame strategy update. Mirrors FFmpeg
-    // ff_eac3_parse_header's parse_aht_info section. `adaptive_hybrid_
-    // transform_enabled` implies num_blocks == 6.
+    // in all six blocks with no mid-frame strategy update (TS 102 366
+    // clause E.1.2.3 audfrm syntax; E.1.3.2.16 - E.1.3.2.18).
+    // `adaptive_hybrid_transform_enabled` implies num_blocks == 6.
     let mut coupling_uses_aht = false;
     let mut channel_uses_aht = vec![false; fullband_channels];
     let mut lfe_uses_aht = false;
@@ -2582,32 +2593,19 @@ fn read_spx(
                     state.chinspx[channel] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
                 }
             }
-            let dst_start_code = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as usize;
+            let spxstrtf = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as usize;
             state.spxbegf = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as usize;
             let spxendf = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as usize;
-            let mut begin_subbnd = state.spxbegf + 2;
-            if begin_subbnd > 7 {
-                begin_subbnd += begin_subbnd - 7;
-            }
-            let mut end_subbnd = spxendf + 5;
-            if end_subbnd > 7 {
-                end_subbnd += end_subbnd - 7;
-            }
-            // Both are hard errors: bailing out mid-syntax would desync every
-            // field after the band structure (FFmpeg rejects them the same
-            // way).
-            if begin_subbnd >= end_subbnd {
-                return Err(ParseError::InvalidHeader("spx-range"));
-            }
+            let SpxLayout {
+                begin_subbnd,
+                end_subbnd,
+            } = spx_layout(spxstrtf, state.spxbegf, spxendf)?;
             state.spx_begin_subbnd = begin_subbnd;
             state.spx_end_subbnd = end_subbnd;
-            state.spx_dst_start_freq = dst_start_code * 12 + 25;
+            state.spx_dst_start_freq = spxstrtf * 12 + 25;
             state.spx_dst_end_freq = end_subbnd * 12 + 25;
-            if state.spx_dst_start_freq >= begin_subbnd * 12 + 25 {
-                return Err(ParseError::InvalidHeader("spx-copy-start"));
-            }
 
-            // Banding structure (FFmpeg decode_band_structure): reset to the
+            // Banding structure (TS 102 366 clause E.2.6.2): reset to the
             // default table on block 0, optionally overridden from the
             // bitstream, and persistent across the remaining blocks.
             if block == 0 {
@@ -2649,44 +2647,36 @@ fn read_spx(
                     reader.read_bit().ok_or(ParseError::ShortPacket)?
                 };
                 if coordinates_present {
-                    // Field order per A/52 Annex E / FFmpeg spx_coordinates:
-                    // spxblnd (5), mstrspxco (2), then per band spxcoexp (4) +
-                    // spxcomant (2).
-                    let spx_blend =
-                        reader.read_bits(5).ok_or(ParseError::ShortPacket)? as f32 / 32.0;
-                    let master = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as usize * 3;
+                    // spxblnd (5), mstrspxco (2), then per band spxcoexp (4)
+                    // and spxcomant (2): TS 102 366 clause E.1.2.4.
+                    let spxblnd = reader.read_bits(5).ok_or(ParseError::ShortPacket)? as u8;
+                    let mstrspxco = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as u8;
+                    let bands = state.nspxbnds.min(SPX_MAX_SUBBANDS);
+                    let mut spxcoexp = [0u8; SPX_MAX_SUBBANDS];
+                    let mut spxcomant = [0u8; SPX_MAX_SUBBANDS];
+                    for band in 0..bands {
+                        spxcoexp[band] = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as u8;
+                        spxcomant[band] = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as u8;
+                    }
                     while state.spx_signal_blend.len() <= channel {
                         state.spx_signal_blend.push(Vec::new());
                     }
-                    let mut blends = std::mem::take(&mut state.spx_signal_blend[channel]);
-                    blends.clear();
-                    blends.reserve(state.nspxbnds);
-                    let mut bin = state.spx_begin_subbnd * 12 + 25;
-                    for band in 0..state.nspxbnds {
-                        let band_size = state.spx_band_sizes.get(band).copied().unwrap_or_default();
-                        // Signal blending factor: sqrt(1 - nratio), the
-                        // counterpart noise term sqrt(3 * nratio) is not
-                        // modeled (no dither noise in this decoder).
-                        let nratio = ((bin + (band_size >> 1)) as f32
-                            / state.spx_dst_end_freq.max(1) as f32
-                            - spx_blend)
-                            .clamp(0.0, 1.0);
-                        let sblend = (1.0 - nratio).sqrt();
-                        bin += band_size;
-
-                        let exponent = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as usize;
-                        let mut mantissa =
-                            reader.read_bits(2).ok_or(ParseError::ShortPacket)? as i32;
-                        if exponent == 15 {
-                            mantissa <<= 1;
-                        } else {
-                            mantissa += 4;
-                        }
-                        mantissa <<= 25 - exponent - master;
-                        let spx_coord = mantissa as f32 / (1 << 23) as f32;
-                        blends.push(sblend * spx_coord);
-                    }
-                    state.spx_signal_blend[channel] = blends;
+                    let mut scales = std::mem::take(&mut state.spx_signal_blend[channel]);
+                    scales.clear();
+                    scales.resize(bands, 0.0);
+                    spx_band_scales(
+                        &SpxLayout {
+                            begin_subbnd: state.spx_begin_subbnd,
+                            end_subbnd: state.spx_end_subbnd,
+                        },
+                        state.spx_band_sizes.get(..bands).unwrap_or(&[]),
+                        spxblnd,
+                        mstrspxco,
+                        &spxcoexp[..bands],
+                        &spxcomant[..bands],
+                        &mut scales,
+                    );
+                    state.spx_signal_blend[channel] = scales;
                 }
             } else {
                 state.first_spx_coords[channel] = true;
@@ -2695,6 +2685,108 @@ fn read_spx(
     }
 
     Ok(())
+}
+
+/// Spectral extension sub-band range derived from one SPX strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpxLayout {
+    /// `spx_begin_subbnd`: the first spectral extension sub-band.
+    begin_subbnd: usize,
+    /// `spx_end_subbnd`: one past the last spectral extension sub-band.
+    end_subbnd: usize,
+}
+
+/// First transform coefficient of spectral extension sub-band `subbnd`
+/// (`spxbandtable[]`, TS 102 366 Table E.2.11: 12 coefficients per sub-band
+/// from coefficient 25; entry 17 is the end of the last sub-band).
+const fn spx_band_start(subbnd: usize) -> usize {
+    25 + 12 * subbnd
+}
+
+/// Derive the spectral extension sub-band range from the transmitted
+/// frequency codes and check it against the copy start.
+fn spx_layout(spxstrtf: usize, spxbegf: usize, spxendf: usize) -> Result<SpxLayout, ParseError> {
+    // spx_begin_subbnd from spxbegf (clause E.1.3.3.5) and spx_end_subbnd
+    // from spxendf (clause E.1.3.3.6); Table E.2.11 lists both mappings.
+    let begin_subbnd = if spxbegf < 6 {
+        spxbegf + 2
+    } else {
+        spxbegf * 2 - 3
+    };
+    let end_subbnd = if spxendf < 3 {
+        spxendf + 5
+    } else {
+        spxendf * 2 + 3
+    };
+    // The extension region must hold at least one sub-band and stay inside
+    // Table E.2.11 (clause E.2.6.2).
+    if begin_subbnd >= end_subbnd || end_subbnd > SPX_MAX_SUBBANDS {
+        return Err(ParseError::InvalidHeader("spx-range"));
+    }
+    // The translation copies from copystartmant = spxbandtable[spxstrtf] up to
+    // copyendmant = spxbandtable[spx_begin_subbnd] (clause E.2.6.4.1): an
+    // empty copy region leaves nothing to translate.
+    if spx_band_start(spxstrtf) >= spx_band_start(begin_subbnd) {
+        return Err(ParseError::InvalidHeader("spx-copy-start"));
+    }
+    Ok(SpxLayout {
+        begin_subbnd,
+        end_subbnd,
+    })
+}
+
+/// One channel's per-band spectral extension scale factors: for each SPX
+/// band, the signal blending factor (clause E.2.6.4.2.1) times the SPX
+/// coordinate (clause E.2.6.3) times the fixed gain of 32 (clause
+/// E.2.6.4.3). The noise path of clause E.2.6.4.2 is not modelled.
+fn spx_band_scales(
+    layout: &SpxLayout,
+    band_sizes: &[usize],
+    spxblnd: u8,
+    mstrspxco: u8,
+    spxcoexp: &[u8],
+    spxcomant: &[u8],
+    scales: &mut [f32],
+) {
+    // Clause E.2.6.4.2.1: noffset = spxblnd / 32; each band's noise ratio is
+    // its mid-point over spxbandtable[spx_end_subbnd], less noffset, clamped
+    // to [0, 1]; the signal keeps sqrt(1 - nratio).
+    let noffset = f32::from(spxblnd) / 32.0;
+    let end_bin = spx_band_start(layout.end_subbnd) as f32;
+    let master_shift = 3 * u32::from(mstrspxco & 3);
+    let mut spxmant = spx_band_start(layout.begin_subbnd);
+    for (((scale, &band_size), &exponent), &mantissa) in scales
+        .iter_mut()
+        .zip(band_sizes)
+        .zip(spxcoexp)
+        .zip(spxcomant)
+    {
+        let mid_point = spxmant as f32 + 0.5 * band_size as f32;
+        let nratio = (mid_point / end_bin - noffset).clamp(0.0, 1.0);
+        let signal_blend = (1.0 - nratio).sqrt();
+        spxmant += band_size;
+
+        // Clause E.2.6.3: the mantissa is spxcomant / 4 when the exponent is
+        // 15, otherwise (spxcomant + 4) / 8 (implicit leading one); the
+        // coordinate is that mantissa shifted right by spxcoexp + 3 *
+        // mstrspxco. Folding in the gain of 32 of clause E.2.6.4.3 makes the
+        // mantissa factor 8 * spxcomant or 4 * (spxcomant + 4), and the
+        // shift at most 15 + 9 = 24, so every step but the blend is exact.
+        let exponent = u32::from(exponent & 0x0f);
+        let mantissa = u32::from(mantissa & 3);
+        let scaled_mantissa = if exponent == 15 {
+            8 * mantissa
+        } else {
+            4 * (mantissa + 4)
+        };
+        let coordinate = scaled_mantissa as f32 / (1u32 << (exponent + master_shift)) as f32;
+        *scale = signal_blend * coordinate;
+    }
+    // Bands the inputs do not cover (mismatched lengths) carry no signal.
+    let written = band_sizes.len().min(spxcoexp.len()).min(spxcomant.len());
+    if let Some(rest) = scales.get_mut(written..) {
+        rest.fill(0.0);
+    }
 }
 
 fn read_coupling_strategy(
@@ -2891,11 +2983,8 @@ fn read_stereo_coupling_phase_flags(
     Ok(())
 }
 
-/// Stereo rematrixing strategy + band flags (A/52 §7.5.4), present only in 2/0
-/// mode. Mirrors FFmpeg `ac3dec.c` decode_audio_block: legacy AC-3 carries a
-/// `rematstr` bit every block; E-AC-3 omits it in block 0 (the flags are always
-/// present there). When the strategy is absent in a later block the previous
-/// bands/flags are reused; an absent strategy in block 0 means "no rematrixing".
+/// Stereo rematrixing strategy and flags (`rematstr`, `rematflg[rbnd]`),
+/// present only in 2/0 mode.
 fn read_rematrixing(
     reader: &mut BitReader<'_>,
     block: usize,
@@ -2907,22 +2996,41 @@ fn read_rematrixing(
     if channel_mode != 2 {
         return Ok(());
     }
-    let strategy = (is_eac3 && block == 0) || reader.read_bit().ok_or(ParseError::ShortPacket)?;
-    if strategy {
-        let mut bands = REMATRIX_BAND_TAB.len() - 1; // 4
-        let cpl_start_freq = state.cplbegf * 12 + 37;
-        if audio_frame.coupling_in_use[block] && cpl_start_freq <= 61 {
-            bands -= 1 + usize::from(cpl_start_freq == 37);
-        } else if state.spx_in_use && state.spx_begin_subbnd * 12 + 25 <= 61 {
-            bands -= 1;
-        }
-        state.num_rematrixing_bands = bands;
-        for band in 0..bands {
-            state.rematrixing_flags[band] = reader.read_bit().ok_or(ParseError::ShortPacket)?;
-        }
-    } else if block == 0 {
-        state.num_rematrixing_bands = 0;
+    // rematstr (clause 4.4.3.19): always 1 in E-AC-3 block 0, where it is not
+    // transmitted (clause E.1.2.4); a 1-bit field otherwise. When it is 0 the
+    // previous band count and flags stay in force. Legacy AC-3 forbids 0 in
+    // block 0; the previous values are then simply kept.
+    let rematstr = if is_eac3 && block == 0 {
+        true
+    } else {
+        reader.read_bit().ok_or(ParseError::ShortPacket)?
+    };
+    if !rematstr {
+        return Ok(());
     }
+    // nrematbd: Table 4.10 for standard coupling, extended by clause E.2.3.2
+    // for spectral extension (E-AC-3 only). Enhanced coupling is never active
+    // here (`ecplinu` is not decoded), so its branch of E.2.3.2 is not needed.
+    let coupling_in_use = audio_frame
+        .coupling_in_use
+        .get(block)
+        .copied()
+        .unwrap_or(false);
+    let bands = if coupling_in_use {
+        match state.cplbegf {
+            0 => 2,
+            1 | 2 => 3,
+            _ => 4,
+        }
+    } else if is_eac3 && state.spx_in_use {
+        if state.spxbegf < 2 { 3 } else { 4 }
+    } else {
+        4
+    };
+    for flag in &mut state.rematrixing_flags[..bands] {
+        *flag = reader.read_bit().ok_or(ParseError::ShortPacket)?;
+    }
+    state.num_rematrixing_bands = bands;
     Ok(())
 }
 
@@ -4153,28 +4261,45 @@ fn decode_block_pcm_mantissas_into(
     Ok(())
 }
 
+/// First transform coefficient of each rematrixing band, plus the end of the
+/// last one (TS 102 366 Table 6.25: coefficients 13-24, 25-36, 37-60 and
+/// 61-252). Tables 6.26-6.28 and clause E.2.3.2 only end the top band
+/// earlier, where coupling or spectral extension begins, which is where the
+/// channels' end mantissas stop anyway.
+const REMATRIX_BAND_EDGES: [usize; MAX_REMATRIX_BANDS + 1] = [13, 25, 37, 61, 253];
+
 /// Apply stereo rematrixing to the two fullband channels' transform
-/// coefficients in place (A/52 §7.5.4). On each flagged band the channels are
-/// reconstructed from their transmitted sum/difference form: `L = c0 + c1`,
-/// `R = c0 - c1`. Only bins below the smaller of the two channels' end mantissas
-/// are touched (the coupled / SPX region above is shared, not rematrixed).
-/// Mirrors FFmpeg `do_rematrixing`.
+/// coefficients in place.
 fn apply_rematrixing(
     coeffs: &mut [[f32; 256]; 2],
     allocation: &BlockAllocationInfo,
     state: &BlockSyntaxState,
 ) {
-    let end_mantissas = allocation.channel_end_mantissas();
-    let end = end_mantissas[0].min(end_mantissas[1]);
-    for band in 0..state.num_rematrixing_bands {
-        if !state.rematrixing_flags[band] {
-            continue;
-        }
-        let band_end = end.min(REMATRIX_BAND_TAB[band + 1]);
-        for bin in REMATRIX_BAND_TAB[band]..band_end {
-            let left_in = coeffs[0][bin];
-            coeffs[0][bin] += coeffs[1][bin];
-            coeffs[1][bin] = left_in - coeffs[1][bin];
+    // Rematrixing only reaches the lower bandwidth of the two channels
+    // (clause 6.5.4); above it lie coupled or extension coefficients.
+    let end = allocation
+        .channel_end_mantissas()
+        .iter()
+        .take(2)
+        .copied()
+        .min()
+        .unwrap_or(0)
+        .min(256);
+    let bands = state.num_rematrixing_bands.min(MAX_REMATRIX_BANDS);
+    let [left, right] = coeffs;
+    for (band, _) in state.rematrixing_flags[..bands]
+        .iter()
+        .enumerate()
+        .filter(|(_, flag)| **flag)
+    {
+        let low = REMATRIX_BAND_EDGES[band].min(end);
+        let high = REMATRIX_BAND_EDGES[band + 1].min(end);
+        // Clause 6.5.4: left = received left + received right, right =
+        // received left - received right.
+        for (l, r) in left[low..high].iter_mut().zip(&mut right[low..high]) {
+            let (sum, difference) = (*l + *r, *l - *r);
+            *l = sum;
+            *r = difference;
         }
     }
 }
@@ -4186,9 +4311,8 @@ fn apply_rematrixing(
 /// copying the low-frequency copy region `[spx_dst_start_freq,
 /// spx_src_start_freq)`, wrapping at band boundaries that do not fit, applying
 /// an optional notch attenuation at each wrap point, and scaling every band by
-/// its signal-blend coordinate. Mirrors FFmpeg
-/// `ff_eac3_apply_spectral_extension`, minus the injected dither noise (this
-/// decoder never models dither).
+/// its signal-blend coordinate (TS 102 366 clause E.2.6.4), without the
+/// noise blend (this decoder never models dither).
 fn apply_spx_extension(
     coeffs: &mut [f32; 256],
     state: &BlockSyntaxState,

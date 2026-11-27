@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Characterize the 64 profile-specific bits in the EXSS asset descriptor of
 // XLL-X streams. Legacy TS 102 114 decoders skip this reserved region.
@@ -70,7 +70,7 @@ fn main() {
         .enumerate()
         .filter(|&(index, &word)| {
             let offset = ((word >> 45) & 0x7ff) as usize * 4;
-            let size = ((word >> 6) & 0x3ff) as usize * 4 + 24;
+            let size = ((word >> 6) & 0x7ff) as usize * 4 + 24;
             offset == x_payload_offsets[index] && size == x_payload_sizes[index]
         })
         .count();
@@ -79,7 +79,7 @@ fn main() {
         .filter(|&&word| {
             let high = (word >> 32) as u32;
             let low = word as u32;
-            high & !0x00ff_e000 == 0x1800_0000 && low & !0x0000_ffc0 == 0x8a28_0000
+            high & !0x00ff_e000 == 0x1800_0000 && low & !0x0001_ffc0 == 0x8a28_0000
         })
         .count();
     println!(
@@ -95,7 +95,7 @@ fn main() {
         .enumerate()
         .filter_map(|(index, &word)| {
             let encoded_offset = ((word >> 45) & 0x7ff) as usize * 4;
-            let encoded_size = ((word >> 6) & 0x3ff) as usize * 4 + 24;
+            let encoded_size = ((word >> 6) & 0x7ff) as usize * 4 + 24;
             let actual_offset = x_payload_offsets[index];
             let actual_size = x_payload_sizes[index];
             (encoded_offset != actual_offset || encoded_size != actual_size).then_some((
@@ -120,7 +120,7 @@ fn main() {
             }
             let actual = actual as usize;
             let offset = ((word >> 45) & 0x7ff) as usize * 4;
-            let size = ((word >> 6) & 0x3ff) as usize * 4 + 24;
+            let size = ((word >> 6) & 0x7ff) as usize * 4 + 24;
             matches +=
                 usize::from(offset == x_payload_offsets[actual] && size == x_payload_sizes[actual]);
             compared += 1;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // MSB-first bit reader, mirroring `eac3/src/eac3dec/bitstream.rs`. DCA is a
 // big-endian bitstream (`get_bits` in ffmpeg's get_bits.h reads MSB-first), so

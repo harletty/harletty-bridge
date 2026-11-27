@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // DTS-HD Master Audio lossless (XLL) decoder. Ported from ffmpeg's dca_xll.c.
 // Supports the single-frequency-band path (freq <= 96 kHz, the common BluRay
@@ -892,6 +892,16 @@ impl XllDecoder {
     /// Empty `output`, keeping its buffers for the next frame.
     pub(crate) fn release_output(&mut self) {
         self.pool.give_slots(&mut self.output);
+    }
+
+    /// Feed `state` what this decoder carries from one frame into the next:
+    /// the peak-bitrate smoothing buffer and its delay, and the stream they
+    /// belong to. Each frame's headers and band data are parsed afresh.
+    pub(crate) fn hash_carried(&self, state: &mut impl std::hash::Hasher) {
+        state.write_u32(self.hd_stream_id);
+        state.write_u32(self.pbr_delay);
+        state.write_usize(self.pbr_buffer.len());
+        state.write(&self.pbr_buffer);
     }
 
     fn clear_pbr(&mut self) {

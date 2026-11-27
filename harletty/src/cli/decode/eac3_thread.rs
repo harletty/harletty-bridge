@@ -75,15 +75,14 @@ impl Dependent {
 /// Learn what a dependent substream carries, reading its blocks once where
 /// that is enough.
 ///
-/// A channel extension is decoded and merged onto the core that waits for
-/// it; a JOC dependent is inspected and handed to the object decoder, which
-/// has no use for its channels. Which it is shows only in the frame, so the
-/// one before it stands in: streams do not switch between the two from one
-/// frame to the next. A dependent expected to be an extension, with a core
-/// to merge it onto, is decoded straight away - the inspection used to come
-/// first and the decode walked the same blocks again. When the guess is
-/// wrong (the first JOC dependent of a stream) the object decoder gets the
-/// frame as it always did, and the next dependent is inspected.
+/// A dependent with a core to merge it onto is decoded straight away, whatever
+/// it carries: a channel extension is merged onto that core for the bed, and a
+/// JOC dependent's channels are merged onto it too, because the seven-channel
+/// downmix configurations read two of the reconstruction's inputs (the back
+/// pair, or the top front pair) from the dependent. The decode also finds the
+/// JOC payload, so the frame is walked once either way. Only a dependent with
+/// no core waiting - the one after an independent frame that carried JOC and
+/// was already emitted - is inspected alone.
 ///
 /// `None` is a frame the inspection rejects, which is then not handled as a
 /// dependent at all, as before.
@@ -94,7 +93,7 @@ fn read_dependent(bytes: &[u8], state: &mut DecoderState) -> Option<Dependent> {
             Some(PendingIndependent::UnsentCore(_))
         );
     let mut decode_failed = false;
-    if core_waits && !state.dependents_carry_joc {
+    if core_waits {
         match state.dependent_pcm_decoder.push_access_unit(bytes) {
             Ok(push) => {
                 state.dependents_carry_joc = push.info.joc_payload_count() > 0;
@@ -374,9 +373,65 @@ fn handle_core_pair(
     let bytes = frame.as_bytes();
 
     if dependent.info().joc_payload_count() > 0 {
+        // The dependent's channels go onto the core first: for the
+        // seven-channel JOC downmix configurations the reconstruction reads
+        // two of its inputs from them, and a bed without them is refused as
+        // a layout it cannot read. This is what the bridge feeds it too.
+        let (merged, dep_info) = match dependent {
+            Dependent::Decoded(push) => (
+                merge_core_with_decoded_dependent(&core_result.pcm, &push.pcm, &push.info),
+                push.info,
+            ),
+            Dependent::Inspected {
+                info,
+                decode_failed: true,
+            } => (None, info),
+            Dependent::Inspected {
+                info,
+                decode_failed: false,
+            } => (
+                merge_core_with_dependent(
+                    &mut state.dependent_pcm_decoder,
+                    &core_result.pcm,
+                    bytes,
+                ),
+                info,
+            ),
+        };
+        let merged_any = merged.is_some();
+        let bed = merged.unwrap_or(core_result.pcm);
+
+        // A configuration that declares a five-channel downmix is the
+        // independent substream on its own: with a dependent overlaid the bed
+        // is a different signal from the one its matrices were written for.
+        // Every stream measured that carries a dependent declares seven
+        // channels, so this guards an assumption rather than a live path.
+        if merged_any
+            && let Some(joc) = dep_info.first_joc_payload()
+            && joc.channel_count == 5
+        {
+            let message = format!(
+                "E-AC3 JOC declares a {}-channel downmix (joc_dmx_config_idx {}) but the bed carries an overlaid dependent",
+                joc.channel_count, joc.downmix_config
+            );
+            if strict_mode {
+                return Err(anyhow::anyhow!("EAC3 decode error: {message}"));
+            }
+            log::warn!("{message}");
+            state.object_decoder.note_non_joc_presentation();
+            state.frame_count += 1;
+            tick_progress(pb);
+            let _ = tx.send(Ok(Eac3FrameMessage::Core(PcmPushResult {
+                frames_seen: state.frame_count,
+                info: dep_info,
+                pcm: bed,
+            })));
+            return Ok(());
+        }
+
         match state
             .object_decoder
-            .push_access_unit_with_core(bytes, core_result.pcm.clone())
+            .push_access_unit_with_core(bytes, bed.clone())
         {
             Ok(Some(obj)) => {
                 state.frame_count += 1;
@@ -385,7 +440,16 @@ fn handle_core_pair(
                 return Ok(());
             }
             Ok(None) => {
-                // No object payload after all — fall through to the channel bed.
+                // No object payload after all: the merged bed is the answer.
+                state.object_decoder.note_non_joc_presentation();
+                state.frame_count += 1;
+                tick_progress(pb);
+                let _ = tx.send(Ok(Eac3FrameMessage::Core(PcmPushResult {
+                    frames_seen: state.frame_count,
+                    info: dep_info,
+                    pcm: bed,
+                })));
+                return Ok(());
             }
             Err(err) => {
                 return surface_decode_err(err, strict_mode, tx, pb, state, &frame.info());

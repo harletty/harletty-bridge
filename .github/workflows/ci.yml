@@ -239,7 +239,7 @@ jobs:
             python: python
             # +crt-static: see .cargo/config.toml, which RUSTFLAGS replaces.
             rustflags: -D warnings -C target-feature=+crt-static
-          - os: macos-14
+          - os: macos-15
             library: libharletty_iamf_bridge.dylib
             python: python3
             rustflags: -D warnings

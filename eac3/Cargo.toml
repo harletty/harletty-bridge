@@ -7,6 +7,9 @@ description = "Independent E-AC-3 bitstream parser and frame extractor"
 repository = "https://github.com/harletty/harletty-bridge"
 authors = ["Rainbaby"]
 rust-version = "1.89.0"
+# A diff against FFmpeg (LGPL-2.1-or-later) kept only as a local test oracle;
+# it is not part of the published crate.
+exclude = ["examples/ffmpeg-bittrace.patch"]
 
 [lib]
 name = "eac3"

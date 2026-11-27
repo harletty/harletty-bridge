@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LGPL-2.1-or-later
 //
 // Classify XLL-X profiles and decoded extension-source activity over an initial
 // bounded portion of one or more raw `[core][EXSS]` elementary streams.

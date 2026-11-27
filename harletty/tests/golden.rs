@@ -90,6 +90,11 @@ fn joc_master_set_matches_golden() {
     );
 
     // .atmos.metadata — the per-event object metadata. Compared verbatim.
+    //
+    // Rebased once when the OAMD started being dated where it applies in the
+    // decoded audio (`eac3::OAMD_LATENCY_SAMPLES`): every samplePos moves 833
+    // samples later, one core block plus the JOC reconstruction, and nothing
+    // else in the file changes. The audio does not move with it.
     let produced_meta = std::fs::read_to_string(out_dir.join("out.atmos.metadata")).unwrap();
     let golden_meta = std::fs::read_to_string(fixture("joc_atmos_1s.atmos.metadata")).unwrap();
     assert_eq!(produced_meta, golden_meta, ".atmos.metadata drifted");
