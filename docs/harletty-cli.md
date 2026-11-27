@@ -60,7 +60,8 @@ cannot reach it, and does not pay for its dependencies.
 
 Download `harletty-cli-<version>-<system>.zip` from the
 [releases page](https://github.com/harletty/harletty-bridge/releases)
-and unzip it anywhere. It is a single self-contained binary.
+and unzip it anywhere. It is a single self-contained binary (on macOS a
+universal one, for Apple silicon and Intel).
 
 Or build it:
 
