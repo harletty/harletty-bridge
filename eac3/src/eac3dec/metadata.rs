@@ -16,6 +16,9 @@ const DISTANCE_FACTORS: [f32; 16] = [
     1.1, 1.3, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0, 6.3, 7.9, 10.0, 12.6, 15.8, 20.0, 25.1, 50.1,
 ];
 const DEPTH_FACTORS: [f32; 4] = [0.25, 0.5, 1.0, 2.0];
+/// `b_default_object_priority`: priority 1.0, in the `object_priority × 32`
+/// scale of [`OamdObjectBlock::priority`].
+const DEFAULT_OBJECT_PRIORITY: u8 = 32;
 const XY_SCALE: f32 = 1.0 / 62.0;
 const Z_SCALE: f32 = 1.0 / 15.0;
 const SIZE_SCALE: f32 = 1.0 / 31.0;
@@ -112,6 +115,10 @@ pub struct OamdObjectBlock {
     /// block. A parsed block carries the flag and no `gain_db`; resolving the
     /// payload fills `gain_db` in.
     pub gain_from_previous_object: bool,
+    /// `object_priority` × 32 (clause 5.6.1.3): `object_priority_bits`, or
+    /// 32 (priority 1.0) when the stream signals the default, and 0 for a
+    /// block at its default values (table 28). `None` until the stream has
+    /// stated it.
     pub priority: Option<u8>,
     pub valid_position: bool,
     pub differential_position: bool,
@@ -370,8 +377,10 @@ impl OamdObjectBlockParseState {
         };
         if basic_info_status == 0 {
             // Default values (table 28): an inactive object, like a block that
-            // neither signals nor reuses its basic info, has a gain of −∞ dB.
+            // neither signals nor reuses its basic info, has a gain of −∞ dB
+            // and a priority of 0.
             self.gain_db = Some(f32::NEG_INFINITY);
+            self.priority = Some(0);
         } else if (basic_info_status & 1) != 0 {
             let blocks = parsed
                 .basic_info_blocks
@@ -388,12 +397,28 @@ impl OamdObjectBlockParseState {
             }
         }
 
+        // Inactive and bed objects carry no render info: theirs is reused.
         let render_info_status = if inactive || bed_or_isf_object {
-            0
+            2
         } else {
             parsed.render_info_status
         };
-        if (render_info_status & 1) != 0 {
+        if render_info_status == 0 {
+            // Default values (table 29): centred, without extent, not
+            // screen anchored.
+            self.valid_position = true;
+            self.differential_position = false;
+            self.position = Some(Vec3 {
+                x: 0.5,
+                y: 0.5,
+                z: 0.0,
+            });
+            self.distance = None;
+            self.size = Some([0.0; 3]);
+            self.anchor = ObjectAnchor::Room;
+            self.screen_factor = None;
+            self.depth_factor = None;
+        } else if (render_info_status & 1) != 0 {
             let blocks = parsed
                 .render_info_blocks
                 .unwrap_or(if render_info_status == 1 { 15 } else { 0 });
@@ -798,8 +823,12 @@ fn parse_oamd_object_block(
             };
         }
 
-        if (blocks & 1) != 0 && !read_bit(reader, "oa_default_priority")? {
-            priority = Some(read_bits(reader, 5, "oa_priority")? as u8);
+        if (blocks & 1) != 0 {
+            priority = Some(if read_bit(reader, "oa_default_priority")? {
+                DEFAULT_OBJECT_PRIORITY
+            } else {
+                read_bits(reader, 5, "oa_priority")? as u8
+            });
         }
     }
 
@@ -2094,6 +2123,17 @@ mod tests {
         parse_oamd_object_block(&mut reader, 0, 0, true).expect("object block")
     }
 
+    /// `b_default_object_priority` is priority 1.0, 32 in the × 32 scale;
+    /// `object_priority_bits` is the priority × 32 (clause 5.6.1.3).
+    #[test]
+    fn object_priority_is_parsed_in_32nds() {
+        assert_eq!(parse_bed_block_gain(&[(0, 2)]).priority, Some(32));
+        let bytes = pack_bits(&[(0, 1), (0, 2), (0, 1), (7, 5), (0, 1)]);
+        let mut reader = BitReader::new(&bytes);
+        let block = parse_oamd_object_block(&mut reader, 0, 0, true).expect("object block");
+        assert_eq!(block.priority, Some(7));
+    }
+
     #[test]
     fn object_gain_is_parsed_in_db() {
         // object_gain_idx 0 and 1 (table 18).
@@ -2228,11 +2268,11 @@ mod tests {
         }
     }
 
-    /// A later block that signals nothing new.
+    /// A later block that signals nothing new: full reuse of both.
     fn unchanged_block() -> OamdObjectBlock {
         OamdObjectBlock {
             basic_info_status: 2,
-            render_info_status: 0,
+            render_info_status: 2,
             ..OamdObjectBlock::default()
         }
     }
@@ -2338,6 +2378,88 @@ mod tests {
         assert_eq!(resolved.size, Some([0.75; 3]));
         assert_eq!(resolved.screen_factor, Some(0.625));
         assert_eq!(resolved.depth_factor, Some(0.5));
+    }
+
+    /// Render info status 0 sets the defaults of table 29 (centred, no
+    /// extent, not screen anchored), and a later block that reuses its
+    /// render info reuses those defaults, not the earlier block's values.
+    #[test]
+    fn a_render_info_status_of_0_resets_to_the_defaults() {
+        let mut payload = payload_with_object_blocks(vec![vec![
+            first_block(-6.0, P, 0.25, Some((0.5, 2.0))),
+            OamdObjectBlock {
+                basic_info_status: 2,
+                render_info_status: 0,
+                ..OamdObjectBlock::default()
+            },
+            unchanged_block(),
+        ]]);
+
+        let mut state = MetadataParseState::default();
+        state.oamd.resolve_payload(&mut payload);
+
+        let centre = Vec3 {
+            x: 0.5,
+            y: 0.5,
+            z: 0.0,
+        };
+        for resolved in &object_blocks(&payload)[1..] {
+            assert!(resolved.valid_position);
+            assert!(!resolved.differential_position);
+            assert_eq!(resolved.position, Some(centre));
+            assert_eq!(resolved.distance, None);
+            assert_eq!(resolved.size, Some([0.0; 3]));
+            assert_eq!(resolved.anchor, ObjectAnchor::Room);
+            assert_eq!(resolved.screen_factor, None);
+            assert_eq!(resolved.depth_factor, None);
+            // Basic info is reused, render defaults do not touch it.
+            assert_eq!(resolved.gain_db, Some(-6.0));
+            assert_eq!(resolved.priority, Some(7));
+        }
+    }
+
+    /// A signalled default priority replaces the priority the previous
+    /// payload's last block left, and basic info status 0 resets it to 0
+    /// (table 28) while a reuse keeps it.
+    #[test]
+    fn a_signalled_default_priority_crosses_the_payload_boundary() {
+        let mut state = MetadataParseState::default();
+
+        let mut first = payload_with_object_blocks(vec![vec![
+            OamdObjectBlock {
+                priority: Some(32),
+                ..first_block(0.0, P, 0.0, None)
+            },
+            OamdObjectBlock {
+                basic_info_status: 3,
+                basic_info_blocks: Some(1),
+                render_info_status: 2,
+                priority: Some(7),
+                ..OamdObjectBlock::default()
+            },
+        ]]);
+        state.oamd.resolve_payload(&mut first);
+        assert_eq!(object_blocks(&first)[1].priority, Some(7));
+
+        let mut second = payload_with_object_blocks(vec![vec![
+            OamdObjectBlock {
+                priority: Some(32),
+                ..first_block(0.0, P, 0.0, None)
+            },
+            unchanged_block(),
+            OamdObjectBlock {
+                basic_info_status: 0,
+                render_info_status: 2,
+                ..OamdObjectBlock::default()
+            },
+        ]]);
+        state.oamd.resolve_payload(&mut second);
+        let priorities: Vec<Option<u8>> = object_blocks(&second)
+            .iter()
+            .map(|block| block.priority)
+            .collect();
+        assert_eq!(priorities, [Some(32), Some(32), Some(0)]);
+        assert_eq!(object_blocks(&second)[2].gain_db, Some(f32::NEG_INFINITY));
     }
 
     /// A block that signals its anchor and is not screen anchored leaves the

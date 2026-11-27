@@ -67,7 +67,7 @@ fn convert_object_block(
 
     info.object_basic_info = ObjectBasicInfo {
         object_gain: gain_to_i8(eac3_block.gain_db),
-        object_priority: eac3_block.priority.map(|p| p as f64 / 31.0).unwrap_or(0.0),
+        object_priority: eac3_block.priority.map(|p| f64::from(p) / 32.0).unwrap_or(0.0),
     };
 
     let mut render = ObjectRenderInfo::default();
