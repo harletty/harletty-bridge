@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 
 /// Samples to hold back while waiting for a verdict: three of the largest
 /// blocks, which is what the detector needs to latch.
-const HOLD_LIMIT: usize = 3 * auro::block::MAX_BLOCK + 4096;
+pub(crate) const HOLD_LIMIT: usize = 3 * auro::block::MAX_BLOCK + 4096;
 
 const PCM_SCALE: f32 = 8_388_608.0;
 

@@ -10,6 +10,12 @@ pub struct InputReader {
     is_pipe: bool,
 }
 
+impl Read for InputReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
 impl InputReader {
     /// Create a new InputReader from a path
     /// Use "-" for stdin pipe input

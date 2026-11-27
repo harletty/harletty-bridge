@@ -12,6 +12,7 @@ pub mod handler;
 pub mod iamf_handler;
 pub mod output;
 pub mod parallel;
+pub mod pcm_auro;
 pub mod processor;
 pub mod progress;
 

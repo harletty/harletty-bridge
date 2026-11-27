@@ -6,10 +6,12 @@ use super::eac3_handler::Eac3DecodeHandler;
 use super::eac3_thread::{Eac3DecoderThreadConfig, spawn_eac3_decoder_thread};
 use super::handler::{DecodeHandler, FrameHandlerContext, WriterState};
 use super::parallel::{ParallelDecoderConfig, spawn_parallel_decoder_thread};
+use super::pcm_auro::{Carrier, NO_AURO, PcmAuroStage};
 use super::progress::{create_progress_bar, estimate_total_frames};
 use crate::cli::command::{AudioFormat, Cli, DecodeArgs};
 use crate::codec_probe::{Codec, probe_codec};
 use crate::input::InputReader;
+use crate::pcm::PcmReader;
 use anyhow::Result;
 use damf::SourceCodec;
 use indicatif::{MultiProgress, ProgressStyle};
@@ -32,6 +34,7 @@ pub fn cmd_decode(args: &DecodeArgs, cli: &Cli, multi: Option<&MultiProgress>) -
     match codec {
         Codec::Eac3 => return cmd_decode_eac3(args, cli, multi, prefix),
         Codec::Dts => return cmd_decode_dts(args, cli, multi, prefix),
+        Codec::Wav => return cmd_decode_wav(args, multi, prefix),
         #[cfg(feature = "iamf")]
         Codec::Iamf => return cmd_decode_iamf(args, cli, multi, prefix),
         #[cfg(not(feature = "iamf"))]
@@ -506,6 +509,68 @@ fn cmd_decode_iamf(
         reader.units,
         handler.decoded_samples
     );
+    Ok(())
+}
+
+/// Decode the Auro-3D a WAV input carries into a master set: the same one
+/// the DTS path writes for the same audio, through the same handler.
+///
+/// One thread: the unfolding is cheap beside the decoding the front end
+/// already did, and the samples are in order.
+fn cmd_decode_wav(args: &DecodeArgs, multi: Option<&MultiProgress>, prefix: Vec<u8>) -> Result<()> {
+    log::info!("Decoding PCM stream: {}", args.input.display());
+
+    // Spinner only: the length of a piped WAV is not known ahead.
+    let pb = if let Some(multi) = multi {
+        Some(create_progress_bar(multi, None)?)
+    } else {
+        None
+    };
+
+    let base_path = args.output_path.clone();
+    let mut handler = DtsDecodeHandler::default();
+    handler.warp_mode = args.warp_mode;
+    handler.bed_conform = args.bed_conform;
+    handler.mono_prefix = args.mono_prefix.clone();
+    let start_time = std::time::Instant::now();
+
+    let decode = || -> Result<()> {
+        // What the probe read off a pipe comes first.
+        let mut pcm = PcmReader::new(InputReader::new(&args.input)?.replaying(prefix))?;
+        let format = pcm.format();
+        let carrier =
+            Carrier::new(format).map_err(|reason| anyhow::anyhow!("{NO_AURO} ({reason})"))?;
+        let mut stage = PcmAuroStage::new(carrier);
+        let mut sink = |msg| handler.handle_message(msg, &base_path, args.format, args.no_audio);
+        let mut bytes = Vec::new();
+        loop {
+            let frames = pcm.read_frames(auro::unfold::MAX_PUSH, &mut bytes)?;
+            if frames == 0 {
+                break;
+            }
+            stage.push(&bytes, &mut sink)?;
+            if let Some(pb) = &pb {
+                pb.inc(1);
+            }
+        }
+        stage.finish(&mut sink)?;
+        handler.finalize()
+    };
+    if let Err(e) = decode() {
+        if let Some(pb) = &pb {
+            pb.finish_with_message("decode failed");
+        }
+        return Err(e);
+    }
+
+    finalize_progress_bar(
+        &pb,
+        None,
+        handler.decoded_samples,
+        handler.final_sample_rate,
+        start_time,
+    );
+    log::info!("PCM decoding completed successfully");
     Ok(())
 }
 

@@ -1,7 +1,8 @@
 # The `harletty` CLI
 
 Offline decoder for TrueHD, E-AC-3 JOC, DTS and IAMF bitstreams (IAMF in
-builds with the `iamf` feature, see [IAMF](#iamf)). It writes
+builds with the `iamf` feature, see [IAMF](#iamf)), and for the Auro-3D
+a lossless track carries as PCM (see [Auro-3D in PCM](#auro-3d-in-pcm)). It writes
 Dolby Atmos master files — a `.atmos` presentation, its
 `.atmos.metadata` object automation, and the `.atmos.audio` bed/object
 interleave — or plain PCM when you ask for a downmix presentation.
@@ -96,7 +97,7 @@ Accepted before or after the subcommand.
 
 | Option | Values | Default | What it does |
 |---|---|---|---|
-| `--codec` | `auto`, `truehd`, `eac3`, `dts`, `iamf` | `auto` | Input format. `auto` detects by sync word, or by the IA sequence header an IAMF stream opens with; override it when the probe guesses wrong on a headerless pipe. |
+| `--codec` | `auto`, `truehd`, `eac3`, `dts`, `iamf`, `wav` | `auto` | Input format. `auto` detects by sync word, by the IA sequence header an IAMF stream opens with, or by the header of a RIFF/WAVE, RF64, BW64 or Sony Wave64 file (`wav`: integer PCM, see [Auro-3D in PCM](#auro-3d-in-pcm)); override it when the probe guesses wrong on a headerless pipe. |
 | `--loglevel` | `off`, `error`, `warn`, `info`, `debug`, `trace` | `info` | `warn` is the useful floor: it still surfaces the timeline warning described under [Damaged streams](#damaged-streams). |
 | `--log-format` | `plain`, `json` | `plain` | `json` emits one structured record per line, for scripted callers. |
 | `--strict` | flag | off | Treat warnings as fatal and stop at the first one. Use it to *audit* a stream, not to convert it — a normal Blu-ray rip trips warnings that do not affect the output. |
@@ -108,7 +109,8 @@ Accepted before or after the subcommand.
 harletty decode [OPTIONS] <INPUT>
 ```
 
-`<INPUT>` is a file, or `-` to read stdin.
+`<INPUT>` is a file, or `-` to read stdin. A `wav` input must carry
+Auro-3D; any other is refused (see [Auro-3D in PCM](#auro-3d-in-pcm)).
 
 | Option | Values | Default | What it does |
 |---|---|---|---|
@@ -122,7 +124,7 @@ harletty decode [OPTIONS] <INPUT>
 | `--no-fold-estimate` | flag | off | DTS:X only. A waveform whose bed fold is still unknown (not stated, and not recomputed from its position) is normally given a fold estimated from the bed's audio, so it plays at its position and leaves the bed. With this flag it stays in the bed and its own channel is muted. |
 | `--warp-mode` | `normal`, `warping`, `prologiciix`, `loro` | *(from stream)* | Downmix warp mode to declare when the metadata does not carry one. |
 | `--no-estimate-progress` | flag | off | Skip the pre-pass that counts frames for the progress bar. Automatic for stdin, which cannot be pre-scanned. |
-| `--threads <N>` | count | `1` | Decode on this many threads, `0` for one per core. **TrueHD and DTS only**; E-AC-3 and IAMF always decode on one. The stream is cut into runs decoded side by side, and the output and the log are the same as on one thread. `--strict` always decodes on one thread. Memory grows with the count: about 150 MB at 16 threads. |
+| `--threads <N>` | count | `1` | Decode on this many threads, `0` for one per core. **TrueHD and DTS only**; E-AC-3, IAMF and PCM always decode on one. The stream is cut into runs decoded side by side, and the output and the log are the same as on one thread. `--strict` always decodes on one thread. Memory grows with the count: about 150 MB at 16 threads. |
 
 ### `info`
 
@@ -182,6 +184,20 @@ Frames seen  : 33 (0.4 s)
 (`DTS:X-7.1.4`, `DTS:X-7.1.4+2`, `Auro-3D-13.1 (7.1_5H_1T carried in
 7.1)`, …), or `none` for a track that carries neither.
 
+PCM (a WAV, see [Auro-3D in PCM](#auro-3d-in-pcm)), read until the carrier
+verdict is in:
+
+```
+Codec        : PCM
+Channels     : 8
+Sample rate  : 48000 Hz
+Bit depth    : 24
+Spatial      : Auro-3D-13.1 (7.1_5H_1T carried in 7.1)
+Frames seen  : 4096 (0.1 s)
+```
+
+(`Frames seen` counts sample frames here, not codec frames.)
+
 IAMF, from the sequence header, the descriptors and the first temporal
 unit that decodes:
 
@@ -208,8 +224,9 @@ report; logs stay on stderr (`--loglevel off` silences them). It is the
 form a catalogue asks for, so that the decoders and the label set live
 here alone. `--max-seconds` stops the read after about that much audio,
 whatever the codec: the DTS report stops on its own within twenty seconds
-(give it at least two, the time a plain track takes to be called plain);
-IAMF stops at its first decoded temporal unit; TrueHD and E-AC-3
+(give it at least two, the time a plain track takes to be called plain,
+which holds for PCM as well: it stops once Auro-3D is found, or after about
+two seconds without it); IAMF stops at its first decoded temporal unit; TrueHD and E-AC-3
 otherwise read the whole input. `taxonomy` prints the
 version fields alone, so a caller knows which label set a binary speaks
 before probing anything.
@@ -219,12 +236,12 @@ before probing anything.
 | `schema` | Shape of the object. Bumped only when a field is removed or changes meaning; a field added keeps it. |
 | `harletty`, `build` | Crate version, and the build line (`git describe`, library version, timestamp). |
 | `taxonomy` | The set of strings `spatial.label` can carry. Bumped whenever a label is added or renamed. |
-| `codec` | `TrueHD`, `EAC3`, `DTS` (core only), `DTS-HD HRA` (core + XXCH, with its DTS:X extension when it carries one), `DTS-HD MA` or `IAMF`; `null` when no frame was found, with `error` saying why. An IAMF stream read by a build without the `iamf` feature reports `IAMF`, its profiles, and an `error` saying the build cannot decode it. |
+| `codec` | `TrueHD`, `EAC3`, `DTS` (core only), `DTS-HD HRA` (core + XXCH, with its DTS:X extension when it carries one), `DTS-HD MA`, `IAMF` or `PCM`; `null` when no frame was found, with `error` saying why. An IAMF stream read by a build without the `iamf` feature reports `IAMF`, its profiles, and an `error` saying the build cannot decode it. A WAV that is not integer PCM reports `null` and an `error` saying so. |
 | `channels`, `sample_rate` | The compatible bed. TrueHD: the highest channel-based presentation. IAMF: the bed of the master set `decode` writes (1 for an LFE-only element, 12 for 7.1.4, 0 for objects alone). |
 | `spatial` | `null` for a plain track. Otherwise `label` (the `sourceCodec` `decode` writes), `kind` (`atmos`, `joc`, `dtsx`, `auro`, `iamf`), `objects` and `fixed` (waveform counts when the presentation states them), `experimental`, and for DTS:X the decoder's `presentation` name. An IAMF track is spatial when it carries objects or a bed with heights. |
 | `truehd` | `max_presentation`, `atmos`, `substreams`. |
 | `eac3` | `oamd`, `joc`, `spx` (Spectral Extension seen in use within the bound; measured only here, it takes a decode), `bitstream_id`. |
-| `auro` | `carrier` and `original` layouts. |
+| `auro` | `carrier` and `original` layouts (DTS-HD MA and PCM input). |
 | `iamf` | `profile` and `additional_profile` (`simple`, `base`, `base-enhanced`, `base-advanced`, `advanced-1`, `advanced-2`), `codec` (`FLAC`, `Opus`, `AAC`, `PCM`), `mix` (the mix presentation decoded), `elements` and `objects` in it; all but the profiles `null` in a build without the `iamf` feature. |
 | `signature` | TrueHD only, and only when this machine has a key: see "Checking a stream's signature". `state` is `verified`, `mismatch`, `unsigned`, `absent` or `unchecked`; `units`, `frames`, `checked`, `verified`, `mismatched`, `sync_checked` and `sync_verified` are the counts behind it. |
 | `frames_seen`, `seconds_seen` | How much was read before the report settled or the bound was reached. |
@@ -402,6 +419,53 @@ decoder resynchronises — are not compensated this way, because the number
 of access units that went by is unknowable. They remain a possible source
 of drift.
 
+## Auro-3D in PCM
+
+Auro-3D's height layer lives in the low bits of 24-bit PCM, so any lossless
+source an ffmpeg can decode bit-exactly (FLAC, LPCM, TrueHD without Atmos)
+can carry it, not only DTS-HD MA. `--codec wav` (or `auto`, which
+recognises the header) reads such PCM from a WAV and runs it through the
+same Auro-3D detection and unfold as a DTS-HD MA track:
+
+```sh
+ffmpeg -i film.flac -c:a pcm_s24le -f wav - \
+  | harletty --codec wav decode --bed-conform - --output-path film
+```
+
+- **Input** is a file or `-`, in RIFF/WAVE, RF64, BW64 or Sony Wave64, as
+  integer PCM (`WAVE_FORMAT_PCM`, or `WAVE_FORMAT_EXTENSIBLE` with the PCM
+  sub-format). Only 24-bit PCM can be Auro-3D; other depths are read but
+  never are. ffmpeg writing to a pipe leaves the sizes of the header and of
+  `data` as placeholders (0 or `0xFFFFFFFF`): the data then runs to the end
+  of the input.
+- **Channel order** comes from the extensible channel mask. A file without
+  one (or whose mask names another number of channels) takes the WAV default
+  order of its channel count: 6 is 5.1 (FL FR FC LFE BL BR) and 8 is 7.1
+  (FL FR FC LFE BL BR SL SR); other counts have no known order and are never
+  Auro-3D. On a 7.1 carrier the side pair is the Auro bed's surround pair
+  and the back pair its rear pair, as the DTS path reads a 7.1 track; on a
+  5.1 one the single pair is the surround pair, back or side.
+- **`decode`** writes exactly the master set the DTS path writes for the same
+  audio: the same labels (`Auro-3D-13.1`, …), bed, static objects and
+  `--bed-conform` handling. A PCM input without Auro-3D is an input error
+  (exit code 1: `no Auro-3D found in the PCM input`), and nothing is
+  written.
+- **`info`** reports `codec` `PCM`, its channels and sample rate, and for a
+  carrier the `Auro-3D-*` label with the `auro` object, `spatial` being
+  `null` for a plain track.
+
+**Bit-exactness.** The side channel does not survive a resampler, a dither,
+a gain, a downmix or anything else that touches the samples. The front end
+must decode to the carrier's own sample rate and channel layout, as 24-bit
+integers, and leave dynamic range control off: for TrueHD that is
+`-drc_scale 0`. A decoder that cannot be made exact shows as `no Auro-3D
+found`, not as damaged audio.
+
+The same audio decoded by ffmpeg and by this binary's own DTS decoder
+differs only in the first 512 samples (the first DTS-HD frame, which the two
+decoders treat differently at the start of a stream); the rest of the master
+set is identical.
+
 ## IAMF
 
 An IAMF input is a standalone OBU stream: an IA sequence header, its
@@ -448,8 +512,8 @@ standalone stream instead (Omniphony's `scripts/iamf2mka.py --extract`).
   removed (see `--no-fold-render`). Whatever is still unknown has its fold
   estimated from the bed's audio (see `--no-fold-estimate`), so it plays on
   its own track and leaves the bed.
-- **Auro-3D is unfolded, not decoded bit-exactly.** A DTS-HD MA track
-  that carries an Auro-Codec side channel in its low bits is recognised
+- **Auro-3D is unfolded, not decoded bit-exactly.** A DTS-HD MA track (or
+  PCM, see [Auro-3D in PCM](#auro-3d-in-pcm)) that carries an Auro-Codec side channel in its low bits is recognised
   and unfolded into the layout it was encoded from: a `7.1_5H_1T` carrier
   becomes a 13.1 master set (bed plus four corner heights, with the centre
   height and the top as static objects, since OAMD has no names for

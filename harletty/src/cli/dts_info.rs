@@ -24,9 +24,17 @@ const SUBSTREAM_SYNC: [u8; 4] = dca::SYNCWORD_SUBSTREAM.to_be_bytes();
 /// Seconds of audio inspected at most, for a stream whose lossless frames
 /// are slow to come (peak-bitrate buffering), unless `--max-seconds` says
 /// otherwise.
-const DEFAULT_MAX_SECONDS: f64 = 20.0;
+pub(super) const DEFAULT_MAX_SECONDS: f64 = 20.0;
 /// Bytes read at most, whatever the sample rate says.
 const MAX_BYTES: usize = 96 * 1024 * 1024;
+
+/// Whether a survey for Auro-3D can stop: a carrier was found, or the
+/// verdict is in that there is none and two seconds went by (a plain track
+/// is called plain only then), or the bound was reached. The rule for DTS
+/// and for PCM alike.
+pub(super) fn auro_settled(found: bool, decided: bool, seconds: f64, max_seconds: f64) -> bool {
+    found || (decided && seconds >= 2.0) || seconds >= max_seconds
+}
 
 #[derive(Default)]
 struct Survey {
@@ -52,11 +60,13 @@ impl Survey {
     /// or the other; a plain track is called plain once the carrier verdict
     /// is in and two seconds went by without a presentation.
     fn done(&self) -> bool {
-        let seconds = self.seconds();
         self.presentation.is_some()
-            || self.auro.is_some()
-            || (self.auro_decided && seconds >= 2.0)
-            || seconds >= self.max_seconds
+            || auro_settled(
+                self.auro.is_some(),
+                self.auro_decided,
+                self.seconds(),
+                self.max_seconds,
+            )
     }
 
     fn seconds(&self) -> f64 {

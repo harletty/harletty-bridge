@@ -5,3 +5,4 @@ pub(crate) mod iamf_info;
 pub(crate) mod info;
 pub(crate) mod info_report;
 pub(crate) mod inspect;
+pub(crate) mod pcm_info;
