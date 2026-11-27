@@ -15,6 +15,10 @@ name: Release
 # and linked in statically on Windows and macOS (scripts/build-static-opus.sh),
 # so that each plugin is one file there.
 #
+# The macOS CLI is one universal binary: built for Apple silicon and for Intel
+# on the arm64 runner (it has no native dependencies, IAMF being off by
+# default) and joined with `lipo`. The bridge plugins stay arm64.
+#
 # A manual run builds and tests the three platforms and publishes nothing: a
 # dry run before tagging.
 
@@ -235,6 +239,18 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      # The Intel half of the universal CLI. Before the libopus step on
+      # purpose: that one sets OPUS_LIB_DIR and OPUS_STATIC for every step
+      # after it, which belong to the IAMF plugin alone (the CLI is built
+      # without IAMF and links no libopus).
+      - name: Build the CLI for Intel (release)
+        run: cargo build --release --locked --target x86_64-apple-darwin -p harletty
+        working-directory: harletty-bridge
+        env:
+          RUSTFLAGS: -D warnings
 
       # libopus from source, static, linked into the IAMF plugin (sets
       # OPUS_LIB_DIR and OPUS_STATIC for what follows).
@@ -262,6 +278,31 @@ jobs:
         run: python3 scripts/check-static-opus.py target/release/libharletty_iamf_bridge.dylib
         working-directory: harletty-bridge
 
+      # The CLI built for Apple silicon (target/release) and for Intel, as
+      # one binary.
+      - name: Join the CLI for both architectures
+        run: |
+          mkdir -p target/release/universal
+          lipo -create \
+            target/release/harletty \
+            target/x86_64-apple-darwin/release/harletty \
+            -output target/release/universal/harletty
+          chmod +x target/release/universal/harletty
+        working-directory: harletty-bridge
+
+      - name: Check the universal CLI
+        run: |
+          lipo -info target/release/universal/harletty
+          test "$(lipo -archs target/release/universal/harletty | tr ' ' '\n' | sort | tr '\n' ' ')" = "arm64 x86_64 "
+          target/release/universal/harletty --version
+          # The Intel half under Rosetta, when the runner has it.
+          if arch -x86_64 /usr/bin/true 2> /dev/null; then
+            arch -x86_64 target/release/universal/harletty --version
+          else
+            echo "Rosetta is not available on this runner: the Intel half is not run"
+          fi
+        working-directory: harletty-bridge
+
       - name: Stage licence files
         shell: bash
         run: |
@@ -276,8 +317,8 @@ jobs:
           zip "harletty-bridge-${GITHUB_REF_NAME}-macos-arm64.zip" \
             libharletty_dolby_bridge.dylib libharletty_dts_bridge.dylib libharletty_iamf_bridge.dylib
           zip -j "harletty-bridge-${GITHUB_REF_NAME}-macos-arm64.zip" licences-bridge/*
-          zip "harletty-cli-${GITHUB_REF_NAME}-macos-arm64.zip" harletty
-          zip -j "harletty-cli-${GITHUB_REF_NAME}-macos-arm64.zip" licences-cli/*
+          zip -j "harletty-cli-${GITHUB_REF_NAME}-macos-universal.zip" universal/harletty
+          zip -j "harletty-cli-${GITHUB_REF_NAME}-macos-universal.zip" licences-cli/*
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -285,7 +326,7 @@ jobs:
           name: harletty-bridge-macos-arm64
           path: |
             harletty-bridge/target/release/harletty-bridge-*-macos-arm64.zip
-            harletty-bridge/target/release/harletty-cli-*-macos-arm64.zip
+            harletty-bridge/target/release/harletty-cli-*-macos-universal.zip
 
   release:
     needs: [omniphony, build-linux, build-windows, build-macos]
@@ -360,4 +401,4 @@ jobs:
             harletty-bridge-*-macos-arm64.zip
             harletty-cli-*-linux-x86_64.zip
             harletty-cli-*-windows-x86_64.zip
-            harletty-cli-*-macos-arm64.zip
+            harletty-cli-*-macos-universal.zip
