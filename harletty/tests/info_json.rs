@@ -45,7 +45,12 @@ fn taxonomy_reports_its_versions() {
     assert_eq!(versions["schema"], 1);
     assert_eq!(versions["taxonomy"], 4);
     assert_eq!(versions["harletty"], env!("CARGO_PKG_VERSION"));
-    assert!(versions["build"].as_str().is_some_and(|s| !s.is_empty()));
+    // The build line leads with the crate version, as `--version` does.
+    let build = versions["build"].as_str().expect("a build line");
+    assert!(
+        build.starts_with(&format!("{} (", env!("CARGO_PKG_VERSION"))),
+        "{build}"
+    );
 }
 
 #[test]

@@ -217,7 +217,7 @@ before probing anything.
 | Field | Meaning |
 |---|---|
 | `schema` | Shape of the object. Bumped only when a field is removed or changes meaning; a field added keeps it. |
-| `harletty`, `build` | Crate version, and the build line (`git describe`, library version, timestamp). |
+| `harletty`, `build` | Crate version, and the build line `harletty --version` prints after the name: the crate version, then `git describe` (a bare commit hash in a build without tags), library version and timestamp. |
 | `taxonomy` | The set of strings `spatial.label` can carry. Bumped whenever a label is added or renamed. |
 | `codec` | `TrueHD`, `EAC3`, `DTS` (core only), `DTS-HD HRA` (core + XXCH, with its DTS:X extension when it carries one), `DTS-HD MA` or `IAMF`; `null` when no frame was found, with `error` saying why. An IAMF stream read by a build without the `iamf` feature reports `IAMF`, its profiles, and an `error` saying the build cannot decode it. |
 | `channels`, `sample_rate` | The compatible bed. TrueHD: the highest channel-based presentation. IAMF: the bed of the master set `decode` writes (1 for an LFE-only element, 12 for 7.1.4, 0 for objects alone). |

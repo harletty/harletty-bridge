@@ -2,9 +2,15 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser as ClapParser, Subcommand, ValueEnum};
 
+/// The crate version, then what identifies the build: `git describe` (a bare
+/// commit hash when the checkout had no tags), the decoder library's version
+/// and the build time. What `--version` prints after the name, what the log
+/// opens with, and `info --json`'s `build`.
 pub const VERSION_INFO: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
     env!("VERGEN_GIT_DESCRIBE"),
-    " (truehd library ",
+    ", truehd library ",
     env!("TRUEHD_VERSION"),
     ") Built: ",
     env!("BUILD_TIMESTAMP")
