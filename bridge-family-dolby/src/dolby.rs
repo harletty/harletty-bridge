@@ -30,7 +30,7 @@ use crate::eac3_spdif::Eac3SpdifStream;
 use crate::frame_builders::validate_frame_shape;
 use crate::logging::{RepeatCounter, bridge_diag_log, bridge_log};
 use crate::mat::MatStream;
-use crate::metadata::OamdWarnings;
+use crate::metadata::{Eac3OamdWarnings, OamdWarnings};
 use crate::perf::PerfStats;
 use crate::shared::{AfterPush, SharedState};
 use crate::truehd_pipeline::{configure_parser, process_extractor_input, required_presentations};
@@ -219,6 +219,8 @@ pub struct DolbyPipeline {
         Option<abi_stable::std_types::RVec<bridge_api::RChannelLabel>>,
     /// TrueHD object metadata the bridge could not use, since the last reset.
     pub(crate) truehd_oamd_warnings: OamdWarnings,
+    /// E-AC-3 object metadata the bridge could not use, since the last reset.
+    pub(crate) eac3_oamd_warnings: Eac3OamdWarnings,
     /// The object metadata of a TrueHD access unit whose samples were dropped
     /// because it restates the previous one's output time, held for the next
     /// frame that goes out. Empty but at a seamless branch.
@@ -283,6 +285,7 @@ impl DolbyPipeline {
             frame_count: 0,
             truehd_spatial_labels: None,
             truehd_oamd_warnings: OamdWarnings::default(),
+            eac3_oamd_warnings: Eac3OamdWarnings::default(),
             truehd_carried_oamd: Vec::new(),
             truehd_carried_new_segment: false,
             truehd_concealer: conceal::Concealer::default(),
@@ -342,6 +345,7 @@ impl DolbyPipeline {
         self.truehd_presentations_stale = false;
         self.truehd_spatial_labels = None;
         self.truehd_oamd_warnings = OamdWarnings::default();
+        self.eac3_oamd_warnings = Eac3OamdWarnings::default();
         self.truehd_carried_oamd.clear();
         self.truehd_carried_new_segment = false;
         self.truehd_concealer.reset();

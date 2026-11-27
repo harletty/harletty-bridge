@@ -13,8 +13,9 @@ pub(crate) use bridge_common::objects::declare_object_channels;
 /// Build an [`RMetadataFrame`] from an OAMD payload parsed from E-AC3.
 ///
 /// Fixed channels are described by the frame's channel labels; here we emit
-/// the dynamic-object events plus the sparse object↔channel declaration
-/// (objects sit after the `num_bed_channels` fixed channels, in PCM order).
+/// the dynamic-object events, the LFE bed's gain, and the sparse
+/// object↔channel declaration (objects sit after the `num_bed_channels`
+/// fixed channels, in PCM order).
 /// Names are not emitted: the engine derives fixed-channel names from labels
 /// and falls back to `Obj_<id>` for unnamed objects, which matches the
 /// legacy generated names exactly.
@@ -25,8 +26,18 @@ pub(crate) fn build_eac3_metadata_frame(
     num_bed_channels: usize,
     object_channel_count: usize,
     shared: &mut SharedState,
+    warnings: &mut Eac3OamdWarnings,
 ) -> RMetadataFrame {
     let events = extract_eac3_events(oamd, evo_base, object_channel_count);
+    let bed_gains = extract_eac3_bed_gains(oamd, num_bed_channels);
+    if bed_gains.later_lfe_gain_update
+        && let Some(frames) = warnings.later_lfe_gain_updates.note()
+    {
+        bridge_log!(
+            log::Level::Warn,
+            "eac3-bridge: LFE bed gain changes after the first block of an OAMD payload; only the first block's gain is applied ({frames} payload(s) so far)"
+        );
+    }
 
     let dynamic_objects = oamd
         .object_count
@@ -43,11 +54,90 @@ pub(crate) fn build_eac3_metadata_frame(
     RMetadataFrame {
         events,
         object_channels,
-        channel_gains: RVec::new(),
+        channel_gains: bed_gains.channel_gains,
         name_updates: RVec::new(),
         sample_pos: frame_sample_pos,
-        ramp_duration: 0,
+        ramp_duration: bed_gains.ramp_duration,
     }
+}
+
+/// The E-AC-3 object metadata the bridge could not use, since the last reset
+/// (logged on the 1st, 2nd, 4th, 8th... payload).
+#[derive(Debug, Default)]
+pub(crate) struct Eac3OamdWarnings {
+    /// Payloads whose LFE bed gain changes in a block after the first. The
+    /// host applies a fixed channel's gain from the first sample of the
+    /// frame, so a frame states one gain per channel: the first block's.
+    pub(crate) later_lfe_gain_updates: RepeatCounter,
+}
+
+/// What [`extract_eac3_bed_gains`] found.
+struct Eac3BedGains {
+    channel_gains: RVec<bridge_api::RChannelGain>,
+    /// The ramp of the payload's first block update.
+    ramp_duration: u32,
+    /// The LFE gain changes in a later block, and that change is dropped.
+    later_lfe_gain_update: bool,
+}
+
+/// The LFE bed object's OAMD gain as a gain on the fixed LFE channel, with
+/// the ramp of the payload's first block update.
+///
+/// In object mode the output carries the core's LFE as its only fixed
+/// channel (channel 0, when `num_bed_channels` is 1); the other bed members
+/// feed the JOC decode and have no output channel of their own, so their
+/// gains have nothing to apply to. As on the TrueHD path, the gain is
+/// re-stated on every frame.
+///
+/// Bed objects come first in the object list, before any ISF object
+/// (ETSI TS 103 420, clause 5.6.4.8), so an LFE bed is found among them
+/// whether or not the program also carries ISF objects.
+fn extract_eac3_bed_gains(oamd: &OamdPayload, num_bed_channels: usize) -> Eac3BedGains {
+    let mut found = Eac3BedGains {
+        channel_gains: RVec::new(),
+        ramp_duration: 0,
+        later_lfe_gain_update: false,
+    };
+    if num_bed_channels == 0 {
+        return found;
+    }
+    let Some(lfe_object) = oamd
+        .bed_assignment
+        .iter()
+        .flatten()
+        .take(oamd.bed_or_isf_objects)
+        .position(|&ch| ch == eac3::BedChannel::LowFrequencyEffects)
+    else {
+        return found;
+    };
+    for element in &oamd.elements {
+        let eac3::OamdElementKind::Object(ref obj_element) = element.kind else {
+            continue;
+        };
+        let Some(block) = obj_element
+            .object_blocks
+            .get(lfe_object)
+            .and_then(|blocks| blocks.first())
+        else {
+            continue;
+        };
+        found.ramp_duration = obj_element
+            .block_updates
+            .first()
+            .map(|u| u.ramp_duration as u32)
+            .unwrap_or(0);
+        let gain_db = event_gain_db(block.gain_db);
+        found.later_lfe_gain_update = obj_element.object_blocks[lfe_object]
+            .iter()
+            .skip(1)
+            .any(|later| event_gain_db(later.gain_db) != gain_db);
+        found.channel_gains.push(bridge_api::RChannelGain {
+            channel: 0,
+            gain_db,
+        });
+        break;
+    }
+    found
 }
 
 /// An E-AC3 object gain (dB, −∞ for a muted object) as an event's `gain_db`:
@@ -204,13 +294,15 @@ mod tests {
     #[test]
     fn eac3_metadata_declares_objects_sparsely() {
         let mut bridge = TestBridge::new(false);
+        let mut warnings = Eac3OamdWarnings::default();
         let mut payload = empty_oamd_payload();
         payload.object_count = 3;
         payload.dynamic_objects = 2;
 
         // Two dynamic objects after one fixed (LFE) channel: ids 10/11 on
         // channels 1/2, declared on the first frame only.
-        let meta = build_eac3_metadata_frame(&payload, 0, 0, 1, 2, &mut bridge.shared);
+        let meta =
+            build_eac3_metadata_frame(&payload, 0, 0, 1, 2, &mut bridge.shared, &mut warnings);
         let decl: Vec<(u32, u32)> = meta
             .object_channels
             .iter()
@@ -220,7 +312,8 @@ mod tests {
         assert!(meta.name_updates.is_empty());
 
         // Unchanged declaration → sparse (empty) re-emission.
-        let again = build_eac3_metadata_frame(&payload, 0, 0, 1, 2, &mut bridge.shared);
+        let again =
+            build_eac3_metadata_frame(&payload, 0, 0, 1, 2, &mut bridge.shared, &mut warnings);
         assert!(again.object_channels.is_empty());
     }
 
@@ -269,6 +362,193 @@ mod tests {
         let events = extract_eac3_events(&payload, 0, gains.len());
         let event_gains: Vec<i8> = events.iter().map(|e| e.gain_db).collect();
         assert_eq!(event_gains, [0, -6, 15, -49, i8::MIN, 0]);
+    }
+
+    /// A payload with one bed object per entry of `bed` (LFE first in the
+    /// usual JOC layout), then one dynamic object, each with its own gain.
+    fn payload_with_bed_gains(
+        bed: &[eac3::BedChannel],
+        bed_gains: &[Option<f32>],
+        ramp_duration: i16,
+    ) -> OamdPayload {
+        use eac3::{OamdBlockUpdate, OamdElement, OamdElementKind, OamdObjectBlock};
+
+        let mut payload = empty_oamd_payload();
+        payload.object_count = bed.len() + 1;
+        payload.beds = bed.len();
+        payload.bed_or_isf_objects = bed.len();
+        payload.dynamic_objects = 1;
+        payload.bed_assignment = vec![bed.to_vec()];
+        payload.element_count = 1;
+        payload.elements = vec![OamdElement {
+            element_index: 1,
+            byte_length: 0,
+            kind: OamdElementKind::Object(eac3::OamdObjectElement {
+                sample_offset: 0,
+                block_updates: vec![OamdBlockUpdate {
+                    offset: 0,
+                    ramp_duration,
+                }],
+                object_blocks: bed_gains
+                    .iter()
+                    .copied()
+                    .chain([Some(-3.0)])
+                    .map(|gain_db| {
+                        vec![OamdObjectBlock {
+                            gain_db,
+                            ..OamdObjectBlock::default()
+                        }]
+                    })
+                    .collect(),
+            }),
+        }];
+        payload
+    }
+
+    fn gains(meta: &RMetadataFrame) -> Vec<(u32, i8)> {
+        meta.channel_gains
+            .iter()
+            .map(|g| (g.channel, g.gain_db))
+            .collect()
+    }
+
+    /// The LFE bed object's gain reaches the fixed LFE channel in dB, with
+    /// the block's ramp, as the TrueHD path states its bed gains; the
+    /// dynamic object's gain stays on its event.
+    #[test]
+    fn eac3_metadata_carries_the_lfe_bed_gain() {
+        use eac3::BedChannel::LowFrequencyEffects;
+
+        let mut bridge = TestBridge::new(false);
+        let mut warnings = Eac3OamdWarnings::default();
+        let payload = payload_with_bed_gains(&[LowFrequencyEffects], &[Some(-10.0)], 64);
+        let meta =
+            build_eac3_metadata_frame(&payload, 0, 0, 1, 1, &mut bridge.shared, &mut warnings);
+        assert_eq!(gains(&meta), [(0, -10)]);
+        assert_eq!(meta.ramp_duration, 64);
+        let events: Vec<(u32, i8)> = meta.events.iter().map(|e| (e.id, e.gain_db)).collect();
+        assert_eq!(events, [(10, -3)]);
+
+        // A muted LFE bed is the host's −∞ sentinel, not full level.
+        let payload = payload_with_bed_gains(&[LowFrequencyEffects], &[Some(f32::NEG_INFINITY)], 0);
+        let meta =
+            build_eac3_metadata_frame(&payload, 0, 0, 1, 1, &mut bridge.shared, &mut warnings);
+        assert_eq!(gains(&meta), [(0, i8::MIN)]);
+    }
+
+    /// Only the LFE has an output channel: a bed member that feeds the JOC
+    /// decode gets no channel gain, and neither does an LFE bed object when
+    /// the core carries no LFE channel.
+    #[test]
+    fn eac3_metadata_states_no_gain_for_a_bed_member_without_a_channel() {
+        use eac3::BedChannel::{Center, LowFrequencyEffects};
+
+        let mut bridge = TestBridge::new(false);
+        let mut warnings = Eac3OamdWarnings::default();
+        let payload = payload_with_bed_gains(
+            &[Center, LowFrequencyEffects],
+            &[Some(-20.0), Some(-4.0)],
+            0,
+        );
+        let meta =
+            build_eac3_metadata_frame(&payload, 0, 0, 1, 1, &mut bridge.shared, &mut warnings);
+        assert_eq!(gains(&meta), [(0, -4)]);
+
+        let payload = payload_with_bed_gains(&[LowFrequencyEffects], &[Some(-4.0)], 0);
+        let meta =
+            build_eac3_metadata_frame(&payload, 0, 0, 0, 1, &mut bridge.shared, &mut warnings);
+        assert!(meta.channel_gains.is_empty());
+        assert_eq!(meta.ramp_duration, 0);
+    }
+
+    /// `payload` with `isf` ISF objects at 0 dB after its bed objects, as
+    /// the object list orders them (ETSI TS 103 420, clause 5.6.4.8).
+    fn with_isf_objects(mut payload: OamdPayload, isf: usize) -> OamdPayload {
+        let eac3::OamdElementKind::Object(ref mut element) = payload.elements[0].kind else {
+            unreachable!("payload_with_bed_gains builds an object element");
+        };
+        let bed = payload.bed_or_isf_objects;
+        for _ in 0..isf {
+            element.object_blocks.insert(
+                bed,
+                vec![eac3::OamdObjectBlock {
+                    gain_db: Some(0.0),
+                    ..eac3::OamdObjectBlock::default()
+                }],
+            );
+        }
+        payload.isf_in_use = true;
+        payload.isf_index = Some(0);
+        payload.bed_or_isf_objects += isf;
+        payload.object_count += isf;
+        payload
+    }
+
+    /// An LFE bed keeps its gain when the program also carries ISF objects:
+    /// the bed objects come first. Without an LFE bed there is no gain.
+    #[test]
+    fn eac3_metadata_carries_the_lfe_bed_gain_next_to_isf_objects() {
+        use eac3::BedChannel::LowFrequencyEffects;
+
+        let mut bridge = TestBridge::new(false);
+        let mut warnings = Eac3OamdWarnings::default();
+        let payload = with_isf_objects(
+            payload_with_bed_gains(&[LowFrequencyEffects], &[Some(f32::NEG_INFINITY)], 0),
+            2,
+        );
+        let meta =
+            build_eac3_metadata_frame(&payload, 0, 0, 1, 1, &mut bridge.shared, &mut warnings);
+        assert_eq!(gains(&meta), [(0, i8::MIN)]);
+        let events: Vec<(u32, i8)> = meta.events.iter().map(|e| (e.id, e.gain_db)).collect();
+        assert_eq!(events, [(10, -3)]);
+
+        let payload = with_isf_objects(payload_with_bed_gains(&[], &[], 0), 2);
+        let meta =
+            build_eac3_metadata_frame(&payload, 0, 0, 1, 1, &mut bridge.shared, &mut warnings);
+        assert!(meta.channel_gains.is_empty());
+    }
+
+    /// A frame states one gain per fixed channel, from its first sample: an
+    /// LFE gain change in a later block cannot be dated, so the first
+    /// block's gain is applied and the dropped change is counted.
+    #[test]
+    fn eac3_metadata_counts_an_lfe_gain_change_after_the_first_block() {
+        use eac3::BedChannel::LowFrequencyEffects;
+        use eac3::OamdObjectBlock;
+
+        let mut bridge = TestBridge::new(false);
+        let mut warnings = Eac3OamdWarnings::default();
+        let mut payload =
+            payload_with_bed_gains(&[LowFrequencyEffects], &[Some(f32::NEG_INFINITY)], 32);
+        let eac3::OamdElementKind::Object(ref mut element) = payload.elements[0].kind else {
+            unreachable!("payload_with_bed_gains builds an object element");
+        };
+        element.block_updates.push(eac3::OamdBlockUpdate {
+            offset: 16,
+            ramp_duration: 64,
+        });
+        for (object, gain_db) in [(0, Some(0.0)), (1, Some(-3.0))] {
+            element.object_blocks[object].push(OamdObjectBlock {
+                gain_db,
+                ..OamdObjectBlock::default()
+            });
+        }
+
+        let meta =
+            build_eac3_metadata_frame(&payload, 0, 0, 1, 1, &mut bridge.shared, &mut warnings);
+        assert_eq!(gains(&meta), [(0, i8::MIN)]);
+        assert_eq!(meta.ramp_duration, 32);
+        assert_eq!(warnings.later_lfe_gain_updates.count(), 1);
+
+        // A later block that keeps the gain drops nothing.
+        let eac3::OamdElementKind::Object(ref mut element) = payload.elements[0].kind else {
+            unreachable!();
+        };
+        element.object_blocks[0][1].gain_db = Some(f32::NEG_INFINITY);
+        let meta =
+            build_eac3_metadata_frame(&payload, 0, 0, 1, 1, &mut bridge.shared, &mut warnings);
+        assert_eq!(gains(&meta), [(0, i8::MIN)]);
+        assert_eq!(warnings.later_lfe_gain_updates.count(), 1);
     }
 
     /// Anisotropic OAMD size [w, d, h] is preserved end-to-end without any
